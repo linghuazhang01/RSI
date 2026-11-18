@@ -1,0 +1,12 @@
+# GPU stack for lora_code/ and edit_code/ (Linux x86_64, CUDA 13.0). Pinned by the user (2026-11-18).
+torch==2.11.0
+vllm==0.24.0
+transformers==5.9.0
+verl==0.9.1
+# used by our code
+peft
+accelerate
+datasets
+safetensors
+pyyaml
+# llmcompressor: every released version conflicts with vllm 0.24.0 (compressed-tensors==0.17.0) + transformers 5.9.0; Paper A writes compressed-tensors checkpoints directly

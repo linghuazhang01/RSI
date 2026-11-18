@@ -1,0 +1,198 @@
+{
+  "verdict": "PASS",
+  "hallucination_rate": 0.0,
+  "pending_rate": 0.0,
+  "warnings": [],
+  "papers": [
+    {
+      "id": "arxiv-0",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2506.10943"
+      }
+    },
+    {
+      "id": "arxiv-1",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2502.14413"
+      }
+    },
+    {
+      "id": "arxiv-2",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2410.15639"
+      }
+    },
+    {
+      "id": "arxiv-3",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2601.09694"
+      }
+    },
+    {
+      "id": "arxiv-4",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2509.05584"
+      }
+    },
+    {
+      "id": "arxiv-5",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2506.06105"
+      }
+    },
+    {
+      "id": "arxiv-6",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2411.05877"
+      }
+    },
+    {
+      "id": "arxiv-7",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2603.08640"
+      }
+    },
+    {
+      "id": "arxiv-8",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2605.27276"
+      }
+    },
+    {
+      "id": "arxiv-9",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2610.12176"
+      }
+    },
+    {
+      "id": "arxiv-10",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2609.26457"
+      }
+    },
+    {
+      "id": "arxiv-11",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2310.00160"
+      }
+    },
+    {
+      "id": "arxiv-12",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2406.12034"
+      }
+    },
+    {
+      "id": "arxiv-13",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2501.06252"
+      }
+    },
+    {
+      "id": "arxiv-14",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2506.16406"
+      }
+    },
+    {
+      "id": "arxiv-15",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2607.28568"
+      }
+    },
+    {
+      "id": "arxiv-16",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2604.15794"
+      }
+    },
+    {
+      "id": "arxiv-17",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2406.02924"
+      }
+    },
+    {
+      "id": "arxiv-18",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2410.14649"
+      }
+    }
+  ]
+}

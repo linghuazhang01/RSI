@@ -1,0 +1,38 @@
+{
+  "verdict": "PASS",
+  "hallucination_rate": 0.0,
+  "pending_rate": 0.0,
+  "warnings": [],
+  "papers": [
+    {
+      "id": "arxiv-0",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2609.06396"
+      }
+    },
+    {
+      "id": "arxiv-1",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2610.22791"
+      }
+    },
+    {
+      "id": "arxiv-2",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2607.03935"
+      }
+    }
+  ]
+}

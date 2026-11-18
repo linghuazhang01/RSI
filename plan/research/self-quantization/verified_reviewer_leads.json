@@ -1,0 +1,28 @@
+{
+  "verdict": "PASS",
+  "hallucination_rate": 0.0,
+  "pending_rate": 0.0,
+  "warnings": [],
+  "papers": [
+    {
+      "id": "arxiv-0",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2611.11975"
+      }
+    },
+    {
+      "id": "arxiv-1",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2608.05499"
+      }
+    }
+  ]
+}

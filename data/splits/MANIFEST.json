@@ -1,0 +1,885 @@
+{
+ "config_sha256": "8416b26876762a85f760d5f0ba832bb7c2ef241256ed43aaca9fb11b84423fa9",
+ "decontamination": {
+  "apibank_train": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "apps": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "arc": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "dapo_math": {
+   "exact_examples": [
+    "dapo/009ddb1d-ab00-4672-8a1a-5ab38e0d2034",
+    "dapo/021af04e-6625-4efd-8343-913dfca529ed",
+    "dapo/02c8f190-4a6c-49fd-99bd-b6936a506dd1",
+    "dapo/0332021f-0487-4b0a-8022-08a8071c902a",
+    "dapo/033e90c9-4c3e-49b4-9458-1d53d893b40e",
+    "dapo/0359299e-2264-4d38-b41e-3c852d9eb50a",
+    "dapo/03630476-2366-4556-9a26-00de066ce926",
+    "dapo/038432de-869b-41bd-ad29-80f2cd58aa8f",
+    "dapo/0389368f-49c8-4f97-9eee-69ee61876ad6",
+    "dapo/03a1ad93-5c2f-4a58-94c0-e08578e1675e",
+    "dapo/03bebf3d-293e-446f-b4cc-9b61aa301e4c",
+    "dapo/04178b4b-96f6-43f5-af7d-e6b0fe425236",
+    "dapo/045e3f2f-a22f-4e90-95cf-3dde19a63ddc",
+    "dapo/0484efff-629b-42f8-b095-bb627378c424",
+    "dapo/04ae351f-21c5-402a-94b0-01ad0bb2dc57",
+    "dapo/05d3d17d-15d8-4f34-a7c0-0563f85bba40",
+    "dapo/061571e3-7269-4e34-b870-f3588646151b",
+    "dapo/066df148-1c72-4467-9fa7-bf84d094a5e4",
+    "dapo/06865281-0468-468f-9f37-b45f411fbbdf",
+    "dapo/071d2258-f634-4b2d-9f4d-1de31c1bfcb5"
+   ],
+   "exact_match_removed": 984,
+   "near_dup_13gram_removed": 85,
+   "near_dup_examples": [
+    [
+     "dapo/0152710e-c10b-4dba-a44b-ad5fba93a867",
+     "math/test/geometry/449"
+    ],
+    [
+     "dapo/03397ac4-f821-471c-b44f-bc26cce8123f",
+     "amc23/10"
+    ],
+    [
+     "dapo/06390219-477f-4848-8e3d-df373fb51e8d",
+     "amc23/16"
+    ],
+    [
+     "dapo/0b7033f6-56ad-43c6-9cad-e728e3e38155",
+     "amc23/44"
+    ],
+    [
+     "dapo/0c69905c-ed03-4dbf-804c-e5d06218d1b0",
+     "amc23/26"
+    ],
+    [
+     "dapo/0cac63d3-2050-4255-8574-9e8b77fa5e36",
+     "olympiadbench/1798"
+    ],
+    [
+     "dapo/0f64e9ec-bc40-4ca8-b80f-3ae2b0dd8d41",
+     "math/test/precalculus/524"
+    ],
+    [
+     "dapo/146bc3eb-f75b-4015-9a51-86f9ea624864",
+     "olympiadbench/1873"
+    ],
+    [
+     "dapo/149719c5-b6ad-46b8-8968-6285a1563889",
+     "olympiadbench/1662"
+    ],
+    [
+     "dapo/15a38198-d5e7-4a3d-88e1-6d045c831da8",
+     "amc23/28"
+    ],
+    [
+     "dapo/1b8f4f92-227d-4471-8309-cb1b09ffb4ea",
+     "olympiadbench/1807"
+    ],
+    [
+     "dapo/1fa53fc5-6c25-443f-900f-49a01399fb17",
+     "amc23/13"
+    ],
+    [
+     "dapo/25f28d8f-466c-48a1-9eec-6f34287c3047",
+     "olympiadbench/2064"
+    ],
+    [
+     "dapo/273daed8-850f-48d5-bc3e-132bcc548d8f",
+     "amc23/4"
+    ],
+    [
+     "dapo/281d4d68-6b5b-444b-84b1-b170dd3472d8",
+     "olympiadbench/1945"
+    ],
+    [
+     "dapo/28899bd8-d432-414d-bc00-f2dbc9e63ec8",
+     "olympiadbench/2022"
+    ],
+    [
+     "dapo/29267fa5-4acc-4983-80d3-7620d96135ee",
+     "olympiadbench/1887"
+    ],
+    [
+     "dapo/2cc4ea28-50fc-4642-be16-d76aab93b525",
+     "olympiadbench/1641"
+    ],
+    [
+     "dapo/2ebec39f-4dea-48c9-9616-f1bde006a0ae",
+     "amc23/8"
+    ],
+    [
+     "dapo/3223a825-9e51-4352-a749-11a54b4e37dc",
+     "olympiadbench/1612"
+    ]
+   ]
+  },
+  "gpqa_main": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "gsm8k_train": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 2,
+   "near_dup_examples": [
+    [
+     "gsm8k/train/1314",
+     "gsm8k/test/602"
+    ],
+    [
+     "gsm8k/train/5162",
+     "gsm8k/test/602"
+    ]
+   ]
+  },
+  "ifeval_train": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 16,
+   "near_dup_examples": [
+    [
+     "rlvr_ifeval/10720",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/11662",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/12709",
+     "ifbench/105"
+    ],
+    [
+     "rlvr_ifeval/1657",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/1999",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/2708",
+     "ifbench/105"
+    ],
+    [
+     "rlvr_ifeval/333",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/3661",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/3964",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/4869",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/6475",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/6670",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/7911",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/7943",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/9757",
+     "ifeval/2216"
+    ],
+    [
+     "rlvr_ifeval/9885",
+     "ifeval/2216"
+    ]
+   ]
+  },
+  "magicoder_oss": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "math_train": {
+   "exact_examples": [
+    "math/train/geometry/433"
+   ],
+   "exact_match_removed": 1,
+   "near_dup_13gram_removed": 33,
+   "near_dup_examples": [
+    [
+     "math/train/algebra/1256",
+     "math/test/geometry/159"
+    ],
+    [
+     "math/train/algebra/1324",
+     "math/test/geometry/159"
+    ],
+    [
+     "math/train/algebra/1376",
+     "math/test/algebra/684"
+    ],
+    [
+     "math/train/algebra/173",
+     "math/test/algebra/1033"
+    ],
+    [
+     "math/train/counting_and_probability/243",
+     "math/test/counting_and_probability/115"
+    ],
+    [
+     "math/train/counting_and_probability/759",
+     "math/test/counting_and_probability/344"
+    ],
+    [
+     "math/train/geometry/1",
+     "math/test/geometry/449"
+    ],
+    [
+     "math/train/geometry/123",
+     "math/test/geometry/159"
+    ],
+    [
+     "math/train/geometry/697",
+     "math/test/geometry/320"
+    ],
+    [
+     "math/train/geometry/799",
+     "math/test/geometry/340"
+    ],
+    [
+     "math/train/intermediate_algebra/214",
+     "math/test/intermediate_algebra/837"
+    ],
+    [
+     "math/train/intermediate_algebra/460",
+     "math/test/intermediate_algebra/837"
+    ],
+    [
+     "math/train/intermediate_algebra/58",
+     "olympiadbench/2890"
+    ],
+    [
+     "math/train/intermediate_algebra/896",
+     "math/test/intermediate_algebra/591"
+    ],
+    [
+     "math/train/number_theory/865",
+     "math/test/prealgebra/185"
+    ],
+    [
+     "math/train/number_theory/868",
+     "math/test/number_theory/301"
+    ],
+    [
+     "math/train/prealgebra/1149",
+     "math/test/prealgebra/652"
+    ],
+    [
+     "math/train/prealgebra/40",
+     "math/test/prealgebra/3"
+    ],
+    [
+     "math/train/prealgebra/703",
+     "math/test/prealgebra/185"
+    ],
+    [
+     "math/train/prealgebra/752",
+     "math/test/prealgebra/185"
+    ]
+   ]
+  },
+  "sealtool_train": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 3,
+   "near_dup_examples": [
+    [
+     "sealtool/train-difficult-8003",
+     "sealtool/test_in_domain-difficult-337"
+    ],
+    [
+     "sealtool/train-difficult-8133",
+     "sealtool/test_in_domain-difficult-337"
+    ],
+    [
+     "sealtool/train-easy-3320",
+     "sealtool/test_out_domain-difficult-610"
+    ]
+   ]
+  },
+  "squad_train": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "taco_verified": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "toolace": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  },
+  "triviaqa_train": {
+   "exact_examples": [
+    "triviaqa/bb_1012",
+    "triviaqa/bb_1082",
+    "triviaqa/bb_1101",
+    "triviaqa/bb_1142",
+    "triviaqa/bb_1193",
+    "triviaqa/bb_1229",
+    "triviaqa/bb_1319",
+    "triviaqa/bb_1386",
+    "triviaqa/bb_1446",
+    "triviaqa/bb_1476",
+    "triviaqa/bb_151",
+    "triviaqa/bb_1604",
+    "triviaqa/bb_1651",
+    "triviaqa/bb_1693",
+    "triviaqa/bb_1700",
+    "triviaqa/bb_1722",
+    "triviaqa/bb_1746",
+    "triviaqa/bb_1762",
+    "triviaqa/bb_1775",
+    "triviaqa/bb_179"
+   ],
+   "exact_match_removed": 2428,
+   "near_dup_13gram_removed": 370,
+   "near_dup_examples": [
+    [
+     "triviaqa/bb_1509",
+     "triviaqa/bt_3155"
+    ],
+    [
+     "triviaqa/bb_2605",
+     "FreebaseQA-eval-3359"
+    ],
+    [
+     "triviaqa/bb_2913",
+     "FreebaseQA-eval-3324"
+    ],
+    [
+     "triviaqa/bb_5956",
+     "FreebaseQA-eval-3728"
+    ],
+    [
+     "triviaqa/bb_9312",
+     "FreebaseQA-eval-3716"
+    ],
+    [
+     "triviaqa/bt_1070",
+     "FreebaseQA-eval-3968"
+    ],
+    [
+     "triviaqa/bt_1306",
+     "FreebaseQA-eval-939"
+    ],
+    [
+     "triviaqa/bt_1581",
+     "FreebaseQA-eval-3703"
+    ],
+    [
+     "triviaqa/bt_1853",
+     "FreebaseQA-eval-3652"
+    ],
+    [
+     "triviaqa/bt_2224",
+     "FreebaseQA-eval-190"
+    ],
+    [
+     "triviaqa/bt_2354",
+     "FreebaseQA-eval-1504"
+    ],
+    [
+     "triviaqa/bt_2369",
+     "FreebaseQA-eval-1696"
+    ],
+    [
+     "triviaqa/bt_272",
+     "FreebaseQA-eval-1111"
+    ],
+    [
+     "triviaqa/bt_273",
+     "FreebaseQA-eval-423"
+    ],
+    [
+     "triviaqa/bt_2924",
+     "FreebaseQA-eval-2018"
+    ],
+    [
+     "triviaqa/bt_2999",
+     "FreebaseQA-eval-2757"
+    ],
+    [
+     "triviaqa/bt_3048",
+     "FreebaseQA-eval-434"
+    ],
+    [
+     "triviaqa/bt_3177",
+     "FreebaseQA-eval-2320"
+    ],
+    [
+     "triviaqa/bt_3298",
+     "triviaqa/qz_6596"
+    ],
+    [
+     "triviaqa/bt_3313",
+     "FreebaseQA-eval-3642"
+    ]
+   ]
+  },
+  "tulu3_if": {
+   "exact_examples": [],
+   "exact_match_removed": 0,
+   "near_dup_13gram_removed": 0,
+   "near_dup_examples": []
+  }
+ },
+ "gate_sizes": {
+  "arc": 500,
+  "dapo_math": 400,
+  "gsm8k_train": 250,
+  "ifeval": 135,
+  "ifeval_train": 1000,
+  "math_train": 350,
+  "sealtool_train": 1000,
+  "taco_verified": 1000,
+  "triviaqa_train": 500
+ },
+ "processed": {
+  "aime24.jsonl": {
+   "n": 30,
+   "sha256": "58be6154d119b7960994841635b5fd2d3e86a9f4ba7ea9cd6b3632d04ad0d1d8"
+  },
+  "aime25.jsonl": {
+   "n": 30,
+   "sha256": "e010f466ad5ad26c4c3d6fa395b0d15074cfe2e22b4c3f9aa35e4abb583da72e"
+  },
+  "alpaca_eval.jsonl": {
+   "n": 805,
+   "sha256": "33963651835fcb04536d7cb3737e80cd7a4729a2ba4b587ac57fc2e6f98f0c28"
+  },
+  "amc23.jsonl": {
+   "n": 40,
+   "sha256": "23187b34dfb40371e22acb6c6aea7d1cef028a20663b36eb8be0befcada71467"
+  },
+  "apibank.jsonl": {
+   "n": 584,
+   "sha256": "97412601e3a6b9e0e6a2282d5f6548b85e0c174a50b18ca9c71b1a69f7f95bd2"
+  },
+  "apibank_train.jsonl": {
+   "n": 10376,
+   "sha256": "45034d87e12825218486fa1237d1451338ccb2b2e146529f21171ebdb681eec4"
+  },
+  "apps.jsonl": {
+   "n": 4449,
+   "sha256": "e113a91755838d73bac61ed60eb89f8032dfce5b69e99e942cd6d3c93189fcc1"
+  },
+  "arc.jsonl": {
+   "n": 3370,
+   "sha256": "c8017756c252e36f9f59f5bb5fa70f4c7599164b955ae9b2f9384dea75f7f1bf"
+  },
+  "bfcl.jsonl": {
+   "n": 4696,
+   "sha256": "91a7dcda3f4fba67e07d2c58906e4e3f613cb468a61e164cf0a16c5d844afc54"
+  },
+  "dapo_math.jsonl": {
+   "n": 17398,
+   "sha256": "1f3dab781ff16b26b2f5cee33c621e1db820301421a078cd278bbb706cf013e8"
+  },
+  "freebaseqa.jsonl": {
+   "n": 3996,
+   "sha256": "0a6d3acf436dc93bce8a155b1a4352ab5990e2fd54f948ad658073e5036a1854"
+  },
+  "gpqa_diamond.jsonl": {
+   "n": 198,
+   "sha256": "7bb3eb151e2193e4aa7338798226de9437daa539941f1106311cccb346fa5a54"
+  },
+  "gpqa_main.jsonl": {
+   "n": 250,
+   "sha256": "8d5cb4d7ed95853cae452d8919bf39e0219e9b14885e9b1ca4eb7194b655328e"
+  },
+  "gsm8k.jsonl": {
+   "n": 1319,
+   "sha256": "f3a329594211901eb5e8ef70fb9df6436ce95dc676b0a0caaff793054ca424e0"
+  },
+  "gsm8k_train.jsonl": {
+   "n": 7473,
+   "sha256": "2949c13a291c250bc919203c8c237e136cd2e154faee8b6d2aa14f569ec46723"
+  },
+  "humanevalplus.jsonl": {
+   "n": 164,
+   "sha256": "2dcbceb3fb5991fd806131eab3f1a6afcc387c795a0327ebb813831c443b6d2f"
+  },
+  "ifbench.jsonl": {
+   "n": 300,
+   "sha256": "e65bca40abd9bc0bd02e4d64c5a3e8e79f345a7459b893641fc8f513f0ecd359"
+  },
+  "ifeval.jsonl": {
+   "n": 541,
+   "sha256": "e3c0be71399c7da6c95458b1d6b18c9e54d7793d835b5b51a8f4887c7713c7ba"
+  },
+  "ifeval_train.jsonl": {
+   "n": 14970,
+   "sha256": "bce8e3efd6e6f76cd936c32dce716838ec1ec59a3c5a1b99cb93032d1774da3f"
+  },
+  "livecodebench.jsonl": {
+   "n": 131,
+   "sha256": "75098d0fe55ae53aaa1c9c30ae5d1ea26e652cc85053e287343f10767ec2c965"
+  },
+  "magicoder_oss.jsonl": {
+   "n": 75197,
+   "sha256": "1d3e83de08d284389d5d14805318466fb0e452da4c4539d04fa3b71f45b1ebde"
+  },
+  "math.jsonl": {
+   "n": 5000,
+   "sha256": "82040287003e8985d62993a30752b20f29358199e7d9701a148470f907f27a56"
+  },
+  "math_train.jsonl": {
+   "n": 7500,
+   "sha256": "e3ac79b08a5beae360628f408a58f1e16462fa6e5cf8b1b664f1fa8537825015"
+  },
+  "mbppplus.jsonl": {
+   "n": 378,
+   "sha256": "b6c89fc83d01ccb86641f5aee41b574ec2f1a76b6dfc7b027cef25a186189966"
+  },
+  "metatool.jsonl": {
+   "n": 5327,
+   "sha256": "7afa57e5a81b5f559bfd35767802c0e71f6ed2e2f4ee74aa942c20f9eb244991"
+  },
+  "mmlu_pro.jsonl": {
+   "n": 12032,
+   "sha256": "283ac4e558499ca4b950864eb627274b2b108e0bd5791800b3f83baf613826db"
+  },
+  "mt_bench.jsonl": {
+   "n": 80,
+   "sha256": "c2671603e96c3f0a620b0da30226e937ab7baa5ae1b72b1d796af9065ef15217"
+  },
+  "olympiadbench.jsonl": {
+   "n": 674,
+   "sha256": "a3c17cd97ada7240479d3ee5f38fdfba9cc5feeee4d8efbb377dbbb0a0f041a1"
+  },
+  "sealtool.jsonl": {
+   "n": 2054,
+   "sha256": "644471bcfd5ab0520ee318d0fee7bf96f4134f878a2b5144c0d8b51f11b72970"
+  },
+  "sealtool_train.jsonl": {
+   "n": 12022,
+   "sha256": "f566d4112e7a17059b06bd29d009b0f7c8dfb2d51b1c5f00a9d968631756cbf2"
+  },
+  "squad_train.jsonl": {
+   "n": 18891,
+   "sha256": "7e744a64eeb3c0107e11dae4d2312e7861ae5cb7c3febd1e21fe759b42c3795f"
+  },
+  "squad_val.jsonl": {
+   "n": 2067,
+   "sha256": "1a4bc9b1f87bc95933e7516ba5c83e978c2a5b33a98af4849cc62d5dda449ce9"
+  },
+  "taco_verified.jsonl": {
+   "n": 10806,
+   "sha256": "18617c0a9df1db69b0a9338f0da15f24605f947cb21eb95b87b47f29a23cb07a"
+  },
+  "teval.jsonl": {
+   "n": 4358,
+   "sha256": "3c9dff43d73f65afff5cb6a332a51e9df4af1e965944743f2f7d54e5d31d41ee"
+  },
+  "toolace.jsonl": {
+   "n": 11300,
+   "sha256": "300ad97d72ada37a80967268f0a9bb3a9f8e2b561baf5e51b84880be280a89b8"
+  },
+  "triviaqa.jsonl": {
+   "n": 9960,
+   "sha256": "ed750b533f51d0862a67455ea2df0d73bd349447845405453a42010814d8b3a7"
+  },
+  "triviaqa_train.jsonl": {
+   "n": 76523,
+   "sha256": "8338200f16e791c2464c9bd14ddb4738fcfc83c72d0bff668fc9f012d6744081"
+  },
+  "tulu3_if.jsonl": {
+   "n": 29980,
+   "sha256": "743fc39e2ae2b5a7d41703ee82b744a19c95c43b76f0f4444be483d6db452de5"
+  }
+ },
+ "seed": 20261118,
+ "splits": {
+  "aime24/test.json": {
+   "n": 30,
+   "sha256": "d93481dd82ad4c7ae8ddbc20e60085804d63c049f3943ecd4db7bd03f8859a0d"
+  },
+  "aime25/test.json": {
+   "n": 30,
+   "sha256": "7b9d41c5790170515fd67294b9bc4c8c5402e5d7d42683e37eca1fba6768309e"
+  },
+  "alpaca_eval/test.json": {
+   "n": 805,
+   "sha256": "38481da2bf7fb913d04d31d35183081370681759ee5a9a71f9fa7407c574f912"
+  },
+  "amc23/test.json": {
+   "n": 40,
+   "sha256": "61abc807e0c94dca06e88295a5beec8b36007899d5a090416d2e223bc19907cf"
+  },
+  "apibank/test.json": {
+   "n": 584,
+   "sha256": "17c679626d4c02187388cd17d16781f691beb951305f4d7e3d0a0787fbd86a05"
+  },
+  "apibank_train/reserve.json": {
+   "n": 10376,
+   "sha256": "014cb27e0ff82562f0100ad67ac6b93592822910bd62bc8bca65fcd53dce71d6"
+  },
+  "apps/reserve.json": {
+   "n": 4449,
+   "sha256": "8cd32828d15a73e506dcaecd8a69c7e548689bdde765ea9f9502ad74f361b888"
+  },
+  "arc/gate.json": {
+   "n": 500,
+   "sha256": "076eccae1a8ac319f8b4e7eea9972748da864c7b30962007f9d7eb3b04b08aa5"
+  },
+  "arc/pool.json": {
+   "n": 2870,
+   "sha256": "d0c5473efb9d5e037a8d35b4376b8e8a10964fa256654456f07d94c1b2717000"
+  },
+  "bfcl/test.json": {
+   "n": 4696,
+   "sha256": "ca9cc3ecd72b9935af0cdafaf1a725b96a3e3b9fdeec2bf5361026af9fd80067"
+  },
+  "dapo_math/gate.json": {
+   "n": 400,
+   "sha256": "923e67e12669d1ff51343326c4dea74fbd82fa73f6cb53a390000b76c235ec64"
+  },
+  "dapo_math/pool.json": {
+   "n": 15929,
+   "sha256": "c037b45b9e40b2d1b01e1b0e8b33f8ce84b92c672d3ca2c8c8d9ff4cdc4b9475"
+  },
+  "dapo_math/train_excluded.json": {
+   "n": 1069,
+   "sha256": "3de58b3c32df0f4baed92ba7877cac4c35f4ce73d898137d22449614c813e78d"
+  },
+  "freebaseqa/test.json": {
+   "n": 3996,
+   "sha256": "5bc9c22a61916838da4789b154a899fb7cceff056490a30b286c8ddf290ab977"
+  },
+  "gpqa_diamond/test.json": {
+   "n": 198,
+   "sha256": "070279ea6128eab84f3942f4d41fdf399851b8bb7aaf7efeb6cccd9404481dae"
+  },
+  "gpqa_main/gate.json": {
+   "n": 250,
+   "sha256": "60cdfc7f750dcfbfc2d52741a2773c7959eb57e27988879c838837e704fbbb9c"
+  },
+  "gsm8k/test.json": {
+   "n": 1319,
+   "sha256": "988bfde749e622fd9f961f3873518d88ed6bc0a6efdda27dd4cfe3cafa05fb44"
+  },
+  "gsm8k_train/gate.json": {
+   "n": 250,
+   "sha256": "cf615ec7afdec59ffd2c69d2d63c89ea81b205c6c651de0a54d9b88048d7a9b0"
+  },
+  "gsm8k_train/pool.json": {
+   "n": 7221,
+   "sha256": "e402172e85bdd99a25197d0fa0b76b69b4ae01a79c05d90fe043737c8d013ab3"
+  },
+  "gsm8k_train/train_excluded.json": {
+   "n": 2,
+   "sha256": "d5cb9bd46c0e9262b8068417b0c1bc7a86096953f1ea6f7f2498460e0db6a3ae"
+  },
+  "humanevalplus/test.json": {
+   "n": 164,
+   "sha256": "c1d25895a875f0a66a5b15457b6e6a289db57be30e177fef6d9299f0385dab7c"
+  },
+  "ifbench/test.json": {
+   "n": 300,
+   "sha256": "4b47b279a6479f00c53e2b9044751440b5c282e617d4beca9213273714ada90a"
+  },
+  "ifeval/gate.json": {
+   "n": 135,
+   "sha256": "5b2723118ea0925c3bc229c04cd1a529f3e4286765d5495febde691b4d995102"
+  },
+  "ifeval/pool.json": {
+   "n": 135,
+   "sha256": "de62be5ab314ba583ff790402a09f47b05ba545c5c527ae77cd6e4ebeb333b70"
+  },
+  "ifeval/test.json": {
+   "n": 271,
+   "sha256": "dc3ab2924c5e5d1fdcc7e94a52f251f2caefa4b9c8bb8965c74efe72df479fc0"
+  },
+  "ifeval_train/gate.json": {
+   "n": 1000,
+   "sha256": "40b7221bfd444c5ae3f20bfde49f2220b56d8d6e25a96f859003596152dda938"
+  },
+  "ifeval_train/pool.json": {
+   "n": 13954,
+   "sha256": "4ae730bd5e513a56dea556e339c9f4bd272ed7bfa1211d46163504a7096f9bdd"
+  },
+  "ifeval_train/train_excluded.json": {
+   "n": 16,
+   "sha256": "a069fe4ad2e31fe34711fe9469d906a5ff866436f69754a06dae17e54cb1b649"
+  },
+  "livecodebench/test.json": {
+   "n": 131,
+   "sha256": "a9628c83ccaddda59e7c102bec1030ba0526f134edff80cd92b2d5db4fff441c"
+  },
+  "magicoder_oss/reserve.json": {
+   "n": 75197,
+   "sha256": "3f493138ff6e04e80756ac6856d65b3204b1ab4507d2fa497f1f2c8fa16dbd88"
+  },
+  "math/reserve.json": {
+   "n": 4500,
+   "sha256": "5ba6a20f7559cc971626d229fc21a42b3f363c37bc15cb1b9ac9863b38da24cf"
+  },
+  "math/test.json": {
+   "n": 500,
+   "sha256": "f626c6944619cda914e51631b05e1c7cf8302ba2db3aac6428d310dcc0c7722f"
+  },
+  "math_train/gate.json": {
+   "n": 350,
+   "sha256": "d3bff4ad1e74d2999e4567fa68349151e4e7298c8cca2dbb5e19d9dde4a397e4"
+  },
+  "math_train/pool.json": {
+   "n": 7116,
+   "sha256": "bb1ebf1ef67e2c190ccbc12509bc9f9652ad2e47b58710ce30df8bf167b980f4"
+  },
+  "math_train/train_excluded.json": {
+   "n": 34,
+   "sha256": "cceba25e7f899f10009483e834155e203a0465fff646688fcd74d0861689831c"
+  },
+  "mbppplus/test.json": {
+   "n": 378,
+   "sha256": "0d0578e1e6c1163c73f5ac5d0a42a369aa7463896013d019da42480f5471c30a"
+  },
+  "metatool/test.json": {
+   "n": 5327,
+   "sha256": "3e7d46511aa4ba2645b7790474bdfdc5c29da3d5cb92395b80a288ac868423f2"
+  },
+  "mmlu_pro/reserve.json": {
+   "n": 10032,
+   "sha256": "01d42431e9e93e0f5611e3e6298079e5b69f1f8b855ce8c9cfcb1f507608bc4b"
+  },
+  "mmlu_pro/test.json": {
+   "n": 2000,
+   "sha256": "0f2530016bc52b4ae3363eecdebe09e65ab62fb6184806c0d3e25bc829c8740d"
+  },
+  "mt_bench/test.json": {
+   "n": 80,
+   "sha256": "1d3eee60fb8300fe6f4b811b37befd47ba05ab6597a6437182f5bfbe30cfb715"
+  },
+  "olympiadbench/test.json": {
+   "n": 674,
+   "sha256": "e76b4fe886fb21a3c0e7379717402d54e06af9dde29d8b05c599dfdf5491cfbe"
+  },
+  "sealtool/reserve.json": {
+   "n": 700,
+   "sha256": "47db1c8c4a97efef078ac96538234a79a51d249503e55686e14911c6b30fd3fe"
+  },
+  "sealtool/test.json": {
+   "n": 1354,
+   "sha256": "75e88b14559c14bbfabb69f16a5d598d86ec9b17df97f67ffe7e9cd0be8c3077"
+  },
+  "sealtool_train/gate.json": {
+   "n": 1000,
+   "sha256": "abe6a2189da0c70dc1a3a0966ba15fb2fcf5a46ccdc0eda3268b012ead633909"
+  },
+  "sealtool_train/pool.json": {
+   "n": 11019,
+   "sha256": "8748af4cd02adbfa5db5a462614fa6e6521efc6c8687d7dc4c319949b3437c96"
+  },
+  "sealtool_train/train_excluded.json": {
+   "n": 3,
+   "sha256": "96e1f1157743faa1ebc251a8f99edc28eef520256a522407605863a320a02b7c"
+  },
+  "squad_train/gate.json": {
+   "n": 50,
+   "sha256": "2c8fb5e04b9cd9fd43badde9969fa97a9919ea4df569624b26dfac4711184c8b"
+  },
+  "squad_train/reserve.json": {
+   "n": 3887,
+   "sha256": "31311334c90c088eeaa940bd5b6a13a35d49a0195ae1234055147674dc9ef347"
+  },
+  "squad_train/search.json": {
+   "n": 50,
+   "sha256": "adb8fe77c0c192c59c238b7caae71c456c8d61ffa501211766cb0b1ccd0a3973"
+  },
+  "squad_train/train.json": {
+   "n": 14904,
+   "sha256": "1b1625a9dd8aa12680dbae539e73b98eb1d1adf2f740685061393dc158f52e6b"
+  },
+  "squad_val/reserve.json": {
+   "n": 1867,
+   "sha256": "5b9e4260858459d54be3a815655abf6140c39951c658156d571731b532e065e7"
+  },
+  "squad_val/test.json": {
+   "n": 200,
+   "sha256": "dcce0ed0a067d62bae3bdb4ae38e924de7cf84a5bf377269d0fc6bbd77cff39f"
+  },
+  "taco_verified/gate.json": {
+   "n": 1000,
+   "sha256": "5228e3bbb7127e2ad1bbd446bf2ef363b629ab11b9ef041c156a7316624c3915"
+  },
+  "taco_verified/pool.json": {
+   "n": 9806,
+   "sha256": "ce685958dcb18862cf7ae3f8dd84a7ffb290eeaab114319f713296c80eb46d0e"
+  },
+  "teval/test.json": {
+   "n": 4358,
+   "sha256": "cce0c2f81ee94d93125af7b566fc6b01e0ab9f18bf8cfcad0ae2a1e461d6c8b3"
+  },
+  "toolace/train.json": {
+   "n": 11300,
+   "sha256": "318caecd30c850af26f35c85c026decd36d5551797f9980c429b646c8ecedc77"
+  },
+  "triviaqa/reserve.json": {
+   "n": 7960,
+   "sha256": "06c6fb54f8485a72bb36e6ddffed9c2ca8d46bdb720190bdc7342cc9392f27ff"
+  },
+  "triviaqa/test.json": {
+   "n": 2000,
+   "sha256": "2bcde2a36366b1a27ea0bbabd5e1cc75df3bd40e63a11dea5616cb1878586aa1"
+  },
+  "triviaqa_train/gate.json": {
+   "n": 500,
+   "sha256": "3a2f2d9b2b6e2cf05d0b55e31440ba737bc90430b8a31adc91c42297afccaf4d"
+  },
+  "triviaqa_train/pool.json": {
+   "n": 73225,
+   "sha256": "27b6dbc1c5894ea999c91bcf3525f8631dfab1d570e26ae2dd21fec3536460ac"
+  },
+  "triviaqa_train/train_excluded.json": {
+   "n": 2798,
+   "sha256": "838786771d3c2ceada3d2c4ebd57ad72479915d1d3857847121a662f83c2225c"
+  },
+  "tulu3_if/reserve.json": {
+   "n": 29980,
+   "sha256": "e44fa814b74bcea91e31ffafff3e1dec1074d1189b06e68bfe2a370d2a493340"
+  }
+ }
+}

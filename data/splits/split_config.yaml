@@ -1,0 +1,125 @@
+# Unified split scheme shared by Paper A and Paper B (revised 2026-11-18, see plan/research/DATA_CONFIG.md).
+# Edit sizes here and rerun:  eval/.venv/bin/python -I data/scripts/make_splits.py
+#
+# Principle (from the RSI data survey, plan/research/method-research/rsi-data/RSI_DATA.md):
+#   * the self-editing loop only ever sees TRAINING-TYPE data;
+#   * benchmarks are HELD-OUT: evaluated after each generation, never fed back, never used to select.
+#
+# Pools (revised again 2026-11-18: per-generation draws)
+#   gate    = fixed GATE slice of a training set (size per domain set in `gate_domains` below):
+#             pass/fail only, limited submissions,
+#             identical in every generation so thresholds stay relative to generation 0
+#   pool    = DRAW POOL = rest of a training set. Every generation draws a fresh sample
+#             (1,000-2,000 items per domain) from it with data/scripts/draw.py; each item is used
+#             at most once per run. Drawn items serve as L1 signal (both papers), KL / calibration
+#             text (Paper A) and gradient-tool training data (Paper B).
+#   train   = whole training set used as text only (toolace: Paper A KL text)
+#   test    = held-out benchmark items (reported only)
+#   reserve = items not used anywhere
+#   train_excluded = training items removed by decontamination
+#   search  = only squad_train (Paper B optional SQuAD task keeps its title-disjoint 50/50 split)
+#
+# role: train  -> training set; ALL of its items are decontaminated against every held-out item
+#                 before splitting, and it is excluded from the held-out text set.
+# Sampling: items sorted by id, shuffled with random.Random(f"{seed}:{dataset}:{stratum}"),
+# then sliced in the order search -> gate -> test. Stratified pools use largest-remainder rounding.
+seed: 20261118
+
+# ---------------------------------------------------------------- fixed gate size (config knob)
+# Total gate items per domain, split over the domain's training sets by weight (largest remainder).
+# Training sets with `gate: domain` take their size from here. Changing a size re-splits the data:
+# every existing draw run is then refused by data/scripts/draw.py (pool hash check) -> start new runs.
+# The per-generation draw size is set separately in data/draw/paper_{a,b}.yaml (`n` per domain).
+# Extra fixed gates outside this table: gpqa_main (all 250) and ifeval (135, WSP-Scope split).
+gate_domains:
+  math:                  {size: 1000, datasets: {gsm8k_train: 0.25, math_train: 0.35, dapo_math: 0.40}}
+  code:                  {size: 1000, datasets: {taco_verified: 1.0}}
+  knowledge:             {size: 1000, datasets: {triviaqa_train: 0.5, arc: 0.5}}
+  instruction_following: {size: 1000, datasets: {ifeval_train: 1.0}}
+  tool_calling:          {size: 1000, datasets: {sealtool_train: 1.0}}
+
+datasets:
+  # ================================================================ math
+  # training sets (ReST-EM, WSP blog / WSP-Scope; DAPO from WHALE)
+  gsm8k_train:  {role: train, gate: domain, rest: pool}
+  math_train:   {role: train, gate: domain, rest: pool}
+  dapo_math:    {role: train, gate: domain, rest: pool}
+  # held-out
+  math:            # MATH test (5,000): MATH-500 -> test, the other 4,500 -> reserve
+    subset_rule: "MATH-500 items (metadata.is_math500) -> test; others -> reserve"
+    rest: reserve
+  gsm8k:        {all: test}
+  aime24:       {all: test}
+  aime25:       {all: test}
+  amc23:        {all: test}          # extra held-out (not in the main table)
+  olympiadbench: {all: test}         # extra held-out (not in the main table)
+
+  # ================================================================ code
+  # training set: APPS train, all difficulties (introductory = ReST-EM's set). Tests in
+  # data/processed/aux/apps_tests.jsonl. Gate stratified by difficulty.
+  apps:         {role: train, all: reserve}   # no longer used (2026-11-19): one code training set only -> TACO-verified
+  # TACO-verified: the only code training set (2026-11-19). Precedents: EvoTrainer, ReVeal (both LCB v6).
+  taco_verified: {role: train, gate: domain, stratify_by: difficulty, rest: pool}
+  # held-out
+  humanevalplus: {all: test}
+  mbppplus:     {all: test}
+  livecodebench:
+    window_start: "2025-02-01"   # inclusive, by contest_date
+    window_end: null
+    all: test
+  magicoder_oss: {role: train, all: reserve}   # superseded by APPS (no tests, no RSI precedent); kept, unused
+
+  # ================================================================ knowledge
+  # training sets (Transformer2: ARC; WSP-Scope: GPQA Main minus Diamond; TriviaQA train for closed-book recall)
+  arc:          {role: train, gate: domain, rest: pool}
+  gpqa_main:    {role: train, all: gate}                       # 250 items: Main minus Diamond (gate only)
+  triviaqa_train: {role: train, gate: domain, rest: pool}
+  # held-out
+  mmlu_pro:     {test: 2000, rest: reserve}
+  gpqa_diamond: {all: test}
+  triviaqa:     {test: 2000, rest: reserve}   # rc.nocontext validation
+  freebaseqa:   {all: test}                   # extra held-out (not in the main table)
+
+  # ================================================================ instruction following
+  # training set (added 2026-11-19): allenai/RLVR-IFeval (Tulu 3 RLVR IF data): Tulu-2 SFT prompts with
+  # one IFEval-style constraint each, graded by eval/evallib/graders/rlvr_if.py. 14,970 items after
+  # dropping 3 exact duplicates; decontaminated against every held-out IF item before splitting.
+  # This is the IF draw source (data/draw/paper_*.yaml).
+  ifeval_train: {role: train, gate: domain, stratify_by: constraint_type, rest: pool}
+  # WSP-Scope split of IFEval: 270 for the loop (pool 135 + gate 135), 271 held-out.
+  # IFEval gate 135 stays an IF gate; the 135-item IFEval pool is kept but no longer drawn from.
+  ifeval:
+    stratify_by: first_instruction_type
+    pool: 135
+    gate: 135
+    test: 271
+  ifbench:      {all: test}                   # OOD held-out (constraint types differ from IFEval)
+  mt_bench:     {all: test}                   # optional, needs LLM judge
+  alpaca_eval:  {all: test}                   # optional, needs LLM judge
+  tulu3_if:     {role: train, all: reserve}   # no gradable kwargs; kept, unused
+
+  # ================================================================ tool calling
+  # training set (TT-SI SFT baseline: SealTool train)
+  sealtool_train: {role: train, gate: domain, rest: pool}
+  toolace:      {role: train, all: train}     # Paper A KL / calibration text only
+  apibank_train: {role: train, all: reserve}  # superseded by SealTool; kept, unused
+  # held-out
+  sealtool:     # dev -> reserve; test_in_domain + test_out_domain -> test
+    rule: "seal_split in (test_in_domain, test_out_domain) -> test; dev -> reserve"
+  apibank:      {all: test}
+  bfcl:         {all: test}
+  metatool:     {all: test}                   # extra held-out (not in the main table)
+  teval:        {all: test}                   # extra held-out (not in the main table)
+
+  # ================================================================ knowledge injection (Paper B, optional SEAL setting)
+  # Unit = passage. test = the 200 SEAL eval passages (974 questions). search/gate passages are drawn
+  # from SQuAD train with distinct Wikipedia titles (title-disjoint from each other and from train).
+  squad_val:
+    test: seal_eval_subset
+    rest: reserve
+  squad_train:
+    role: train
+    search_titles: 50
+    gate_titles: 50
+    passages_per_title: 1
+    rest: train

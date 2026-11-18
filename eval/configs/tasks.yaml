@@ -1,0 +1,82 @@
+# Per-task decoding + grading config for eval/run_eval.py.
+# Precedence: CLI flags (--temperature/--n/--max-tokens/--thinking) > task entry > defaults.
+# `thinking` toggles Qwen3 thinking mode via chat_template_kwargs={"enable_thinking": ...}
+# (vLLM passes it to the chat template). When thinking is on, max_tokens_thinking is used.
+
+defaults:
+  temperature: 0.0          # greedy
+  top_p: 1.0
+  n: 1
+  max_tokens: 4096
+  max_tokens_thinking: 32768
+  thinking: false
+  seed: 20261118            # sent to vLLM for sampled decoding (reproducible n>1 sampling)
+  send_chat_template_kwargs: true
+
+# Optional LLM judge (MT-Bench / AlpacaEval only). Fixed here so judged scores are comparable.
+# Requires --judge-endpoint (or set endpoint below); the API key is read from env var api_key_env.
+judge:
+  endpoint: null
+  model: gpt-4.1-2025-04-14
+  api_key_env: JUDGE_API_KEY
+  temperature: 0.0
+  max_tokens: 2048
+
+templates:
+  math_cot: "{problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+  mcq: "Answer the following multiple choice question. Think step by step, then finish your response with \"The answer is (X)\" where X is one of {letters}.\n\nQuestion: {question}"
+  short_qa: "Answer the following trivia question with a short answer (a name, number, date or short phrase); do not explain. End your response with \"Answer: <answer>\".\n\nQuestion: {question}"
+  squad_closed_book: "Answer the following question about \"{title}\" from memory with a short phrase. End your response with \"Answer: <answer>\".\n\nQuestion: {question}"
+  humaneval: "Complete the following Python function. Return the complete function (signature included) in a single ```python code block.\n\n```python\n{prompt}\n```"
+  mbpp: "You are an expert Python programmer. Solve the following task and return the complete solution in a single ```python code block. Your code should pass this test:\n\n{test}\n\nTask: {prompt}"
+  lcb_system: "You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests."
+
+tasks:
+  # ------------------------------------------------------------- math
+  # training sets: draw pool (pool=pool, use --ids-file from data/scripts/draw.py) and fixed gate (pool=gate)
+  gsm8k_train:    {dataset: gsm8k_train, category: math, grader: math, allowed_pools: [pool, gate]}
+  math_train:     {dataset: math_train, category: math, grader: math, allowed_pools: [pool, gate]}
+  dapo_math:      {dataset: dapo_math, category: math, grader: math, max_tokens: 8192, allowed_pools: [pool, gate]}
+  # held-out
+  gsm8k:          {dataset: gsm8k, category: math, grader: math}               # pool: test (all 1,319)
+  math:           {dataset: math, category: math, grader: math}               # pools: test(=MATH-500) / reserve
+  math500:        {dataset: math, category: math, grader: math, allowed_pools: [test]}
+  aime24:         {dataset: aime24, category: math, grader: math, n: 8, temperature: 0.6, top_p: 0.95, max_tokens: 16384}
+  aime25:         {dataset: aime25, category: math, grader: math, n: 8, temperature: 0.6, top_p: 0.95, max_tokens: 16384}
+  amc23:          {dataset: amc23, category: math, grader: math, n: 8, temperature: 0.6, top_p: 0.95, max_tokens: 16384}
+  olympiadbench:  {dataset: olympiadbench, category: math, grader: math, max_tokens: 8192}
+  # ------------------------------------------------------------- code (graded only in the Docker sandbox)
+  apps:           {dataset: apps, category: code, grader: apps, max_tokens: 4096, allowed_pools: [reserve]}  # no longer used (2026-11-19); kept for reference
+  taco_verified:  {dataset: taco_verified, category: code, grader: apps, max_tokens: 4096, allowed_pools: [pool, gate]}  # training set
+  humanevalplus:  {dataset: humanevalplus, category: code, grader: humanevalplus}
+  mbppplus:       {dataset: mbppplus, category: code, grader: mbppplus}
+  livecodebench:  {dataset: livecodebench, category: code, grader: livecodebench, max_tokens: 8192}
+  # ------------------------------------------------------------- knowledge
+  # training sets
+  arc:            {dataset: arc, category: knowledge, grader: mcq, allowed_pools: [pool, gate]}
+  gpqa_main:      {dataset: gpqa_main, category: knowledge, grader: mcq, allowed_pools: [pool, gate]}  # Main minus Diamond; gated data
+  triviaqa_train: {dataset: triviaqa_train, category: knowledge, grader: short_qa, max_tokens: 256, allowed_pools: [pool, gate]}
+  # held-out
+  mmlu_pro:       {dataset: mmlu_pro, category: knowledge, grader: mcq}
+  gpqa_diamond:   {dataset: gpqa_diamond, category: knowledge, grader: mcq}   # needs manual download
+  triviaqa:       {dataset: triviaqa, category: knowledge, grader: short_qa, max_tokens: 256}
+  freebaseqa:     {dataset: freebaseqa, category: knowledge, grader: short_qa, max_tokens: 256}
+  # ------------------------------------------------------------- knowledge injection (Paper B / SEAL setting)
+  squad_closed_book_test: {dataset: squad_val, category: knowledge_injection, grader: squad_closed_book, max_tokens: 256, allowed_pools: [test, reserve]}
+  squad_closed_book_dev:  {dataset: squad_train, category: knowledge_injection, grader: squad_closed_book, max_tokens: 256, allowed_pools: [pool, gate]}
+  # ------------------------------------------------------------- instruction following
+  # training set: RLVR-IFeval (one constraint per prompt; deterministic verifiers in graders/rlvr_if.py)
+  ifeval_train:   {dataset: ifeval_train, category: instruction_following, grader: rlvr_if, max_tokens: 2048, allowed_pools: [pool, gate]}
+  # IFEval: gate (135) = IF gate, test (271) = held-out; its 135-item pool is no longer drawn from
+  ifeval:         {dataset: ifeval, category: instruction_following, grader: ifeval, max_tokens: 2048}
+  ifbench:        {dataset: ifbench, category: instruction_following, grader: ifbench, max_tokens: 2048}
+  mt_bench:       {dataset: mt_bench, category: instruction_following, grader: mt_bench_judge, max_tokens: 2048, temperature: 0.0, optional_judge: true}
+  alpaca_eval:    {dataset: alpaca_eval, category: instruction_following, grader: alpaca_eval_judge, max_tokens: 2048, optional_judge: true}
+  # ------------------------------------------------------------- tool calling
+  sealtool_train: {dataset: sealtool_train, category: tool_calling, grader: sealtool, max_tokens: 1024, allowed_pools: [pool, gate]}  # training set
+  sealtool:       {dataset: sealtool, category: tool_calling, grader: sealtool, max_tokens: 1024}   # held-out: test_in_domain + test_out_domain
+  bfcl:           {dataset: bfcl, category: tool_calling, grader: bfcl, max_tokens: 2048}
+  teval:          {dataset: teval, category: tool_calling, grader: teval, max_tokens: 2048,
+                   subsets: [instruct_v2, review_str_v2, retrieve_str_v2, understand_str_v2]}
+  metatool:       {dataset: metatool, category: tool_calling, grader: metatool, max_tokens: 512}
+  apibank:        {dataset: apibank, category: tool_calling, grader: apibank, max_tokens: 512}

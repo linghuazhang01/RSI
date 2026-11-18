@@ -1,0 +1,432 @@
+{
+  "arxiv:2611.06858": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2611.06858"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2502.14413": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2502.14413"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2601.09694": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2601.09694"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2509.05584": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2509.05584"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2410.17170": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2410.17170"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2610.06174": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2610.06174"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2410.15639": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2410.15639"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2611.07319": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2611.07319"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2609.26457": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2609.26457"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2610.12176": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2610.12176"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2606.28438": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2606.28438"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2505.19433": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2505.19433"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2602.09130": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2602.09130"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2310.01382": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2310.01382"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2504.04823": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2504.04823"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2504.02010": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2504.02010"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2609.01587": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2609.01587"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2608.06564": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2608.06564"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2607.27275": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2607.27275"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2604.15794": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2604.15794"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2410.09982": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2410.09982"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2605.18475": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2605.18475"
+    },
+    "ts": 1794621883.1143959
+  },
+  "arxiv:2506.10943": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2506.10943"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2601.14532": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2601.14532"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2310.00160": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2310.00160"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2406.12034": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2406.12034"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2501.06252": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2501.06252"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2506.06105": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2506.06105"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2411.05877": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2411.05877"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2605.27276": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2605.27276"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2603.08640": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2603.08640"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2609.00196": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2609.00196"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2603.01712": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2603.01712"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2605.20189": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2605.20189"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2505.03335": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2505.03335"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2508.05004": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2508.05004"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2401.10020": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2401.10020"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2510.07841": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2510.07841"
+    },
+    "ts": 1794621889.920736
+  },
+  "arxiv:2609.06396": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2609.06396"
+    },
+    "ts": 1794623198.9071019
+  },
+  "arxiv:2610.22791": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2610.22791"
+    },
+    "ts": 1794623198.9071019
+  },
+  "arxiv:2607.03935": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2607.03935"
+    },
+    "ts": 1794623198.9071019
+  },
+  "arxiv:2611.11975": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2611.11975"
+    },
+    "ts": 1794623200.4843981
+  },
+  "arxiv:2608.05499": {
+    "status": "verified",
+    "method": "arxiv",
+    "confidence": "high",
+    "reason": null,
+    "identifiers": {
+      "arxiv_id": "2608.05499"
+    },
+    "ts": 1794623200.4843981
+  }
+}

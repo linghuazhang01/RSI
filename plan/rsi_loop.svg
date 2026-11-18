@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="450" viewBox="0 0 680 450" font-family="PingFang SC, Helvetica, Arial, sans-serif">
+<title>RSI 闭环：自量化（A）与自写 LoRA（B）</title>
+<rect width="680" height="450" fill="#ffffff"/>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g font-size="14" text-anchor="middle" dominant-baseline="central">
+<rect x="220" y="30" width="240" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.8"/>
+<text x="340" y="49" fill="#3C3489" font-weight="500">当前模型 M_t</text>
+<text x="340" y="68" fill="#534AB7" font-size="12">既是改造者，也是被改对象</text>
+<rect x="40" y="130" width="170" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.8"/>
+<text x="125" y="149" fill="#444441" font-weight="500">写程序</text>
+<text x="125" y="168" fill="#5F5E5A" font-size="12">A 量化方案 / B 写 LoRA</text>
+<rect x="255" y="130" width="170" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.8"/>
+<text x="340" y="149" fill="#444441" font-weight="500">生成候选</text>
+<text x="340" y="168" fill="#5F5E5A" font-size="12">量化权重 / 合并 LoRA</text>
+<rect x="470" y="130" width="170" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.8"/>
+<text x="555" y="149" fill="#085041" font-weight="500">L1 信号评分</text>
+<text x="555" y="168" fill="#0F6E56" font-size="12">训练集信号切片</text>
+<rect x="255" y="250" width="170" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.8"/>
+<text x="340" y="269" fill="#085041" font-weight="500">L2 验收</text>
+<text x="340" y="288" fill="#0F6E56" font-size="12">训练集验收切片，≤3 次</text>
+<rect x="40" y="250" width="170" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.8"/>
+<text x="125" y="269" fill="#444441" font-weight="500">未通过</text>
+<text x="125" y="288" fill="#5F5E5A" font-size="12">A 停止 / B 回退</text>
+<rect x="470" y="250" width="170" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.8"/>
+<text x="555" y="269" fill="#3C3489" font-weight="500">新模型 M_t+1</text>
+<text x="555" y="288" fill="#534AB7" font-size="12">接任下一代改造者</text>
+<rect x="470" y="350" width="170" height="56" rx="8" fill="#ffffff" stroke="#888780" stroke-width="0.8" stroke-dasharray="4 3"/>
+<text x="555" y="369" fill="#2C2C2A" font-weight="500">L3 留出评测</text>
+<text x="555" y="388" fill="#5F5E5A" font-size="12">benchmark，不回传</text>
+<text x="320" y="212" fill="#5F5E5A" font-size="12">↻ 分数和错例回到“写程序”：A ≤24 次，B ≤32 次</text>
+</g>
+<g fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)">
+<path d="M340 86 L340 108 L125 108 L125 128"/>
+<line x1="210" y1="158" x2="253" y2="158"/>
+<line x1="425" y1="158" x2="468" y2="158"/>
+<path d="M555 186 L555 230 L340 230 L340 248"/>
+<line x1="255" y1="278" x2="212" y2="278"/>
+<line x1="425" y1="278" x2="468" y2="278"/>
+<line x1="555" y1="306" x2="555" y2="348" stroke-dasharray="4 3"/>
+</g>
+<g font-size="12" fill="#5F5E5A" dominant-baseline="central">
+<text x="40" y="368">↻ M_t+1 回到顶部，成为下一代的 M_t</text>
+<text x="40" y="392">每代另测改造者能力 E_t（固定任务）</text>
+<text x="40" y="430">紫 = 模型　青 = 训练集反馈　虚线 = 留出集（只报告）</text>
+</g>
+</svg>

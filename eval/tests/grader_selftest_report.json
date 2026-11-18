@@ -1,0 +1,815 @@
+{
+ "gsm8k": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 1319,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 1.2
+ },
+ "math": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 5000,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 12.7
+ },
+ "aime24": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 30,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.0
+ },
+ "aime25": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 30,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.0
+ },
+ "amc23": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 40,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.0
+ },
+ "olympiadbench": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 674,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 2.8
+ },
+ "mmlu_pro": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 12032,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.1
+ },
+ "gpqa_diamond": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 198,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.0
+ },
+ "triviaqa": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 9960,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 11.9
+ },
+ "freebaseqa": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 3996,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.6
+ },
+ "squad_closed_book_test": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 974,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.3
+ },
+ "bfcl": {
+  "gold_acc": 0.99423235374897,
+  "wrong_acc": 0.0,
+  "n_graded_units": 3641,
+  "pass": true,
+  "gold_failures": [
+   {
+    "id": "simple_java_1",
+    "parsed": "[{'SQLCompletionAnalyzer.makeProposalsFromObject': {'object': 'Customers', 'useShortName': 'true', 'params': \"{'limit': 50, 'schemaFilter': 'public'}\"}}]",
+    "metrics": "{'decision': 'call', 'error': ['Incorrect type for parameter \\'params\\'. Expected type HashMap, got str. Parameter value: \"{\\'limit\\': 50, \\'schemaFilter\\': \\'public\\'}\".'], 'error_type': 'type_error:simple'}",
+    "item": "simple_java_1"
+   },
+   {
+    "id": "simple_java_22",
+    "parsed": "[{'PmsProductServiceImpl.updateNewStatus': {'ids': 'new ArrayList<>(Arrays.asList(101, 202, 303))', 'newStatus': '2'}}]",
+    "metrics": "{'decision': 'call', 'error': [\"Nested type checking failed for parameter 'ids'. Expected outer type ArrayList with inner type <class 'int'>. Parameter value: ['101', '202', '303'].\"], 'error_type': 'type_error:nested'}",
+    "item": "simple_java_22"
+   },
+   {
+    "id": "simple_java_35",
+    "parsed": "[{'RedissonConnection.bitOp': {'op': 'BitOperation.AND', 'destination': 'user:online:both', 'keys': 'new String[]{\"user:online:today\", \"user:online:yesterday\"}'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'keys\\': [\\'\"user:online:today\"\\', \\'\"user:online:yesterday\"\\']. Expected one of [[\\'user:online:today\\', \\'user:online:yesterday\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_35"
+   },
+   {
+    "id": "simple_java_36",
+    "parsed": "[{'ObjectMapEntryReplayDecoder.decode': {'parts': 'new ArrayList<>(Arrays.asList(userID, 42, username, johndoe, isActive, True))', 'state': 'processingState'}}]",
+    "metrics": "{'decision': 'call', 'error': [\"Invalid value for parameter 'parts': ['userID', '42', 'username', 'johndoe', 'isActive', 'True']. Expected one of [['userID', 42, 'username', 'johndoe', 'isActive', True]].\"], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_36"
+   },
+   {
+    "id": "simple_java_64",
+    "parsed": "[{'DateScriptFieldType.createFieldType': {'name': 'timestamp', 'factory': 'dateFactory', 'script': 'dateScript', 'meta': \"{'format': 'epoch_millis'}\", 'onScriptError': 'FAIL'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Incorrect type for parameter \\'meta\\'. Expected type HashMap, got str. Parameter value: \"{\\'format\\': \\'epoch_millis\\'}\".'], 'error_type': 'type_error:simple'}",
+    "item": "simple_java_64"
+   },
+   {
+    "id": "simple_java_65",
+    "parsed": "[{'RootObjectMapper.doXContent': {'builder': 'xContentBuilderInstance', 'params': 'new ArrayList<>(Arrays.asList(include_defaults, True, TOXCONTENT_SKIP_RUNTIME, True))'}}]",
+    "metrics": "{'decision': 'call', 'error': [\"Invalid value for parameter 'params': ['include_defaults', 'True', 'TOXCONTENT_SKIP_RUNTIME', 'True']. Expected one of [['include_defaults', True, 'TOXCONTENT_SKIP_RUNTIME', True]].\"], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_65"
+   },
+   {
+    "id": "simple_java_67",
+    "parsed": "[{'MacDmgBundler.prepareDMGSetupScript': {'appLocation': '/Applications/PhotoEditor.app', 'params': \"{'APP_NAME': 'PhotoEditor'}\"}}]",
+    "metrics": "{'decision': 'call', 'error': ['Incorrect type for parameter \\'params\\'. Expected type HashMap, got str. Parameter value: \"{\\'APP_NAME\\': \\'PhotoEditor\\'}\".'], 'error_type': 'type_error:simple'}",
+    "item": "simple_java_67"
+   },
+   {
+    "id": "simple_java_68",
+    "parsed": "[{'MacBaseInstallerBundler.validateAppImageAndBundeler': {'params': \"{'/Applications/MyApp.app': 'MyApp'}\"}}]",
+    "metrics": "{'decision': 'call', 'error': ['Incorrect type for parameter \\'params\\'. Expected type HashMap, got str. Parameter value: \"{\\'/Applications/MyApp.app\\': \\'MyApp\\'}\".'], 'error_type': 'type_error:simple'}",
+    "item": "simple_java_68"
+   },
+   {
+    "id": "simple_java_78",
+    "parsed": "[{'OptionSpecBuilder.requiredUnless': {'dependent': 'quiet', 'otherDependents': 'new String[]{\"verbose\"}'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'otherDependents\\': [\\'\"verbose\"\\']. Expected one of [[\\'verbose\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_78"
+   },
+   {
+    "id": "simple_java_83",
+    "parsed": "[{'thrcputime002.runIt': {'argv': 'new String[]{\"-waitTime\", \"2\", \"-iterations\", \"500\"}', 'out': 'System.out'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'argv\\': [\\'\"-waitTime\"\\', \\'\"2\"\\', \\'\"-iterations\"\\', \\'\"500\"\\']. Expected one of [[\\'-waitTime\\', \\'2\\', \\'-iterations\\', \\'500\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_83"
+   },
+   {
+    "id": "simple_java_85",
+    "parsed": "[{'classfloadhk005.runIt': {'argv': 'new String[]{\"/path/to/classes\", \"60\"}', 'out': 'logStream'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'argv\\': [\\'\"/path/to/classes\"\\', \\'\"60\"\\']. Expected one of [[\\'/path/to/classes\\', \\'60\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_85"
+   },
+   {
+    "id": "simple_java_86",
+    "parsed": "[{'argumenttypes001.runThis': {'argv': 'new String[]{\"-v\", \"--no-strict\"}', 'out': 'debugOutput'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'argv\\': [\\'\"-v\"\\', \\'\"--no-strict\"\\']. Expected one of [[\\'-v\\', \\'--no-strict\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_86"
+   },
+   {
+    "id": "simple_java_89",
+    "parsed": "[{'runThis': {'argv': 'new String[]{\"-waitTime\", \"2\", \"-debuggeeName\", \"TestDebuggee\"}', 'out': 'testLogStream'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'argv\\': [\\'\"-waitTime\"\\', \\'\"2\"\\', \\'\"-debuggeeName\"\\', \\'\"TestDebuggee\"\\']. Expected one of [[\\'-waitTime\\', \\'2\\', \\'-debuggeeName\\', \\'TestDebuggee\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_89"
+   },
+   {
+    "id": "simple_java_90",
+    "parsed": "[{'sourcepaths002.runIt': {'args': 'new String[]{\"-v\", \"-p\"}', 'out': 'System.out'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'args\\': [\\'\"-v\"\\', \\'\"-p\"\\']. Expected one of [[\\'-v\\', \\'-p\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_90"
+   },
+   {
+    "id": "simple_java_91",
+    "parsed": "[{'invokemethod007.runIt': {'args': 'new String[]{\"suspend\", \"log\"}', 'out': 'debugLog'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Invalid value for parameter \\'args\\': [\\'\"suspend\"\\', \\'\"log\"\\']. Expected one of [[\\'suspend\\', \\'log\\']].'], 'error_type': 'value_error:list/tuple'}",
+    "item": "simple_java_91"
+   },
+   {
+    "id": "parallel_multiple_26",
+    "parsed": "[{'bank.get_transaction_history': {'account': '00125648', 'days': 7}}, {'bank.calculate_balance': {'account': '00125648', 'transactions': [], 'type': 'credit'}}]",
+    "metrics": "{'decision': 'call', 'error': ['Could not find a matching function among index [1] of model output for index 1 of possible answers.', {'Model Result Index 1': {'sub_error': [\"Unexpected parameter: 'type'.\"], 'sub_error_type': 'simple_function_checker:unexpected_param', 'model_output_item': {'bank.ca",
+    "item": "parallel_multiple_26"
+   },
+   {
+    "id": "live_simple_106-63-0",
+    "parsed": "[{'record': {'acc_routing_start': ['Please provide the routing number for my account.', 'Which account number should I use for setting up eStatements?', 'Please give me the account number for my busin",
+    "metrics": "{'decision': 'call', 'error': [\"Nested type checking failed for parameter 'auto_loan_payment_start'. Expected outer type array with inner type <class 'str'>. Parameter value: [].\", \"Incorrect type for parameter 'auto_loan_payment_start'. Expected type array, got list. Parameter value: [].\"], 'error_",
+    "item": "live_simple_106-63-0"
+   },
+   {
+    "id": "live_simple_112-68-0",
+    "parsed": "[{'record': {'acc_routing_start': [], 'atm_finder_start': [], 'faq_link_accounts_start': [], 'get_balance_start': [], 'get_transactions_start': [], 'outofscope': ['what is the weather like']}}]",
+    "metrics": "{'decision': 'call', 'error': [\"Nested type checking failed for parameter 'acc_routing_start'. Expected outer type array with inner type <class 'str'>. Parameter value: [].\", \"Incorrect type for parameter 'acc_routing_start'. Expected type array, got list. Parameter value: [].\"], 'error_type': 'type",
+    "item": "live_simple_112-68-0"
+   },
+   {
+    "id": "live_multiple_507-149-4",
+    "parsed": "[{'Flights_4_SearchOnewayFlight': {'destination_airport': 'New York', 'departure_date': '2023-03-14', 'number_of_tickets': 1}}]",
+    "metrics": "{'decision': 'call', 'error': [\"Missing required parameter: 'origin_airport'.\"], 'error_type': 'simple_function_checker:missing_required'}",
+    "item": "live_multiple_507-149-4"
+   },
+   {
+    "id": "live_multiple_862-181-3",
+    "parsed": "[{'Trains_1_FindTrains': {'_from': 'New York, NY', 'to': 'Los Angeles, CA', 'date_of_journey': '05/15/2023', 'journey_start_time': '09:00'}}]",
+    "metrics": "{'decision': 'call', 'error': [\"Unexpected parameter: 'journey_start_time'.\"], 'error_type': 'simple_function_checker:unexpected_param'}",
+    "item": "live_multiple_862-181-3"
+   },
+   {
+    "id": "live_multiple_964-207-0",
+    "parsed": "[{'transfer_to_human_agent': {'question': 'Can you tell me what is the minimum package arrival time?'}}]",
+    "metrics": "{'decision': 'call', 'error': [\"Missing required parameter: 'statement'.\"], 'error_type': 'simple_function_checker:missing_required'}",
+    "item": "live_multiple_964-207-0"
+   }
+  ],
+  "n_gold_failures": 21,
+  "n_wrong_nonzero": 0,
+  "seconds": 3.1
+ },
+ "teval": {
+  "gold_acc": 0.9948741845293569,
+  "wrong_acc": 0.0,
+  "n_graded_units": 2146,
+  "pass": true,
+  "gold_failures": [
+   {
+    "id": "teval/understand_str_v2/query_347_0_1_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_347_0_1_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_41_1_0_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_41_1_0_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_332_2_0_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_332_2_0_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_92_1_4_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_92_1_4_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_199_0_2_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_199_0_2_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_269_2_3_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_269_2_3_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_372_2_1_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_372_2_1_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_348_0_0_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_348_0_0_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_354_0_0_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_354_0_0_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_204_0_1_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_204_0_1_0"
+   },
+   {
+    "id": "teval/understand_str_v2/query_199_2_2_0",
+    "parsed": "None",
+    "metrics": "{'args': 0.0, 'parse_rate': 1.0}",
+    "item": "teval/understand_str_v2/query_199_2_2_0"
+   }
+  ],
+  "n_gold_failures": 11,
+  "n_wrong_nonzero": 0,
+  "seconds": 3.9
+ },
+ "metatool": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 5327,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.3
+ },
+ "apibank": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 534,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.0
+ },
+ "gsm8k_train": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 7473,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 5.1
+ },
+ "math_train": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 7500,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 19.7
+ },
+ "dapo_math": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 17398,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 11.4
+ },
+ "arc": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 3370,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.0
+ },
+ "gpqa_main": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 250,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.0
+ },
+ "triviaqa_train": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 76523,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 93.6
+ },
+ "sealtool_train": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 12022,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 1.5
+ },
+ "sealtool": {
+  "gold_acc": 1.0,
+  "wrong_acc": 0.0,
+  "n_graded_units": 2054,
+  "pass": true,
+  "gold_failures": [],
+  "n_gold_failures": 0,
+  "n_wrong_nonzero": 0,
+  "seconds": 0.2
+ },
+ "ifeval": {
+  "handmade_pass_acc": 1.0,
+  "handmade_fail_acc": 0.0,
+  "n": 6,
+  "pass": true,
+  "failures": []
+ },
+ "ifbench": {
+  "handmade_pass_acc": 1.0,
+  "handmade_fail_acc": 0.0,
+  "n": 3,
+  "pass": true,
+  "failures": []
+ },
+ "ifeval_train": {
+  "handmade_pass_acc": 1.0,
+  "handmade_fail_acc": 0.0,
+  "n": 24,
+  "func_names_covered": 24,
+  "func_names_total": 24,
+  "pass": true,
+  "failures": []
+ },
+ "ifeval_train_crosscheck_vs_ifeval": {
+  "overall_agreement": 0.7633333333333333,
+  "n": 4500,
+  "per_func": {
+   "validate_end": {
+    "ifeval_checker": "startend:end_checker",
+    "n": 300,
+    "agreement": 0.6933333333333334,
+    "pass_rate_ifeval": 0.65,
+    "pass_rate_own": 0.3433333333333333,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/3675",
+      "response": "Moving fox dog dog moving open sea? Hills fox a toward. Brown and toward hills falls? that's crazy.",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/13560",
+      "response": "\"Hills keeps clouds clouds fox brown keeps brown while? That's all.\"",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/5459",
+      "response": "Brown quick while open quick and jumps falls jumps. Moving under quick lazy river on. The river the and rain the grey a brown a under? Moving open sea grey hill",
+      "ifeval": true,
+      "own": false
+     }
+    ]
+   },
+   "validate_forbidden_words": {
+    "ifeval_checker": "keywords:forbidden_words",
+    "n": 300,
+    "agreement": 0.59,
+    "pass_rate_ifeval": 0.6233333333333333,
+    "pass_rate_own": 0.21333333333333335,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/2545",
+      "response": "Rain fox the toward grey clouds open sea falls over hills brown. Fox a open jumps quick hills over quick moving quiet river grey. Quick sea dog the. labyrinthal",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/12901",
+      "response": "Keeps and dog sea sea the moving clouds? Grey clouds rain grey moving quick and grey quick jumps sea over? The grey on a and brown. Jumps while toward hills tow",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/12984",
+      "response": "Open a fox sea jumps clouds river brown the lazy. Falls keeps clouds clouds under rain grey under dog the falls. Falls dog under an keeps moving over quiet? Ope",
+      "ifeval": true,
+      "own": false
+     }
+    ]
+   },
+   "validate_highlighted_sections": {
+    "ifeval_checker": "detectable_format:number_highlighted_sections",
+    "n": 300,
+    "agreement": 0.20666666666666667,
+    "pass_rate_ifeval": 0.09333333333333334,
+    "pass_rate_own": 0.8866666666666667,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/2345",
+      "response": "**grey quiet** *jumps lazy\n* *jumps clouds\n* *over toward\n* *the fox\n* *rain while* *falls grey\n* * under fox * *dog the\n* *quick rain\n* **hills keeps** **brown",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/8338",
+      "response": "*lazy over* *under hills* *clouds sea\n* *fox quiet\n* * the brown * **lazy open** *rain the* **lazy grey** *open on\n* **rain under** *clouds on\n* *jumps fox* * a",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/1358",
+      "response": "*open a\n* *an quick\n* **open fox** *jumps sea\n* *while on* **while quick** *quick fox\n* **lazy a** **sea and** *an toward* **on the** *quiet an* * river the * *",
+      "ifeval": false,
+      "own": true
+     }
+    ]
+   },
+   "validate_json_format": {
+    "ifeval_checker": "detectable_format:json_format",
+    "n": 300,
+    "agreement": 0.7,
+    "pass_rate_ifeval": 0.71,
+    "pass_rate_own": 0.41,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/10709",
+      "response": "```json\n{\"answer\": \"Keeps river open a rain sea the toward while while hills brown!\", \"n\": 7}\n```",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/2565",
+      "response": "```json\n{\"answer\": \"Falls grey river open quiet river grey open under sea the falls!\", \"n\": 5}\n```",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/8559",
+      "response": "```json\n{\"answer\": \"Falls a under jumps keeps grey dog quiet a while sea the?\", \"n\": 3}\n```",
+      "ifeval": true,
+      "own": false
+     }
+    ]
+   },
+   "validate_lowercase": {
+    "ifeval_checker": "change_case:english_lowercase",
+    "n": 300,
+    "agreement": 0.9966666666666667,
+    "pass_rate_ifeval": 0.11666666666666667,
+    "pass_rate_own": 0.12,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/12963",
+      "response": "open river brown keeps keeps. ok",
+      "ifeval": false,
+      "own": true
+     }
+    ]
+   },
+   "validate_no_commas": {
+    "ifeval_checker": "punctuation:no_comma",
+    "n": 300,
+    "agreement": 1.0,
+    "pass_rate_ifeval": 0.4866666666666667,
+    "pass_rate_own": 0.4866666666666667,
+    "disagreement_examples": []
+   },
+   "validate_paragraphs": {
+    "ifeval_checker": "length_constraints:nth_paragraph_first_word",
+    "n": 300,
+    "agreement": 0.8533333333333334,
+    "pass_rate_ifeval": 0.18,
+    "pass_rate_own": 0.10666666666666667,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/5697",
+      "response": "Over over rain quiet quick.\n\n\nSea dog moving a a hills fox moving.\n\n\nOn grey lazy the while under brown moving an!\n\n\nAnd on grey dog rain grey jumps lazy moving",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/8279",
+      "response": "Keeps lazy river keeps?\n\nAn moving falls under hills open fox open brown river.\n\nA falls rain fox an grey quick sea.\n\nGrey and brown clouds hills falls lazy bro",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/4218",
+      "response": "A quiet sea rain moving and lazy jumps an the while?\n\nLazy clouds quiet hills the the keeps the sea on?\n\nDog river river quick moving a brown a fox over.\n\n\"fran",
+      "ifeval": true,
+      "own": false
+     }
+    ]
+   },
+   "validate_placeholders": {
+    "ifeval_checker": "detectable_content:number_placeholders",
+    "n": 300,
+    "agreement": 1.0,
+    "pass_rate_ifeval": 0.5866666666666667,
+    "pass_rate_own": 0.5866666666666667,
+    "disagreement_examples": []
+   },
+   "validate_quotation": {
+    "ifeval_checker": "startend:quotation",
+    "n": 300,
+    "agreement": 0.8366666666666667,
+    "pass_rate_ifeval": 0.43,
+    "pass_rate_own": 0.5933333333333334,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/14449",
+      "response": "\"",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/4200",
+      "response": "\"",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/10324",
+      "response": "\"",
+      "ifeval": false,
+      "own": true
+     }
+    ]
+   },
+   "validate_title": {
+    "ifeval_checker": "detectable_format:title",
+    "n": 300,
+    "agreement": 0.6833333333333333,
+    "pass_rate_ifeval": 0.17666666666666667,
+    "pass_rate_own": 0.49333333333333335,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/6592",
+      "response": "<< >> And quick and open falls sea the fox moving under! Jumps and hills clouds open. Over while quiet over clouds river over under quick!",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/7268",
+      "response": "<< >> An brown clouds fox and grey hills clouds rain a under a.",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/611",
+      "response": "<<>> While hills rain lazy?",
+      "ifeval": false,
+      "own": true
+     }
+    ]
+   },
+   "validate_two_responses": {
+    "ifeval_checker": "combination:two_responses",
+    "n": 300,
+    "agreement": 0.6866666666666666,
+    "pass_rate_ifeval": 0.29,
+    "pass_rate_own": 0.25,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/464",
+      "response": "Sea moving sea jumps on keeps under! And dog toward jumps? The brown moving keeps fox keeps. Quiet quiet an fox the sea grey moving while brown!\n******\n",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/1600",
+      "response": "On keeps open grey hills hills.\n******\n",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/14541",
+      "response": "The jumps the falls open sea! Rain sea brown while quiet! Grey quiet quiet over open clouds and sea and.\n******\n",
+      "ifeval": false,
+      "own": true
+     }
+    ]
+   },
+   "validate_uppercase": {
+    "ifeval_checker": "change_case:english_capital",
+    "n": 300,
+    "agreement": 0.8966666666666666,
+    "pass_rate_ifeval": 0.06333333333333334,
+    "pass_rate_own": 0.16666666666666666,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/8597",
+      "response": "BROWN RAIN KEEPS MOVING RAIN OVER HILLS HILLS.",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/10969",
+      "response": "BROWN AND A FOX FOX THE AN BROWN WHILE. AN HILLS FOX AN QUICK WHILE FOX QUIET AND RIVER! UNDER CLOUDS CLOUDS RAIN BROWN AN QUICK DOG TOWARD QUICK BROWN THE! OPE",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/14392",
+      "response": "DOG OPEN TOWARD RIVER ON DOG.",
+      "ifeval": false,
+      "own": true
+     }
+    ]
+   },
+   "verify_bullet_points": {
+    "ifeval_checker": "detectable_format:number_bullet_lists",
+    "n": 300,
+    "agreement": 0.7466666666666667,
+    "pass_rate_ifeval": 0.06666666666666667,
+    "pass_rate_own": 0.24666666666666667,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/11330",
+      "response": "Intro.\n- Dog jumps rain falls on clouds fox and rain quiet moving and.\n-Quick an and jumps rain sea rain jumps lazy and under?\n*And quiet quick clouds falls kee",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/3317",
+      "response": "Intro.\n* Toward lazy open on.\n* Brown clouds an falls over lazy clouds hills open and while a!\n  * Quiet a clouds over the?\n*And sea hills dog and sea.\n**bold**",
+      "ifeval": false,
+      "own": true
+     },
+     {
+      "id": "rlvr_ifeval/4773",
+      "response": "Intro.\n- Fox the hills over?\n* Keeps fox lazy under.\n* While river hills river quick brown grey an over.\n**bold** And jumps fox on grey sea river river toward f",
+      "ifeval": false,
+      "own": true
+     }
+    ]
+   },
+   "verify_keywords": {
+    "ifeval_checker": "keywords:existence",
+    "n": 300,
+    "agreement": 1.0,
+    "pass_rate_ifeval": 0.6533333333333333,
+    "pass_rate_own": 0.6533333333333333,
+    "disagreement_examples": []
+   },
+   "verify_postscript": {
+    "ifeval_checker": "detectable_content:postscript",
+    "n": 300,
+    "agreement": 0.56,
+    "pass_rate_ifeval": 0.7333333333333333,
+    "pass_rate_own": 0.29333333333333333,
+    "disagreement_examples": [
+     {
+      "id": "rlvr_ifeval/7702",
+      "response": "Jumps on over falls quiet river the.\nAddendum:",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/6116",
+      "response": "Over brown jumps moving hills grey dog lazy keeps river the the! Fox sea sea jumps clouds clouds clouds? Keeps lazy rain an a a! On a lazy quiet keeps dog.\nbefo",
+      "ifeval": true,
+      "own": false
+     },
+     {
+      "id": "rlvr_ifeval/4236",
+      "response": "Lazy the hills while on lazy quick the an hills rain brown. Grey quiet lazy fox. Grey rain hills rain hills. An lazy toward river the lazy keeps sea falls.\nAdde",
+      "ifeval": true,
+      "own": false
+     }
+    ]
+   }
+  }
+ },
+ "humanevalplus": {
+  "gold_extraction_exact": 164,
+  "n": 164,
+  "pass": true,
+  "execution": "PENDING (sandbox only)"
+ },
+ "mbppplus": {
+  "gold_extraction_exact": 378,
+  "n": 378,
+  "pass": true,
+  "execution": "PENDING (sandbox only)"
+ },
+ "apps": {
+  "gold_extraction_exact": 4449,
+  "n": 4449,
+  "pass": true,
+  "execution": "PENDING (sandbox only)"
+ },
+ "taco_verified": {
+  "gold_extraction_exact": 10806,
+  "n": 10806,
+  "pass": true,
+  "execution": "PENDING (sandbox only)"
+ }
+}

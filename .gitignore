@@ -1,0 +1,30 @@
+# OS / editor
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environments (rebuild with ./setup_env.sh)
+.venv/
+venv/
+eval/.venv/
+eval/.nltk_data/
+
+# Datasets (rebuild with ./download_data.sh); keep scripts, splits and docs
+data/raw/
+data/processed/
+
+# Pinned third-party harness repos (cloned by eval/setup_env.sh); keep pins.yaml
+eval/third_party/*/
+
+# Model weights / checkpoints
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.gguf
+
+# Paper PDFs (large, third-party copyright); notes in Markdown are kept
+*.pdf

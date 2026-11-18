@@ -1,0 +1,30 @@
+# Per-generation draw config for Paper A (self-quantization). Copied into the run directory on the
+# first draw and locked there (its sha256 is checked on every later draw).
+# Config knobs: `n` per domain = items drawn per generation (signal); `screen_n`; `kl_contexts`.
+# The FIXED gate size is set in data/splits/split_config.yaml (`gate_domains`), not here.
+paper: A
+seed: 20261118
+screen_n: 200          # per domain: stratified subset of `signal`, used for the cheap first-stage evaluation
+kl_contexts: 256       # total KL / calibration contexts per generation, split evenly over domains,
+                       # disjoint from `signal`
+reuse:                   # revised 2026-11-19: training data is reusable across generations
+  across_generations: true          # never-used items first, then least recently used
+  never_signal_after: [train, shown] # once trained on (Paper B) or shown to the editor, never signal again
+domains:
+  math:
+    n: 2000
+    datasets: {gsm8k_train: 0.25, math_train: 0.35, dapo_math: 0.40}
+  code:
+    n: 1000
+    datasets: {taco_verified: 1.0}   # single code training set (2026-11-19)
+    stratify_by: difficulty
+  knowledge:
+    n: 2000
+    datasets: {triviaqa_train: 0.5, arc: 0.5}
+  instruction_following:
+    n: 2000
+    datasets: {ifeval_train: 1.0}
+    stratify_by: constraint_type
+  tool_calling:
+    n: 2000
+    datasets: {sealtool_train: 1.0}

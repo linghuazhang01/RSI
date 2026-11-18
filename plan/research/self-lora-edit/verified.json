@@ -1,0 +1,260 @@
+{
+  "verdict": "WARN",
+  "hallucination_rate": 0.0,
+  "pending_rate": 0.64,
+  "warnings": [
+    "transient_failures_present"
+  ],
+  "papers": [
+    {
+      "id": "arxiv-0",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2611.09382"
+      }
+    },
+    {
+      "id": "arxiv-1",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2611.04268"
+      }
+    },
+    {
+      "id": "arxiv-2",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2611.08070"
+      }
+    },
+    {
+      "id": "arxiv-3",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2611.09376"
+      }
+    },
+    {
+      "id": "arxiv-4",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2611.07319"
+      }
+    },
+    {
+      "id": "arxiv-5",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2410.15639"
+      }
+    },
+    {
+      "id": "arxiv-6",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2307.13269"
+      }
+    },
+    {
+      "id": "arxiv-7",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2403.13187"
+      }
+    },
+    {
+      "id": "arxiv-8",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2605.29295"
+      }
+    },
+    {
+      "id": "arxiv-9",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2606.05016"
+      }
+    },
+    {
+      "id": "arxiv-10",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2604.27796"
+      }
+    },
+    {
+      "id": "arxiv-11",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2609.06396"
+      }
+    },
+    {
+      "id": "arxiv-12",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2601.14532"
+      }
+    },
+    {
+      "id": "arxiv-13",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2506.10943"
+      }
+    },
+    {
+      "id": "arxiv-14",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2610.12176"
+      }
+    },
+    {
+      "id": "arxiv-15",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2610.22791"
+      }
+    },
+    {
+      "id": "arxiv-16",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2607.03935"
+      }
+    },
+    {
+      "id": "arxiv-17",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2501.06252"
+      }
+    },
+    {
+      "id": "arxiv-18",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2506.06105"
+      }
+    },
+    {
+      "id": "arxiv-19",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2411.05877"
+      }
+    },
+    {
+      "id": "arxiv-20",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2611.11975"
+      }
+    },
+    {
+      "id": "arxiv-21",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2508.05004"
+      }
+    },
+    {
+      "id": "arxiv-22",
+      "status": "verified",
+      "method": "arxiv",
+      "confidence": "high",
+      "reason": null,
+      "identifiers": {
+        "arxiv_id": "2606.28438"
+      }
+    },
+    {
+      "id": "arxiv-23",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2604.15794"
+      }
+    },
+    {
+      "id": "arxiv-24",
+      "status": "verify_pending",
+      "method": null,
+      "confidence": null,
+      "reason": "arxiv_verify_pending",
+      "identifiers": {
+        "arxiv_id": "2610.06174"
+      }
+    }
+  ]
+}

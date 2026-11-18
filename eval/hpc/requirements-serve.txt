@@ -1,0 +1,4 @@
+# Superseded 2026-11-18: serving now uses the same pinned GPU stack as training/editing.
+# Install with:  bash eval/hpc/setup_gpu_env.sh   (reads eval/hpc/requirements-gpu.lock)
+# Stack: verl 0.9.1 | vllm 0.24.0 | transformers 5.9.0 | torch 2.11.0+cu130
+-r requirements-gpu.lock

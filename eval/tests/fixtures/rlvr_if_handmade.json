@@ -1,0 +1,122 @@
+{
+ "rlvr_ifeval/2294": {
+  "func_name": "validate_choice",
+  "pass": "yes. A simple version is: const rotate = s => s.slice(3) + s.slice(0, 3); console.log(rotate('abcdef'));",
+  "fail": "Here is the code: const rotate = s => s.slice(3) + s.slice(0, 3); console.log(rotate('abcdef'));"
+ },
+ "rlvr_ifeval/11352": {
+  "func_name": "validate_end",
+  "pass": "<a href=\"https://www.example.com\" target=\"_blank\">Visit Example</a>\nThat's it.",
+  "fail": "That's it. <a href=\"https://www.example.com\" target=\"_blank\">Visit Example</a>"
+ },
+ "rlvr_ifeval/10860": {
+  "func_name": "validate_forbidden_words",
+  "pass": "Why did the chicken join a band? Because it already had the drumsticks.",
+  "fail": "Why did the chicken run? It heard the rattles of the farmer's old truck."
+ },
+ "rlvr_ifeval/1511": {
+  "func_name": "validate_frequency_capital_words",
+  "pass": "THE KEY IDEA IS TO COMBINE THE TWO J TERMS FIRST AND THEN DIVIDE BOTH SIDES BY THE SAME NUMBER SO THAT J STANDS ALONE AND WE CAN READ OFF THE FINAL ANSWER WITH NO WORK: -6966*j + 5634*j = -1332*j, so -55944 = -1332*j and j = 42.",
+  "fail": "Combine the J terms: -6966*j + 5634*j = -1332*j. So -55944 = -1332*j and j = 42. DONE, VERY EASY."
+ },
+ "rlvr_ifeval/5786": {
+  "func_name": "validate_highlighted_sections",
+  "pass": "TITLE: Gold Rush Protocol\n*Scene 1: the heist crew regroups* and argues about the next move.\n*Scene 2: the heist crew regroups* and argues about the next move.\n*Scene 3: the heist crew regroups* and argues about the next move.\n*Scene 4: the heist crew regroups* and argues about the next move.\n*Scene 5: the heist crew regroups* and argues about the next move.\n*Scene 6: the heist crew regroups* and argues about the next move.\n*Scene 7: the heist crew regroups* and argues about the next move.\n*Scene 8: the heist crew regroups* and argues about the next move.\n*Scene 9: the heist crew regroups* and argues about the next move.\n*Scene 10: the heist crew regroups* and argues about the next move.\n*Scene 11: the heist crew regroups* and argues about the next move.\n*Scene 12: the heist crew regroups* and argues about the next move.\n*Scene 13: the heist crew regroups* and argues about the next move.\n*Scene 14: the heist crew regroups* and argues about the next move.\n*Scene 15: the heist crew regroups* and argues about the next move.\n*Scene 16: the heist crew regroups* and argues about the next move.\n*Scene 17: the heist crew regroups* and argues about the next move.\n*Scene 18: the heist crew regroups* and argues about the next move.\n*Scene 19: the heist crew regroups* and argues about the next move.\n*Scene 20: the heist crew regroups* and argues about the next move.\n*Scene 21: the heist crew regroups* and argues about the next move.\n*Scene 22: the heist crew regroups* and argues about the next move.\n*Scene 23: the heist crew regroups* and argues about the next move.\n*Scene 24: the heist crew regroups* and argues about the next move.\n*Scene 25: the heist crew regroups* and argues about the next move.\n*Scene 26: the heist crew regroups* and argues about the next move.\n*Scene 27: the heist crew regroups* and argues about the next move.\n*Scene 28: the heist crew regroups* and argues about the next move.\n*Scene 29: the heist crew regroups* and argues about the next move.\n*Scene 30: the heist crew regroups* and argues about the next move.\n*Scene 31: the heist crew regroups* and argues about the next move.\n*Scene 32: the heist crew regroups* and argues about the next move.\n*Scene 33: the heist crew regroups* and argues about the next move.\n*Scene 34: the heist crew regroups* and argues about the next move.\n*Scene 35: the heist crew regroups* and argues about the next move.\n*Scene 36: the heist crew regroups* and argues about the next move.\n*Scene 37: the heist crew regroups* and argues about the next move.\n*Scene 38: the heist crew regroups* and argues about the next move.\n*Scene 39: the heist crew regroups* and argues about the next move.",
+  "fail": "TITLE: Gold Rush Protocol\n*Scene 1: the heist crew meets* in a diner.\n*Scene 2: the vault* is opened."
+ },
+ "rlvr_ifeval/11239": {
+  "func_name": "validate_json_format",
+  "pass": "{\"question\": \"Is it a good idea to brush your teeth with sand instead of toothpaste?\", \"answer\": \"no\"}",
+  "fail": "The question was: Is sand a good substitute for toothpaste? {\"answer\": \"no\"}"
+ },
+ "rlvr_ifeval/1663": {
+  "func_name": "validate_lowercase",
+  "pass": "green today, greener tomorrow: everyday products that are kind to you and to the planet we all share.",
+  "fail": "Green Today, Greener Tomorrow: everyday products that are kind to you and to the planet we all share."
+ },
+ "rlvr_ifeval/11679": {
+  "func_name": "validate_no_commas",
+  "pass": "Combine the j terms to get -1332*j. Then j = -55944 / -1332 = 42.",
+  "fail": "First, combine the j terms: -6966*j + 5634*j = -1332*j, so j = 42."
+ },
+ "rlvr_ifeval/12300": {
+  "func_name": "validate_paragraphs",
+  "pass": "Step 1 of the integration covers one small part of the PayPal checkout flow.\n\nStep 2 of the integration covers one small part of the PayPal checkout flow.\n\nStep 3 of the integration covers one small part of the PayPal checkout flow.\n\nStep 4 of the integration covers one small part of the PayPal checkout flow.\n\nStep 5 of the integration covers one small part of the PayPal checkout flow.\n\nStep 6 of the integration covers one small part of the PayPal checkout flow.\n\nStep 7 of the integration covers one small part of the PayPal checkout flow.\n\nStep 8 of the integration covers one small part of the PayPal checkout flow.\n\nStep 9 of the integration covers one small part of the PayPal checkout flow.\n\nStep 10 of the integration covers one small part of the PayPal checkout flow.\n\nStep 11 of the integration covers one small part of the PayPal checkout flow.\n\nStep 12 of the integration covers one small part of the PayPal checkout flow.\n\nStep 13 of the integration covers one small part of the PayPal checkout flow.\n\nStep 14 of the integration covers one small part of the PayPal checkout flow.\n\nOvercrowd the cart page with nothing: keep the PayPal button as the single call to action.\n\nStep 16 of the integration covers one small part of the PayPal checkout flow.\n\nStep 17 of the integration covers one small part of the PayPal checkout flow.\n\nStep 18 of the integration covers one small part of the PayPal checkout flow.\n\nStep 19 of the integration covers one small part of the PayPal checkout flow.\n\nStep 20 of the integration covers one small part of the PayPal checkout flow.\n\nStep 21 of the integration covers one small part of the PayPal checkout flow.\n\nStep 22 of the integration covers one small part of the PayPal checkout flow.\n\nStep 23 of the integration covers one small part of the PayPal checkout flow.\n\nStep 24 of the integration covers one small part of the PayPal checkout flow.\n\nStep 25 of the integration covers one small part of the PayPal checkout flow.\n\nStep 26 of the integration covers one small part of the PayPal checkout flow.\n\nStep 27 of the integration covers one small part of the PayPal checkout flow.\n\nStep 28 of the integration covers one small part of the PayPal checkout flow.\n\nStep 29 of the integration covers one small part of the PayPal checkout flow.\n\nStep 30 of the integration covers one small part of the PayPal checkout flow.\n\nStep 31 of the integration covers one small part of the PayPal checkout flow.\n\nStep 32 of the integration covers one small part of the PayPal checkout flow.\n\nStep 33 of the integration covers one small part of the PayPal checkout flow.\n\nStep 34 of the integration covers one small part of the PayPal checkout flow.\n\nStep 35 of the integration covers one small part of the PayPal checkout flow.\n\nStep 36 of the integration covers one small part of the PayPal checkout flow.\n\nStep 37 of the integration covers one small part of the PayPal checkout flow.\n\nStep 38 of the integration covers one small part of the PayPal checkout flow.\n\nStep 39 of the integration covers one small part of the PayPal checkout flow.",
+  "fail": "Step 1 of the integration covers one small part of the PayPal checkout flow.\n\nStep 2 of the integration covers one small part of the PayPal checkout flow.\n\nStep 3 of the integration covers one small part of the PayPal checkout flow.\n\nStep 4 of the integration covers one small part of the PayPal checkout flow.\n\nStep 5 of the integration covers one small part of the PayPal checkout flow.\n\nStep 6 of the integration covers one small part of the PayPal checkout flow.\n\nStep 7 of the integration covers one small part of the PayPal checkout flow.\n\nStep 8 of the integration covers one small part of the PayPal checkout flow.\n\nStep 9 of the integration covers one small part of the PayPal checkout flow.\n\nStep 10 of the integration covers one small part of the PayPal checkout flow.\n\nStep 11 of the integration covers one small part of the PayPal checkout flow.\n\nStep 12 of the integration covers one small part of the PayPal checkout flow.\n\nStep 13 of the integration covers one small part of the PayPal checkout flow.\n\nStep 14 of the integration covers one small part of the PayPal checkout flow.\n\nStep 15 of the integration covers one small part of the PayPal checkout flow.\n\nStep 16 of the integration covers one small part of the PayPal checkout flow.\n\nStep 17 of the integration covers one small part of the PayPal checkout flow.\n\nStep 18 of the integration covers one small part of the PayPal checkout flow.\n\nStep 19 of the integration covers one small part of the PayPal checkout flow.\n\nStep 20 of the integration covers one small part of the PayPal checkout flow.\n\nStep 21 of the integration covers one small part of the PayPal checkout flow.\n\nStep 22 of the integration covers one small part of the PayPal checkout flow.\n\nStep 23 of the integration covers one small part of the PayPal checkout flow.\n\nStep 24 of the integration covers one small part of the PayPal checkout flow.\n\nStep 25 of the integration covers one small part of the PayPal checkout flow.\n\nStep 26 of the integration covers one small part of the PayPal checkout flow.\n\nStep 27 of the integration covers one small part of the PayPal checkout flow.\n\nStep 28 of the integration covers one small part of the PayPal checkout flow.\n\nStep 29 of the integration covers one small part of the PayPal checkout flow.\n\nStep 30 of the integration covers one small part of the PayPal checkout flow.\n\nStep 31 of the integration covers one small part of the PayPal checkout flow.\n\nStep 32 of the integration covers one small part of the PayPal checkout flow.\n\nStep 33 of the integration covers one small part of the PayPal checkout flow.\n\nStep 34 of the integration covers one small part of the PayPal checkout flow.\n\nStep 35 of the integration covers one small part of the PayPal checkout flow.\n\nStep 36 of the integration covers one small part of the PayPal checkout flow.\n\nStep 37 of the integration covers one small part of the PayPal checkout flow.\n\nStep 38 of the integration covers one small part of the PayPal checkout flow.\n\nStep 39 of the integration covers one small part of the PayPal checkout flow."
+ },
+ "rlvr_ifeval/7863": {
+  "func_name": "validate_placeholders",
+  "pass": "Para ir a la Luna necesitas estos datos: [nombre] [fecha] [hora] [cohete] [agencia] [presupuesto] [traje] [entrenamiento] [medico] [piloto] [base] [destino] [regreso] [seguro].",
+  "fail": "Para ir a la Luna necesitas un cohete [cohete], una agencia [agencia] y mucho entrenamiento [entrenamiento]."
+ },
+ "rlvr_ifeval/14620": {
+  "func_name": "validate_quotation",
+  "pass": "\"Joyful, anxious, furious, serene, nostalgic, hopeful.\"",
+  "fail": "Joyful, anxious, furious, serene, nostalgic, hopeful."
+ },
+ "rlvr_ifeval/3837": {
+  "func_name": "validate_repeat_prompt",
+  "pass": "tell me a story about a boy named james\n\nOnce upon a time, a boy named James built a kite that could talk.",
+  "fail": "Once upon a time, a boy named James built a kite that could talk."
+ },
+ "rlvr_ifeval/6598": {
+  "func_name": "validate_sections",
+  "pass": "Part: 1\nStep 1 of reversing the words of the string.\nPart: 2\nStep 2 of reversing the words of the string.\nPart: 3\nStep 3 of reversing the words of the string.\nPart: 4\nStep 4 of reversing the words of the string.\nPart: 5\nStep 5 of reversing the words of the string.\nPart: 6\nStep 6 of reversing the words of the string.\nPart: 7\nStep 7 of reversing the words of the string.\nPart: 8\nStep 8 of reversing the words of the string.\nPart: 9\nStep 9 of reversing the words of the string.\nPart: 10\nStep 10 of reversing the words of the string.\nPart: 11\nStep 11 of reversing the words of the string.\nPart: 12\nStep 12 of reversing the words of the string.\nPart: 13\nStep 13 of reversing the words of the string.\nPart: 14\nStep 14 of reversing the words of the string.\nPart: 15\nStep 15 of reversing the words of the string.\nPart: 16\nStep 16 of reversing the words of the string.\nPart: 17\nStep 17 of reversing the words of the string.\nPart: 18\nStep 18 of reversing the words of the string.\nPart: 19\nStep 19 of reversing the words of the string.\nPart: 20\nStep 20 of reversing the words of the string.\nPart: 21\nStep 21 of reversing the words of the string.\nPart: 22\nStep 22 of reversing the words of the string.\nPart: 23\nStep 23 of reversing the words of the string.\nPart: 24\nStep 24 of reversing the words of the string.\nPart: 25\nStep 25 of reversing the words of the string.\nPart: 26\nStep 26 of reversing the words of the string.\nPart: 27\nStep 27 of reversing the words of the string.\nPart: 28\nStep 28 of reversing the words of the string.\nPart: 29\nStep 29 of reversing the words of the string.\nPart: 30\nStep 30 of reversing the words of the string.\nPart: 31\nStep 31 of reversing the words of the string.",
+  "fail": "Part: 1\nSplit the string.\nPart: 2\nReverse the list.\nPart: 3\nJoin it back: ' '.join(string.split()[::-1])"
+ },
+ "rlvr_ifeval/10410": {
+  "func_name": "validate_title",
+  "pass": "<<Dark Matter Versus Dark Energy>>\nDark matter pulls galaxies together through gravity, while dark energy pushes the universe apart.",
+  "fail": "Dark matter pulls galaxies together through gravity, while dark energy pushes the universe apart."
+ },
+ "rlvr_ifeval/11673": {
+  "func_name": "validate_two_responses",
+  "pass": "Inflation, high public debt and slowing trade are the main issues.\n******\nThe main issues are energy prices, supply-chain shocks and rising inequality.",
+  "fail": "Inflation, high public debt and slowing trade are the main issues."
+ },
+ "rlvr_ifeval/8201": {
+  "func_name": "validate_uppercase",
+  "pass": "THE DIGESTIVE SYSTEM BREAKS FOOD DOWN INTO NUTRIENTS THAT THE BODY CAN ABSORB. IT STARTS IN THE MOUTH, CONTINUES THROUGH THE STOMACH AND THE SMALL INTESTINE, AND ENDS IN THE LARGE INTESTINE.",
+  "fail": "The digestive system breaks food down into nutrients that the body can absorb. It starts in the mouth."
+ },
+ "rlvr_ifeval/13177": {
+  "func_name": "validate_word_constraint",
+  "pass": "1. Set a weekly budget. 2. Plan meals around staples. 3. Buy seasonal produce. 4. Cook in batches. 5. Track spending.",
+  "fail": "Budget."
+ },
+ "rlvr_ifeval/14552": {
+  "func_name": "verify_bullet_points",
+  "pass": "Skills survey\n* Question 1: rate your confidence in topic 1 from 1 to 5.\n* Question 2: rate your confidence in topic 2 from 1 to 5.\n* Question 3: rate your confidence in topic 3 from 1 to 5.\n* Question 4: rate your confidence in topic 4 from 1 to 5.\n* Question 5: rate your confidence in topic 5 from 1 to 5.\n* Question 6: rate your confidence in topic 6 from 1 to 5.\n* Question 7: rate your confidence in topic 7 from 1 to 5.\n* Question 8: rate your confidence in topic 8 from 1 to 5.\n* Question 9: rate your confidence in topic 9 from 1 to 5.\n* Question 10: rate your confidence in topic 10 from 1 to 5.\n* Question 11: rate your confidence in topic 11 from 1 to 5.\n* Question 12: rate your confidence in topic 12 from 1 to 5.\n* Question 13: rate your confidence in topic 13 from 1 to 5.\n* Question 14: rate your confidence in topic 14 from 1 to 5.\n* Question 15: rate your confidence in topic 15 from 1 to 5.\n* Question 16: rate your confidence in topic 16 from 1 to 5.\n* Question 17: rate your confidence in topic 17 from 1 to 5.\n* Question 18: rate your confidence in topic 18 from 1 to 5.\n* Question 19: rate your confidence in topic 19 from 1 to 5.\n* Question 20: rate your confidence in topic 20 from 1 to 5.\n* Question 21: rate your confidence in topic 21 from 1 to 5.\n* Question 22: rate your confidence in topic 22 from 1 to 5.\n* Question 23: rate your confidence in topic 23 from 1 to 5.\n* Question 24: rate your confidence in topic 24 from 1 to 5.\n* Question 25: rate your confidence in topic 25 from 1 to 5.\n* Question 26: rate your confidence in topic 26 from 1 to 5.\n* Question 27: rate your confidence in topic 27 from 1 to 5.\n* Question 28: rate your confidence in topic 28 from 1 to 5.\n* Question 29: rate your confidence in topic 29 from 1 to 5.",
+  "fail": "Skills survey\n* Question 1: Mathematics\n* Question 2: Science\n* Question 3: English"
+ },
+ "rlvr_ifeval/1732": {
+  "func_name": "verify_keyword_frequency",
+  "pass": "需要的技能：繪畫、敘事與分工。 drawly drawly drawly drawly drawly drawly drawly drawly drawly drawly drawly drawly drawly 步驟：選主題、寫腳本、畫四格、發表。",
+  "fail": "需要的技能：繪畫、敘事與分工。 drawly drawly drawly drawly drawly drawly drawly drawly drawly drawly drawly drawly 步驟：選主題、寫腳本、畫四格、發表。"
+ },
+ "rlvr_ifeval/11294": {
+  "func_name": "verify_keywords",
+  "pass": "熊妈妈原来有19根玉米：小熊得到3根后有8根，熊妈妈剩下16根，正好是小熊的2倍，再加上给出的3根就是19根 (stigmaticalness, malicho)。",
+  "fail": "熊妈妈原来有19根玉米：小熊得到3根后有8根，熊妈妈剩下16根，正好是小熊的2倍，再加上给出的3根就是19根 (stigmaticalness)。"
+ },
+ "rlvr_ifeval/14828": {
+  "func_name": "verify_letter_frequency",
+  "pass": "C, Go, Rust, Java, Elixir, Lisp, Swift, Kotlin, Dart, Ruby: each one can echo \"hello world\" to the console.",
+  "fail": "Python: print('hello world'); JavaScript: console.log('hello world'); C: printf(\"hello world\");"
+ },
+ "rlvr_ifeval/7418": {
+  "func_name": "verify_paragraph_count",
+  "pass": "Use a ruler.\n* * *\nPlace the pen along it.\n* * *\nAlign one end with zero.\n* * *\nRead the other end.\n* * *\nA typical pen is about 14 cm.",
+  "fail": "Use a ruler.\n* * *\nPlace the pen along it.\n* * *\nA typical pen is about 14 cm."
+ },
+ "rlvr_ifeval/11421": {
+  "func_name": "verify_postscript",
+  "pass": "Porque puede ocultar si el estudiante realmente aprendio.\n\nBefore I forget: los profesores pueden pedir borradores.",
+  "fail": "Porque puede ocultar si el estudiante realmente aprendio."
+ },
+ "rlvr_ifeval/2854": {
+  "func_name": "verify_sentence_constraint",
+  "pass": "Climb three times a week, mixing limit bouldering, technique drills and full rest days.",
+  "fail": "Climb three times a week. Add one day of hangboard training. Rest on the other days."
+ }
+}

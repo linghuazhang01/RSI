@@ -1,0 +1,38 @@
+{
+ "ifeval/1019": {
+  "pass": "what are the two young boys with toy guns and horns playing?",
+  "fail": "What Are The Two Young Boys Playing?"
+ },
+ "ifeval/1187": {
+  "pass": "Good afternoon. I am heading to the beach today.\nGreetings. I plan to visit the beach today.",
+  "fail": "Hello, I am going to the beach today, friend."
+ },
+ "ifeval/1220": {
+  "pass": "Two strangers met over coffee\nand stayed until the rain stopped.\nIs there anything else I can help with?",
+  "fail": "Two strangers met over coffee. The end."
+ },
+ "ifeval/1367": {
+  "pass": "Session plan: learn Java syntax, then build a small game.\n\nP.P.S Bring a laptop and snacks.",
+  "fail": "Session plan: learn Java syntax, then build a small game."
+ },
+ "ifeval/122": {
+  "pass": "\"The internet began as a research network and now shapes how teenagers learn and socialize.\"",
+  "fail": "The internet began as a research network and now shapes how teenagers learn."
+ },
+ "ifeval/102": {
+  "pass": "* Ava: Are you really wearing sweats tonight?\n* Ben: Comfort first, style second.\n* Ava: Then I will shine for both of us.",
+  "fail": "* Ava: Ready?\n* Ben: Almost."
+ },
+ "ifbench/41": {
+  "pass": "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu apple banana cherry grape lemon mango melon olive peach pear plum quince raspberry strawberry tomato carrot celery garlic ginger kale leek onion pepper potato radish spinach squash turnip yam acorn birch cedar daisy elm fern holly iris jasmine lilac maple oak pine rose sage tulip violet.",
+  "fail": "Seneca argued that mercy strengthens rule."
+ },
+ "ifbench/54": {
+  "pass": "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu apple banana cherry grape lemon mango melon olive peach pear plum quince raspberry strawberry tomato carrot celery garlic ginger kale leek onion pepper potato radish spinach squash turnip yam acorn birch cedar daisy elm fern holly iris jasmine lilac maple oak pine rose sage tulip violet willow anchor bridge castle desert forest garden harbor island jungle lagoon meadow mountain ocean prairie quarry river valley.",
+  "fail": "Lua is a language. Lua is a language. Lua is a language."
+ },
+ "ifbench/30": {
+  "pass": "I think you know that he and she said it was ours. We told them that they gave me him and her, and us them. I asked you whether he saw it, and she said we and they knew. You and I and he.",
+  "fail": "Trade increased the wealth of the pharaoh."
+ }
+}
