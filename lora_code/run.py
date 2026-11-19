@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / "eval")]
 
 from lora_code.common import (DOMAIN_DATASET, DOMAINS, deep_merge, gate_policy, gold_target,  # noqa: E402
-                              load_records, method_mode, prompt_text, read_json, render_messages,
+                              gpu_layout, load_records, method_mode, prompt_text, read_json, render_messages,
                               retention_domains, role_gpus, write_json)
 
 
@@ -630,7 +630,8 @@ class Run:
             if self.mode == "edit":
                 rlo = self.load_lora(self.lora_file(gd / "baselines" / ("sft_lora" if raw["same_as_sft"] else "raw_lora")))
                 best, log = BL.random_edit_search(bws, rlo, evals=n_ev, seed=rc.seed,
-                                                  scales=nc.get("search_scales", [0.5, 0.75, 1.0, 1.25]))
+                                                  scales=nc.get("search_scales", [0.5, 0.75, 1.0, 1.25]),
+                                                  use_regmean=bool(kl_texts))
             elif self.mode == "scratch":
                 best, log = BL.random_construct_search(bws, evals=n_ev, seed=rc.seed)
             else:
@@ -745,9 +746,10 @@ class Run:
                                                   retention=self.retention_domains, n_train=len(ws.train.ids()),
                                                   sft_info=sftinfo, raw_info=rawinfo),
                               diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "")
-        sysmsg = system_prompt(cfg, budget=budget, mode=self.mode)
-        policy = (M.make_mock_policy(rc.seed, skill=self.quality(self.served(g)) or 0.7, tag=f"g{g}", mode=self.mode)
-                  if rc.mock else None)
+        has_ret = bool(ws.retention_texts)
+        sysmsg = system_prompt(cfg, budget=budget, mode=self.mode, retention=has_ret)
+        policy = (M.make_mock_policy(rc.seed, skill=self.quality(self.served(g)) or 0.7, tag=f"g{g}", mode=self.mode,
+                                     retention=has_ret) if rc.mock else None)
 
         def editor_factory(th):
             return Editor(ev.endpoint, self.served(g), system_prompt=sysmsg, seed=rc.seed + 1000 * g + th,
@@ -875,6 +877,7 @@ class Run:
         non = read_json(gd / "baselines" / "nonllm.json", {}) or {}
         raw = read_json(gd / "baselines" / "raw.json", {}) or {}
         info = {"gen": g, "editor": self.served(g), "successor": self.served(g + 1), "method": self.mode,
+                "scope": self.cfg.get("scope", "all"), "retention_domains": list(self.retention_domains),
                 "gate_reference": self.gate_ref, "gate_fallback": self.gate_fallback,
                 "accepted": {k: acc.get(k) for k in ("source", "cid", "name", "gate_scores")},
                 "gate_submissions": [{"cid": s["cid"], "passed": s["passed"], "reasons": (s.get("info") or {}).get("reasons")}
@@ -944,10 +947,17 @@ def main(argv=None):
     hw = cfg.get("hardware", "b300")
     if rc.mock:
         cfg = deep_merge(cfg, cfg.get("mock_overrides", {}) or {})
-    roles = {r: role_gpus(rc, cfg, r) for r in ("main", "theta0", "train")}   # fail fast: enough --gpus?
+    try:
+        roles, unused = gpu_layout(rc, cfg)                                      # fail fast: enough --gpus?
+    except ValueError as e:
+        print(f"[lora_code] {e}", flush=True)
+        return 1
     mode, (gref, gfb) = method_mode(cfg), gate_policy(cfg)                      # fail fast: valid method / gate
-    print(f"[lora_code] hardware={hw} gpu roles {roles} method={mode} gate reference={gref} fallback={gfb}",
-          flush=True)
+    if not (cfg.get("e_t") or {}).get("enabled", True):
+        roles = {k: v for k, v in roles.items() if k != "theta0"}               # theta0 server never starts
+    print(f"[lora_code] hardware={hw} scope={cfg.get('scope', 'all')} gpus={rc.gpus} roles {roles} method={mode} "
+          f"gate reference={gref} fallback={gfb}"
+          + (f" (UNUSED {unused}: tensor parallelism needs 1/2/4/8 GPUs per role)" if unused else ""), flush=True)
     try:
         Run(rc, cfg).run()
     except Exception:  # noqa: BLE001

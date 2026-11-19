@@ -173,17 +173,37 @@ def gate_policy(cfg: dict) -> tuple[str, str]:
     return ref, fb
 
 
-def role_gpus(rc, cfg: dict, role: str) -> list[int]:
-    """GPU ids for a role, from cfg["gpu_roles"][role] = indices into --gpus (negative = from the end).
-    Paper B roles: main (vLLM: M_t + candidate LoRAs, the editor), theta0 (vLLM: original model, E_t and
-    references), train (HF model for training / gradient tools, weight store, diagnostics, merge; several
-    GPUs = the HF model is split across them). Several GPUs for a vLLM role = tensor parallelism.
-    Defaults (288 GB B300): main [0], theta0 [-1], train [-1]."""
+PAPER_B_GROWTH = [("main", 2), ("train", 2), ("main", 4), ("theta0", 2), ("main", 8), ("theta0", 4)]
+
+
+def gpu_layout(rc, cfg: dict) -> tuple[dict, list[int]]:
+    """({role: [GPU ids]}, [unused GPU ids]) for Paper B. Roles: main (vLLM: M_t + candidate LoRAs, the
+    editor), theta0 (vLLM: original model, only for E_t / e_ref), train (HF model for training, weight store,
+    diagnostics, merge; several GPUs = the HF model is split across them). Several GPUs for a vLLM role =
+    tensor parallelism.
+    gpu_roles not set (default): every GPU of --gpus is used (rsicore.gpu_layout.allocate). theta0 gets its
+    own GPU only when E_t is on and gpu_layout.theta0_own_gpu (h20: a 27B per card); otherwise it shares the
+    first train GPU. Extra GPUs go to main (TP 2), train (2), main (TP 4), theta0 (TP 2), main (TP 8), and
+    whatever is left to train (the HF model can be split over any number of GPUs), so no GPU stays idle.
+    e.g. h20 single-domain: 2 -> main | train, 3 -> main x2 | train, 4 -> main x2 | train x2,
+    5 -> main x2 | train x3, 6 -> main x4 | train x2.
+    gpu_roles set: those roles are pinned (indices into --gpus, negative = from the end); the others are laid
+    out automatically on the remaining GPUs."""
+    from rsicore.gpu_layout import layout
     gpus = list(rc.gpus or [0])
-    roles = cfg.get("gpu_roles") or {}
-    default = {"main": [0], "theta0": [-1], "train": [-1]}
-    idx = [int(i) for i in roles.get(role, default[role])]
-    bad = [i for i in idx if not -len(gpus) <= i < len(gpus)]
-    if bad:
-        raise ValueError(f"gpu_roles.{role} = {idx} needs more GPUs than --gpus {gpus}")
-    return [gpus[i] for i in idx]
+    lay = cfg.get("gpu_layout") or {}
+    own_theta0 = bool(lay.get("theta0_own_gpu", False)) and bool((cfg.get("e_t") or {}).get("enabled", True))
+    try:
+        idx, unused = layout(len(gpus), own=["main", "theta0", "train"] if own_theta0 else ["main", "train"],
+                             growth=PAPER_B_GROWTH, shared={} if own_theta0 else {"theta0": "train"},
+                             spill="train", share_single=bool(lay.get("share_single_gpu", False)),
+                             explicit=cfg.get("gpu_roles"))
+    except ValueError as e:
+        raise ValueError(f"Paper B on --gpus {gpus}: {e}") from None
+    return {r: [gpus[i] for i in ii] for r, ii in idx.items()}, [gpus[i] for i in unused]
+
+
+def role_gpus(rc, cfg: dict, role: str) -> list[int]:
+    """GPU ids of one role (see gpu_layout)."""
+    return gpu_layout(rc, cfg)[0][role]
+

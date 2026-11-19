@@ -63,11 +63,14 @@ TOOL_DOCS = {
 }
 
 
-def tools_for_mode(mode: str) -> dict:
+def tools_for_mode(mode: str, retention: bool = True) -> dict:
     """TOOL_DOCS available to the editor in method.mode: free = everything except raw_lora; edit = no
-    training / gradient tools, plus raw_lora; scratch = no training / gradient tools, no raw_lora."""
+    training / gradient tools, plus raw_lora; scratch = no training / gradient tools, no raw_lora.
+    retention=False (no retention texts: scope=single, or the E task): no regmean_preserve."""
     from .common import GRADIENT_TOOLS
     out = dict(TOOL_DOCS)
+    if not retention:
+        out.pop("regmean_preserve", None)
     if mode in ("edit", "scratch"):
         for t in GRADIENT_TOOLS:
             out.pop(t, None)
@@ -252,7 +255,7 @@ class Workspace:
     def build_api(self):
         if self._registered:
             return self.api
-        docs = tools_for_mode(self.mode)
+        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts))
         if self.mode == "edit" and self.raw is None:
             docs.pop("raw_lora", None)
         for name, doc in docs.items():

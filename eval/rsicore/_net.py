@@ -1,6 +1,7 @@
 """Tiny stdlib HTTP helpers (no proxies, JSON in/out). Used for localhost servers only."""
 import json
 import socket
+import threading
 import urllib.error
 import urllib.request
 
@@ -36,9 +37,19 @@ def get_json(url: str, timeout: float = 10):
     return json.loads(text)
 
 
+_PORT_LOCK = threading.Lock()
+_GIVEN: set = set()
+
+
 def free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+    """A free local port, never the same one twice in this process (servers may start concurrently)."""
+    with _PORT_LOCK:
+        for _ in range(100):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            p = s.getsockname()[1]
+            s.close()
+            if p not in _GIVEN:
+                _GIVEN.add(p)
+                return p
+        return p

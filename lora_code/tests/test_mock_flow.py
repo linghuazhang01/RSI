@@ -141,7 +141,7 @@ def test_mock_run_end_to_end(tmp_path):
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--runs-dir", str(tmp_path), "--run-id", "B_test_mock",
+           "--runs-dir", str(tmp_path), "--run-id", "B_test_mock", "--set", "scope=all",
            "--set", "e_t.branches=[parent,llm]", "--set", "nonllm.frontiers=false"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
@@ -183,3 +183,27 @@ def test_mock_run_scratch(tmp_path):
     assert summ["nonllm"]["kind"] == "random_construct_search"
     assert all(k in ("pure_construct", "construct+ops", "keep", "error", "none") for k in summ["search"]["strategies"])
     assert (run / "gen_00" / "parent_gate.json").exists()
+
+
+def test_mock_run_single_domain(tmp_path):
+    """scope=single: only the target dataset is evaluated / gated, held-out only on the target domain."""
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
+           "--runs-dir", str(tmp_path), "--run-id", "B_test_single",   # scope single is the default
+           "--set", "nonllm.frontiers=false"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    run = tmp_path / "B_test_single"
+    state = json.loads((run / "state.json").read_text())
+    assert "e_ref" not in state and not any("/e_t/" in k for k in state)
+    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
+    assert list(gate) == ["dapo_math"]
+    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
+    assert summ["scope"] == "single" and summ["retention_domains"] == []
+    assert set(summ["heldout"]) <= {"math500", "gsm8k", "aime24", "aime25"} and summ["heldout"]
+    assert set((summ["accepted"].get("gate_scores") or {"dapo_math": 0})) == {"dapo_math"}
+    evals = {p.name for p in (run / "gen_00" / "evals").glob("*/*/*.json")}
+    assert evals <= {"dapo_math.json"}, evals
+    prompt = (run / "gen_00" / "editor" / "thread_0.jsonl").read_text()
+    assert "Single-domain run" in prompt and "- regmean_preserve(" not in prompt

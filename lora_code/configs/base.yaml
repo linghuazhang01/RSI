@@ -14,6 +14,19 @@ draw_config: data/draw/paper_b.yaml   # target/retention sizes (n, target_train_
 method:
   mode: edit                # edit | scratch | free
 
+# Domain scope (default single since 2026-11-19; --set scope=all or ./launch.sh --all-domains for the original
+# design). single = ONLY the run's --domain: training, gate, feedback and token-KL use the target domain only
+# (no retention probes), held-out on the target domain's benchmarks only, E_t (a different-domain task) off.
+# all = the target domain is trained / gated, the other four domains are retention probes, held-out covers all
+# five domains, E_t on. Merged before --set, so e.g. --set e_t.enabled=true still wins.
+scope: single
+scope_profiles:
+  all: {}
+  single:
+    retention: {domains: []}
+    heldout: {domains: run}
+    e_t: {enabled: false}   # (no E_t -> no theta0 server: the GPU layout needs only main + train)
+
 raw:                        # mode=edit: recipe of the LoRA the editor starts from; null = take the `sft` value
   n_train: null             # train items used for the raw LoRA (null = all of this generation's train items)
   rank: null
@@ -57,7 +70,7 @@ feedback:
   mark_shown: true
 
 retention:
-  domains: null            # null = all non-target domains; [] = target-domain training/evaluation only
+  domains: null            # null = all non-target domains; [] = target-domain training/evaluation only (scope=single)
 
 gate:
   reference: auto           # auto = by method.mode (edit: raw, scratch: parent, free: sft) | raw | sft | parent
@@ -123,7 +136,7 @@ e_t:
 
 heldout:
   enabled: true
-  domains: all             # use math for a math-only experiment
+  domains: all             # all | run (= the run's --domain; scope=single) | a domain list, e.g. math
   limit: null
 
 baseline:
@@ -139,13 +152,22 @@ server:
   theta0_args: ["--gpu-memory-utilization", "0.45", "--max-logprobs", "20"]
   mock_tasks: null
 
+# GPU roles (lora_code/common.py gpu_layout). gpu_roles unset = EVERY GPU of --gpus is used: one GPU each for
+# main and train (+ theta0 when E_t is on and theta0_own_gpu), extra GPUs to main (TP 2), train (2), main (TP 4),
+# theta0 (TP 2), main (TP 8). e.g. single-domain: 2 -> main | train, 3 -> main x2 | train, 4 -> main x2 | train x2.
+# Set gpu_roles (indices into --gpus) only to override, e.g. --set 'gpu_roles.train=[2,3]'.
+gpu_roles: null
+gpu_layout:
+  theta0_own_gpu: false     # B300: the theta0 server shares the first train GPU (0.45 utilisation)
+  share_single_gpu: false
+
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
 # cards. rsicore.config merges the profile over base/domain config and BEFORE --set (--set wins).
 hardware: b300
 hardware_profiles:
   b300: {}
-  h20:                      # 80 GB H20, Qwen3.8-27B (BF16 ~52 GB): one full model per card, 3 cards per run
-    gpu_roles: {main: [0], theta0: [1], train: [2]}   # 4 cards: train: [2, 3] (HF model split across both)
+  h20:                      # 80 GB H20, Qwen3.8-27B (BF16 ~52 GB): one full model per card
+    gpu_layout: {theta0_own_gpu: true}   # original-model server on its own card when E_t is on (scope all: >= 3 cards)
     server:
       max_loras: 4          # vLLM reserves GPU memory for max_loras adapters of rank_cap
       main_args: ["--gpu-memory-utilization", "0.92", "--max-model-len", "20480", "--max-num-seqs", "32", "--max-logprobs", "20"]

@@ -5,25 +5,32 @@
 # Usage:
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20]
 #               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all] [--smoke]
-#               [--set KEY=VALUE ...] [--dry-run] [--mock] [--skip-checks]
+#               [--all-domains] [--set KEY=VALUE ...] [--dry-run] [--mock] [--skip-checks]
 #
 #   --paper     A, B or both (default both)
 #   --domains   all = math,code,knowledge,instruction_following,tool_calling (default all)
 #   --gens      generations per run (default 5)
-#   --hw        hardware profile (default b300). Qwen3.8-27B GPUs per run:
-#                 b300 (288 GB): Paper A 2, Paper B 2
-#                 h20  (80 GB):  Paper A 2 (editor | candidates), Paper B 3 (main | original model | training)
-#   --gpus      GPU ids to use (default: every GPU nvidia-smi lists); runs get consecutive groups
-#   --per-run   GPUs per run for every run (default: from --hw); more GPUs need matching gpu_roles,
-#               e.g. --hw h20 --per-run 4 --set 'gpu_roles.train=[2,3]' (Paper B)
-#   --set       passed to every run.py (repeatable), e.g. --set search.max_evaluate=12
+#   --hw        hardware profile (default b300). Qwen3.8-27B: minimum GPUs per run
+#                 Paper A 2 (editor | candidates); Paper B 2 (main | training), 3 on h20 with --all-domains
+#                 (+ original-model server for E_t)
+#   --gpus      GPU ids to use, any order / gaps (default: every GPU nvidia-smi lists). ALL of them are used:
+#               every run gets its minimum, the rest are handed out one by one over the runs, and each run
+#               spreads its GPUs over its roles (more tensor parallelism / a split training model; see
+#               gpu_layout in edit_code/common.py and lora_code/common.py). Runs get consecutive groups.
+#   --per-run   fixed GPUs per run instead (the rest stay idle)
+#   --set       passed to every run.py (repeatable), e.g. --set search.max_evaluate=12, or a manual GPU
+#               split --set 'gpu_roles.train=[2,3]' (indices into the run's GPUs; overrides the automatic one)
 #   --with-all  also start Paper A's five-domain main experiment (--domain all)
 #   --smoke     1 generation, run ids end in _smoke (first real-hardware check; separate from formal runs)
+#   (default)   each run uses ONLY its own domain (scope single): training, gate, feedback, KL and held-out
+#               on that domain; Paper B has no retention probes and no E_t. Run ids end in _single.
+#   --all-domains  the original design (scope all): the other four domains are retention probes / KL texts,
+#               held-out on all five domains, Paper B E_t on. Run ids without _single.
 #   --dry-run   print the preflight result and the commands, start nothing
 #   --mock      laptop test: mock model server, no GPU (fake GPU ids), uses eval/.venv
 #   --skip-checks  skip the preflight checks
 #
-# Run ids: <A|B>_<domain>_s<seed>[_smoke], outputs in experiment_records/<run-id>/.
+# Run ids: <A|B>_<domain>_s<seed>[_single][_smoke] (A_all_s<seed> for --with-all), in experiment_records/.
 # Logs and pids: experiment_records/_launch/<timestamp>/. Rerunning the same command resumes every run
 # (finished steps are skipped); a run whose process is still alive is not started twice.
 #
@@ -34,6 +41,8 @@
 #   ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1
 #   ./launch.sh --paper A --domains math --gens 5 --gpus 0,1
 #   ./launch.sh --paper B --domains code,math --gens 5 --gpus 4,5,6,7
+#   ./launch.sh --hw h20 --paper both --domains math --gens 5 --gpus 0,1,2,3   # A on 0,1 and B on 2,3
+#   ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 4,5,6,7      # one run: editor 1 + 3 candidate servers
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -41,7 +50,7 @@ cd "$ROOT"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$ROOT/launch.sh"; }
 
 PAPER=both; DOMAINS=all; GENS=5; GPUS=""; PER_RUN=""; MODEL=qwen3.8-27b; SEED=42; HW=b300
-WITH_ALL=0; SMOKE=0; DRY=0; MOCK=0; SKIP=0; SETS=()
+WITH_ALL=0; SMOKE=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; SETS=()
 need() { [ $# -ge 2 ] || { echo "ERROR: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,6 +66,8 @@ while [ $# -gt 0 ]; do
     --seed) need "$@"; SEED="$2"; shift ;;
     --with-all) WITH_ALL=1 ;;
     --smoke) SMOKE=1 ;;
+    --single-domain) SINGLE=1 ;;
+    --all-domains) SINGLE=0 ;;
     --dry-run) DRY=1 ;;
     --mock) MOCK=1 ;;
     --skip-checks) SKIP=1 ;;
@@ -67,9 +78,8 @@ done
 
 ALL_DOMAINS="math code knowledge instruction_following tool_calling"
 case "$HW" in b300|h20) ;; *) echo "ERROR: --hw must be b300 or h20" >&2; exit 2 ;; esac
-per_run_of() {  # paper -> GPUs per run
-  if [ -n "$PER_RUN" ]; then echo "$PER_RUN"
-  elif [ "$HW" = h20 ] && [ "$1" = B ]; then echo 3
+min_of() {  # paper domain -> minimum GPUs of one run
+  if [ "$HW" = h20 ] && [ "$1" = B ] && { [ "$SINGLE" -eq 0 ] || [ "$2" = all ]; }; then echo 3
   else echo 2; fi
 }
 case "$PAPER" in A|a) PAPERS="A" ;; B|b) PAPERS="B" ;; both) PAPERS="A B" ;;
@@ -79,20 +89,24 @@ for d in $DOMS; do
   case " $ALL_DOMAINS " in *" $d "*) ;; *) echo "ERROR: unknown domain $d" >&2; exit 2 ;; esac
 done
 [ "$SMOKE" -eq 1 ] && GENS=1
-SUFFIX=""; [ "$SMOKE" -eq 1 ] && SUFFIX="_smoke"
+SUFFIX=""; [ "$SINGLE" -eq 1 ] && SUFFIX="_single"
+[ "$SINGLE" -eq 0 ] && SETS=(--set scope=all ${SETS[@]+"${SETS[@]}"})   # explicit --set values come later and win
+SMOKE_SUFFIX=""; [ "$SMOKE" -eq 1 ] && SMOKE_SUFFIX="_smoke"
 
 # ---------------------------------------------------------------- run list
 RUNS=()   # "paper domain run_id"
 for p in $PAPERS; do
-  for d in $DOMS; do RUNS+=("$p $d ${p}_${d}_s${SEED}${SUFFIX}"); done
+  for d in $DOMS; do RUNS+=("$p $d ${p}_${d}_s${SEED}${SUFFIX}${SMOKE_SUFFIX}"); done
 done
-if [ "$WITH_ALL" -eq 1 ]; then
-  case " $PAPERS " in *" A "*) RUNS+=("A all A_all_s${SEED}${SUFFIX}") ;;
+if [ "$WITH_ALL" -eq 1 ]; then   # Paper A's five-domain run always uses scope all
+  case " $PAPERS " in *" A "*) RUNS+=("A all A_all_s${SEED}${SMOKE_SUFFIX}") ;;
     *) echo "WARNING: --with-all only applies to Paper A; ignored" >&2 ;; esac
 fi
 N_RUNS=${#RUNS[@]}
 NEED=0
-for r in "${RUNS[@]}"; do set -- $r; NEED=$((NEED + $(per_run_of "$1"))); done
+for r in "${RUNS[@]}"; do set -- $r; m="$(min_of "$1" "$2")"
+  [ -n "$PER_RUN" ] && { [ "$PER_RUN" -lt "$m" ] && { echo "ERROR: --per-run $PER_RUN < minimum $m for $3" >&2; exit 2; }; m=$PER_RUN; }
+  NEED=$((NEED + m)); done
 
 # ---------------------------------------------------------------- GPUs
 if [ -z "$GPUS" ]; then
@@ -106,9 +120,17 @@ if [ -z "$GPUS" ]; then
 fi
 IFS=, read -r -a GPU_LIST <<< "$GPUS"
 if [ "${#GPU_LIST[@]}" -lt "$NEED" ]; then
-  echo "ERROR: $N_RUNS runs need $NEED GPUs (--hw $HW), only ${#GPU_LIST[@]} given ($GPUS)." >&2
+  echo "ERROR: $N_RUNS runs need at least $NEED GPUs (--hw $HW), only ${#GPU_LIST[@]} given ($GPUS)." >&2
   echo "       Start fewer runs (--paper / --domains) or give more GPUs (--gpus)." >&2
   exit 1
+fi
+# GPUs per run: the minimum (or --per-run), then every remaining GPU one by one over the runs
+COUNTS=()
+for r in "${RUNS[@]}"; do set -- $r; if [ -n "$PER_RUN" ]; then COUNTS+=("$PER_RUN"); else COUNTS+=("$(min_of "$1" "$2")"); fi; done
+if [ -z "$PER_RUN" ]; then
+  EXTRA=$(( ${#GPU_LIST[@]} - NEED )); i=0
+  while [ "$EXTRA" -gt 0 ]; do COUNTS[$i]=$(( COUNTS[$i] + 1 )); EXTRA=$((EXTRA - 1)); i=$(( (i + 1) % N_RUNS )); done
+  NEED=${#GPU_LIST[@]}
 fi
 
 # ---------------------------------------------------------------- preflight
@@ -156,10 +178,10 @@ LDIR="experiment_records/_launch/$STAMP"
 RUNS_DIR="${RSI_RUNS_DIR:-$ROOT/experiment_records}"
 [ "$DRY" -eq 1 ] || mkdir -p "$LDIR"
 echo "== $N_RUNS run(s), $GENS generation(s) each, model $MODEL, seed $SEED, hardware $HW, $NEED GPUs$([ "$MOCK" -eq 1 ] && echo ', MOCK')"
-off=0
+off=0; k=0
 for r in "${RUNS[@]}"; do
   set -- $r; p=$1; d=$2; rid=$3
-  n="$(per_run_of "$p")"
+  n="${COUNTS[$k]}"; k=$((k + 1))
   g="$(IFS=,; echo "${GPU_LIST[*]:$off:$n}")"
   off=$((off + n))
   cmd=(./run_rsi.sh --paper "$p" --domain "$d" --gens "$GENS" --model "$MODEL" --seed "$SEED"

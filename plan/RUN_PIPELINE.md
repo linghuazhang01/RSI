@@ -14,10 +14,12 @@
 ./download_models.sh qwen3.8-27b   # 两篇都用 Qwen3.8-27B
 
 # 正式启动（launch.sh：先检查环境 / 模型 / 数据 / Docker，再按卡数分配 GPU，各领域后台并行）
-./launch.sh --hw h20 --paper both --smoke          # 先每个领域跑 1 代检查（H20：25 张卡）
+./launch.sh --hw h20 --paper both --smoke          # 先每个领域跑 1 代检查（默认单领域：每个运行至少 2 张，共至少 20 张）
 ./launch.sh --hw h20 --paper both --gens 5         # 正式：两篇 × 五个领域
 ./launch.sh --hw b300 --paper both --gens 5 --with-all   # B300：再加 Paper A 五领域主实验
 ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1    # 只跑一个
+./launch.sh --hw h20 --paper both --domains math --gens 5 --gpus 0,1,2,3   # 默认单领域：A 用 0,1，B 用 2,3
+./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 4,5,6,7      # 一个运行用 4 张卡（改造者 1 + 3 个候选同时评测）
 ./launch.sh ... --dry-run                          # 只打印检查结果和命令
 
 # 单个运行（launch.sh 内部调用的就是它）
@@ -30,6 +32,8 @@
 - 配置：`edit_code/configs/base.yaml`、`lora_code/configs/base.yaml`（含硬件档 `hardware_profiles`），`configs/domains/<领域>.yaml`。
 - 每次运行的全部产物写进 `experiment_records/<run-id>/`；launch.sh 的日志和进程号在 `experiment_records/_launch/<时间>/`。
 - `--domain` 可选 `math | code | knowledge | instruction_following | tool_calling`，Paper A 另有 `all`。
+- **默认单领域**（`scope: single`，运行名加 `_single`）：训练、验收、评测都只在这次运行的领域上做。Paper A 的 KL / 校准文本和留出评测只用这个领域；Paper B 没有保留探针（验收、反馈、KL 只看目标领域）、留出评测只测这个领域、E_t 关闭。原设计用 `--set scope=all`（`launch.sh --all-domains`）。
+- **给多少张卡就用多少张**：`launch.sh` 先给每个运行最少的卡（Paper A 2；Paper B 2，H20 五领域 3），剩下的卡轮流分给各个运行；每个运行再把自己的卡分给各个角色：Paper A 改造者 1 张、其余卡各起一个候选服务同时评测；Paper B 多的卡给 main（张量并行）和训练模型（拆到多张卡）。见两篇 README 的"硬件"。`--per-run N` 改成固定每个运行 N 张。
 
 ## 2. "每个领域单独跑"在两篇里的含义
 
@@ -46,8 +50,8 @@ Paper A（2026-11-19 修订：改造者冻结、体积固定、迭代被量化�
   第 0 代：原模型 M_0 的验收分、噪声带、留出评测；对 M_0 建一次逐层量化缓存（之后每代复用）；
           体积 = 统一 3 bit GPTQ 配置的大小；Q_0 = 这份配置，是第一个 incumbent
   第 g 代：
-    卡 0：vLLM 加载 M_0（冻结的改造者 + 参照）
-    卡 1：候选（都从 M_0 原始权重量化到同一体积）的拼装、导出和评测
+    卡 0：vLLM 加载 M_0（冻结的改造者 + 参照），只占 1 张卡
+    其余卡：候选服务池，每张卡（candidate_group_size）一个候选服务；同一步里各线程的候选同时导出、加载、评测
     1. draw.py 抽本代的题
     2. incumbent 在本代题上打分，展示给改造者
     3. 改造者写程序 → 候选 → 快速筛 →（前 3 名）完整一批，≤24 次评测
@@ -71,10 +75,10 @@ Paper B（每代 M_t 写 LoRA，合并进自己；2026-11-19 起分两种方式�
 
 ## 4. 需要几张卡（Qwen3.8-27B，BF16 约 52 GB）
 
-| 硬件档 | Paper A 每个运行 | Paper B 每个运行 | 两篇 × 五个领域 |
+| 硬件档 | Paper A 每个运行（最少） | Paper B 每个运行（最少；单领域 / 五领域） | 两篇 × 五个领域（最少） |
 |---|---|---|---|
 | `b300`（288 GB） | 2 张 | 2 张（原模型服务、训练和 main 以外的部分共用第 2 张） | 20 张（加 Paper A `all` 共 22 张） |
-| `h20`（80 GB） | 2 张：每张卡只放一个 27B | 3 张：main / 原模型 / 训练各一张 | 25 张 |
+| `h20`（80 GB） | 2 张：每张卡只放一个 27B | 2 张（main / 训练）；五领域 3 张（再加原模型给 E_t） | 单领域 20 张；五领域 25 张 |
 
 H20 档（`--set hardware=h20`，launch.sh 用 `--hw h20`）具体做了这些：
 - vLLM 显存比例 0.92、`--max-num-seqs 32`、上下文 20480（够 AIME 的 16k 回答）；52 GB 权重之外约 15 GB 给 KV 缓存和线性注意力状态。

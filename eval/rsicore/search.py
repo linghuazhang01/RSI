@@ -16,6 +16,7 @@ load_candidates and submit_to_gate) for additional searches of one generation (e
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -87,67 +88,102 @@ def ranked(cands) -> list[Candidate]:
 
 def inner_search(rc, gen: int, *, editor_factory, render_context, build_fn, screen_fn, full_fn,
                  threads: int, steps: int, max_candidates: int, top_full: int = 3, rerun_seeds: int = 0,
-                 out_dir: Path | None = None) -> list[Candidate]:
+                 out_dir: Path | None = None, parallel: int = 1) -> list[Candidate]:
+    """parallel=1: one thread after another (a thread sees the candidates of the threads before it in the
+    same step). parallel=N>1: within a step, up to N threads propose, build and screen at the same time
+    (they all see the history up to the end of the previous step; the paper's build/screen functions must
+    be thread-safe, e.g. a pool of N candidate servers), and the top_full stage runs N at a time. Results
+    are recorded in thread order, so the record does not depend on which job finished first."""
     gd = _out(rc, gen, out_dir)
     (gd / "programs").mkdir(exist_ok=True)
     (gd / "feedback").mkdir(exist_ok=True)
     cands = load_candidates(rc, gen, gd)
     editors = {}
+
+    def one(th: int, step: int, cid: str, history: list) -> Candidate:
+        msg = render_context(history, th)
+        t0 = time.time()
+        program = editors[th].propose(msg)
+        cost = {"propose_s": round(time.time() - t0, 2)}
+        (gd / "programs" / f"{cid}.py").write_text(program)
+        t0 = time.time()
+        try:
+            artifact, error = build_fn(program, cid) if program.strip() else (None, "no ```python block in the reply")
+        except Exception as e:  # noqa: BLE001 - a failing program must not stop the search
+            artifact, error = None, f"build_fn raised {type(e).__name__}: {e}\n{traceback.format_exc(limit=5)[-3000:]}"
+        cost["build_s"] = round(time.time() - t0, 2)
+        if artifact is not None and isinstance(artifact.get("cost"), dict):
+            cost.update(artifact["cost"])
+        screen = None
+        if artifact is not None and error is None:
+            t0 = time.time()
+            sc, fb = screen_fn(artifact, cid)
+            cost["screen_s"] = round(time.time() - t0, 2)
+            screen = {"score": None if sc is None else float(sc), "feedback": fb}
+        return Candidate(cid=cid, thread=th, step=step, program=program, artifact=artifact, error=error,
+                         screen=screen, full=None, score=(screen or {}).get("score"), cost=cost)
+
+    def record(c: Candidate):
+        cands[c.cid] = c
+        _write_feedback(gd, c)
+        _save(gd, cands)
+
     for step in range(steps):
+        batch = []
         for th in range(threads):
             cid = _cid(gen, th, step)
             if cid in cands:
                 continue
-            if len(cands) >= max_candidates:
+            if len(cands) + len(batch) >= max_candidates:
                 break
+            batch.append((th, cid))
+        for th, _ in batch:
             if th not in editors:
                 editors[th] = editor_factory(th)
+        if parallel <= 1 or len(batch) <= 1:
+            for th, cid in batch:
+                record(one(th, step, cid, list(cands.values())))
+        else:
             history = list(cands.values())
-            msg = render_context(history, th)
-            t0 = time.time()
-            program = editors[th].propose(msg)
-            cost = {"propose_s": round(time.time() - t0, 2)}
-            (gd / "programs" / f"{cid}.py").write_text(program)
-            t0 = time.time()
-            try:
-                artifact, error = build_fn(program, cid) if program.strip() else (None, "no ```python block in the reply")
-            except Exception as e:  # noqa: BLE001 - a failing program must not stop the search
-                artifact, error = None, f"build_fn raised {type(e).__name__}: {e}\n{traceback.format_exc(limit=5)[-3000:]}"
-            cost["build_s"] = round(time.time() - t0, 2)
-            if artifact is not None and isinstance(artifact.get("cost"), dict):
-                cost.update(artifact["cost"])
-            screen = None
-            if artifact is not None and error is None:
-                t0 = time.time()
-                s, fb = screen_fn(artifact, cid)
-                cost["screen_s"] = round(time.time() - t0, 2)
-                screen = {"score": None if s is None else float(s), "feedback": fb}
-            c = Candidate(cid=cid, thread=th, step=step, program=program, artifact=artifact, error=error,
-                          screen=screen, full=None, score=(screen or {}).get("score"), cost=cost)
-            cands[cid] = c
-            _write_feedback(gd, c)
-            _save(gd, cands)
+            with ThreadPoolExecutor(max_workers=min(int(parallel), len(batch))) as ex:
+                futs = [ex.submit(one, th, step, cid, history) for th, cid in batch]
+                for f in futs:          # thread order
+                    record(f.result())
+
     # second stage: full evaluation of the best screened candidates
     screened = [c for c in cands.values() if c.screen and c.screen.get("score") is not None]
     top = sorted(screened, key=lambda c: c.screen["score"], reverse=True)[:top_full]
-    for c in top:
-        if c.full is not None and len(c.full.get("reruns", [])) >= rerun_seeds:
-            continue
+    todo = [c for c in top if not (c.full is not None and len(c.full.get("reruns", [])) >= rerun_seeds)]
+
+    def full_of(c: Candidate) -> tuple[dict, float]:
         t0 = time.time()
-        full = c.full or {}
+        full = dict(c.full or {})
         if "first" not in full:
-            s, fb = full_fn(c.artifact, c.cid)
-            full = {"first": None if s is None else float(s), "feedback": fb, "reruns": []}
+            sc, fb = full_fn(c.artifact, c.cid)
+            full = {"first": None if sc is None else float(sc), "feedback": fb, "reruns": []}
+        full["reruns"] = list(full.get("reruns", []))
         for i in range(len(full["reruns"]) + 1, rerun_seeds + 1):
-            s, _ = full_fn(c.artifact, f"{c.cid}_r{i}")
-            full["reruns"].append(None if s is None else float(s))
+            sc, _ = full_fn(c.artifact, f"{c.cid}_r{i}")
+            full["reruns"].append(None if sc is None else float(sc))
         vals = [v for v in [full["first"]] + full["reruns"] if v is not None]
         full["score"] = sum(vals) / len(vals) if vals else None
+        return full, time.time() - t0
+
+    def finish(c: Candidate, full: dict, secs: float):
         c.full = full
         c.score = full["score"] if full["score"] is not None else c.screen["score"]
-        c.cost["full_s"] = round(c.cost.get("full_s", 0) + time.time() - t0, 2)
+        c.cost["full_s"] = round(c.cost.get("full_s", 0) + secs, 2)
         _write_feedback(gd, c)
         _save(gd, cands)
+
+    if parallel <= 1 or len(todo) <= 1:
+        for c in todo:
+            finish(c, *full_of(c))
+    else:
+        with ThreadPoolExecutor(max_workers=min(int(parallel), len(todo))) as ex:
+            futs = [(c, ex.submit(full_of, c)) for c in todo]
+            for c, f in futs:
+                finish(c, *f.result())
     return ranked(cands.values())
 
 

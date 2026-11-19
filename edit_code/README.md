@@ -8,6 +8,10 @@
 - 第 g 代的目标是超过当前最好的量化 Q_{g-1}（incumbent）：在固定验收集上逐题配对比较，平均提升 ≥ `gate.min_delta`，至少一个领域显著变好、没有领域显著变差，才换成新的 incumbent；否则保留。连续 `loop.patience` 代没有新的 incumbent 就停。
 - 改造者能看到：incumbent 的配置和它在本代题目上的分数、往代每代最好的几个候选（经验通道）、诊断表。
 
+## 单领域实验（`scope`）
+
+**默认 `scope: single`（2026-11-19 起）**：只用这次运行的 `--domain`。信号和验收只用这个领域，KL / 校准文本（`kl.domains: run`）和留出评测（`heldout.domains: run`）也只用这个领域，不考虑别的领域。运行名默认带 `_single`。原设计（KL / 校准文本和留出评测覆盖五个领域）用 `--set scope=all`（`launch.sh --all-domains`）；`--domain all` 总是 `scope=all`。
+
 ## 启动
 
 ```bash
@@ -51,12 +55,17 @@
 
 ## 硬件（`hardware`，27B）
 
-| 档 | 每个运行的卡 | 分工 |
-|---|---|---|
-| `b300`（默认，288 GB） | 2 | 卡 0：M_0 / 改造者；卡 1：候选服务、校准、缓存 |
-| `h20`（80 GB） | 2 | 同上；每张卡只放一个 27B（约 52 GB），vLLM 显存比例 0.92、`--max-num-seqs 32`，校准每次 4 层 Hessian |
+角色：editor（vLLM：M_0 / 改造者、参照）、candidate（候选服务；校准、缓存、诊断在它的第一张卡上）。
 
-`gpu_roles` 可改分工，比如 4 张 H20：`--set 'gpu_roles={editor: [0, 1], candidate: [2, 3]}'`（vLLM 张量并行 2）。
+**改造者 1 张卡，其余卡全部用来同时评测候选**（`common.gpu_layout` / `candidate_groups`，不设 `gpu_roles` 时）：
+- 改造者在候选评测时是空闲的，所以默认只给 1 张卡；
+- 其余卡按 `gpu_layout.candidate_group_size`（默认 1）分组，每组起一个候选 vLLM 服务（组内张量并行）。2 张卡 → 1 个候选服务，4 张 → 3 个，8 张 → 7 个；
+- 搜索的每一步里，各线程的程序同时提出、构建、评测（`rsicore.search.inner_search(parallel=组数)`），完整评测的前 3 名也同时跑。每个线程看到的是上一步结束时的全部候选；结果按线程顺序记录；
+- `QuantProblem.serve` 从服务池里取一个空闲组：在这组的卡上导出该候选的 fake-quant 检查点（导出共用一个逐层缓存，一次一个），再在这组卡上起 vLLM，用完归还。`evaluate` 线程安全：同一个配置只评一次（其他线程等结果），计费的快速筛先预留预算，不会超过每代上限；
+- 磁盘：每个候选服务各留一个检查点（约 54 GB），8 张卡时约 7 × 54 GB；
+- 只有 1 组时（2 张卡）就是原来的逐个评测。手动指定：`--set 'gpu_roles.editor=[0,1]'`（改造者张量并行 2），候选用剩下的卡。
+
+H20 档：至少 2 张（每张卡只放一个 27B，约 52 GB），vLLM 显存比例 0.92、`--max-num-seqs 32`，校准每次 4 层 Hessian。B300 / mock 只给 1 张时两个角色共用。
 
 ## 模块组（Qwen3.5 dense，含 GDN）
 

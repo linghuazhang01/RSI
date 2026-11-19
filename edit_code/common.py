@@ -132,21 +132,55 @@ def tail(s: str | None, n: int = 1500) -> str:
     return s if len(s) <= n else "..." + s[-n:]
 
 
-def role_gpus(rc, cfg: dict, role: str) -> list[int]:
-    """GPU ids for a role, from cfg["gpu_roles"][role] = indices into --gpus (negative = from the end).
-    Paper A roles: editor (vLLM: M_0 / editor, references), candidate (vLLM candidate server; layer cache,
-    GPTQ and diagnostics run on its first GPU). Several GPUs for a vLLM role = tensor parallelism.
-    Defaults (one 288 GB B300 per role): editor [0], candidate [1] (both [0] with a single GPU)."""
+def gpu_layout(rc, cfg: dict) -> tuple[dict, list[int]]:
+    """({role: [GPU ids]}, [unused GPU ids]) for Paper A. Roles: editor (vLLM: M_0 / editor, references;
+    it is idle while candidates are evaluated, so ONE GPU by default) and candidate (every other GPU: the
+    candidate servers, plus the layer cache / GPTQ / calibration on its first GPU).
+    The candidate GPUs are split into groups of gpu_layout.candidate_group_size (1 / 2 / 4 / 8, tensor
+    parallel inside a group); each group serves one candidate, so len(groups) candidates are evaluated at
+    the same time (candidate_groups). GPUs left over by the grouping are reported as unused.
+    1 GPU: editor and candidate share it if gpu_layout.share_single_gpu (B300 / mock; h20 forbids it).
+    gpu_roles set: those roles are pinned (indices into --gpus, negative = from the end), e.g.
+    --set 'gpu_roles.editor=[0,1]' (editor with TP 2); the other role takes the remaining GPUs."""
+    from rsicore.gpu_layout import layout
     gpus = list(rc.gpus or [0])
-    roles = cfg.get("gpu_roles") or {}
-    default = {"editor": [0], "candidate": [1]}
-    if role in roles:
-        idx = [int(i) for i in roles[role]]
-        bad = [i for i in idx if not -len(gpus) <= i < len(gpus)]
-        if bad:
-            raise ValueError(f"gpu_roles.{role} = {idx} needs more GPUs than --gpus {gpus}")
-        return [gpus[i] for i in idx]
-    return [gpus[min(i, len(gpus) - 1)] for i in default[role]]
+    lay = cfg.get("gpu_layout") or {}
+    try:
+        idx, unused = layout(len(gpus), own=["editor", "candidate"], growth=[], spill="candidate",
+                             share_single=bool(lay.get("share_single_gpu", True)), explicit=cfg.get("gpu_roles"))
+    except ValueError as e:
+        raise ValueError(f"Paper A on --gpus {gpus}: {e}") from None
+    roles = {r: [gpus[i] for i in ii] for r, ii in idx.items()}
+    unused = [gpus[i] for i in unused]
+    gs = _group_size(cfg)
+    cand = roles["candidate"]
+    if len(cand) >= gs:
+        keep = len(cand) // gs * gs
+        unused += cand[keep:]
+        roles["candidate"] = cand[:keep]
+    return roles, unused
+
+
+def _group_size(cfg: dict) -> int:
+    gs = int((cfg.get("gpu_layout") or {}).get("candidate_group_size", 1) or 1)
+    if gs not in (1, 2, 4, 8):
+        raise ValueError(f"gpu_layout.candidate_group_size must be 1, 2, 4 or 8 (tensor parallel), got {gs}")
+    return gs
+
+
+def candidate_groups(rc, cfg: dict) -> list[list[int]]:
+    """The candidate GPUs in groups of gpu_layout.candidate_group_size: one candidate server per group,
+    evaluated concurrently (fewer GPUs than one group: a single group of all of them)."""
+    cand = gpu_layout(rc, cfg)[0]["candidate"]
+    gs = _group_size(cfg)
+    if len(cand) < gs:
+        return [cand]
+    return [cand[i:i + gs] for i in range(0, len(cand), gs)]
+
+
+def role_gpus(rc, cfg: dict, role: str) -> list[int]:
+    """GPU ids of one role (see gpu_layout)."""
+    return gpu_layout(rc, cfg)[0][role]
 
 
 def free_cuda():

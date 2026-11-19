@@ -199,7 +199,7 @@ def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=Non
 
 ### 3.1 core 实现说明（2026-11-19，均为增补，原签名不变）
 
-- `config`：`hardware_profiles[hardware]`（`--set hardware=h20`）在 base/domain 之后、`--set` 之前合并（`--set` 优先），结果锁进 run_config.yaml。CLI 另有 `--runs-dir`（默认 `experiment_records/`）、`--paper-dir`（覆盖读取 configs/ 的目录）、`--set KEY=VALUE`（可重复，点号键，YAML 值，并入 paper_cfg）。`run_config.yaml` 锁定 paper/domain/model/model_path/seed/mock/draw_config/paper_cfg；`gens`、`gpus` 可改（延长运行、换机器）。`RunConfig.cli_extra` 记录论文自加的 CLI 参数（不锁定）。`config.eval_python()`：run_eval.py / draw.py 用的解释器（`RSI_EVAL_PYTHON` > `eval/.venv/bin/python` > 当前解释器）。真实模式下 model_path 不存在直接报错。
+- `config`：`hardware_profiles[hardware]`（`--set hardware=h20`）和 `scope_profiles[scope]`（`--set scope=single`：只用这次运行的领域；`--domain all` 时拒绝）依次在 base/domain 之后、`--set` 之前合并（`--set` 优先），之后 `heldout.domains: run` 解析成运行的领域，结果锁进 run_config.yaml。CLI 另有 `--runs-dir`（默认 `experiment_records/`）、`--paper-dir`（覆盖读取 configs/ 的目录）、`--set KEY=VALUE`（可重复，点号键，YAML 值，并入 paper_cfg）。`run_config.yaml` 锁定 paper/domain/model/model_path/seed/mock/draw_config/paper_cfg；`gens`、`gpus` 可改（延长运行、换机器）。`RunConfig.cli_extra` 记录论文自加的 CLI 参数（不锁定）。`config.eval_python()`：run_eval.py / draw.py 用的解释器（`RSI_EVAL_PYTHON` > `eval/.venv/bin/python` > 当前解释器）。真实模式下 model_path 不存在直接报错。
 - `state.RunState`：另有 `unmark(key)`、`keys()`；`step()` 块内自己调用 `mark(key, info)` 不会被覆盖。
 - `records`：另有 `read_json(path, default)`、`read_jsonl(path)`；`summary.json = {"run_id","paper","domain","gens": {"<g>": {...}}}`。
 - `draws`：已抽过的代 / 已切过的 gate 直接读文件，不再起子进程；`ids()` 文件不存在返回 `[]`。

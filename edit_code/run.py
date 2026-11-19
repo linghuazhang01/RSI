@@ -14,7 +14,8 @@ generation); budget = budget.gib or the packed size of budget.reference (uniform
 Q_0 = the reference config, scored on the gate (it is the first incumbent) and on the held-out sets.
 Generation g = 1..gens (gen_XX/): draw -> M_0 references on this generation's items -> incumbent scored
 on the same items (shown to the editor) -> inner search (threads x steps, <= max_evaluate evaluations;
-candidates from the shared cache, served on gpus[1]) -> optional baselines -> gate (<= 3 submissions of
+candidates from the shared cache; one candidate server per candidate-GPU group, so the threads of a step
+are built and evaluated at the same time) -> optional baselines -> gate (<= 3 submissions of
 candidates whose score beats the incumbent's: fits the budget AND paired gain over the incumbent on the
 gate set) -> new incumbent exported + held-out evaluation, or the incumbent stays. The loop stops after
 loop.patience generations without a new incumbent. Every step is a rsicore.state.RunState key; rerunning
@@ -48,7 +49,8 @@ from rsicore.state import RunState  # noqa: E402
 
 from edit_code import mock as M  # noqa: E402
 from edit_code.baselines import run_baselines  # noqa: E402
-from edit_code.common import deep_merge, read_json, read_jsonl, role_gpus, tail, write_json  # noqa: E402
+from edit_code.common import (candidate_groups, deep_merge, gpu_layout, read_json, read_jsonl, tail,  # noqa: E402
+                              write_json)
 from edit_code.problem import EvalBudgetExhausted, QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
 from edit_code.prompts import archive_text, make_render_context, system_prompt  # noqa: E402
 from edit_code.quant import schema, sizes  # noqa: E402
@@ -110,9 +112,13 @@ class Runner:
         kd = cfg["kl"].get("domains", "all")
         self.kl_datasets = [ds for d in (ALL_DOMAINS if kd == "all" else doms) for ds in D.DOMAIN_TRAIN[d]]
         self.registry = self.run_dir / "mock_registry.json"
-        self.gpu_editor, self.gpu_cand = role_gpus(rc, cfg, "editor"), role_gpus(rc, cfg, "candidate")
-        print(f"[edit_code] hardware={cfg.get('hardware', 'b300')} gpu roles editor={self.gpu_editor} "
-              f"candidate={self.gpu_cand}", flush=True)
+        roles, unused = gpu_layout(rc, cfg)
+        self.gpu_editor, self.gpu_cand = roles["editor"], roles["candidate"]
+        self.cand_slots = candidate_groups(rc, cfg)   # one candidate server per slot, evaluated concurrently
+        print(f"[edit_code] hardware={cfg.get('hardware', 'b300')} scope={cfg.get('scope', 'all')} gpus={rc.gpus} "
+              f"editor={self.gpu_editor} candidate servers={self.cand_slots} "
+              f"({len(self.cand_slots)} candidate(s) evaluated at a time)"
+              + (f" UNUSED {unused} (gpu_layout.candidate_group_size)" if unused else ""), flush=True)
         self.editor_mode = (cfg.get("loop") or {}).get("editor", "frozen")
         if self.editor_mode not in ("frozen", "current"):
             raise ValueError(f"loop.editor must be frozen or current, got {self.editor_mode!r}")
@@ -254,7 +260,7 @@ class Runner:
         return S.inner_search(self.rc, gen, threads=scfg["threads"], steps=scfg["steps"],
                               max_candidates=scfg.get("max_candidates", scfg["max_evaluate"]),
                               top_full=scfg.get("top_full", 3), rerun_seeds=scfg.get("rerun_seeds", 0),
-                              out_dir=gdir, **fns)
+                              out_dir=gdir, parallel=len(prob.slots), **fns)
 
     def shown_items(self, prob: QuantProblem) -> dict:
         shown = {}
@@ -320,7 +326,7 @@ class Runner:
                 self.log(f"[baseline] budget {budget:.3f} GiB; Q_0 (reference) gate scores {inc['gate_scores']}")
         with st.step("baseline/q0_heldout") as todo:
             if todo:
-                srv = self.model_server(bdir / "q0" / "model", f"{rc.run_id}-q0", self.gpu_cand, "candidate_args")
+                srv = self.model_server(bdir / "q0" / "model", f"{rc.run_id}-q0", self.cand_slots[0], "candidate_args")
                 with srv:
                     s = srv.get()
                     h = run_heldout(s.endpoint, srv.name, bdir / "q0" / "heldout",
@@ -534,7 +540,7 @@ class Runner:
                     shutil.rmtree(gd / "ckpt", ignore_errors=True)
             with st.step(f"{p}/heldout") as todo:
                 if todo:
-                    srv = self.model_server(gd / "model", f"{rc.run_id}-q{g:02d}", self.gpu_cand, "candidate_args")
+                    srv = self.model_server(gd / "model", f"{rc.run_id}-q{g:02d}", self.cand_slots[0], "candidate_args")
                     with srv:
                         s = srv.get()
                         h = run_heldout(s.endpoint, srv.name, gd / "heldout",
@@ -630,7 +636,8 @@ class Runner:
     def run(self):
         rc = self.rc
         self.log(f"[run] {rc.run_id} paper A domain={rc.domain} gens={rc.gens} editor={self.editor_mode} "
-                 f"mock={rc.mock} datasets={self.datasets}")
+                 f"mock={rc.mock} scope={self.cfg.get('scope', 'all')} datasets={self.datasets} "
+                 f"kl_datasets={self.kl_datasets} heldout={self.cfg['heldout'].get('domains', 'all')}")
         write_json(self.run_dir / "edit_config.json", self.cfg)
         self.baseline()
         for g in range(1, rc.gens + 1):

@@ -20,6 +20,15 @@ raw LoRA 的大小在 `raw` 里设置，空着的字段沿用 `sft` 配方；全
 
 `gate.reference` / `gate.fallback` 可以覆盖上表的默认值。非 LLM 分支随模式变化：edit = 对 raw LoRA 随机组合编辑规则（截断 / 剪枝 / intruder / RegMean / 正交化 / 缩放），scratch = 随机的无梯度构造（奇异方向缩放），free = SFT 超参随机搜索。ΔE_write 的参照分支：edit = M_t ⊕ raw（raw 与 SFT 不同时自动加一个 `raw` 分支），scratch = parent，free = SFT；另外总是报告 `dE_write_vs_sft`。E_t 会话用同一个模式（edit 时为 θ0 在 E 任务上按同一 raw 配方训练一个 raw LoRA，在 `e_ref` 里只算一次）。
 
+## 单领域实验（`scope`）
+
+**默认 `scope: single`（2026-11-19 起）**：只用这次运行的 `--domain`，训练、验收、评测都只在这个领域上做，不考虑别的领域。
+- 训练数据只来自目标领域的 train 题；没有保留探针：验收、反馈、token-KL 都只看目标领域（`retention.domains: []`）。改造者的提示词里说明是单领域运行，`regmean_preserve`（需要保留集）不提供；
+- 留出评测只测这个领域的基准（`heldout.domains: run`）；
+- E_t 关闭（E 任务是另一个领域），不起原模型服务；
+- 运行名默认带 `_single`（例如 `B_math_s42_single`），和旧的五领域运行分开。
+- 原设计（其余四个领域作保留探针、五个领域留出评测、E_t）：`--set scope=all`（`launch.sh --all-domains`）。`--set` 显式给的值仍然优先，例如 `--set e_t.enabled=true`。
+
 ## 启动
 
 ```bash
@@ -101,12 +110,22 @@ raw LoRA 的大小在 `raw` 里设置，空着的字段沿用 `sft` 配方；全
 
 ## 硬件（`hardware`，27B）
 
-| 档 | 每个运行的卡 | 分工（`gpu_roles`，--gpus 里的下标） |
-|---|---|---|
-| `b300`（默认，288 GB） | 2 | main [0]；theta0 [-1]；train [-1]（原模型服务和训练共用第 2 张） |
-| `h20`（80 GB） | 3 | main [0]（M_t + LoRA，改造者）；theta0 [1]（原模型）；train [2]（HF 模型训练 / 梯度工具、权重缓存、诊断、合并） |
+角色：main（vLLM：M_t + 候选 LoRA，改造者）、theta0（vLLM：原模型，只给 E_t / e_ref 用）、train（HF 模型：训练、权重缓存、诊断、合并）。vLLM 角色多张卡 = 张量并行；train 多张卡 = 按层拆开（`device_map`）。
 
-H20 档另外：vLLM 显存比例 0.92、`--max-num-seqs 32`、上下文 20480、4 个 LoRA 槽；训练 `train.micro_batch: 1`（每次前向 1 条序列，梯度累积，结果等于整批的平均损失）。4 张卡时 `--set 'gpu_roles.train=[2,3]'` 会把训练模型按层拆到两张卡上（`device_map`）。
+**给多少张卡就用多少张**（`common.gpu_layout`，不设 `gpu_roles` 时）：main 和 train 各一张，E_t 开着且 `gpu_layout.theta0_own_gpu`（H20）时 theta0 也单独一张，否则 theta0 和 train 共用第一张；多的卡依次给 main（TP 2）→ train（2）→ main（TP 4）→ theta0（TP 2）→ main（TP 8），剩下的全给 train，不留空卡。
+
+| 卡数 | 单领域（默认） | 五领域（`scope=all`，H20） |
+|---|---|---|
+| 2 | main 1 · train 1 | 不够（要 3 张） |
+| 3 | main 2 · train 1 | main 1 · theta0 1 · train 1 |
+| 4 | main 2 · train 2 | main 2 · theta0 1 · train 1 |
+| 5 | main 2 · train 3 | main 2 · theta0 1 · train 2 |
+| 6 | main 4 · train 2 | main 2 · theta0 2 · train 2 |
+| 8 | main 4 · train 4 | main 4 · theta0 2 · train 2 |
+
+手动指定：`--set 'gpu_roles.train=[2,3]'`（--gpus 里的下标）把这个角色固定下来，其余角色在剩下的卡上自动分。B300 上 theta0 和 train 共用一张卡（显存比例 0.45）。
+
+H20 档另外：vLLM 显存比例 0.92、`--max-num-seqs 32`、上下文 20480、4 个 LoRA 槽；训练 `train.micro_batch: 1`（每次前向 1 条序列，梯度累积，结果等于整批的平均损失）。
 
 ## 只能在 GPU 上验证的部分（本机未实跑）
 

@@ -59,7 +59,7 @@ def build_arg_parser(paper: str) -> argparse.ArgumentParser:
     ap.add_argument("--model", default="qwen3.8-27b", help="download_models.sh name or a path")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gpus", default="0,1", help="comma-separated GPU ids")
-    ap.add_argument("--run-id", default=None, help="default <paper>_<domain>_s<seed>[_mock]")
+    ap.add_argument("--run-id", default=None, help="default <paper>_<domain>_s<seed>[_single][_mock]")
     ap.add_argument("--mock", action="store_true", help="no real model: mock OpenAI server + mock builders")
     ap.add_argument("--runs-dir", default=str(ROOT / "experiment_records"), help="parent of run directories")
     ap.add_argument("--paper-dir", default=None, help="override the paper code dir holding configs/")
@@ -89,26 +89,54 @@ def _apply_set(cfg: dict, items) -> dict:
         d = cfg
         parts = k.split(".")
         for p in parts[:-1]:
-            d = d.setdefault(p, {})
+            if not isinstance(d.get(p), dict):   # e.g. gpu_roles: null in base.yaml + --set gpu_roles.train=[2,3]
+                d[p] = {}
+            d = d[p]
         d[parts[-1]] = yaml.safe_load(v)
     return cfg
 
 
-def _apply_hardware(cfg: dict, sets) -> dict:
-    """Merge cfg["hardware_profiles"][hw] (hw = --set hardware=... or cfg["hardware"]) BEFORE the --set
-    overrides, so `--set gpu_roles...` etc. win over the profile. The result is locked in run_config.yaml."""
-    profiles = cfg.get("hardware_profiles") or {}
+def _apply_profile(cfg: dict, sets, key: str, default: str) -> dict:
+    """Merge cfg[f"{key}_profiles"][name] (name = --set key=... or cfg[key] or default) BEFORE the --set
+    overrides, so explicit --set values win over the profile. The result is locked in run_config.yaml."""
+    profiles = cfg.get(f"{key}_profiles") or {}
     if not profiles:
         return cfg
-    hw = cfg.get("hardware") or "b300"
+    name = cfg.get(key) or default
     for it in sets:
         k, _, v = it.partition("=")
-        if k.strip() == "hardware":
-            hw = str(yaml.safe_load(v))
-    if hw not in profiles:
-        raise SystemExit(f"unknown hardware profile {hw!r}; known: {sorted(profiles)}")
-    cfg = _deep_merge(cfg, profiles[hw] or {})
-    cfg["hardware"] = hw
+        if k.strip() == key:
+            name = str(yaml.safe_load(v))
+    if name not in profiles:
+        raise SystemExit(f"unknown {key} profile {name!r}; known: {sorted(profiles)}")
+    cfg = _deep_merge(cfg, profiles[name] or {})
+    cfg[key] = name
+    return cfg
+
+
+def _apply_hardware(cfg: dict, sets) -> dict:
+    """hardware: b300 | h20 ... (hardware_profiles)."""
+    return _apply_profile(cfg, sets, "hardware", "b300")
+
+
+def _apply_scope(cfg: dict, sets, domain: str) -> dict:
+    """scope: single | all (scope_profiles). single = one domain only: training, signal, gate, feedback and
+    held-out evaluation all on the run's --domain (the paper's scope_profiles.single says which keys that
+    sets). --domain all (Paper A) runs with scope all unless --set scope=single is given (refused)."""
+    explicit = any(it.partition("=")[0].strip() == "scope" for it in sets)
+    if domain == "all" and cfg.get("scope_profiles"):
+        if explicit and any(it.partition("=")[0].strip() == "scope" and yaml.safe_load(it.partition("=")[2]) == "single"
+                            for it in sets):
+            raise SystemExit("scope=single needs one --domain, not 'all'")
+        cfg = dict(cfg, scope="all")
+    return _apply_profile(cfg, sets, "scope", "single")
+
+
+def _resolve_run_domain(cfg: dict, domain: str) -> dict:
+    """heldout.domains: run -> the run's domain ('all' for Paper A's --domain all)."""
+    h = cfg.get("heldout")
+    if isinstance(h, dict) and h.get("domains") == "run":
+        h["domains"] = domain
     return cfg
 
 
@@ -137,10 +165,14 @@ def load_run_config(paper: str, args) -> RunConfig:
     cfg = _deep_merge(_load_yaml(cdir / "base.yaml"), _load_yaml(cdir / "domains" / f"{args.domain}.yaml"))
     sets = list(getattr(args, "set", []) or [])
     cfg = _apply_hardware(cfg, sets)
+    cfg = _apply_scope(cfg, sets, args.domain)
     cfg = _apply_set(cfg, sets)
+    cfg = _resolve_run_domain(cfg, args.domain)
     draw_cfg = cfg.get("draw_config")
     draw_cfg = (ROOT / draw_cfg).resolve() if draw_cfg else DRAW_CONFIGS[paper]
-    run_id = args.run_id or f"{paper}_{args.domain}_s{args.seed}" + ("_mock" if args.mock else "")
+    single = cfg.get("scope") == "single" and args.domain != "all"
+    run_id = args.run_id or (f"{paper}_{args.domain}_s{args.seed}" + ("_single" if single else "")
+                             + ("_mock" if args.mock else ""))
     run_dir = Path(getattr(args, "runs_dir", None) or ROOT / "experiment_records").resolve() / run_id
     gpus = [int(g) for g in str(args.gpus).split(",") if str(g).strip() != ""]
     common = {"domain", "gens", "model", "seed", "gpus", "run_id", "mock", "runs_dir", "paper_dir", "set"}

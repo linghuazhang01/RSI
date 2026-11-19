@@ -82,13 +82,13 @@ MODE_TEXT = {
 }
 
 
-def system_prompt(cfg: dict, *, budget: dict, e_task: bool = False, mode: str = "free") -> str:
+def system_prompt(cfg: dict, *, budget: dict, e_task: bool = False, mode: str = "free", retention: bool = True) -> str:
     who = ("an AI model asked to write a LoRA for a FIXED base model on a tool-calling / coding task"
            if e_task else "the model being edited: the LoRA you write will be merged into YOUR OWN weights "
                           "if it passes a fixed gate, and the merged model becomes the next editor")
     whose = ("The model you edit is the original base model, not yourself." if e_task else
              "You are editing yourself.")
-    tools = "\n".join(f"- {d}" for d in tools_for_mode(mode).values())
+    tools = "\n".join(f"- {d}" for d in tools_for_mode(mode, retention=retention).values())
     return SYSTEM_PROMPT.format(who=who, whose=whose, rank_cap=cfg.get("lora", {}).get("rank_cap", 64),
                                 tau=cfg.get("lora", {}).get("norm_cap_tau", 0.1),
                                 timeout_s=cfg.get("sandbox", {}).get("timeout_s", 1800),
@@ -163,7 +163,8 @@ def task_text(*, gen: int, target: str, dataset: str, retention: list[str], n_tr
                 f"{target} ({dataset}); {n_train} training items are available through api.train_ids(). "
                 "Feedback compares against the unmodified base model." + _raw_line(raw_info))
     s = (f"Generation {gen}. Target domain: {target} (training set {dataset}; {n_train} train items via "
-         f"api.train_ids()). Retention domains (must not get worse): {', '.join(retention)}.")
+         f"api.train_ids()). " + (f"Retention domains (must not get worse): {', '.join(retention)}." if retention
+                                  else "Single-domain run: only the target domain is evaluated and gated."))
     if sft_info:
         s += (f"\nReference: the fixed-recipe SFT LoRA (rank {sft_info.get('rank')}, same GPU budget) changes the "
               f"target screen score by {sft_info.get('target_gain')} and the worst retention screen score by "

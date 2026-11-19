@@ -1,0 +1,174 @@
+"""Parallel candidate evaluation (2026-11-19): editor on one GPU, one candidate server per candidate-GPU group.
+
+    <venv>/bin/python -I -m pytest -q edit_code/tests/test_parallel.py
+
+- the Paper A GPU layout (editor 1 GPU, candidate groups);
+- rsicore.search.inner_search(parallel=N) really runs a step's threads at the same time, records them in
+  thread order, and parallel=1 keeps the old sequential behaviour;
+- QuantProblem.evaluate is thread-safe: an identical config is evaluated once, charged screen evaluations
+  reserve the budget before they start (never more than eval_budget), and serve() hands out distinct slots.
+"""
+from __future__ import annotations
+
+import sys
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(REPO), str(REPO / "eval")]
+
+
+def test_layout_editor_one_gpu_and_groups():
+    from edit_code.common import candidate_groups, gpu_layout
+
+    def lay(n, **cfg):
+        rc = SimpleNamespace(gpus=[10 + i for i in range(n)])
+        return gpu_layout(rc, cfg), candidate_groups(rc, cfg)
+    assert lay(2) == (({"editor": [10], "candidate": [11]}, []), [[11]])
+    assert lay(4)[1] == [[11], [12], [13]]
+    assert lay(8)[1] == [[11], [12], [13], [14], [15], [16], [17]]
+    (roles, unused), groups = lay(4, gpu_layout={"candidate_group_size": 2})
+    assert groups == [[11, 12]] and unused == [13]
+    assert lay(5, gpu_layout={"candidate_group_size": 2})[1] == [[11, 12], [13, 14]]
+    (roles, _), groups = lay(5, gpu_roles={"editor": [0, 1]})
+    assert roles["editor"] == [10, 11] and groups == [[12], [13], [14]]
+    with pytest.raises(ValueError):
+        lay(1, gpu_layout={"share_single_gpu": False})
+    assert lay(1)[1] == [[10]]                                     # B300 / mock: shared single GPU
+    with pytest.raises(ValueError):
+        lay(4, gpu_layout={"candidate_group_size": 3})
+
+
+class _Editor:
+    def __init__(self, th):
+        self.th = th
+
+    def propose(self, msg):
+        return f"# thread {self.th}\nprogram"
+
+
+def _search(tmp, parallel, delay=0.2):
+    from rsicore.search import inner_search
+    live, peak, lock = [0], [0], threading.Lock()
+
+    def screen(art, cid):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(delay)
+        with lock:
+            live[0] -= 1
+        return float(art["v"]), {"cid": cid}
+
+    seen = {}
+
+    def render(history, th):
+        seen.setdefault(th, []).append(sorted(c.cid for c in history))
+        return f"thread {th}"
+
+    rc = SimpleNamespace(run_dir=tmp, run_id="t")
+    t0 = time.time()
+    out = inner_search(rc, 1, editor_factory=_Editor, render_context=render,
+                       build_fn=lambda prog, cid: ({"v": int(cid[5]) / 10}, None), screen_fn=screen,
+                       full_fn=lambda art, cid: screen(art, cid), threads=4, steps=2, max_candidates=8,
+                       top_full=3, out_dir=tmp, parallel=parallel)
+    return out, peak[0], time.time() - t0, seen
+
+
+def test_inner_search_parallel(tmp_path):
+    out, peak, secs, seen = _search(tmp_path / "par", parallel=4)
+    assert len(out) == 8 and peak == 4                             # 4 screens at the same time
+    assert secs < 8 * 0.2 + 0.6                                    # well under the sequential time
+    assert seen[3][1] == seen[0][1]                                # step 1: every thread sees the same history
+    lines = (tmp_path / "par" / "candidates.jsonl").read_text().splitlines()
+    assert [l.split('"cid": "')[1][:10] for l in lines] == [f"g01_t{t}_s{s:02d}" for s in range(2) for t in range(4)]
+    out1, peak1, _, seen1 = _search(tmp_path / "seq", parallel=1, delay=0.01)
+    assert peak1 == 1 and len(out1) == 8
+    assert seen1[1][0] == ["g01_t0_s00"]                           # sequential: thread 1 sees thread 0
+    assert [c.cid for c in out] == [c.cid for c in out1]           # same ranking either way
+
+
+def _problem(tmp, n_gpus=4, budget=3):
+    from edit_code.problem import QuantProblem
+    rc = SimpleNamespace(mock=True, run_dir=tmp, run_id="t", seed=42, gpus=list(range(n_gpus)))
+    cfg = {"gpu_layout": {"candidate_group_size": 1}, "candidates": {"keep_checkpoints": 1}}
+    return QuantProblem(rc, cfg, tag="t", gen=1, out_dir=tmp / "p", prep_dir=tmp / "prep", source_dir=None,
+                        source_state=None, budget_gib=10.0, datasets=["dapo_math"], data={}, kl_texts=[],
+                        refs_dir=tmp / "refs", eval_budget=budget)
+
+
+def test_evaluate_thread_safe(tmp_path, monkeypatch):
+    prob = _problem(tmp_path)
+    assert prob.slots == [[1], [2], [3]]
+    calls, lock = [], threading.Lock()
+
+    def fake(art, stage, cid, key, charged, origin):
+        with lock:
+            calls.append(art["config_hash"])
+        time.sleep(0.2)
+        rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "score": 0.5, "feedback": {}, "charged": charged}
+        with prob._lock:
+            prob._evals[key] = rec
+        return dict(rec)
+    monkeypatch.setattr(prob, "_evaluate", fake)
+    res, errs = [], []
+
+    def go(h):
+        try:
+            res.append(prob.evaluate({"config_hash": h}, "screen", f"c{h}"))
+        except Exception as e:  # noqa: BLE001
+            errs.append(type(e).__name__)
+    ts = [threading.Thread(target=go, args=(h,)) for h in ["a", "a", "a", "b", "c", "d", "e"]]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert calls.count("a") == 1                                   # identical config evaluated once
+    assert len(set(calls)) == 3 and prob.evals_used == 3           # budget 3: exactly 3 distinct evaluations
+    assert errs.count("EvalBudgetExhausted") == 2
+    assert sum(1 for r in res if r.get("cached")) == 2             # the two waiting "a" threads
+
+
+def test_serve_pool_distinct_slots(tmp_path, monkeypatch):
+    import edit_code.problem as P
+    prob = _problem(tmp_path)
+    used, live, peak, lock = [], [0], [0], threading.Lock()
+
+    class FakeServer:
+        def __init__(self, path, name, gpus, **kw):
+            self.gpus = gpus
+
+        def __enter__(self):
+            with lock:
+                used.append(tuple(self.gpus))
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            return self
+
+        def __exit__(self, *a):
+            with lock:
+                live[0] -= 1
+
+    import rsicore.servers
+    monkeypatch.setattr(rsicore.servers, "VLLMServer", FakeServer)
+    monkeypatch.setattr(P.M, "register", lambda *a, **k: None)
+    holding = []
+
+    def go(i):
+        with prob.serve({"mock_quality": 0.5, "config_hash": str(i)}, f"n{i}") as srv:
+            with lock:
+                holding.append(tuple(srv.gpus))
+                assert len(set(holding)) == len(holding)           # no slot handed out twice at once
+            time.sleep(0.15)
+            with lock:
+                holding.remove(tuple(srv.gpus))
+    ts = [threading.Thread(target=go, args=(i,)) for i in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert peak[0] == 3 and set(used) == {(1,), (2,), (3,)} and len(used) == 6

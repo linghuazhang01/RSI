@@ -3,12 +3,21 @@
 Paper A (fixed size, 2026-11-19): every problem quantizes the ORIGINAL BF16 model M_0 to the same
 budget; generation g tries to beat the incumbent (best accepted quantization so far). It owns: the model spec, the layer
 cache + diagnostics (prepare), config validation / sizing, candidate build (artifact), lazy
-fake-quant materialization, candidate serving (vLLM on the candidate GPU, or the mock server), and
-staged evaluation (screen / full / gate) with structured L1 feedback (RSI_LOOP_DESIGN §2.2).
+fake-quant materialization, candidate serving, and staged evaluation (screen / full / gate) with
+structured L1 feedback (RSI_LOOP_DESIGN §2.2).
+
+Candidate serving (2026-11-19): the candidate GPUs are split into groups (common.candidate_groups); each
+group is one slot of a pool. serve() takes a free slot, exports the candidate's fake-quant checkpoint into
+that slot's directory on the slot's own GPU (exports are serialized: one shared layer cache), starts vLLM
+on the slot's GPUs, and gives the slot back afterwards. So with N groups, N candidates are evaluated at
+the same time (rsicore.search.inner_search(parallel=N)). evaluate() is thread-safe: an identical config
+being evaluated by another thread is waited for (evaluated once), and charged screen evaluations reserve
+their budget before they start.
 """
 from __future__ import annotations
 
 import math
+import queue
 import shutil
 import threading
 import time
@@ -16,8 +25,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import mock as M
-from .common import (append_jsonl, config_hash, free_cuda, load_processed, read_json, read_jsonl, record_text,
-                     role_gpus, tail, write_json)
+from .common import (append_jsonl, candidate_groups, config_hash, free_cuda, load_processed, read_json, read_jsonl,
+                     record_text, role_gpus, tail, write_json)
 from .diagnostics import bytes_table, load_tables, save_tables, summarize_profile
 from .quant import schema, sizes
 from .quant.spec import ModelSpec, spec_from_checkpoint, synthetic_spec
@@ -74,6 +83,13 @@ class QuantProblem:
         self.cache = None
         self.shown: dict[str, set] = {}
         self._lock = threading.RLock()
+        self._export_lock = threading.Lock()       # one export at a time (shared layer cache)
+        self._inflight: dict = {}                  # (hash, stage) -> threading.Event
+        self._reserved = 0                         # charged screen evaluations running now
+        self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
+        self._pool: queue.Queue = queue.Queue()
+        for i in range(len(self.slots)):
+            self._pool.put(i)
         self._evals = {}
         for r in read_jsonl(self.out_dir / "evals.jsonl"):
             self._evals[(r["hash"], r["stage"])] = r
@@ -196,39 +212,54 @@ class QuantProblem:
         return read_json(self.out_dir / "configs" / f"{art['config_hash']}.json")
 
     # ------------------------------------------------------------------ candidate model
-    def materialize(self, art: dict, dst: Path | None = None) -> Path | None:
-        """Write the fake-quant checkpoint (real mode). Returns its path."""
+    def materialize(self, art: dict, dst: Path | None = None, slot: int = 0) -> Path | None:
+        """Write the fake-quant checkpoint (real mode) on the first GPU of candidate slot `slot` (free at this
+        point: its previous server has stopped). Default dst: out_dir/ckpt/slot<k>/<hash>, one checkpoint
+        per slot on disk (candidates.keep_checkpoints <= 1). Returns its path."""
         if self.mock:
             return None
         from .quant.export import export_fake_quant
-        dst = Path(dst) if dst else self.out_dir / "ckpt" / art["config_hash"]
+        sdir = self.out_dir / "ckpt" / f"slot{slot}"
+        dst = Path(dst) if dst else sdir / art["config_hash"]
         if (dst / "fake_quant.json").exists():
             return dst
-        if dst.parent.name == "ckpt" and self.cfg["candidates"].get("keep_checkpoints", 1) <= 1:
-            for p in (self.out_dir / "ckpt").glob("*"):  # bounded disk: one candidate checkpoint at a time
+        if dst.parent == sdir and self.cfg["candidates"].get("keep_checkpoints", 1) <= 1:
+            for p in sdir.glob("*"):  # bounded disk: one candidate checkpoint per slot
                 if p != dst:
                     shutil.rmtree(p, ignore_errors=True)
-        export_fake_quant(self.source_dir, dst, self.norm_of(art), self.spec, self.cache,
-                          meta={"tag": self.tag, "gen": self.gen, "budget_gib": self.budget_gib}, log=self.log)
-        free_cuda()   # the candidate vLLM server starts on the same GPU next (80 GB cards: every GB counts)
+        with self._export_lock:
+            dev = self.cache.device
+            if str(dev).startswith("cuda"):
+                self.cache.device = f"cuda:{self.slots[slot][0]}"
+            try:
+                export_fake_quant(self.source_dir, dst, self.norm_of(art), self.spec, self.cache,
+                                  meta={"tag": self.tag, "gen": self.gen, "budget_gib": self.budget_gib}, log=self.log)
+            finally:
+                self.cache.device = dev
+            free_cuda()   # the candidate vLLM server starts on this GPU next (80 GB cards: every GB counts)
         return dst
 
     @contextmanager
     def serve(self, art: dict, name: str):
+        """Serve one candidate on a free slot of the candidate-server pool (blocks until one is free)."""
         from rsicore.servers import VLLMServer
-        cand_gpu = role_gpus(self.rc, self.cfg, "candidate")
-        logs = Path(self.rc.run_dir) / "logs"
-        if self.mock:
-            M.register(self.registry, name, art["mock_quality"])
-            # no --tasks: candidates are also scored on held-out tasks (E_t); the index is cached
-            with VLLMServer("mock-" + name, name, cand_gpu, mock=True, mock_registry=self.registry,
-                            seed=self.rc.seed, log_dir=logs) as srv:
-                yield srv
-        else:  # pragma: no cover - GPU path
-            ckpt = self.materialize(art)
-            with VLLMServer(ckpt, name, cand_gpu, seed=self.rc.seed, log_dir=logs,
-                            extra_args=self.cfg["vllm"].get("candidate_args", [])) as srv:
-                yield srv
+        slot = self._pool.get()
+        try:
+            gpus = self.slots[slot]
+            logs = Path(self.rc.run_dir) / "logs"
+            if self.mock:
+                M.register(self.registry, name, art["mock_quality"])
+                # no --tasks: candidates are also scored on held-out tasks (E_t); the index is cached
+                with VLLMServer("mock-" + name, name, gpus, mock=True, mock_registry=self.registry,
+                                seed=self.rc.seed, log_dir=logs) as srv:
+                    yield srv
+            else:  # pragma: no cover - GPU path
+                ckpt = self.materialize(art, slot=slot)
+                with VLLMServer(ckpt, name, gpus, seed=self.rc.seed, log_dir=logs,
+                                extra_args=self.cfg["vllm"].get("candidate_args", [])) as srv:
+                    yield srv
+        finally:
+            self._pool.put(slot)
 
     # ------------------------------------------------------------------ evaluation
     def _ids(self, ds: str, stage: str) -> list[str]:
@@ -265,13 +296,29 @@ class QuantProblem:
         Returns {"score", "feedback", ...}. Screen evaluations count against the evaluate budget."""
         art = config_or_art if "config_hash" in config_or_art else self.build(config_or_art, cid)
         key = (art["config_hash"], stage)
-        with self._lock:
-            if key in self._evals:
-                r = dict(self._evals[key])
-                r["cached"] = True
-                return r
-            if stage == "screen" and charge and self.evals_left <= 0:
-                raise EvalBudgetExhausted(f"evaluate budget of this generation exhausted ({self.eval_budget})")
+        charged = bool(charge and stage == "screen")
+        while True:
+            with self._lock:
+                if key in self._evals:
+                    r = dict(self._evals[key])
+                    r["cached"] = True
+                    return r
+                busy = self._inflight.get(key)
+                if busy is None:   # this thread evaluates it
+                    if charged and self.evals_left - self._reserved <= 0:
+                        raise EvalBudgetExhausted(f"evaluate budget of this generation exhausted ({self.eval_budget})")
+                    self._inflight[key] = threading.Event()
+                    self._reserved += int(charged)
+                    break
+            busy.wait()            # another thread is evaluating the same config: use its result
+        try:
+            return self._evaluate(art, stage, cid, key, charged, origin)
+        finally:
+            with self._lock:
+                self._reserved -= int(charged)
+                self._inflight.pop(key).set()
+
+    def _evaluate(self, art: dict, stage: str, cid: str, key: tuple, charged: bool, origin: str) -> dict:
         t0 = time.time()
         from rsicore.evaluate import paired_delta, score
         name = f"{self.rc.run_id}-{self.tag}-{art['config_hash']}"
@@ -322,8 +369,9 @@ class QuantProblem:
               "linear_avg_bits": art["linear_avg_bits"], "kl": kl, "probes": probes}
         if regressions:
             fb["regressions"] = regressions[: self.show_examples * max(1, len(self.datasets))]
-            for r in fb["regressions"]:
-                self.shown.setdefault(r["dataset"], set()).add(r["id"])
+            with self._lock:
+                for r in fb["regressions"]:
+                    self.shown.setdefault(r["dataset"], set()).add(r["id"])
         if stage == "gate":
             passed, why = self._gate_decision(art, probes)
             fb["gate"] = {"passed": passed, "reason": why}
@@ -338,7 +386,7 @@ class QuantProblem:
                 sc = round(1.0 - klw * klv, 5) if kl else None
             fb["retention"] = None if ret is None else round(ret, 4)
         rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "origin": origin, "score": sc, "feedback": fb,
-               "charged": bool(charge and stage == "screen"), "seconds": round(time.time() - t0, 1)}
+               "charged": charged, "seconds": round(time.time() - t0, 1)}
         with self._lock:
             self._evals[key] = rec
             append_jsonl(self.out_dir / "evals.jsonl", rec)

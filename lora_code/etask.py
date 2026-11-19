@@ -107,7 +107,7 @@ def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str
     ws.build_api()
     if raw is not None:
         raw_info = dict(ws.raw_info or {})
-    sysmsg = system_prompt(cfg, budget=budget, e_task=True, mode=mode)
+    sysmsg = system_prompt(cfg, budget=budget, e_task=True, mode=mode, retention=bool(ws.retention_texts))
     ctx = ContextRenderer(task_text=task_text(gen=0, target=task["domain"], dataset=ds, retention=[],
                                               n_train=len(items["train"]), sft_info=None, e_task=True,
                                               raw_info=raw_info),
@@ -115,7 +115,7 @@ def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str
                                     "api.acts().)")
     seed = rc.seed
     policy = M.make_mock_policy(seed, skill=editor_skill if editor_skill is not None else 0.7,
-                                tag=f"E{branch}", mode=mode) if rc.mock else None
+                                tag=f"E{branch}", mode=mode, retention=bool(ws.retention_texts)) if rc.mock else None
 
     def editor_factory(th):
         return Editor(editor_endpoint, editor_served, system_prompt=sysmsg, seed=seed + th,

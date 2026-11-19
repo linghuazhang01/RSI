@@ -294,7 +294,7 @@ RECIPES = ["sgd", "sgd_trunc", "sgd_intruder", "construct_sgd", "sgd_regmean", "
            "sgd_prune_orth", "keep"]
 
 
-def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "free"):
+def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "free", retention: bool = True):
     """Return policy(history) -> program text. Choices vary with (thread, step) parsed from the last user
     message ("[thread=K step=S]"); a higher `skill` (the editor model's mock quality) picks better
     hyper-parameters and protective operators more often. mode (method.mode): free = SFT-based recipes
@@ -313,6 +313,8 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
         good = rng.random() < skill
         if mode == "edit":
             recipe = EDIT_RECIPES[(th * 3 + st + rng.randrange(len(EDIT_RECIPES))) % len(EDIT_RECIPES)]
+            if recipe == "regmean" and not retention:   # no regmean_preserve without retention texts
+                recipe = "intruder"
             return EDIT_PROGRAM.format(recipe=recipe, th=th, st=st,
                                        k=rng.choice([8, 16] if good else [2, 4]),
                                        lam=rng.choice([0.3, 0.5] if good else [0.1, 0.9]),
@@ -321,11 +323,15 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
                                        lo=rng.choice([0, 8, 16]), hi=rng.choice([48, 56, 64]))
         if mode == "scratch":
             recipe = SCRATCH_RECIPES[(th + st + rng.randrange(len(SCRATCH_RECIPES))) % len(SCRATCH_RECIPES)]
+            if recipe == "singular_regmean" and not retention:
+                recipe = "singular_scale"
             return SCRATCH_PROGRAM.format(recipe=recipe, th=th, st=st, n=rng.choice([8, 16] if good else [2, 32]),
                                           f=rng.choice([1.04, 1.06] if good else [1.3, 0.7]),
                                           alpha=rng.choice([0.3, 0.5] if good else [2.0]),
                                           lo=rng.choice([8, 16]), hi=rng.choice([48, 56]))
         recipe = RECIPES[(th * 3 + st + rng.randrange(len(RECIPES))) % len(RECIPES)]
+        if recipe == "sgd_regmean" and not retention:
+            recipe = "sgd_intruder"
         if recipe == "keep" and (st == 0 or rng.random() < 0.7):
             recipe = "sgd_trunc"
         lr = rng.choice([1e-4, 2e-4, 3e-4] if good else [5e-5, 1e-3, 2e-3])
