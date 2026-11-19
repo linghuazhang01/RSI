@@ -292,7 +292,8 @@ class Runner:
             with st.step("baseline/heldout") as todo:
                 if todo:
                     srv = m0.get()
-                    h = run_heldout(srv.endpoint, m0.name, bdir / "heldout", domains="all", mock=rc.mock,
+                    h = run_heldout(srv.endpoint, m0.name, bdir / "heldout",
+                                    domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
                                     limit=cfg["heldout"].get("limit"))
                     write_json(bdir / "heldout.json", h)
         finally:
@@ -322,7 +323,8 @@ class Runner:
                 srv = self.model_server(bdir / "q0" / "model", f"{rc.run_id}-q0", self.gpu_cand, "candidate_args")
                 with srv:
                     s = srv.get()
-                    h = run_heldout(s.endpoint, srv.name, bdir / "q0" / "heldout", domains="all", mock=rc.mock,
+                    h = run_heldout(s.endpoint, srv.name, bdir / "q0" / "heldout",
+                                    domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
                                     limit=cfg["heldout"].get("limit"))
                 write_json(bdir / "q0" / "heldout.json", h)
         if cfg["e_task"].get("enabled", False):
@@ -409,7 +411,8 @@ class Runner:
         if best is not None:
             hk = prob.heldout_kl(best.artifact)
             with prob.serve(best.artifact, f"{rc.run_id}-e{g:02d}-best") as srv:
-                h = run_heldout(srv.endpoint, srv.served_name, out / "heldout", domains="all", mock=rc.mock,
+                h = run_heldout(srv.endpoint, srv.served_name, out / "heldout",
+                                domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
                                 limit=ec.get("heldout_limit"))
             res["best"] = {"cid": best.cid, "score": best.score, "bytes_gib": best.artifact["bytes_gib"],
                            "config": best.artifact["config"], "heldout_kl": hk, "heldout": h,
@@ -534,7 +537,8 @@ class Runner:
                     srv = self.model_server(gd / "model", f"{rc.run_id}-q{g:02d}", self.gpu_cand, "candidate_args")
                     with srv:
                         s = srv.get()
-                        h = run_heldout(s.endpoint, srv.name, gd / "heldout", domains="all", mock=rc.mock,
+                        h = run_heldout(s.endpoint, srv.name, gd / "heldout",
+                                        domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
                                         limit=cfg["heldout"].get("limit"))
                     write_json(gd / "heldout.json", h)
             self.log(f"[gen {g}] new incumbent {new['cid']}: gate {new['gate_scores']}")

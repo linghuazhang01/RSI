@@ -34,6 +34,9 @@ feedback:
   n_examples: 3             # error / regression examples per feedback (marked as shown -> never signal again)
   mark_shown: true
 
+retention:
+  domains: null            # null = all non-target domains; [] = target-domain training/evaluation only
+
 gate:
   epsilon: 0.01             # [pilot] target gate >= SFT gate - epsilon
   delta: 0.02               # [pilot] retention gate >= gen-0 - max(delta, noise band); learned targets >= post-learning - delta
@@ -92,6 +95,7 @@ e_t:
 
 heldout:
   enabled: true
+  domains: all             # use math for a math-only experiment
   limit: null
 
 baseline:

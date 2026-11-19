@@ -110,6 +110,7 @@ archive:
   top_candidates: 3
 
 heldout:
+  domains: all                        # use math for a math-only experiment
   limit: null                         # per-task item limit (null = full held-out sets)
 
 e_task:                               # editor-capability task E_t: a fresh session (no archive) of this

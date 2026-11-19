@@ -523,7 +523,7 @@ def _apps_io_to_lcb(io: dict):
     return {"inputs": ins, "outputs": outs, "fn_name": fn}
 
 
-def rsi_train():
+def rsi_math():
     out = {}
     # DAPO-Math-17K (WHALE D_weight): dedupe the repeated prompts, strip the instruction template.
     # Source defect (found 2026-11-19): some prompts lost the backslash of LaTeX commands, so Python
@@ -556,6 +556,11 @@ def rsi_train():
                         reference=str(r["reward_model"]["ground_truth"]), source=r["data_source"]))
     print("  dapo_math control-character repair:", dict(fix))
     out["dapo_math"] = rows
+    return out
+
+
+def rsi_train():
+    out = rsi_math()
 
     # APPS train, all difficulties (introductory = ReST-EM's set; interview + competition added
     # 2026-11-18 so the per-generation draw pool is large enough). Keep problems with tests and
@@ -747,7 +752,8 @@ def main():
     a = ap.parse_args()
     only = set(filter(None, a.only.split(",")))
     OUT.mkdir(parents=True, exist_ok=True)
-    for b in BUILDERS:
+    builders = BUILDERS + ([rsi_math] if "rsi_math" in only else [])
+    for b in builders:
         if only and b.__name__ not in only:
             continue
         for name, rows in b().items():

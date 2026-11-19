@@ -31,6 +31,20 @@ $PY data/scripts/report_table.py       # 打印下表
 
 `make_splits.py` 只依赖 item id、`split_config.yaml` 和种子 `seed=20261118`，可重复生成；改划分规模时只需改 `split_config.yaml` 后重跑。
 
+只准备数学实验时，下载数学来源后，单独运行数学规范化：
+
+```bash
+eval/.venv/bin/python -I data/scripts/normalize.py --only gsm8k,math,aime_amc,rsi_math
+eval/.venv/bin/python -I data/scripts/make_splits.py
+```
+
+`rsi_math` 只读取 DAPO-Math，不读取代码或知识来源。默认的完整规范化仍调用 `rsi_train`，保持原有行为。
+数学来源还应包含 MATH-500、AMC23、OlympiadBench，供 MATH-500 划分和数学去污染使用。
+运行时将 draw 配置的 `domains` 限定为 `math`。
+Paper A 设置 `kl.domains=run` 和 `heldout.domains=math`。
+Paper B 设置 `retention.domains=[]`、`heldout.domains=math` 和 `e_t.enabled=false`，关闭跨域保持评测与 E_t 分支。
+这些选项不缩减单代训练、搜索和数学留出评测预算。
+
 ## 当前配置（2026-11-19 修订）
 
 每个领域**只用一个训练集**，配 1–3 个留出集。自量化 / 自编辑循环**只看训练集**：

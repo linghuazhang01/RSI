@@ -15,8 +15,18 @@ VENV="${1:-$HOME/venvs/rsi-gpu}"
 command -v uv >/dev/null || { echo "uv not found: https://docs.astral.sh/uv/ (pip install uv)"; exit 1; }
 [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] || { echo "needs Linux x86_64"; exit 1; }
 if [ "$REUSE" = 1 ] && [ -x "$VENV/bin/python" ]; then echo "reusing venv $VENV"; else uv venv --python 3.11 "$VENV"; fi
+# Optional download mirrors; the package versions still come from the same lock.
+INDEX_ARGS=(--index-url "${RSI_PYPI_INDEX_URL:-https://pypi.org/simple}")
+if [ -n "${RSI_TORCH_WHEEL_LINKS:-}" ]; then
+  INDEX_ARGS+=(--find-links "$RSI_TORCH_WHEEL_LINKS")
+else
+  INDEX_ARGS+=(--extra-index-url "${RSI_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}")
+fi
+if [ -n "${RSI_EXTRA_INDEX_URL:-}" ]; then
+  INDEX_ARGS+=(--extra-index-url "$RSI_EXTRA_INDEX_URL")
+fi
 uv pip install --python "$VENV/bin/python" \
-  --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu130 \
+  "${INDEX_ARGS[@]}" \
   --index-strategy unsafe-best-match -r "$HERE/requirements-gpu.lock"
 "$VENV/bin/python" -I "$HERE/check_gpu_env.py"
 echo "done: $VENV"

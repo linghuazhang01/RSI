@@ -82,7 +82,12 @@ class Run:
         self.registry = rc.run_dir / "mock_registry.json"
         self.target = rc.domain
         self.tds = DOMAIN_DATASET[rc.domain]
-        self.datasets = [DOMAIN_DATASET[d] for d in DOMAINS]
+        retention = cfg.get("retention", {}).get("domains")
+        self.retention_domains = retention_domains(self.target) if retention is None else list(retention)
+        if any(d not in DOMAINS or d == self.target for d in self.retention_domains):
+            raise ValueError("retention.domains must contain only non-target domains")
+        self.datasets = [DOMAIN_DATASET[d] for d in DOMAINS
+                         if d == self.target or d in self.retention_domains]
         self.mcfg = cfg.get("mock", {})
         self._stores = {}
         self._hf = {}
@@ -214,7 +219,7 @@ class Run:
         from rsicore import draws
         n = self.cfg.get("eval", {}).get("kl_limit")
         texts = []
-        for d in retention_domains(self.target):
+        for d in self.retention_domains:
             ds = DOMAIN_DATASET[d]
             ids = limit_ids(draws.ids(self.rc, g, ds, "kl"), n)
             recs = load_records(ds, ids)
@@ -314,7 +319,8 @@ class Run:
         if self.cfg.get("heldout", {}).get("enabled", True) and not self.st.done("baseline/heldout"):
             from rsicore.heldout import run_heldout
             srv = self.servers.get("main", self.model_path(0), self.served(0))
-            h = run_heldout(srv.endpoint, self.served(0), bdir / "heldout", domains="all", mock=self.rc.mock,
+            h = run_heldout(srv.endpoint, self.served(0), bdir / "heldout",
+                            domains=self.cfg.get("heldout", {}).get("domains", "all"), mock=self.rc.mock,
                             limit=self.cfg.get("heldout", {}).get("limit"))
             write_json(bdir / "heldout.json", h)
             self.st.mark("baseline/heldout", {"tasks": len(h)})
@@ -566,7 +572,8 @@ class Run:
             nxt = self.model_path(g + 1)
             srv = self.servers.get("main", nxt, self.served(g + 1))
             state.clear()
-            h = run_heldout(srv.endpoint, self.served(g + 1), gd / "heldout", domains="all", mock=rc.mock,
+            h = run_heldout(srv.endpoint, self.served(g + 1), gd / "heldout",
+                            domains=cfg.get("heldout", {}).get("domains", "all"), mock=rc.mock,
                             limit=cfg.get("heldout", {}).get("limit"))
             write_json(gd / "heldout.json", h)
             st.mark(f"{P}/heldout", {"tasks": len(h)})
@@ -617,7 +624,7 @@ class Run:
         sftinfo = {"rank": (sft.get("train") or {}).get("rank"), "target_gain": sp.get("target_gain"),
                    "worst_retention": sp.get("worst_retention_delta")}
         ctx = ContextRenderer(task_text=task_text(gen=g, target=self.target, dataset=self.tds,
-                                                  retention=retention_domains(self.target), n_train=len(ws.train.ids()),
+                                                  retention=self.retention_domains, n_train=len(ws.train.ids()),
                                                   sft_info=sftinfo),
                               diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "")
         sysmsg = system_prompt(cfg, budget=budget)

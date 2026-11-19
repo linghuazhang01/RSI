@@ -1,8 +1,6 @@
 # HPC 服务端（vLLM）安装与使用说明
 
-本机（Apple M3 Pro，无 CUDA）只安装了客户端/评测端（`eval/.venv`），**没有安装 vLLM**。
 模型推理在 Linux + CUDA 的 HPC 集群上用 vLLM 的 OpenAI 兼容服务完成，`eval/run_eval.py` 通过 HTTP 访问它。
-本文件只是文档；本次环境搭建没有登录任何远程机器。
 
 ## 1. 安装（GPU 环境，训练 / 编辑 / 服务共用）
 
@@ -16,8 +14,23 @@ bash eval/hpc/setup_gpu_env.sh ~/venvs/rsi-gpu        # 只能在 Linux x86_64 �
 - `requirements-gpu.in`：直接依赖；`requirements-gpu.lock`：用 uv 为 x86_64-manylinux_2_28、Python 3.11 解析出的完整锁定（243 个包，含 `torch==2.11.0+cu130`、`vllm==0.24.0`、`transformers==5.9.0`、`verl==0.9.1`、`peft==0.21.3`、`ray==2.60.0`、`tensordict==0.8.3`、`compressed-tensors==0.17.0`、`flashinfer-python==0.6.12`）。
 - PyPI 上的 torch 2.11.0 本身就是 CUDA 13.0 构建，vLLM 0.24.0 的 wheel 也依赖 cu13 组件；脚本仍显式加了 PyTorch 的 cu130 源。
 - **llm-compressor 装不进这套环境**：所有已发布版本都与 vLLM 0.24.0 固定的 `compressed-tensors==0.17.0` 加 Transformers 5.9.0 冲突。Paper A 的量化代码需要自己写出 compressed-tensors 格式的权重。
-- **模型架构支持未验证**：本机没有 GPU，锁文件只在本机解析过，没有实际安装。vLLM 0.24.0 发布于 2026-06-30，是否支持 Qwen3.8 27B 要在 HPC 上用 `check_gpu_env.py --model` 确认。
+- **模型架构已验证**：2026-11-19 在 H20-3e 上安装锁定环境后，`check_gpu_env.py --model` 通过，Qwen3.8-27B 的 `Qwen3_5ForConditionalGeneration` 架构获得支持。Paper A 双卡服务和 Paper B 单卡 LoRA 服务均已返回真实生成请求；完整单代实验仍需单独验收。
 - 评测客户端仍是 CPU 环境 `eval/.venv`（`bash eval/setup_env.sh`），通过 HTTP 访问 vLLM。
+
+下载时支持指定镜像源，依赖版本仍由原锁文件决定：
+
+```bash
+RSI_PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+RSI_TORCH_WHEEL_LINKS=https://mirrors.aliyun.com/pytorch-wheels/cu130/ \
+UV_HTTP_TIMEOUT=180 ./setup_env.sh gpu
+```
+
+`RSI_TORCH_WHEEL_LINKS` 指定包含 wheel 链接的平面目录。标准 PyTorch 包索引使用
+`RSI_TORCH_INDEX_URL`，额外包索引使用 `RSI_EXTRA_INDEX_URL`。
+未指定镜像时仍使用 PyPI 和官方 cu130 索引。
+
+驱动 570、CUDA 13.0 编译工具链和共享文件系统缓存的复现步骤见
+[CUDA 运行环境修复](CUDA_RUNTIME.md)。这些步骤只作用于实验进程，不修改系统驱动或 GPU 依赖锁。
 
 ## 2. 启动服务
 
