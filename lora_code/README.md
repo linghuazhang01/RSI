@@ -33,7 +33,7 @@ raw LoRA 的大小在 `raw` 里设置，空着的字段沿用 `sft` 配方；全
 
 ```bash
 ./run_rsi.sh --paper B --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id B_math_s42
-./run_rsi.sh --paper B --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1,2 --run-id B_math_s42 --set hardware=h20   # H20 80GB
+./run_rsi.sh --paper B --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1,2 --run-id B_math_s42 --set hardware=h20   # H20（按每张卡 110 GB 规划）
 ./run_rsi.sh --paper B --domain math --gens 2 --mock          # 本机 mock，约 5 分钟
 # 改配置：--set search.max_evaluate=16 --set gate.delta=0.03（写进 run_config.yaml 并锁定）
 ```
@@ -125,7 +125,7 @@ raw LoRA 的大小在 `raw` 里设置，空着的字段沿用 `sft` 配方；全
 
 手动指定：`--set 'gpu_roles.train=[2,3]'`（--gpus 里的下标）把这个角色固定下来，其余角色在剩下的卡上自动分。B300 上 theta0 和 train 共用一张卡（显存比例 0.45）。
 
-H20 档另外：vLLM 显存比例 0.92、`--max-num-seqs 32`、上下文 20480、4 个 LoRA 槽；训练 `train.micro_batch: 1`（每次前向 1 条序列，梯度累积，结果等于整批的平均损失）。
+H20 档（按每张卡 110 GB 规划，卡约 140 GB）另外：vLLM 显存用 `--rsi-gpu-memory-gib 110`（启动时换算成显存比例），`--max-num-seqs 128`、上下文 20480、8 个 LoRA 槽；训练 `train.micro_batch: 2`【试点值】（每次前向 2 条序列，梯度累积，结果等于整批的平均损失）。原模型服务和训练模型放不进同一张 110 GB 的卡，所以五领域（有 E_t）时原模型单独一张。80 GB 的卡用 `h20_80`（0.92、32 条序列、4 个 LoRA 槽、每次 1 条）。
 
 ## 只能在 GPU 上验证的部分（本机未实跑）
 

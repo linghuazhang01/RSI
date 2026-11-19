@@ -78,13 +78,16 @@ Paper B（每代 M_t 写 LoRA，合并进自己；2026-11-19 起分两种方式�
 | 硬件档 | Paper A 每个运行（最少） | Paper B 每个运行（最少；单领域 / 五领域） | 两篇 × 五个领域（最少） |
 |---|---|---|---|
 | `b300`（288 GB） | 2 张 | 2 张（原模型服务、训练和 main 以外的部分共用第 2 张） | 20 张（加 Paper A `all` 共 22 张） |
-| `h20`（80 GB） | 2 张：每张卡只放一个 27B | 2 张（main / 训练）；五领域 3 张（再加原模型给 E_t） | 单领域 20 张；五领域 25 张 |
+| `h20`（卡约 140 GB，按 110 GB 规划） | 2 张：每张卡只放一个 27B | 2 张（main / 训练）；五领域 3 张（再加原模型给 E_t） | 单领域 20 张；五领域 25 张 |
+| `h20_80`（80 GB，之前的规划） | 2 张 | 同上 | 同上 |
 
-H20 档（`--set hardware=h20`，launch.sh 用 `--hw h20`）具体做了这些：
-- vLLM 显存比例 0.92、`--max-num-seqs 32`、上下文 20480（够 AIME 的 16k 回答）；52 GB 权重之外约 15 GB 给 KV 缓存和线性注意力状态。
-- Paper A：校准每次只放 4 层的 Hessian（每层约 1.6 GB），候选导出后释放显存再起 vLLM。
-- Paper B：vLLM 预留 4 个 LoRA 槽（B300 是 8 个）；训练每次只前向 1 条序列、梯度累积（fp32 logits 在约 24.8 万词表上每条 4k token 约 4 GB）。
-- 卡更多时可以提速：`--per-run 4` 配合 `gpu_roles`，例如 Paper A `--set 'gpu_roles={editor: [0, 1], candidate: [2, 3]}'`（张量并行 2），Paper B `--set 'gpu_roles.train=[2,3]'`（训练模型拆到两张卡）。
+H20 档（`--set hardware=h20`，launch.sh 用 `--hw h20`；2026-11-20 起按每张卡 110 GB 规划，卡实际约 140 GB，剩下的作余量）：
+- 仍然每张卡只放一个 27B（约 52 GB）：两个 27B 就是 104 GB，不剩 KV 缓存。
+- vLLM 的显存按 GiB 给：参数 `--rsi-gpu-memory-gib 110` 在启动时换算成 `--gpu-memory-utilization = 110 / 卡的总显存`（`rsicore.servers`，读 nvidia-smi；读不到时用配置里的 0.78）。52 GB 权重和约 6 GB 运行时之外，约 50 GB 给 KV 缓存和线性注意力状态【估计】，所以 `--max-num-seqs 128`；上下文 20480（够 AIME 的 16k 回答），Paper A 改造者 32768。
+- Paper A：校准用默认的每次 16 层 Hessian（52 GB 模型 + 16 × 1.6 GB）。
+- Paper B：8 个 LoRA 槽；训练每次前向 2 条序列【试点值】（每条 4k token 的 fp32 logits、梯度和 log-softmax 约 12 GB），smoke 运行看到显存峰值后再调。
+- 原来按 80 GB 规划的档改名为 `h20_80`（`--hw h20_80`）：0.92、32 条序列、4 个 LoRA 槽、训练每次 1 条、校准每次 4 层。之前用旧 `h20` 档启动的运行要接着跑，需要改用 `--hw h20_80`（运行配置是锁定的）。
+- 卡的分工是自动的：给多少张卡就用多少张（见上面）。
 
 **速度（假设，未实测）**：H20 的 BF16 算力约为 B300 的 1/15，显存带宽约一半。生成（解码）主要受带宽限制，约慢 2 倍；校准、LoRA 训练、长提示的预填充受算力限制，会慢很多。B300 上估计 Paper A 每代 11–13 h、Paper B 每代 20–22 h，H20 上可能是 2–5 倍，第一周用 `--smoke` 实测后再定代数和评测预算（`--set search.max_evaluate=...`）。
 
@@ -94,5 +97,5 @@ H20 档（`--set hardware=h20`，launch.sh 用 `--hw h20`）具体做了这些�
 
 1. vLLM 0.24.0 在 H20 / B300 上加载 Qwen3.8-27B、fake-quant 检查点、Qwen3.5 结构的 LoRA（含线性注意力投影）。
 2. Paper A：逐层量化缓存（GPTQ）的耗时和显存；每个候选的导出 + 加载耗时（27B 每次写 52 GB）。
-3. Paper B：27B LoRA 短训练在 80 GB 上的显存峰值和速度；main 卡上 4 个 LoRA 槽是否够。
+3. Paper B：27B LoRA 短训练在 110 GB 规划下的显存峰值和速度（micro_batch 2 能否加大）；8 个 LoRA 槽和 128 条并发序列是否放得下。
 4. 代码领域的 Docker 判分。

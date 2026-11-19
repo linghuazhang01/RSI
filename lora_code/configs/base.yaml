@@ -166,8 +166,20 @@ gpu_layout:
 hardware: b300
 hardware_profiles:
   b300: {}
-  h20:                      # 80 GB H20, Qwen3.8-27B (BF16 ~52 GB): one full model per card
-    gpu_layout: {theta0_own_gpu: true}   # original-model server on its own card when E_t is on (scope all: >= 3 cards)
+  h20:                      # H20 cards (~140 GB) PLANNED AT 110 GB each (2026-11-20); Qwen3.8-27B BF16 ~52 GB
+    gpu_layout: {theta0_own_gpu: true}   # theta0 vLLM (52 GB + KV) and the training model (52 GB + activations)
+                                         # do not fit on one 110 GB card: own card when E_t is on (scope all)
+    server:                 # --rsi-gpu-memory-gib 110 -> --gpu-memory-utilization = 110 GB / card total (rsicore.servers)
+      max_loras: 8          # ~0.8 GB per rank-64 adapter slot [estimate]
+      main_args: ["--rsi-gpu-memory-gib", "110", "--gpu-memory-utilization", "0.78", "--max-model-len", "20480",
+                  "--max-num-seqs", "128", "--max-logprobs", "20"]
+      theta0_args: ["--rsi-gpu-memory-gib", "110", "--gpu-memory-utilization", "0.78", "--max-model-len", "20480",
+                    "--max-num-seqs", "128", "--max-logprobs", "20"]
+    train:
+      micro_batch: 2        # [pilot] 52 GB weights + 2 x (4k tokens: fp32 logits + grad + log-softmax ~12 GB,
+                            # checkpointed activations ~1.5 GB) ~ 80 GB; raise after the smoke run's memory peak
+  h20_80:                   # 80 GB H20 (the earlier plan)
+    gpu_layout: {theta0_own_gpu: true}
     server:
       max_loras: 4          # vLLM reserves GPU memory for max_loras adapters of rank_cap
       main_args: ["--gpu-memory-utilization", "0.92", "--max-model-len", "20480", "--max-num-seqs", "32", "--max-logprobs", "20"]

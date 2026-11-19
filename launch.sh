@@ -10,7 +10,8 @@
 #   --paper     A, B or both (default both)
 #   --domains   all = math,code,knowledge,instruction_following,tool_calling (default all)
 #   --gens      generations per run (default 5)
-#   --hw        hardware profile (default b300). Qwen3.8-27B: minimum GPUs per run
+#   --hw        hardware profile (default b300): b300 (288 GB), h20 (H20 planned at 110 GB per card),
+#               h20_80 (80 GB H20). Qwen3.8-27B (one model per card): minimum GPUs per run
 #                 Paper A 2 (editor | candidates); Paper B 2 (main | training), 3 on h20 with --all-domains
 #                 (+ original-model server for E_t)
 #   --gpus      GPU ids to use, any order / gaps (default: every GPU nvidia-smi lists). ALL of them are used:
@@ -77,9 +78,9 @@ while [ $# -gt 0 ]; do
 done
 
 ALL_DOMAINS="math code knowledge instruction_following tool_calling"
-case "$HW" in b300|h20) ;; *) echo "ERROR: --hw must be b300 or h20" >&2; exit 2 ;; esac
+case "$HW" in b300|h20|h20_80) ;; *) echo "ERROR: --hw must be b300, h20 or h20_80" >&2; exit 2 ;; esac
 min_of() {  # paper domain -> minimum GPUs of one run
-  if [ "$HW" = h20 ] && [ "$1" = B ] && { [ "$SINGLE" -eq 0 ] || [ "$2" = all ]; }; then echo 3
+  if [ "$HW" != b300 ] && [ "$1" = B ] && { [ "$SINGLE" -eq 0 ] || [ "$2" = all ]; }; then echo 3
   else echo 2; fi
 }
 case "$PAPER" in A|a) PAPERS="A" ;; B|b) PAPERS="B" ;; both) PAPERS="A B" ;;

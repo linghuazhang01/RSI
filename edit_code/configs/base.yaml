@@ -159,9 +159,19 @@ gpu_layout:
 hardware: b300
 hardware_profiles:
   b300: {}
-  h20:                                # 80 GB H20, Qwen3.8-27B (BF16 ~52 GB): one full model per card, >= 2 cards per run
+  h20:                                # H20 cards (~140 GB) PLANNED AT 110 GB each (2026-11-20); Qwen3.8-27B BF16 ~52 GB:
+    gpu_layout: {share_single_gpu: false}   # still one model per card (editor + a candidate = 104 GB, no KV left)
+    vllm:                             # --rsi-gpu-memory-gib 110 -> --gpu-memory-utilization = 110 GB / card total
+      # (rsicore.servers; 0.78 = 110/140 if nvidia-smi is unavailable). 110 - 52 GB weights - ~6 GB runtime
+      # leaves ~50 GB for KV cache + GDN states [estimate: ~64 KB/token on the 16 full-attention layers]
+      editor_args: [--rsi-gpu-memory-gib, "110", --gpu-memory-utilization, "0.78", --max-model-len, "32768",
+                    --max-num-seqs, "128", --max-logprobs, "20"]
+      candidate_args: [--rsi-gpu-memory-gib, "110", --gpu-memory-utilization, "0.78", --max-model-len, "20480",
+                       --max-num-seqs, "128", --max-logprobs, "20"]
+    # calibration: the base 16 layers per pass fits (52 GB HF model + 16 x 1.6 GB fp32 Hessians + activations)
+  h20_80:                             # 80 GB H20 (the earlier plan): one model per card, ~15 GB KV
     gpu_layout: {share_single_gpu: false}
-    vllm:                             # 0.92 x 80 GB - 52 GB weights leaves ~15 GB for KV cache + GDN states
+    vllm:
       editor_args: [--gpu-memory-utilization, "0.92", --max-model-len, "32768", --max-num-seqs, "32", --max-logprobs, "20"]
       candidate_args: [--gpu-memory-utilization, "0.92", --max-model-len, "20480", --max-num-seqs, "32", --max-logprobs, "20"]
     calibration:

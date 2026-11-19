@@ -17,7 +17,7 @@
 ```bash
 ./run_rsi.sh --paper A --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id A_math_s42
 ./run_rsi.sh --paper A --domain all  --gens 5 --run-id A_all_s42
-./run_rsi.sh --paper A --domain math --gens 5 --gpus 0,1 --run-id A_math_s42 --set hardware=h20   # H20 80GB
+./run_rsi.sh --paper A --domain math --gens 5 --gpus 0,1 --run-id A_math_s42 --set hardware=h20   # H20（按每张卡 110 GB 规划）
 ./run_rsi.sh --paper A --domain math --gens 2 --mock            # 本机，无 GPU，约 1–2 分钟
 # 等价：python -I edit_code/run.py ...；附加参数 --budget-gib 11.5（固定体积），--set key=value（覆盖 configs，写入锁定的 run_config.yaml）
 ```
@@ -65,7 +65,7 @@
 - 磁盘：每个候选服务各留一个检查点（约 54 GB），8 张卡时约 7 × 54 GB；
 - 只有 1 组时（2 张卡）就是原来的逐个评测。手动指定：`--set 'gpu_roles.editor=[0,1]'`（改造者张量并行 2），候选用剩下的卡。
 
-H20 档：至少 2 张（每张卡只放一个 27B，约 52 GB），vLLM 显存比例 0.92、`--max-num-seqs 32`，校准每次 4 层 Hessian。B300 / mock 只给 1 张时两个角色共用。
+H20 档（按每张卡 110 GB 规划，卡约 140 GB）：至少 2 张（每张卡只放一个 27B，约 52 GB）；vLLM 显存用 `--rsi-gpu-memory-gib 110`（启动时换算成显存比例），`--max-num-seqs 128`，校准每次 16 层 Hessian。80 GB 的卡用 `h20_80`（0.92、32 条序列、校准每次 4 层）。B300 / mock 只给 1 张时两个角色共用。
 
 ## 模块组（Qwen3.5 dense，含 GDN）
 

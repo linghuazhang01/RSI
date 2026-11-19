@@ -40,6 +40,49 @@ def _vllm_cmd() -> list[str]:
     return [sys.executable, "-m", "vllm.entrypoints.cli.main"]
 
 
+MEM_FLAG = "--rsi-gpu-memory-gib"
+
+
+def gpu_total_gib(gpu_ids) -> float | None:
+    """Smallest total memory (GiB) among the physical GPUs gpu_ids (nvidia-smi), None if unknown."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    tot = {}
+    for line in out.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit():
+            try:
+                tot[int(parts[0])] = float(parts[1]) / 1024
+            except ValueError:
+                pass
+    vals = [tot[g] for g in gpu_ids if g in tot]
+    return min(vals) if vals and len(vals) == len(list(gpu_ids)) else None
+
+
+def apply_memory_budget(args: list[str], gpu_ids, total_gib: float | None = None) -> tuple[list[str], dict]:
+    """`--rsi-gpu-memory-gib X` in vLLM args -> --gpu-memory-utilization = X / the card's total memory
+    (capped at 0.95), replacing any utilization given; the pseudo flag is removed. Without nvidia-smi the
+    configured --gpu-memory-utilization (if any) is kept. Returns (args, info)."""
+    args = [str(a) for a in args]
+    if MEM_FLAG not in args:
+        return args, {}
+    i = args.index(MEM_FLAG)
+    gib = float(args[i + 1])
+    args = args[:i] + args[i + 2:]
+    total = total_gib if total_gib is not None else gpu_total_gib(gpu_ids)
+    if not total:
+        return args, {"memory_gib": gib, "total_gib": None, "note": "nvidia-smi unavailable: configured utilization kept"}
+    util = round(min(0.95, gib / total), 3)
+    if "--gpu-memory-utilization" in args:
+        j = args.index("--gpu-memory-utilization")
+        args = args[:j] + args[j + 2:]
+    return args + ["--gpu-memory-utilization", str(util)], {"memory_gib": gib, "total_gib": round(total, 1),
+                                                           "utilization": util}
+
+
 class VLLMServer:
     def __init__(self, model_path, served_name: str, gpu_ids: list[int], *, port: int | None = None,
                  enable_lora: bool = False, max_loras: int = 8, max_lora_rank: int = 64,
@@ -52,6 +95,12 @@ class VLLMServer:
         self.host = host
         self.enable_lora, self.max_loras, self.max_lora_rank = enable_lora, max_loras, max_lora_rank
         self.extra_args = [str(a) for a in extra_args]
+        self.memory = {}
+        if mock and MEM_FLAG in self.extra_args:     # the mock server takes none of vLLM's flags
+            i = self.extra_args.index(MEM_FLAG)
+            self.extra_args = self.extra_args[:i] + self.extra_args[i + 2:]
+        elif MEM_FLAG in self.extra_args:            # plan GPU memory in GiB (e.g. 110 GB on a 140 GB card)
+            self.extra_args, self.memory = apply_memory_budget(self.extra_args, self.gpu_ids)
         self.mock, self.mock_registry, self.seed = mock, mock_registry, seed
         self.log_dir = Path(log_dir) if log_dir else Path(tempfile.gettempdir()) / "rsicore_logs"
         self.ready_timeout_s = ready_timeout_s

@@ -172,3 +172,40 @@ def test_serve_pool_distinct_slots(tmp_path, monkeypatch):
     for t in ts:
         t.join()
     assert peak[0] == 3 and set(used) == {(1,), (2,), (3,)} and len(used) == 6
+
+
+def test_memory_budget_in_gib(monkeypatch):
+    """h20 plans 110 GB per card: --rsi-gpu-memory-gib 110 becomes --gpu-memory-utilization 110 / total."""
+    import rsicore.servers as S
+    args = ["--rsi-gpu-memory-gib", "110", "--gpu-memory-utilization", "0.78", "--max-num-seqs", "128"]
+    out, info = S.apply_memory_budget(args, [0], total_gib=140.4)
+    assert S.MEM_FLAG not in out and out.count("--gpu-memory-utilization") == 1
+    assert out[out.index("--gpu-memory-utilization") + 1] == "0.783" and info["utilization"] == 0.783
+    out, info = S.apply_memory_budget(args, [0], total_gib=96.0)       # smaller card: 110/96 capped at 0.95
+    assert out[out.index("--gpu-memory-utilization") + 1] == "0.95"
+    monkeypatch.setattr(S, "gpu_total_gib", lambda ids: None)           # no nvidia-smi: configured 0.78 kept
+    out, info = S.apply_memory_budget(args, [0])
+    assert out[out.index("--gpu-memory-utilization") + 1] == "0.78" and info["total_gib"] is None
+    monkeypatch.setattr(S, "gpu_total_gib", lambda ids: 140.0)
+    srv = S.VLLMServer("/m", "x", [3, 4], extra_args=args)
+    cmd = srv.command()
+    assert S.MEM_FLAG not in cmd and cmd[cmd.index("--gpu-memory-utilization") + 1] == "0.786"
+    assert cmd[cmd.index("--tensor-parallel-size") + 1] == "2"
+    mock = S.VLLMServer("/m", "x", [0], extra_args=args, mock=True)
+    assert S.MEM_FLAG not in mock.command()
+
+
+def test_h20_profiles(tmp_path):
+    from rsicore.config import build_arg_parser, load_run_config
+
+    def load(paper, hw):
+        a = build_arg_parser(paper).parse_args(["--domain", "math", "--mock", "--runs-dir", str(tmp_path / hw / paper),
+                                                "--set", f"hardware={hw}"])
+        return load_run_config(paper, a).paper_cfg
+    a, b = load("A", "h20"), load("B", "h20")
+    for args in (a["vllm"]["editor_args"], a["vllm"]["candidate_args"], b["server"]["main_args"]):
+        assert args[args.index("--rsi-gpu-memory-gib") + 1] == "110" and "128" in args
+    assert a["calibration"]["layers_per_pass"] == 16 and b["train"]["micro_batch"] == 2 and b["server"]["max_loras"] == 8
+    a80, b80 = load("A", "h20_80"), load("B", "h20_80")
+    assert a80["calibration"]["layers_per_pass"] == 4 and b80["train"]["micro_batch"] == 1
+    assert "--rsi-gpu-memory-gib" not in a80["vllm"]["editor_args"]
