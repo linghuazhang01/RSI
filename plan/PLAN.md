@@ -10,23 +10,22 @@
 
 ## 1. 数据
 
-规则：**循环只看训练集，benchmark 只做留出评测。**
-每份训练集分两块：
-- **验收集**：每个领域固定 1,000 题，每代相同（L2，只返回通过 / 不通过）；大小在 `data/splits/split_config.yaml` 的 `gate_domains` 里改；
-- **抽样池**：其余全部。**每一代抽一批新题**（数学 / 知识 / 指令 / 工具 2,000，代码 1,000；在 `data/draw/paper_{a,b}.yaml` 的 `n` 里改）。训练数据可以跨代复用：先抽没用过的题，用完后按最久未用的顺序复用；训练过或展示给编辑者看过的题不再当信号：
+规则：**循环只看训练集，benchmark 只做留出评测。** 每个领域只用一个训练集（2026-11-19 定）。
+
+| 领域 | 训练集 | 抽样池 / 验收集 | 留出评测集 |
+|---|---|---|---|
+| 数学 | DAPO-Math-17K | 15,314 / 1,000 | MATH-500、GSM8K test、AIME 24+25 |
+| 代码 | TACO-verified（参考解都跑过测试；先例 EvoTrainer、ReVeal） | 9,806 / 1,000 | HumanEval+、MBPP+、LiveCodeBench |
+| 知识 | TriviaQA train | 70,725 / 3,000 | GPQA-Diamond、MMLU-Pro（2,000）、TriviaQA（2,000） |
+| 指令遵循 | RLVR-IFeval（24 种 IFEval 类约束，可判分） | 13,954 / 1,000 | IFEval 271、IFBench 300（领域外） |
+| 工具调用 | Seal-Tools train | 11,019 / 1,000 | Seal-Tools test、API-Bank test、BFCL |
+
+- **验收集动态切分**：数据文件里每个训练集只是一个整体的抽样池；每次运行开始时，`data/scripts/draw.py` 按配置里的 `gate_n` 从池里切出固定验收集，写到运行目录 `draws/gate/`，之后每代都用这一份。切分只由 `gate.seed`（20261118）和各领域的 `gate_n` 决定，所以验收集大小相同的运行，验收集完全一样，和实验种子无关。改大小只要改配置，不用重切数据。
+- **每代抽样**：从验收集以外的池子里抽（数学 / 知识 / 指令 / 工具 2,000，代码 1,000；`n`）。可以跨代复用：先抽没用过的，用完后按最久未用的顺序复用；训练过或展示给编辑者看过的题不再当信号。
   - A：全部作信号，另抽 256 段作 KL / 校准文本；
-  - B：目标领域 80% 作梯度训练数据、20% 作信号，其余领域各 400 题作保留探针。
+  - B：目标领域 80% 作梯度训练数据、20% 作信号，其余领域各 400 题作保留探针；
   - 代内分两阶段评测：每个候选先跑 200 题，前 3 名再跑完整一批。
-- 抽样代码 `data/scripts/draw.py`，配置 `data/draw/paper_{a,b}.yaml`。
-
-| 领域 | 训练集 | 留出评测集 |
-|---|---|---|
-| 数学 | GSM8K train、MATH train、DAPO-Math-17K | MATH-500、GSM8K test、AIME 24+25 |
-| 代码 | **TACO-verified**（10,806 题，参考解都跑过测试；唯一的代码训练集，先例 EvoTrainer、ReVeal） | HumanEval+、MBPP+、LiveCodeBench |
-| 知识 | ARC train、TriviaQA train；GPQA Main（去掉 Diamond，250 题只作验收） | GPQA-Diamond、MMLU-Pro（2,000）、TriviaQA（2,000） |
-| 指令遵循 | RLVR-IFeval（14,970 条，24 种 IFEval 类约束，可判分）；IFEval 的 135 条作验收 | IFEval 其余 271、IFBench 300（领域外） |
-| 工具调用 | Seal-Tools train | Seal-Tools test、API-Bank test、BFCL |
-
+- 配置：`data/draw/paper_{a,b}.yaml`（`gate_n`、`n`、`gate.seed`、`seed`）。
 - 训练集在切分前已对全部留出集去污染（精确匹配 + 13-gram 近似重复）。
 - 数据依据和条数见 `plan/research/DATA_CONFIG.md`，实现见 `data/README.md`。
 
@@ -47,6 +46,8 @@
 - **当前模型 M_t vs 冻结的 M_0** 当改造者：差值 = 权重被自己改过带来的变化；
 - **带搜索记录 vs 不带**：差值 = 经验积累带来的变化。
 
+**种子**：只跑单种子 42（抽题、改造者采样、评测解码都用 42；数据切分固定用 20261118）。置信区间用按题目的配对 bootstrap。
+
 **反馈规则**：
 - 不用模型自评；判分全部确定性（精确匹配、单元测试、规则检查）。
 - 门槛相对第 0 代。
@@ -59,18 +60,17 @@
 
 | 项 | 内容 |
 |---|---|
-| 每代做什么 | M_t 写量化方案（每组模块的比特、group size、量化器、校准数据），**直接量化自己当前的权重**，得到 M_{t+1} |
-| 预算序列 | 16 → 12 → 10 → 8 GiB |
+| 每代做什么 | 冻结的改造者 M_0 写量化方案（每组模块的比特、group size、量化器），**从原始权重量化自己的一份拷贝**；比当前最好的量化（incumbent）好才替换（2026-11-19 修订） |
+| 体积 | 所有代同一个；默认 = 统一 3 bit GPTQ（词嵌入和输出层 8 bit）的大小，它也是起点 Q_0 |
 | L1 反馈 | 训练文本上相对 BF16 的 KL（按领域）；五个领域信号切片的分数、误调用 / 漏调用率；大小和速度 |
-| L2 验收 | 五个领域验收切片相对第 0 代：平均 ≥ 0.8 倍，单项 ≥ 0.7 倍；大小 ≤ 预算 |
-| E_t | 固定任务：在 12 GiB 下压缩 BF16 原模型 S，看留出 KL 和留出分数 |
-| 主要结果 | 自压缩深度 D（五个领域都 ≥ 第 0 代 95% 的连续代数）；E_t 曲线；经验抵消退化的交叉点 |
-| 对照 | "从 S 重新量化"vs"在自己身上继续量化"（拆出重复量化的损伤）；冻结改造者 M_0；不带搜索记录 |
+| L2 验收 | 大小 ≤ 体积，且在验收集上逐题配对比 incumbent 好：平均提升 ≥ 0.005，至少一个领域显著变好、没有领域显著变差；否则保留 incumbent，连续 2 代没有提升就停 |
+| 主要结果 | 固定体积下验收分和留出分随代数的曲线；追回的差距 =（最终 − Q_0）/（M_0 − Q_0） |
+| 对照 | 不带经验（`archive.enabled=false`）；不冻结改造者（由当前 incumbent 来写，`loop.editor=current`） |
 | 基线 | 统一量化、KL 背包求解、KL + 行为背包求解、EvoPress、GAMMA |
 
 ---
 
-## 4. B：自写 LoRA（Qwen3-8B，扩展到 27B）
+## 4. B：自写 LoRA（Qwen3.8-27B，和 A 用同一个模型）
 
 | 项 | 内容 |
 |---|---|
@@ -113,4 +113,4 @@
 根目录三个入口脚本：
 - `setup_env.sh cpu|gpu|sandbox|all`（`--check` 只查不装）：GPU 环境为 verl 0.9.1 · vLLM 0.24.0 · Transformers 5.9.0 · PyTorch 2.11.0 + cu130；
 - `download_data.sh`：按固定版本重建全部数据（GPQA 用你自己的 HF 登录）；
-- `download_models.sh [--list|--dry-run]`：Qwen3.8-27B、Qwen3-8B（默认），Qwen3.6-27B、Gemma-4-31B-it（可选），下载到 `$MODELS_DIR`。
+- `download_models.sh [--list|--dry-run]`：Qwen3.8-27B（默认，两篇都用），Qwen3-8B、Qwen3.6-27B、Gemma-4-31B-it（可选），下载到 `$MODELS_DIR`。

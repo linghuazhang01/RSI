@@ -1,0 +1,212 @@
+"""Scoring (via eval/run_eval.py), paired bootstrap, and prompt-logprob token KL.
+
+score() runs eval/run_eval.py in a subprocess with the eval interpreter (config.eval_python()),
+--ids-file (temp file under out_dir/_ids), --no-cache and --quiet. Use one out_dir per (model, stage):
+run_eval merges into <out_dir>/summary.json, so two concurrent score() calls must not share an out_dir.
+Code tasks stay status=pending_sandbox (score None) when Docker is unavailable; mock mode always
+passes --no-sandbox (never starts Docker). seed / temperature override the task's decoding (run_eval
+--seed / --temperature); the seed only reaches the server for sampled decoding (temperature > 0).
+
+Token KL uses vLLM's /v1/completions with `prompt_logprobs=k` (an extra sampling param that vLLM's
+OpenAI server accepts in the request body); the response's choices[0].prompt_logprobs is a list
+(first entry null) of {token_id: {"logprob", "rank", "decoded_token"}} with the top-k tokens plus the
+actual prompt token. Server must allow k <= --max-logprobs (vLLM default 20).
+"""
+import hashlib
+import json
+import math
+import random
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import _net
+from .config import EVAL_DIR, eval_python
+from .draws import DOMAIN_TRAIN
+
+RUN_EVAL = EVAL_DIR / "run_eval.py"
+
+
+@dataclass
+class EvalResult:
+    summary: dict              # this task's entry of run_eval's summary.json
+    records: list[dict]        # per-unit records (id, score, ...)
+    out_dir: Path
+
+    @property
+    def accuracy(self):
+        return self.summary.get("accuracy")
+
+
+def domain_eval_tasks(domain: str) -> list[str]:
+    if domain == "all":
+        return [t for d in DOMAIN_TRAIN.values() for t in d]
+    return list(DOMAIN_TRAIN[domain])
+
+
+def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
+          lora: str | None = None, extra: list[str] = (), mock: bool = False,
+          seed: int | None = None, temperature: float | None = None) -> EvalResult:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [eval_python(), "-I", str(RUN_EVAL), "--task", task, "--pool", pool, "--endpoint", endpoint,
+           "--model", served_name, "--out", str(out_dir), "--no-cache", "--quiet"]
+    if ids is not None:
+        ids = sorted(set(ids))
+        if not ids:
+            return EvalResult({"accuracy": None, "n": 0, "n_pending": 0, "note": "empty id list"}, [], out_dir)
+        blob = json.dumps(ids)
+        idf = out_dir / "_ids" / f"{task}.{hashlib.sha256(blob.encode()).hexdigest()[:12]}.json"
+        idf.parent.mkdir(exist_ok=True)
+        idf.write_text(blob)
+        cmd += ["--ids-file", str(idf)]
+    if lora:
+        cmd += ["--lora", lora]
+    if seed is not None:
+        cmd += ["--seed", str(int(seed))]
+    if temperature is not None:
+        cmd += ["--temperature", str(float(temperature))]
+    if mock and "--no-sandbox" not in extra:
+        cmd += ["--no-sandbox"]
+    cmd += [str(x) for x in extra]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"run_eval failed ({r.returncode}): {' '.join(cmd)}\n{r.stdout[-2000:]}\n{r.stderr[-4000:]}")
+    summ_all = json.loads((out_dir / "summary.json").read_text()) if (out_dir / "summary.json").exists() else {}
+    if task not in summ_all:  # e.g. "no items in pool"
+        return EvalResult({"accuracy": None, "n": 0, "n_pending": 0, "note": r.stdout[-500:]}, [], out_dir)
+    recs = [json.loads(l) for l in (out_dir / f"{task}.jsonl").read_text().splitlines() if l.strip()]
+    return EvalResult(summ_all[task], recs, out_dir)
+
+
+# ----------------------------------------------------------------------------- paired bootstrap
+def _per_id(records: list[dict]) -> dict:
+    per = {}
+    for r in records:
+        if r.get("score") is not None:
+            per.setdefault(r["id"], []).append(float(r["score"]))
+    return {k: sum(v) / len(v) for k, v in per.items()}
+
+
+def paired_delta(a: list[dict], b: list[dict], seed: int = 42, n_boot: int = 1000) -> dict:
+    """delta = mean over shared ids of (b - a) (b = candidate, a = reference); 95% percentile bootstrap
+    CI resampling ids. Units of one id are averaged first; pending (score None) records are skipped."""
+    pa, pb = _per_id(a), _per_id(b)
+    common = sorted(set(pa) & set(pb))
+    if not common:
+        return {"delta": None, "ci": [None, None], "n": 0}
+    d = [pb[i] - pa[i] for i in common]
+    n = len(d)
+    rng = random.Random(seed)
+    boots = sorted(sum(d[rng.randrange(n)] for _ in range(n)) / n for _ in range(n_boot))
+    lo, hi = boots[int(0.025 * (n_boot - 1))], boots[int(math.ceil(0.975 * (n_boot - 1)))]
+    return {"delta": sum(d) / n, "ci": [lo, hi], "n": n}
+
+
+# ----------------------------------------------------------------------------- prompt logprobs / KL
+def _sha(t: str) -> str:
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+def _prompt_logprobs(endpoint: str, model: str, text: str, top_k: int) -> list:
+    """-> list over positions of [ids], [logprobs] (position 0 has none)."""
+    url = endpoint.rstrip("/") + "/completions"
+    payload = {"model": model, "prompt": text, "max_tokens": 1, "temperature": 0.0, "prompt_logprobs": top_k}
+    last = None
+    for attempt in range(4):
+        try:
+            resp = _net.post_json(url, payload, timeout=1800)
+            break
+        except (_net.HTTPError, OSError) as e:
+            last = e
+            if isinstance(e, _net.HTTPError) and e.status < 500:
+                raise
+            time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(f"prompt_logprobs request failed: {last}")
+    ch = (resp.get("choices") or [{}])[0]
+    plp = ch.get("prompt_logprobs") if ch.get("prompt_logprobs") is not None else resp.get("prompt_logprobs")
+    if plp is None:
+        raise RuntimeError("server returned no prompt_logprobs (is this vLLM >= 0.6 / the mock server?)")
+    out = []
+    for pos in plp:
+        if not pos:
+            out.append([[], []])
+            continue
+        items = sorted(pos.items(), key=lambda kv: kv[1].get("rank") or 10 ** 9)
+        out.append([[int(k) for k, _ in items], [round(float(v["logprob"]), 5) for _, v in items]])
+    return out
+
+
+def _fetch_many(endpoint, model, texts, top_k, workers=8):
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(lambda t: _prompt_logprobs(endpoint, model, t, top_k), texts))
+
+
+def _load_cache(cache: Path) -> dict:
+    d = {}
+    if Path(cache).exists():
+        for line in Path(cache).read_text().splitlines():
+            if line.strip():
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                d[(r["sha"], r["top_k"])] = r["pos"]
+    return d
+
+
+def reference_logprobs(endpoint, served_name, texts: list[str], cache: Path, top_k: int = 20) -> Path:
+    """Fetch (once) the reference model's prompt logprobs for `texts`; cached in `cache` (jsonl of
+    {"sha", "top_k", "pos": [[ids], [logprobs]] per position})."""
+    cache = Path(cache)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    have = _load_cache(cache)
+    todo = [t for t in dict.fromkeys(texts) if (_sha(t), top_k) not in have]
+    if todo:
+        res = _fetch_many(endpoint, served_name, todo, top_k)
+        with open(cache, "a") as f:
+            for t, pos in zip(todo, res):
+                f.write(json.dumps({"sha": _sha(t), "top_k": top_k, "model": served_name, "pos": pos}) + "\n")
+    return cache
+
+
+def _kl_position(ref_ids, ref_lps, cand: dict) -> float:
+    """KL(ref || cand) on the partition {each ref-reported token} + {rest}. Tokens missing from the
+    candidate's list get the candidate's smallest reported logprob (an upper bound on their prob)."""
+    if not ref_ids:
+        return 0.0
+    floor = min(cand.values()) if cand else -30.0
+    kl, P, Q = 0.0, 0.0, 0.0
+    for i, lp in zip(ref_ids, ref_lps):
+        p, q_lp = math.exp(lp), cand.get(i, floor)
+        kl += p * (lp - q_lp)
+        P += p
+        Q += math.exp(q_lp)
+    rp, rq = max(0.0, 1.0 - P), max(1e-12, 1.0 - min(Q, 1.0 - 1e-9))
+    if rp > 1e-12:
+        kl += rp * (math.log(rp) - math.log(rq))
+    return max(0.0, kl)
+
+
+def token_kl(ref_cache: Path, endpoint, served_name, texts: list[str], lora: str | None = None,
+             top_k: int = 20) -> dict:
+    """Top-k approximate token KL(ref || cand) per text (mean over positions); "mean" = mean over texts,
+    "token_mean" = mean over all positions. Candidate = `lora` if given, else `served_name`."""
+    ref = _load_cache(ref_cache)
+    missing = [t for t in texts if (_sha(t), top_k) not in ref]
+    if missing:
+        raise KeyError(f"{len(missing)} texts not in reference cache {ref_cache}; call reference_logprobs first")
+    cand_all = _fetch_many(endpoint, lora or served_name, texts, top_k)
+    per_text, tot, ntok = [], 0.0, 0
+    for t, cpos in zip(texts, cand_all):
+        rpos = ref[(_sha(t), top_k)]
+        L = min(len(rpos), len(cpos))
+        kls = [_kl_position(rpos[j][0], rpos[j][1], dict(zip(cpos[j][0], cpos[j][1]))) for j in range(L) if rpos[j][0]]
+        per_text.append(sum(kls) / len(kls) if kls else 0.0)
+        tot += sum(kls)
+        ntok += len(kls)
+    return {"mean": sum(per_text) / len(per_text) if per_text else 0.0, "token_mean": tot / ntok if ntok else 0.0,
+            "per_text": per_text, "n_texts": len(texts), "n_tokens": ntok, "top_k": top_k}

@@ -1,0 +1,161 @@
+# Paper A (iterative self-quantization at a fixed size, 2026-11-19) -- base config. Merged with configs/domains/<domain>.yaml and
+# --set KEY=VALUE overrides by rsicore.config.load_run_config (locked in run_config.yaml).
+# Values marked [pilot] are assumptions to be fixed in A-P0.
+
+draw_config: data/draw/paper_a.yaml
+
+# One fixed size for every generation. Every candidate quantizes the ORIGINAL BF16 model M_0 (the layer
+# cache is built once); generation g must beat the incumbent (best accepted quantization so far).
+budget:
+  gib: null                           # explicit packed GiB (overrides `reference`); CLI --budget-gib
+  reference:                          # null gib -> budget = packed size of this config; it is also the
+    default: {bits: 3, group_size: 128, quantizer: gptq}   # starting incumbent Q_0 (uniform W3 GPTQ)
+    embed: 8
+    lm_head: 8
+
+loop:
+  editor: frozen                      # frozen: M_0 (BF16) writes every generation; current: the incumbent (ablation)
+  patience: 2                         # stop after this many consecutive generations without a new incumbent
+
+action_space:                         # what a config may use
+  bits: [2, 3, 4, 8, 16]              # 16 = keep BF16
+  group_sizes: [32, 64, 128]
+  quantizers: [rtn, gptq, awq]        # awq = AWQ-lite (activation-aware channel scaling, RTN grid)
+  embed: [bf16, 8, 4]
+  lm_head: [bf16, 8, 4]
+
+search:                               # inner search (RSI_LOOP_DESIGN §1.2)
+  threads: 4
+  steps: 6
+  max_evaluate: 24                    # evaluations per generation: candidates + api.evaluate calls
+  program_evaluate_calls: 2           # max api.evaluate calls inside one program
+  top_full: 3                         # best screened candidates re-evaluated on the full signal set
+  rerun_seeds: 0
+  kl_weight: 0.5                      # score = mean retention vs current model - kl_weight * KL  [pilot]
+
+gate:                                 # L2: beat the incumbent on the fixed gate set (paired per item)
+  min_delta: 0.005                    # mean paired gain over gate datasets
+  require_significant: true           # some dataset 95% CI lower bound > 0, none with upper bound < 0
+  max_submissions: 3
+  allow_unscored: false               # true lets a gate with no scored items pass (code w/o Docker)
+
+feedback:
+  examples: 2                         # regression examples per dataset in screen feedback (marked shown)
+  parent_full: true                   # score the current model on the full signal set (paired deltas)
+
+noise:
+  repeats: 3                          # M_0 screen re-runs for the noise band
+  temperature: 0.6                    # sampled re-runs (seeds seed, seed+1, ...); greedy repeats are identical
+
+kl:
+  domains: all                        # KL/calibration texts from all five domains' `kl` draw (or: run)
+  top_k: 20                           # vLLM prompt_logprobs top-k (<= --max-logprobs)
+  max_chars: 8000
+  self_generated: false               # append the reference model's greedy response to each KL prompt
+  self_generated_max_tokens: 512
+
+calibration:                          # Hessians for GPTQ / AWQ (original model, generation-0 kl texts, once)
+  max_texts: 256
+  max_len: 2048
+  layers_per_pass: 16                 # window of layers per calibration pass (fp32 Hessians ~1.6 GB/layer)
+
+diagnostics:
+  profile_bits: [2, 3, 4, 8]
+  profile_group_size: 128
+  profile_contexts: 32                # subsample of KL contexts for the profile table
+  profile_max_len: 512
+
+cache:
+  device: cuda                        # cuda -> cuda:<gpus[1]>; or cpu
+  lazy: true                          # compute missing (module, quantizer, bits, gs) entries on demand
+  gptq_damp: 0.01
+  # the cache (run_dir/prep/) is built once from M_0 and reused by every generation
+  warm:                               # precomputed for every module in the prep step
+    - {quantizer: rtn, bits: 2, group_size: 128}
+    - {quantizer: rtn, bits: 3, group_size: 128}
+    - {quantizer: rtn, bits: 4, group_size: 128}
+    - {quantizer: rtn, bits: 8, group_size: 128}
+    - {quantizer: gptq, bits: 2, group_size: 128}
+    - {quantizer: gptq, bits: 3, group_size: 128}
+    - {quantizer: gptq, bits: 4, group_size: 128}
+    - {quantizer: gptq, bits: 8, group_size: 128}
+
+candidates:
+  keep_checkpoints: 1                 # fake-quant candidate checkpoints kept on disk (~54 GB each)
+
+bytes:
+  count_visual: true                  # vision tower counted (BF16) in the packed size
+
+tools:                                # ablations: remove tools from the editor's API
+  profile_table: true
+  activation_table: true
+  solve_allocation: true
+
+solver:
+  group_sizes: [128]                  # group sizes solve_allocation chooses from by default (KL-greedy baseline)
+  group_size_factor: {128: 1.0, 64: 0.8, 32: 0.65}   # damage scaling vs the profiled g128 [pilot]
+
+editor:
+  temperature: 0.6
+  top_p: 0.95
+  max_tokens: 16384
+  extra_body: {}
+
+sandbox:
+  timeout_s: 1800                     # includes time inside api.evaluate calls
+  mem_gb: 16
+
+archive:
+  enabled: true                       # experience channel: earlier rounds' incumbents + top candidates in context
+  top_candidates: 3
+
+heldout:
+  limit: null                         # per-task item limit (null = full held-out sets)
+
+e_task:                               # editor-capability task E_t: a fresh session (no archive) of this
+  enabled: false                      # generation's editor on the fixed-size task; only informative with
+  budget_gib: null                    # loop.editor=current (null = the main budget)
+  evaluate: 24
+  threads: 4
+  steps: 6
+  top_full: 1
+  heldout_limit: 200
+
+baselines:
+  methods: []                         # e.g. [uniform, kl_greedy, evo]; run after the search each generation
+  full: false
+  evo_evaluations: 24
+
+vllm:
+  editor_args: [--gpu-memory-utilization, "0.90", --max-model-len, "32768", --max-logprobs, "20"]
+  candidate_args: [--gpu-memory-utilization, "0.55", --max-model-len, "20480", --max-logprobs, "20"]
+
+
+# Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
+# cards. A profile is merged on top of everything else (before mock_overrides).
+hardware: b300
+hardware_profiles:
+  b300: {}
+  h20:                                # 80 GB H20, Qwen3.8-27B (BF16 ~52 GB): one full model per card, 2 cards per run
+    gpu_roles: {editor: [0], candidate: [1]}   # 4 cards: {editor: [0, 1], candidate: [2, 3]} (tensor parallel 2)
+    vllm:                             # 0.92 x 80 GB - 52 GB weights leaves ~15 GB for KV cache + GDN states
+      editor_args: [--gpu-memory-utilization, "0.92", --max-model-len, "32768", --max-num-seqs, "32", --max-logprobs, "20"]
+      candidate_args: [--gpu-memory-utilization, "0.92", --max-model-len, "20480", --max-num-seqs, "32", --max-logprobs, "20"]
+    calibration:
+      layers_per_pass: 4              # fp32 Hessians ~1.6 GB/layer next to the 52 GB HF model on the candidate card
+      max_len: 2048
+    diagnostics:
+      profile_contexts: 16
+
+mock:
+  base_quality: 0.8                   # mock accuracy of M_0
+  lam: 1.2                            # quality = base * exp(-lam * accumulated damage)
+
+mock_overrides:                       # applied in --mock runs only (fast local end-to-end check)
+  search: {threads: 2, steps: 2, max_evaluate: 4, top_full: 1, program_evaluate_calls: 1}
+  noise: {repeats: 3}
+  heldout: {limit: 20}
+  e_task: {threads: 1, steps: 2, evaluate: 2, top_full: 1, heldout_limit: 20}
+  gate: {allow_unscored: true, min_delta: 0.002}
+  baselines: {methods: [uniform, kl_greedy]}
+  sandbox: {timeout_s: 300, mem_gb: 4}

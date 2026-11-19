@@ -16,7 +16,11 @@ Roles written per domain:
            stage), kl (KL / calibration contexts, disjoint from signal when the pool allows)
   Paper B: target domain -> train (gradient-tool data) + signal + screen
            other domains -> signal (retention probes) + screen + kl (token-KL prompts)
-The fixed gate (data/splits/<dataset>/gate.json) and the held-out test pools are never drawn.
+Fixed gate (revised 2026-11-19: split dynamically from the config): before the first draw, each
+domain's `gate_n` items are taken from its training pool (data/splits/<dataset>/pool.json),
+deterministically from `gate.seed` (default 20261118) and the gate sizes only -- so every run with
+the same gate sizes gets the same gate, whatever its experiment seed. The gate is written to
+draws/gate/ and is never drawn for anything else; held-out test pools are never touched.
 
 Usage (run with -I; nothing here executes downloaded data):
   PY="eval/.venv/bin/python -I"
@@ -24,6 +28,8 @@ Usage (run with -I; nothing here executes downloaded data):
   $PY data/scripts/draw.py --run experiment_records/<run_id> --gen 1                 # config is locked in the run
   $PY data/scripts/draw.py --run experiment_records/<run_id> --gen 0 --target math    # Paper B
   $PY data/scripts/draw.py --run experiment_records/<run_id> --gen 1 --export-jsonl   # also write item JSONL
+  $PY data/scripts/draw.py --run experiment_records/<run_id> --gate-only --config data/draw/paper_a.yaml
+      # split and write the fixed gate only (e.g. to evaluate generation 0 on the gate first)
   $PY data/scripts/draw.py --run experiment_records/<run_id> --status
   $PY data/scripts/draw.py --run experiment_records/<run_id> --gen 1 --mark-shown shown.json
       # shown.json = {"<dataset>": ["<id>", ...]}: items whose content was shown to the editor in
@@ -101,6 +107,7 @@ class Store:
 
     def __init__(self):
         self._rows, self._pools = {}, {}
+        self.gate = {}  # ds -> set(ids) excluded from every draw
 
     def rows(self, ds):
         if ds not in self._rows:
@@ -109,6 +116,12 @@ class Store:
         return self._rows[ds]
 
     def pool(self, ds):
+        """Draw pool = split pool minus this run's fixed gate."""
+        full = self.full_pool(ds)
+        g = self.gate.get(ds)
+        return [i for i in full if i not in g] if g else full
+
+    def full_pool(self, ds):
         if ds not in self._pools:
             p = SPL / ds / "pool.json"
             if not p.exists():
@@ -262,6 +275,67 @@ def draw_generation(cfg, run_name, gen, ledger, store, target=None):
     return domains, problems
 
 
+def compute_gate(cfg, store):
+    """Fixed gate per domain: `gate_n` items split over the domain's datasets by weight, stratified by
+    `stratify_by`, chosen with an RNG seeded only by gate.seed, dataset and stratum (not by the run)."""
+    gseed = (cfg.get("gate") or {}).get("seed", 20261118)
+    out = {}
+    for d, dc in cfg["domains"].items():
+        n = int(dc.get("gate_n", 0))
+        if n <= 0:
+            continue
+        weights = {ds: float(w) for ds, w in dc["datasets"].items()}
+        caps = {ds: len(store.full_pool(ds)) for ds in weights}
+        a = alloc(weights, n, caps)
+        if sum(a.values()) < n:
+            sys.exit(f"gate for {d}: pools too small for gate_n={n}")
+        out[d] = {}
+        key = dc.get("stratify_by")
+        for ds, k in a.items():
+            if not k:
+                continue
+            rows = store.rows(ds)
+            by = defaultdict(list)
+            for i in store.full_pool(ds):
+                by[str(rows[i]["metadata"].get(key)) if key else "_"].append(i)
+            sizes = {st: len(v) for st, v in by.items()}
+            per = alloc(sizes, k, caps=sizes)
+            ids = []
+            for st in sorted(by):
+                lst = sorted(by[st])
+                random.Random(f"{gseed}:gate:{ds}:{st}").shuffle(lst)
+                ids += lst[:per[st]]
+            out[d][ds] = sorted(ids)
+    return out
+
+
+def load_or_make_gate(ddir, cfg, store):
+    """Write draws/gate/ on first use; afterwards verify it is unchanged. Installs it in `store`."""
+    gate = compute_gate(cfg, store)
+    gdir = ddir / "gate"
+    man = gdir / "manifest.json"
+    if man.exists():
+        old = json.load(open(man))["domains"]
+        if old != gate:
+            sys.exit(f"{man} differs from the gate implied by the locked config and current pools "
+                     "(re-split?). Start a new run.")
+    else:
+        gdir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(man, {"seed": (cfg.get("gate") or {}).get("seed", 20261118),
+                                "sizes": {d: sum(len(v) for v in g.values()) for d, g in gate.items()},
+                                "domains": gate})
+        per = defaultdict(list)
+        for g in gate.values():
+            for ds, ids in g.items():
+                per[ds] += ids
+        for ds, ids in per.items():
+            write_json_atomic(gdir / f"{ds}.gate.json", sorted(ids))
+    for g in gate.values():
+        for ds, ids in g.items():
+            store.gate.setdefault(ds, set()).update(ids)
+    return gate
+
+
 def merge(a, b):
     out = {ds: list(v) for ds, v in a.items()}
     for ds, v in b.items():
@@ -315,7 +389,9 @@ def status(run: Path):
     cfg = yaml.safe_load(open(ddir / "draw_config.yaml"))
     led = load_ledger(ddir / "ledger.json")
     store = Store()
+    gate = load_or_make_gate(ddir, cfg, store)
     print(f"run {run.name}  paper {cfg['paper']}  generations {sorted(int(g) for g in led['gens'])}")
+    print("  fixed gate: " + "  ".join(f"{d}:{sum(len(v) for v in g.values())}" for d, g in gate.items()))
     for g in sorted(led["gens"], key=int):
         m = json.load(open(ddir / f"gen_{int(g):02d}" / "manifest.json"))
         print(f"  gen {int(g):2d} target={m.get('target')} " +
@@ -365,13 +441,14 @@ def main():
     ap.add_argument("--export-jsonl", action="store_true")
     ap.add_argument("--force", action="store_true", help="redraw the LATEST generation")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--gate-only", action="store_true", help="only split / verify the fixed gate")
     ap.add_argument("--mark-shown", metavar="JSON",
                     help='record items shown to the editor in --gen: {"<dataset>": ["<id>", ...]}')
     a = ap.parse_args()
     run = Path(a.run).resolve()
     if a.status:
         return status(run)
-    if a.gen is None or a.gen < 0:
+    if a.gen is None and not a.gate_only or (a.gen is not None and a.gen < 0):
         sys.exit("--gen N (>= 0) is required")
     if a.mark_shown:
         return mark_shown(run, a.gen, Path(a.mark_shown))
@@ -386,11 +463,16 @@ def main():
             sys.exit("first draw of a run needs --config (e.g. data/draw/paper_a.yaml)")
         shutil.copyfile(a.config, locked)
     cfg = yaml.safe_load(open(locked))
+    store = Store()
+    gate = load_or_make_gate(ddir, cfg, store)
+    if a.gate_only:
+        print("fixed gate -> " + str(ddir / "gate") + "  " +
+              "  ".join(f"{d}:{sum(len(v) for v in g.values())}" for d, g in gate.items()))
+        return 0
     led_path = ddir / "ledger.json"
     ledger = load_ledger(led_path)
     gens = sorted(int(g) for g in ledger["gens"])
     gdir = ddir / f"gen_{a.gen:02d}"
-    store = Store()
 
     if a.gen in gens and not a.force:
         m = json.load(open(gdir / "manifest.json"))
@@ -429,6 +511,9 @@ def main():
             for ds, lst in ids.items():
                 pool = set(store.pool(ds))
                 assert all(i in pool for i in lst), f"{d}/{role}/{ds}: id outside draw pool"
+        for role, ids in info["roles"].items():
+            for ds, lst in ids.items():
+                assert not (set(lst) & store.gate.get(ds, set())), f"{d}/{role}/{ds}: drew a gate item"
         sig = {(ds, i) for ds, v in info["roles"].get("signal", {}).items() for i in v}
         scr = {(ds, i) for ds, v in info["roles"]["screen"].items() for i in v}
         assert scr <= sig, f"{d}: screen is not a subset of signal"

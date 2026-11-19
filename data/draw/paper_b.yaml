@@ -2,9 +2,10 @@
 # given on the command line (--target). Copied into the run directory and locked on the first draw.
 # Config knobs: `n` per domain = items drawn per generation for the target domain (split by
 # `target_train_frac` into train / signal); `retention_n` for the other domains; `screen_n`; `retention_kl`.
-# The FIXED gate size is set in data/splits/split_config.yaml (`gate_domains`), not here.
+# Fixed gate: `gate_n` per domain, split dynamically from the training pool before the first draw
+# (data/scripts/draw.py); `gate.seed` keeps the same gate across runs with the same gate sizes.
 paper: B
-seed: 20261118
+seed: 42                 # experiment seed (2026-11-19: single seed 42); data splits keep their own seed 20261118
 screen_n: 200            # per domain: stratified subset of `signal` for the first-stage evaluation
 target_train_frac: 0.8   # target domain: 80% of the draw -> `train` (gradient-tool data), 20% -> `signal`
 retention_n: 400         # every other domain: `signal` items used as retention probes
@@ -12,21 +13,28 @@ retention_kl: 64         # every other domain: prompts for token-KL vs the curre
 reuse:                   # revised 2026-11-19: training data is reusable across generations
   across_generations: true          # never-used items first, then least recently used
   never_signal_after: [train, shown] # once trained on (Paper B) or shown to the editor, never signal again
+gate:
+  seed: 20261118         # fixed: identical gate in every run that uses the same gate_n values
 domains:
   math:
     n: 2000
-    datasets: {gsm8k_train: 0.25, math_train: 0.35, dapo_math: 0.40}
+    gate_n: 1000
+    datasets: {dapo_math: 1.0}
   code:
     n: 1000
-    datasets: {taco_verified: 1.0}   # single code training set (2026-11-19)
+    gate_n: 1000
+    datasets: {taco_verified: 1.0}
     stratify_by: difficulty
   knowledge:
     n: 2000
-    datasets: {triviaqa_train: 0.5, arc: 0.5}
+    gate_n: 3000
+    datasets: {triviaqa_train: 1.0}
   instruction_following:
     n: 2000
+    gate_n: 1000
     datasets: {ifeval_train: 1.0}
     stratify_by: constraint_type
   tool_calling:
     n: 2000
+    gate_n: 1000
     datasets: {sealtool_train: 1.0}

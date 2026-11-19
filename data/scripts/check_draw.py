@@ -47,9 +47,17 @@ def ids_of(info, role):
     return {(ds, i) for ds, v in info["roles"].get(role, {}).items() for i in v}
 
 
+def gate_of(run):
+    m = json.load(open(run / "draws" / "gate" / "manifest.json"))
+    return {(ds, i) for g in m["domains"].values() for ds, ids in g.items() for i in ids}, m
+
+
 def policy_checks(run, gens, shown_by_gen):
     """shown_by_gen: {gen: set((ds, id))} marked shown after drawing that generation."""
     led = json.load(open(run / "draws" / "ledger.json"))
+    gate, _ = gate_of(run)
+    for ds in led["items"]:
+        check(not ({(ds, i) for i in led["items"][ds]} & gate), f"{ds}: a gate item was drawn")
     for ds in led["items"]:
         pool = set(json.load(open(ROOT / "data" / "splits" / ds / "pool.json")))
         check(set(led["items"][ds]) <= pool, f"{ds}: ledger has ids outside the pool")
@@ -131,6 +139,20 @@ def main():
     check(lines == cfg_a["domains"]["math"]["n"], "export-jsonl line count")
     r = draw(ra, "--gen", "1", "--mark-shown", str(base / "marks_a" / "shown_0.json"), ok=False)
     check(r.returncode != 0, "--mark-shown with ids from another generation must fail")
+
+    print("== fixed gate: sizes, independent of run name and experiment seed")
+    gate_a, gm = gate_of(ra)
+    for d, dc in cfg_a["domains"].items():
+        check(gm["sizes"].get(d, 0) == int(dc.get("gate_n", 0)), f"gate {d}: {gm['sizes'].get(d)} != {dc.get('gate_n')}")
+    cfg_seed = dict(cfg_a, seed=7)
+    alt_cfg = base / "paper_a_seed7.yaml"
+    yaml.safe_dump(cfg_seed, open(alt_cfg, "w"))
+    r_alt = base / "other_name_seed7"
+    draw(r_alt, "--gate-only", "--config", str(alt_cfg))
+    check(gate_of(r_alt)[0] == gate_a, "gate must not depend on run name or experiment seed")
+    draw(r_alt, "--gen", "0")
+    s_alt = ids_of(manifest(r_alt, 0)["domains"]["math"], "signal")
+    check(s_alt != ids_of(manifest(ra, 0)["domains"]["math"], "signal"), "a different seed should draw different items")
 
     print("== determinism (second directory, same run name, same mark-shown sequence)")
     rb = base / "copy" / "A_run"

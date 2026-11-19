@@ -48,11 +48,11 @@
   "pass": true
  },
  "gold/ifeval": {
-  "pool": "gate",
+  "pool": "reserve",
   "metric": "prompt_strict",
   "value": 1.0,
-  "n": 4,
-  "n_units": 4,
+  "n": 6,
+  "n_units": 6,
   "pass": true
  },
  "gold/ifbench": {
@@ -141,52 +141,20 @@
   "n_units": 100,
   "pass": true
  },
- "gold/gsm8k_train": {
-  "pool": "pool",
-  "metric": "accuracy",
-  "value": 1.0,
-  "n": 500,
-  "n_units": 500,
-  "pass": true
- },
- "gold/math_train": {
-  "pool": "gate",
-  "metric": "accuracy",
-  "value": 1.0,
-  "n": 350,
-  "n_units": 350,
-  "pass": true
- },
  "gold/dapo_math": {
   "pool": "pool",
   "metric": "accuracy",
   "value": 1.0,
-  "n": 800,
-  "n_units": 800,
-  "pass": true
- },
- "gold/arc": {
-  "pool": "pool",
-  "metric": "accuracy",
-  "value": 1.0,
-  "n": 1000,
-  "n_units": 1000,
-  "pass": true
- },
- "gold/gpqa_main": {
-  "pool": "gate",
-  "metric": "accuracy",
-  "value": 1.0,
-  "n": 250,
-  "n_units": 250,
+  "n": 300,
+  "n_units": 300,
   "pass": true
  },
  "gold/triviaqa_train": {
   "pool": "pool",
   "metric": "accuracy",
   "value": 1.0,
-  "n": 100,
-  "n_units": 100,
+  "n": 200,
+  "n_units": 200,
   "pass": true
  },
  "gold/sealtool_train": {
@@ -214,11 +182,11 @@
   "pass": true
  },
  "gold/oracle_stats": {
-  "requests": 8770,
-  "hits": 8510,
+  "requests": 8272,
+  "hits": 8012,
   "misses": 0,
   "judge": 260,
-  "collisions": 1765
+  "collisions": 350
  },
  "wrong/gsm8k": {
   "pool": "test",
@@ -269,11 +237,11 @@
   "pass": true
  },
  "wrong/ifeval": {
-  "pool": "gate",
+  "pool": "reserve",
   "metric": "prompt_strict",
   "value": 0.0,
-  "n": 4,
-  "n_units": 4,
+  "n": 6,
+  "n_units": 6,
   "pass": true
  },
  "wrong/ifbench": {
@@ -362,52 +330,20 @@
   "n_units": 100,
   "pass": true
  },
- "wrong/gsm8k_train": {
-  "pool": "pool",
-  "metric": "accuracy",
-  "value": 0.0,
-  "n": 500,
-  "n_units": 500,
-  "pass": true
- },
- "wrong/math_train": {
-  "pool": "gate",
-  "metric": "accuracy",
-  "value": 0.0,
-  "n": 350,
-  "n_units": 350,
-  "pass": true
- },
  "wrong/dapo_math": {
   "pool": "pool",
   "metric": "accuracy",
   "value": 0.0,
-  "n": 800,
-  "n_units": 800,
-  "pass": true
- },
- "wrong/arc": {
-  "pool": "pool",
-  "metric": "accuracy",
-  "value": 0.0,
-  "n": 1000,
-  "n_units": 1000,
-  "pass": true
- },
- "wrong/gpqa_main": {
-  "pool": "gate",
-  "metric": "accuracy",
-  "value": 0.0,
-  "n": 250,
-  "n_units": 250,
+  "n": 300,
+  "n_units": 300,
   "pass": true
  },
  "wrong/triviaqa_train": {
   "pool": "pool",
   "metric": "accuracy",
   "value": 0.0,
-  "n": 100,
-  "n_units": 100,
+  "n": 200,
+  "n_units": 200,
   "pass": true
  },
  "wrong/sealtool_train": {
@@ -435,10 +371,10 @@
   "pass": true
  },
  "wrong/oracle_stats": {
-  "requests": 8770,
-  "hits": 8510,
+  "requests": 8272,
+  "hits": 8012,
   "misses": 0,
   "judge": 260,
-  "collisions": 1765
+  "collisions": 350
  }
 }

@@ -1,0 +1,472 @@
+"""One quantization search problem = (source model, size budget, evaluation data, references).
+
+Paper A (fixed size, 2026-11-19): every problem quantizes the ORIGINAL BF16 model M_0 to the same
+budget; generation g tries to beat the incumbent (best accepted quantization so far). It owns: the model spec, the layer
+cache + diagnostics (prepare), config validation / sizing, candidate build (artifact), lazy
+fake-quant materialization, candidate serving (vLLM on the candidate GPU, or the mock server), and
+staged evaluation (screen / full / gate) with structured L1 feedback (RSI_LOOP_DESIGN §2.2).
+"""
+from __future__ import annotations
+
+import math
+import shutil
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+from . import mock as M
+from .common import (append_jsonl, config_hash, free_cuda, load_processed, read_json, read_jsonl, record_text,
+                     role_gpus, tail, write_json)
+from .diagnostics import bytes_table, load_tables, save_tables, summarize_profile
+from .quant import schema, sizes
+from .quant.spec import ModelSpec, spec_from_checkpoint, synthetic_spec
+
+DATASET_DOMAIN = {"dapo_math": "math", "taco_verified": "code", "triviaqa_train": "knowledge",
+                  "ifeval_train": "instruction_following", "sealtool_train": "tool_calling"}
+
+
+class EvalBudgetExhausted(RuntimeError):
+    pass
+
+
+def _mean_per_id(records: list[dict]) -> tuple[float | None, dict, int]:
+    per, pending = {}, 0
+    for r in records:
+        if r.get("score") is None:
+            pending += 1
+            continue
+        per.setdefault(r["id"], []).append(float(r["score"]))
+    per = {k: sum(v) / len(v) for k, v in per.items()}
+    return (sum(per.values()) / len(per) if per else None), per, pending
+
+
+class QuantProblem:
+    def __init__(self, rc, cfg: dict, *, tag: str, gen: int, out_dir: Path, prep_dir: Path,
+                 source_dir: Path | None, source_state: dict | None, budget_gib: float,
+                 datasets: list[str], data: dict, kl_texts: list[tuple[str, str]], kl_heldout: list[tuple[str, str]] = (),
+                 refs_dir: Path, noise: dict | None = None, gate_baseline: dict | None = None,
+                 eval_budget: int = 24, show_examples: int = 2, incumbent: dict | None = None, log=print):
+        from rsicore import evaluate as _ev  # noqa: F401  (fail early if rsicore is missing)
+        self.rc, self.cfg, self.tag, self.gen = rc, cfg, tag, gen
+        self.mock = bool(rc.mock)
+        self.out_dir, self.prep_dir, self.refs_dir = Path(out_dir), Path(prep_dir), Path(refs_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.source_dir = Path(source_dir) if source_dir else None
+        self.source_state = source_state
+        self.budget_gib = float(budget_gib)
+        self.datasets = list(datasets)
+        self.data = data                                  # {dataset: {"screen": ids, "signal": ids}}
+        self.kl_texts = list(kl_texts)                    # [(domain, text)]
+        self.kl_heldout = list(kl_heldout)
+        self.noise = noise or {}
+        self.gate_baseline = gate_baseline or {}
+        # incumbent = best accepted quantization so far: {"gen", "cid", "config", "gate": {ds: {"score", "records"}}}
+        self.incumbent = incumbent
+        self.incumbent_scores: dict = {}                  # {"screen": x, "full": y} on this problem's items
+        self.eval_budget = int(eval_budget)
+        self.show_examples = int(show_examples)
+        self.log = log
+        self.space = dict(schema.DEFAULT_ACTION_SPACE, **(cfg.get("action_space") or {}))
+        self.registry = Path(rc.run_dir) / "mock_registry.json"
+        self.spec: ModelSpec | None = None
+        self.tables: dict | None = None
+        self.cache = None
+        self.shown: dict[str, set] = {}
+        self._lock = threading.RLock()
+        self._evals = {}
+        for r in read_jsonl(self.out_dir / "evals.jsonl"):
+            self._evals[(r["hash"], r["stage"])] = r
+        self.parent_refs: dict = read_json(self.refs_dir / "refs.json", {}) or {}
+
+    # ------------------------------------------------------------------ bookkeeping
+    @property
+    def evals_used(self) -> int:
+        return sum(1 for (h, st), r in self._evals.items() if st == "screen" and r.get("charged", True))
+
+    @property
+    def evals_left(self) -> int:
+        return max(0, self.eval_budget - self.evals_used)
+
+    @property
+    def domains(self) -> list[str]:
+        return [DATASET_DOMAIN.get(d, d) for d in self.datasets]
+
+    # ------------------------------------------------------------------ preparation
+    def prepare(self):
+        """Spec, diagnostics and (real mode) the layer cache for the source model; cached in prep_dir."""
+        sp = self.prep_dir / "spec.json"
+        if sp.exists():
+            self.spec = ModelSpec.from_json(read_json(sp))
+        elif self.mock:
+            self.spec = synthetic_spec(self.cfg.get("mock", {}).get("spec"))
+        else:
+            self.spec = spec_from_checkpoint(self.source_dir, count_visual=self.cfg["bytes"].get("count_visual", True))
+        write_json(sp, self.spec.to_json())
+        dcfg = self.cfg["diagnostics"]
+        self.tables = load_tables(self.prep_dir / "diagnostics")
+        if self.tables is None:
+            if self.mock:
+                prof = M.profile_table(self.spec, self.source_state, dcfg["profile_bits"], dcfg["profile_group_size"])
+                act = M.activation_table(self.spec)
+                meta = {"mock": True}
+            else:
+                prof, act, meta = self._prepare_real()
+            self.tables = save_tables(self.prep_dir / "diagnostics", prof, act,
+                                      bytes_table(self.spec, [b for b in self.space["bits"] if b < 16],
+                                                  self.space["group_sizes"]), meta)
+        if not self.mock and self.cache is None:
+            self.cache = self._open_cache()
+        return self
+
+    def _device(self) -> str:
+        g = role_gpus(self.rc, self.cfg, "candidate")[0]
+        dev = self.cfg["cache"].get("device", "cuda")
+        return f"cuda:{g}" if dev == "cuda" else dev
+
+    def _open_cache(self):
+        from .quant.cache import QuantCache
+        return QuantCache(self.prep_dir / "cache", self.spec, self.source_dir, hessian_dir=self.prep_dir / "hessians",
+                          device=self._device(), damp=self.cfg["cache"].get("gptq_damp", 0.01),
+                          lazy=self.cfg["cache"].get("lazy", True), log=self.log)
+
+    def _prepare_real(self):  # GPU path on the cluster; exercised on CPU by tests/test_quant.py
+        import torch
+        from .diagnostics import activation_table_real, profile_table_real
+        from .quant.hessian import collect_stats, load_hf_model, tokenize_texts
+        from .quant.kl import reference
+        dcfg, ccfg = self.cfg["diagnostics"], self.cfg["calibration"]
+        dev = self._device()
+        t0 = time.time()
+        texts = [t for _, t in self.kl_texts][: ccfg.get("max_texts", 256)]
+        self.log(f"[prep:{self.tag}] loading {self.source_dir} on {dev}")
+        model = load_hf_model(self.source_dir, dev)
+        batches = tokenize_texts(self.source_dir, texts, ccfg.get("max_len", 2048))
+        stats = collect_stats(model, self.spec, batches, self.prep_dir / "hessians",
+                              layers_per_pass=ccfg.get("layers_per_pass", 16), device=dev, log=self.log)
+        pb = tokenize_texts(self.source_dir, texts[: dcfg["profile_contexts"]], dcfg["profile_max_len"])
+        refs = reference(model, pb)
+        prof = profile_table_real(model, self.spec, pb, refs, bits_list=dcfg["profile_bits"],
+                                  group_size=dcfg["profile_group_size"], log=self.log)
+        act = activation_table_real(self.spec, stats)
+        del model, refs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.cache = self._open_cache()
+        self.cache.warm(self.cfg["cache"].get("warm", []))
+        free_cuda()
+        return prof, act, {"seconds": time.time() - t0, "contexts": len(batches), "profile_contexts": len(pb),
+                           "cache_disk_gib": self.cache.disk_bytes() / 2 ** 30}
+
+    # ------------------------------------------------------------------ configs
+    def normalize(self, config) -> dict:
+        return schema.normalize(config, self.spec, self.space)
+
+    def size(self, config_or_norm) -> dict:
+        norm = self.normalize(config_or_norm) if "default" in config_or_norm else config_or_norm
+        return sizes.config_bytes(norm, self.spec)
+
+    def parent_config(self) -> dict | None:
+        if self.mock:
+            st = self.source_state or {}
+            if not st.get("bits"):
+                return None
+            return {"bits_by_group": st["bits"], "embed": st.get("embed"), "lm_head": st.get("lm_head")}
+        fq = read_json(self.source_dir / "fake_quant.json") if self.source_dir else None
+        return schema.compress(fq["config"], self.spec) if fq else None
+
+    def build(self, config, cid: str) -> dict:
+        """Validate + size a config -> artifact dict (raises schema.ConfigError / ValueError)."""
+        norm = self.normalize(config)
+        b = sizes.config_bytes(norm, self.spec)
+        if b["gib"] > self.budget_gib + 1e-9:
+            raise ValueError(f"config is {b['gib']:.3f} GiB > budget {self.budget_gib:.3f} GiB "
+                             f"(linear avg {b['linear_avg_bits']:.2f} bits; by group GiB: "
+                             + ", ".join(f"{g}={v:.2f}" for g, v in b["by_group_gib"].items()) + ")")
+        h = config_hash(norm)
+        write_json(self.out_dir / "configs" / f"{h}.json", norm)
+        art = {"config_hash": h, "config": schema.compress(norm, self.spec), "bytes_gib": round(b["gib"], 4),
+               "budget_gib": self.budget_gib, "linear_avg_bits": round(b["linear_avg_bits"], 3), "tag": self.tag}
+        if self.mock:
+            st = M.apply_config(self.spec, self.source_state, norm, self.cfg["mock"].get("lam", 1.2))
+            art["mock_quality"] = round(st["quality"], 6)
+        return art
+
+    def norm_of(self, art: dict) -> dict:
+        return read_json(self.out_dir / "configs" / f"{art['config_hash']}.json")
+
+    # ------------------------------------------------------------------ candidate model
+    def materialize(self, art: dict, dst: Path | None = None) -> Path | None:
+        """Write the fake-quant checkpoint (real mode). Returns its path."""
+        if self.mock:
+            return None
+        from .quant.export import export_fake_quant
+        dst = Path(dst) if dst else self.out_dir / "ckpt" / art["config_hash"]
+        if (dst / "fake_quant.json").exists():
+            return dst
+        if dst.parent.name == "ckpt" and self.cfg["candidates"].get("keep_checkpoints", 1) <= 1:
+            for p in (self.out_dir / "ckpt").glob("*"):  # bounded disk: one candidate checkpoint at a time
+                if p != dst:
+                    shutil.rmtree(p, ignore_errors=True)
+        export_fake_quant(self.source_dir, dst, self.norm_of(art), self.spec, self.cache,
+                          meta={"tag": self.tag, "gen": self.gen, "budget_gib": self.budget_gib}, log=self.log)
+        free_cuda()   # the candidate vLLM server starts on the same GPU next (80 GB cards: every GB counts)
+        return dst
+
+    @contextmanager
+    def serve(self, art: dict, name: str):
+        from rsicore.servers import VLLMServer
+        cand_gpu = role_gpus(self.rc, self.cfg, "candidate")
+        logs = Path(self.rc.run_dir) / "logs"
+        if self.mock:
+            M.register(self.registry, name, art["mock_quality"])
+            # no --tasks: candidates are also scored on held-out tasks (E_t); the index is cached
+            with VLLMServer("mock-" + name, name, cand_gpu, mock=True, mock_registry=self.registry,
+                            seed=self.rc.seed, log_dir=logs) as srv:
+                yield srv
+        else:  # pragma: no cover - GPU path
+            ckpt = self.materialize(art)
+            with VLLMServer(ckpt, name, cand_gpu, seed=self.rc.seed, log_dir=logs,
+                            extra_args=self.cfg["vllm"].get("candidate_args", [])) as srv:
+                yield srv
+
+    # ------------------------------------------------------------------ evaluation
+    def _ids(self, ds: str, stage: str) -> list[str]:
+        if stage == "gate":
+            from rsicore.draws import gate_ids
+            return gate_ids(self.rc, ds)
+        return list(self.data[ds]["signal" if stage == "full" else "screen"])
+
+    def _kl(self, srv, art: dict, stage: str, heldout: bool = False) -> dict | None:
+        texts = self.kl_heldout if heldout else self.kl_texts
+        if not texts:
+            return None
+        if self.mock:
+            st = M.apply_config(self.spec, self.source_state, self.norm_of(art), self.cfg["mock"].get("lam", 1.2))
+            inc = st["kl_vs_parent"]
+            out = {"overall": round(inc, 5)}
+            for d in sorted({d for d, _ in texts}):
+                out[d] = round(inc * M.DOMAIN_KL.get(d, 1.0), 5)
+            out["vs_original"] = round(st["kl_vs_original"], 5)
+            return out
+        from rsicore.evaluate import token_kl  # pragma: no cover - GPU path
+        ref = self.refs_dir / ("kl_ref_heldout.jsonl" if heldout else "kl_ref.jsonl")
+        r = token_kl(ref, srv.endpoint, srv.served_name, [t for _, t in texts], top_k=self.cfg["kl"]["top_k"])
+        out = {"overall": round(r["mean"], 5), "token_mean": round(r["token_mean"], 5)}
+        by = {}
+        for (d, _), v in zip(texts, r["per_text"]):
+            by.setdefault(d, []).append(v)
+        for d, v in by.items():
+            out[d] = round(sum(v) / len(v), 5)
+        return out
+
+    def evaluate(self, config_or_art, stage: str, cid: str, *, charge: bool = True, origin: str = "candidate") -> dict:
+        """Evaluate a config at `stage` (screen | full | gate). Cached by (config hash, stage).
+        Returns {"score", "feedback", ...}. Screen evaluations count against the evaluate budget."""
+        art = config_or_art if "config_hash" in config_or_art else self.build(config_or_art, cid)
+        key = (art["config_hash"], stage)
+        with self._lock:
+            if key in self._evals:
+                r = dict(self._evals[key])
+                r["cached"] = True
+                return r
+            if stage == "screen" and charge and self.evals_left <= 0:
+                raise EvalBudgetExhausted(f"evaluate budget of this generation exhausted ({self.eval_budget})")
+        t0 = time.time()
+        from rsicore.evaluate import paired_delta, score
+        name = f"{self.rc.run_id}-{self.tag}-{art['config_hash']}"
+        edir = self.out_dir / "evals" / f"{cid}" / stage
+        probes, regressions, scored = {}, [], {}
+        with self.serve(art, name) as srv:
+            for ds in self.datasets:
+                ids = self._ids(ds, stage)
+                res = score(srv.endpoint, name, ds, pool="pool", ids=ids, out_dir=edir, mock=self.mock)
+                acc, per, pending = _mean_per_id(res.records)
+                dom = DATASET_DOMAIN.get(ds, ds)
+                p = {"dataset": ds, "score": None if acc is None else round(acc, 4), "n": len(per), "pending": pending}
+                if acc is not None and per:
+                    se = math.sqrt(max(acc * (1 - acc), 1e-9) / len(per))
+                    p["ci"] = [round(max(0.0, acc - 1.96 * se), 4), round(min(1.0, acc + 1.96 * se), 4)]
+                if stage == "gate":
+                    base = self.gate_baseline.get(ds)
+                    p["records"] = str(edir / f"{ds}.jsonl")
+                    p["original"] = base
+                    p["ratio_vs_original"] = None if (acc is None or not base) else round(acc / base, 4)
+                    inc = ((self.incumbent or {}).get("gate") or {}).get(ds)
+                    if inc and inc.get("records"):
+                        d = paired_delta(read_jsonl(Path(inc["records"])), res.records, seed=self.rc.seed)
+                        p["incumbent"] = inc.get("score")
+                        p["vs_incumbent"] = None if d["delta"] is None else round(d["delta"], 5)
+                        p["delta_ci"] = [None if x is None else round(x, 5) for x in d["ci"]]
+                else:
+                    pref = self._parent_records(ds, stage)
+                    if pref is not None:
+                        pacc, _, _ = _mean_per_id(pref)
+                        d = paired_delta(pref, res.records, seed=self.rc.seed)
+                        p["parent"] = None if pacc is None else round(pacc, 4)
+                        p["vs_parent"] = None if d["delta"] is None else round(d["delta"], 4)
+                        p["delta_ci"] = [None if x is None else round(x, 4) for x in d["ci"]]
+                        nb = self.noise.get(ds)
+                        p["noise_band"] = nb
+                        if d["delta"] is not None:
+                            lo, hi = d["ci"]
+                            p["significant"] = bool(abs(d["delta"]) > (nb or 0.0) and (lo > 0 or hi < 0))
+                        if self.show_examples and stage == "screen":
+                            regressions += self._regressions(ds, pref, res.records)
+                        if pacc:
+                            p["retention"] = None if acc is None else round(acc / pacc, 4)
+                probes[dom] = p
+                scored[ds] = acc
+            kl = self._kl(srv, art, stage) if stage in ("screen", "full") else None
+        fb = {"stage": stage, "bytes_gib": art["bytes_gib"], "budget_gib": art["budget_gib"],
+              "linear_avg_bits": art["linear_avg_bits"], "kl": kl, "probes": probes}
+        if regressions:
+            fb["regressions"] = regressions[: self.show_examples * max(1, len(self.datasets))]
+            for r in fb["regressions"]:
+                self.shown.setdefault(r["dataset"], set()).add(r["id"])
+        if stage == "gate":
+            passed, why = self._gate_decision(art, probes)
+            fb["gate"] = {"passed": passed, "reason": why}
+            sc = 1.0 if passed else 0.0
+        else:
+            rets = [p.get("retention") for p in probes.values() if p.get("retention") is not None]
+            ret = sum(rets) / len(rets) if rets else None
+            klw = self.cfg["search"].get("kl_weight", 0.0)
+            klv = (kl or {}).get("overall") or 0.0
+            sc = None if ret is None else round(ret - klw * klv, 5)
+            if sc is None:  # nothing scored (e.g. code tasks without Docker): rank by KL only
+                sc = round(1.0 - klw * klv, 5) if kl else None
+            fb["retention"] = None if ret is None else round(ret, 4)
+        rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "origin": origin, "score": sc, "feedback": fb,
+               "charged": bool(charge and stage == "screen"), "seconds": round(time.time() - t0, 1)}
+        with self._lock:
+            self._evals[key] = rec
+            append_jsonl(self.out_dir / "evals.jsonl", rec)
+        out = dict(rec)
+        out["feedback"] = dict(fb, budget_left={"evaluate": self.evals_left})
+        return out
+
+    def _gate_decision(self, art: dict, probes: dict) -> tuple[bool, str]:
+        """Fixed-size gate: fits the budget AND beats the incumbent on the gate set (paired per item):
+        mean paired delta over gate datasets >= gate.min_delta; with gate.require_significant, at least one
+        dataset's 95% CI lower bound > 0 and no dataset's upper bound < 0."""
+        g = self.cfg["gate"]
+        if art["bytes_gib"] > self.budget_gib + 1e-9:
+            return False, f"size {art['bytes_gib']:.3f} GiB > budget {self.budget_gib:.3f}"
+        if not self.incumbent:
+            return False, "no incumbent to compare with"
+        deltas = {d: p for d, p in probes.items() if p.get("vs_incumbent") is not None}
+        if not deltas:
+            if g.get("allow_unscored", False):
+                return True, "no scored gate items (allowed by gate.allow_unscored)"
+            return False, "no scored gate items"
+        mean = sum(p["vs_incumbent"] for p in deltas.values()) / len(deltas)
+        desc = ", ".join(f"{d} {p['vs_incumbent']:+.4f} [{p['delta_ci'][0]:+.4f}, {p['delta_ci'][1]:+.4f}]"
+                         for d, p in deltas.items())
+        if mean < float(g.get("min_delta", 0.0)):
+            return False, f"mean delta vs incumbent {mean:+.4f} < {g.get('min_delta', 0.0)} ({desc})"
+        if g.get("require_significant", True):
+            worse = [d for d, p in deltas.items() if p["delta_ci"][1] < 0]
+            if worse:
+                return False, f"significantly worse than the incumbent on {worse} ({desc})"
+            if not any(p["delta_ci"][0] > 0 for p in deltas.values()):
+                return False, f"no significant gain over the incumbent ({desc})"
+        return True, f"beats the incumbent: mean delta {mean:+.4f} ({desc})"
+
+    def _regressions(self, ds: str, parent: list[dict], cand: list[dict]) -> list[dict]:
+        pp = {r["id"]: r for r in parent if r.get("score") is not None}
+        out = []
+        recs = None
+        for r in sorted(cand, key=lambda r: r["id"]):
+            p = pp.get(r["id"])
+            if p is None or r.get("score") is None or not (p["score"] > 0.5 >= r["score"]):
+                continue
+            if recs is None:
+                recs = load_processed(ds)
+            item = recs.get(r["id"], {})
+            q = item.get("prompt") or (item.get("messages") or [{}])[-1].get("content", "")
+            out.append({"dataset": ds, "id": r["id"], "prompt": tail(str(q)[:400], 400),
+                        "parent_answer": str(p.get("parsed_answer"))[:200],
+                        "candidate_answer": str(r.get("parsed_answer"))[:200],
+                        "candidate_output_tail": tail(r.get("raw_output") or "", 300)})
+            if len(out) >= self.show_examples:
+                break
+        return out
+
+    # ------------------------------------------------------------------ parent references
+    def _parent_records(self, ds: str, stage: str) -> list[dict] | None:
+        info = (self.parent_refs.get(stage) or {}).get(ds)
+        if not info:
+            return None
+        return read_jsonl(Path(info["records"]))
+
+    def compute_parent_refs(self, endpoint: str, served_name: str, stages=("screen", "full")) -> dict:
+        """Score the source model (served as the editor) on this problem's screen / signal items, and
+        cache its prompt logprobs on the KL texts (real mode)."""
+        from rsicore.evaluate import reference_logprobs, score
+        refs = dict(self.parent_refs)
+        for stage in stages:
+            refs.setdefault(stage, {})
+            for ds in self.datasets:
+                if ds in refs[stage]:
+                    continue
+                odir = self.refs_dir / stage
+                res = score(endpoint, served_name, ds, pool="pool", ids=self._ids(ds, stage), out_dir=odir,
+                            mock=self.mock)
+                acc, per, pending = _mean_per_id(res.records)
+                refs[stage][ds] = {"records": str(odir / f"{ds}.jsonl"), "score": acc, "n": len(per),
+                                   "pending": pending}
+                self.parent_refs = refs
+                write_json(self.refs_dir / "refs.json", refs)
+        if not self.mock:  # pragma: no cover - GPU path
+            k = self.cfg["kl"]["top_k"]
+            if self.kl_texts:
+                reference_logprobs(endpoint, served_name, [t for _, t in self.kl_texts], self.refs_dir / "kl_ref.jsonl", k)
+            if self.kl_heldout:
+                reference_logprobs(endpoint, served_name, [t for _, t in self.kl_heldout],
+                                   self.refs_dir / "kl_ref_heldout.jsonl", k)
+        self.parent_refs = refs
+        write_json(self.refs_dir / "refs.json", refs)
+        return refs
+
+    def heldout_kl(self, art: dict) -> dict | None:
+        if not self.kl_heldout:
+            return None
+        with self.serve(art, f"{self.rc.run_id}-{self.tag}-{art['config_hash']}-hk") as srv:
+            return self._kl(srv, art, "full", heldout=True)
+
+
+# ---------------------------------------------------------------------------------- data helpers
+def kl_texts_for(rc, gen: int, datasets_all: list[str], cfg: dict) -> list[tuple[str, str]]:
+    """(domain, text) KL / calibration contexts from the draw's `kl` role."""
+    from rsicore.draws import ids
+    out = []
+    for ds in datasets_all:
+        recs = load_processed(ds, ids(rc, gen, ds, "kl"))
+        for i in sorted(recs):
+            out.append((DATASET_DOMAIN.get(ds, ds), record_text(recs[i], max_chars=cfg["kl"].get("max_chars", 8000))))
+    return out
+
+
+def add_self_generated(texts: list[tuple[str, str]], endpoint: str, served_name: str, cfg: dict,
+                       cache: Path) -> list[tuple[str, str]]:  # pragma: no cover - needs a server
+    """Append the reference model's own greedy response to each KL prompt (2504.04823: reasoning-style
+    calibration text). Cached as jsonl {prompt_sha: response}."""
+    import hashlib
+    import json
+    import urllib.request
+    have = {r["sha"]: r["response"] for r in read_jsonl(cache)}
+    out = []
+    for d, t in texts:
+        sha = hashlib.sha256(t.encode()).hexdigest()
+        if sha not in have:
+            body = {"model": served_name, "prompt": t, "max_tokens": cfg["kl"]["self_generated_max_tokens"],
+                    "temperature": 0.0}
+            req = urllib.request.Request(endpoint.rstrip("/") + "/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                resp = json.loads(r.read())
+            have[sha] = resp["choices"][0].get("text") or ""
+            append_jsonl(cache, {"sha": sha, "response": have[sha]})
+        out.append((d, t + have[sha] + "<|im_end|>"))
+    return out

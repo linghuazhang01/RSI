@@ -7,7 +7,7 @@
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 1.2
+  "seconds": 1.1
  },
  "math": {
   "gold_acc": 1.0,
@@ -17,7 +17,7 @@
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 12.7
+  "seconds": 12.6
  },
  "aime24": {
   "gold_acc": 1.0,
@@ -107,7 +107,7 @@
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 0.3
+  "seconds": 0.2
  },
  "bfcl": {
   "gold_acc": 0.99423235374897,
@@ -321,7 +321,7 @@
   ],
   "n_gold_failures": 11,
   "n_wrong_nonzero": 0,
-  "seconds": 3.9
+  "seconds": 4.3
  },
  "metatool": {
   "gold_acc": 1.0,
@@ -351,7 +351,7 @@
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 5.1
+  "seconds": 5.0
  },
  "math_train": {
   "gold_acc": 1.0,
@@ -361,17 +361,17 @@
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 19.7
+  "seconds": 19.6
  },
  "dapo_math": {
   "gold_acc": 1.0,
   "wrong_acc": 0.0,
-  "n_graded_units": 17398,
+  "n_graded_units": 17382,
   "pass": true,
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 11.4
+  "seconds": 11.5
  },
  "arc": {
   "gold_acc": 1.0,
@@ -401,7 +401,7 @@
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 93.6
+  "seconds": 92.2
  },
  "sealtool_train": {
   "gold_acc": 1.0,
@@ -411,7 +411,7 @@
   "gold_failures": [],
   "n_gold_failures": 0,
   "n_wrong_nonzero": 0,
-  "seconds": 1.5
+  "seconds": 1.4
  },
  "sealtool": {
   "gold_acc": 1.0,

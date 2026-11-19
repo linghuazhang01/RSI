@@ -27,7 +27,7 @@ EXPECTED = {
     "magicoder_oss": 75197, "tulu3_if": 29980, "toolace": 11300, "apibank_train": 10376,
     "squad_val": 2067, "squad_train": 18891, "gpqa_diamond": 198,
     # added 2026-11-18 (RSI-validated training sets + Seal-Tools held-out)
-    "dapo_math": 17398, "apps": 4449, "taco_verified": 10806, "arc": 3370, "gpqa_main": 250, "sealtool_train": 12022, "sealtool": 2054,
+    "dapo_math": 17382, "apps": 4449, "taco_verified": 10806, "arc": 3370, "gpqa_main": 250, "sealtool_train": 12022, "sealtool": 2054,
     # added 2026-11-19 (gradable IF training set)
     "ifeval_train": 14970,
 }
@@ -45,7 +45,7 @@ EXPECTED_NOTES = {
     "squad_val": "2,067 passages / 10,570 questions (SEAL eval subset: 200 passages / 974 questions)",
     "squad_train": "18,891 passages / 87,599 questions",
     "gpqa_diamond": "manual (gated)",
-    "dapo_math": "1,791,700 rows = 17,398 unique prompts (WHALE reports 17,917)",
+    "dapo_math": "1,791,700 rows = 17,398 unique prompts (WHALE reports 17,917); 639 lost-backslash prompts repaired, 16 unrecoverable dropped -> 17,382",
     "apps": "APPS train 5,000 (all difficulties) -> 4,449 with tests and >=1 solution (introductory 2,397; ReST-EM reports 2,342)",
     "taco_verified": "TACO-verified 12,898 -> 10,806 (tests parse, verified solution, no pictures / multi-answer, no internal duplicates); the only code training set",
     "arc": "ARC-Easy train 2,251 + ARC-Challenge train 1,119",

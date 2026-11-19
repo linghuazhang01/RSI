@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="652" viewBox="0 0 680 652" font-family="PingFang SC, Helvetica, Arial, sans-serif">
+<title>一代的交互流程（自量化 A / 自写 LoRA B）</title>
+<rect width="680" height="652" fill="#ffffff"/>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g font-size="14" text-anchor="middle" dominant-baseline="central">
+<rect x="60" y="40" width="340" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.8"/><text x="230" y="59" fill="#444441" font-weight="500">抽本代的题</text><text x="230" y="78" fill="#5F5E5A" font-size="12">每领域 2,000 题（代码 1,000），种子 42</text>
+<rect x="60" y="120" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.8"/><text x="230" y="139" fill="#3C3489" font-weight="500">改造者写程序（A：冻结的 M_0　B：M_t）</text><text x="230" y="158" fill="#534AB7" font-size="12">读诊断表、以往候选和反馈</text>
+<rect x="60" y="200" width="340" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.8"/><text x="230" y="219" fill="#444441" font-weight="500">沙箱执行程序，生成候选</text><text x="230" y="238" fill="#5F5E5A" font-size="12">A：量化配置（原权重、固定体积）　B：写出 LoRA</text>
+<rect x="60" y="280" width="340" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.8"/><text x="230" y="299" fill="#085041" font-weight="500">L1 信号评分</text><text x="230" y="318" fill="#0F6E56" font-size="12">先 200 题快速筛，前 3 名跑完整一批</text>
+<rect x="60" y="370" width="340" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.8"/><text x="230" y="389" fill="#085041" font-weight="500">L2 固定验收</text><text x="230" y="408" fill="#0F6E56" font-size="12">A：超过当前最好才替换　B：通过/不通过</text>
+<rect x="60" y="450" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.8"/><text x="230" y="469" fill="#3C3489" font-weight="500">更新</text><text x="230" y="488" fill="#534AB7" font-size="12">A：新的最好量化　B：合并 LoRA 后的 M_t+1</text>
+<rect x="60" y="530" width="340" height="56" rx="8" fill="#ffffff" stroke="#888780" stroke-width="0.8" stroke-dasharray="4 3"/><text x="230" y="549" fill="#2C2C2A" font-weight="500">留出评测（B 另测改造者能力 E_t）</text><text x="230" y="568" fill="#5F5E5A" font-size="12">五个领域全测，只记录、不回传</text>
+<rect x="460" y="40" width="180" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.8"/><text x="550" y="59" fill="#085041" font-weight="500">抽样池</text><text x="550" y="78" fill="#0F6E56" font-size="12">训练集，可跨代复用</text>
+<rect x="460" y="370" width="180" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.8"/><text x="550" y="389" fill="#085041" font-weight="500">固定验收集</text><text x="550" y="408" fill="#0F6E56" font-size="12">每领域 1,000 题</text>
+<rect x="460" y="530" width="180" height="56" rx="8" fill="#ffffff" stroke="#888780" stroke-width="0.8" stroke-dasharray="4 3"/><text x="550" y="549" fill="#2C2C2A" font-weight="500">留出评测集</text><text x="550" y="568" fill="#5F5E5A" font-size="12">benchmark</text>
+</g>
+<g fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)">
+<line x1="230" y1="96" x2="230" y2="118"/><line x1="230" y1="176" x2="230" y2="198"/><line x1="230" y1="256" x2="230" y2="278"/>
+<line x1="230" y1="336" x2="230" y2="368"/><line x1="230" y1="426" x2="230" y2="448"/><line x1="230" y1="506" x2="230" y2="528" stroke-dasharray="4 3"/>
+<line x1="460" y1="68" x2="404" y2="68"/><line x1="460" y1="398" x2="404" y2="398"/><line x1="460" y1="558" x2="404" y2="558" stroke-dasharray="4 3"/>
+</g>
+<g font-size="12" fill="#5F5E5A" dominant-baseline="central">
+<text x="420" y="308">↻ 回到写程序：A ≤24、B ≤32 次</text>
+<text x="420" y="478">↻ B：成为下一代的改造者</text>
+<text x="60" y="614">紫 = 模型　青 = 训练集与反馈　虚线 = 留出（只报告）</text>
+<text x="60" y="636">L2 不通过：A 保留当前最好（连续 2 代没有提升就停），B 回退到 SFT 基线</text>
+</g>
+</svg>

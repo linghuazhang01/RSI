@@ -1,0 +1,4 @@
+# Paper A, single domain: signal, screen and gate use only this domain's training set
+# (rsicore.draws.DOMAIN_TRAIN["math"]); held-out evaluation still covers all five domains.
+# KL / calibration texts come from all five domains (kl.domains: all) unless overridden here.
+domain: math

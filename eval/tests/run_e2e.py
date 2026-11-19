@@ -26,7 +26,7 @@ CASES = [
     ("triviaqa", "test", ["--limit", "500"], "accuracy", 1.0, 0.0),                # knowledge (EM)
     # squad: 1 question text appears twice under the same title with different gold -> oracle collision
     ("squad_closed_book_test", "test", [], "accuracy", 0.998, 0.0),                # knowledge injection
-    ("ifeval", "gate", ["--ids-file", str(FX / "ifeval_e2e_ids.json")], "prompt_strict", 1.0, 0.0),
+    ("ifeval", "reserve", ["--ids-file", str(FX / "ifeval_e2e_ids.json")], "prompt_strict", 1.0, 0.0),  # hand-made items (not test)
     ("ifbench", "test", ["--ids-file", str(FX / "ifbench_e2e_ids.json")], "prompt_strict", 1.0, 0.0),
     ("sealtool", "test", ["--limit", "300"], "accuracy", 1.0, 0.0),                # tool calling (Seal-Tools)
     ("bfcl", "test", ["--limit", "600"], "accuracy", 0.97, 0.0),                   # tool calling (FC)
@@ -36,15 +36,12 @@ CASES = [
     ("humanevalplus", "test", ["--no-sandbox"], None, None, None),                # code: generation + extraction; exec PENDING
     ("mt_bench", "test", ["--judge-endpoint", "JUDGE"], "mean_rating", 10.0, 1.0),  # optional judge path
     ("alpaca_eval", "test", ["--limit", "100", "--judge-endpoint", "JUDGE"], "win_rate", 0.98, 0.02),
-    # ---- training sets: draw pool (pool=pool, ids from a draw) / fixed gate (pool=gate)
-    ("gsm8k_train", "pool", ["--ids-file", "DRAW:gsm8k_train.signal"], "accuracy", 1.0, 0.0),
-    ("math_train", "gate", [], "accuracy", 1.0, 0.0),
+    # ---- training sets (five, 2026-11-19): pool + ids from a draw (DRAW:<ds>.<role>) or the run's gate (GATE:<ds>)
     ("dapo_math", "pool", ["--ids-file", "DRAW:dapo_math.signal"], "accuracy", 1.0, 0.0),
-    ("arc", "pool", ["--ids-file", "DRAW:arc.signal"], "accuracy", 1.0, 0.0),
-    ("gpqa_main", "gate", [], "accuracy", 1.0, 0.0),
+    ("dapo_math", "pool", ["--ids-file", "GATE:dapo_math", "--limit", "300"], "accuracy", 1.0, 0.0),
     ("triviaqa_train", "pool", ["--ids-file", "DRAW:triviaqa_train.screen"], "accuracy", 1.0, 0.0),
     ("sealtool_train", "pool", ["--ids-file", "DRAW:sealtool_train.screen"], "accuracy", 1.0, 0.0),
-    ("ifeval_train", "gate", ["--ids-file", str(FX / "ifeval_train_e2e_ids.json")], "accuracy", 1.0, 0.0),  # hand-made
+    ("ifeval_train", "pool", ["--ids-file", str(FX / "ifeval_train_e2e_ids.json")], "accuracy", 1.0, 0.0),  # hand-made
     ("ifeval_train", "pool", ["--ids-file", "DRAW:ifeval_train.screen"], None, None, None),  # no oracle: run only
     ("taco_verified", "pool", ["--ids-file", "DRAW:taco_verified.screen", "--no-sandbox"], None, None, None),
 ]
@@ -92,7 +89,8 @@ def main():
             ep = f"http://127.0.0.1:{port}/v1"
             out = EVAL / "results" / f"e2e_oracle_{mode}"
             for task, pool, extra, key, gmin, wmax in CASES:
-                extra = [ep if x == "JUDGE" else str(ids_dir / (x[5:] + ".json")) if x.startswith("DRAW:") else x
+                extra = [ep if x == "JUDGE" else str(ids_dir / (x[5:] + ".json")) if x.startswith("DRAW:")
+                         else str(ids_dir.parent.parent / "gate" / (x[5:] + ".gate.json")) if x.startswith("GATE:") else x
                          for x in extra]
                 cmd = [PY, "-I", str(EVAL / "run_eval.py"), "--task", task, "--pool", pool, "--endpoint", ep,
                        "--model", "oracle-model", "--out", str(out), "--no-cache", "--quiet", "--concurrency", "32"] + extra

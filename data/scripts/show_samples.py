@@ -13,13 +13,13 @@ PROC = DATA / "processed"
 SEED = 20261118
 
 DOMAINS = [
-    ("数学", [("gsm8k_train", "pool"), ("math_train", "pool"), ("dapo_math", "pool")],
+    ("数学", [("dapo_math", "pool")],
              [("math", "test", "MATH-500"), ("gsm8k", "test", None), ("aime24", "test", None), ("aime25", "test", None)]),
     ("代码", [("taco_verified", "pool")],
              [("humanevalplus", "test", None), ("mbppplus", "test", None), ("livecodebench", "test", None)]),
-    ("通用推理 / 知识", [("triviaqa_train", "pool"), ("arc", "pool"), ("gpqa_main", "gate")],
+    ("通用推理 / 知识", [("triviaqa_train", "pool")],
              [("gpqa_diamond", "test", None), ("mmlu_pro", "test", None), ("triviaqa", "test", None)]),
-    ("指令遵循", [("ifeval_train", "pool"), ("ifeval", "gate")],
+    ("指令遵循", [("ifeval_train", "pool")],
              [("ifeval", "test", None), ("ifbench", "test", None)]),
     ("工具调用", [("sealtool_train", "pool")],
              [("sealtool", "test", None), ("apibank", "test", None), ("bfcl", "test", None)]),
@@ -79,7 +79,7 @@ def block(ds, r, plen, rlen):
 def main():
     rng = random.Random(SEED)
     out = ["# 数据样例（训练集每个 10 道，评测集每个 3 道）", "",
-           "由 `data/scripts/show_samples.py` 生成（随机种子 20261118）。训练集从抽样池（`pool`，GPQA Main 与 IFEval 从验收集 `gate`）里抽，"
+           "由 `data/scripts/show_samples.py` 生成（随机种子 20261118）。训练集从整体抽样池（`pool`）里抽，"
            "评测集从留出池（`test`）里抽。长文本已截断。GPQA 按数据作者要求不展示题目。", ""]
     for dom, trains, evals in DOMAINS:
         out += [f"## {dom}", ""]

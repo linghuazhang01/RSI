@@ -4,7 +4,7 @@
 # Usage (from any directory):
 #   ./download_models.sh [--list] [--dry-run] [NAME ...|all]
 #
-#   NAME       one or more names from --list (default: qwen3.8-27b qwen3-8b, the Paper A and
+#   NAME       one or more names from --list (default: qwen3.8-27b, used by both Paper A and Paper B since 2026-11-19; formerly also qwen3-8b, the Paper A and
 #              Paper B main models); `all` selects every model
 #   --list     show names, repos, pinned revisions, sizes, licenses (offline, no network)
 #   --dry-run  query the Hub, verify each pinned revision and file list, print the disk space
@@ -51,9 +51,9 @@ from pathlib import Path
 # "bytes" = sum of the files selected by want() below at that commit.
 MODELS = [
     ("qwen3.8-27b", "Qwen/Qwen3.8-27B", "37561816e66b5b9153b1b64c10968c18c1e6f4a0", "apache-2.0", False,
-     55586105445, "Qwen3_5ForConditionalGeneration", "Paper A main (dense 27B, BF16; also Paper B extension)"),
+     55586105445, "Qwen3_5ForConditionalGeneration", "Paper A + Paper B main (dense 27B, BF16)"),
     ("qwen3-8b", "Qwen/Qwen3-8B", "b968826d9c46dd6066d109eabc6255188de91218", "apache-2.0", False,
-     16397459696, "Qwen3ForCausalLM", "Paper B main (dense 8B, BF16)"),
+     16397459696, "Qwen3ForCausalLM", "optional (dense 8B, BF16; former Paper B model)"),
     ("qwen3.6-27b", "Qwen/Qwen3.6-27B", "8f33b98937c6031bb49e713dee3e8e185aafd26f", "apache-2.0", False,
      55586099687, "Qwen3_5ForConditionalGeneration", "Paper A backup (dense 27B, BF16)"),
     ("gemma-4-31b", "google/gemma-4-31B-it", "842da3794eaa0b77d5f08bae87a17459d91ff475", "apache-2.0", False,
@@ -61,7 +61,7 @@ MODELS = [
     # Base (pre-trained) Gemma 4 31B, if the cross-family check needs it:
     # ("gemma-4-31b-base", "google/gemma-4-31B", "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89", ...),
 ]
-DEFAULT = ["qwen3.8-27b", "qwen3-8b"]
+DEFAULT = ["qwen3.8-27b"]   # 2026-11-19: both papers use Qwen3.8-27B
 BY_NAME = {m[0]: m for m in MODELS}
 
 KEEP_SUFFIX = (".safetensors", ".json", ".jinja", ".txt", ".model", ".tiktoken")

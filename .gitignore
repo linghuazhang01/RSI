@@ -28,3 +28,8 @@ checkpoints/
 
 # Paper PDFs (large, third-party copyright); notes in Markdown are kept
 *.pdf
+
+# Run outputs and local caches (mock index holds dataset prompts, incl. gated GPQA)
+eval/.cache/
+experiment_records/*/
+!experiment_records/README.md

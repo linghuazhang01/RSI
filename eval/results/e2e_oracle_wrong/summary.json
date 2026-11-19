@@ -11,7 +11,7 @@
   },
   "data_provenance": {
    "processed_sha256": "58be6154d119b7960994841635b5fd2d3e86a9f4ba7ea9cd6b3632d04ad0d1d8",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "aime24",
   "decoding": {
@@ -19,13 +19,13 @@
    "max_tokens": 16384,
    "max_tokens_thinking": 32768,
    "n": 8,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.6,
    "thinking": false,
    "top_p": 0.95
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.1,
   "ids_file": null,
@@ -46,7 +46,7 @@
    "ok": 30
   },
   "task": "aime24",
-  "timestamp": "2026-11-19T02:09:50",
+  "timestamp": "2026-11-19T04:57:54",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -65,7 +65,7 @@
   },
   "data_provenance": {
    "processed_sha256": "33963651835fcb04536d7cb3737e80cd7a4729a2ba4b587ac57fc2e6f98f0c28",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "alpaca_eval",
   "decoding": {
@@ -73,13 +73,13 @@
    "max_tokens": 2048,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.1,
   "ids_file": null,
@@ -89,9 +89,9 @@
     "cache_hits": 0,
     "failures": 0,
     "requests": 100,
-    "retries": 0
+    "retries": 8
    },
-   "endpoint": "http://127.0.0.1:52253/v1",
+   "endpoint": "http://127.0.0.1:49826/v1",
    "model": "gpt-4.1-2025-04-14"
   },
   "limit": 100,
@@ -108,7 +108,7 @@
    "judged": 100
   },
   "task": "alpaca_eval",
-  "timestamp": "2026-11-19T02:10:07",
+  "timestamp": "2026-11-19T04:58:18",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -128,7 +128,7 @@
   },
   "data_provenance": {
    "processed_sha256": "97412601e3a6b9e0e6a2282d5f6548b85e0c174a50b18ca9c71b1a69f7f95bd2",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "apibank",
   "decoding": {
@@ -136,15 +136,15 @@
    "max_tokens": 512,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 0.1,
+  "generation_seconds": 0.2,
   "ids_file": null,
   "item_accuracy": 0.0,
   "limit": 200,
@@ -167,7 +167,7 @@
    "ok": 200
   },
   "task": "apibank",
-  "timestamp": "2026-11-19T02:10:02",
+  "timestamp": "2026-11-19T04:58:08",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -242,7 +242,7 @@
   },
   "data_provenance": {
    "processed_sha256": "c8017756c252e36f9f59f5bb5fa70f4c7599164b955ae9b2f9384dea75f7f1bf",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "841bb9f3f0274499cc84965fed36500f2384b047272837d1c852ded35fc17b50"
   },
   "dataset": "arc",
   "decoding": {
@@ -250,16 +250,16 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:61817/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.6,
-  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_4af3adn2/e2e_run/draws/gen_00/ids/arc.signal.json",
+  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_e_9f9qom/e2e_run/draws/gen_00/ids/arc.signal.json",
   "item_accuracy": 0.0,
   "limit": null,
   "lora": null,
@@ -275,7 +275,7 @@
    "ok": 1000
   },
   "task": "arc",
-  "timestamp": "2026-11-19T02:10:13",
+  "timestamp": "2026-11-19T02:38:07",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -298,11 +298,11 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 600,
-   "retries": 0
+   "retries": 9
   },
   "data_provenance": {
    "processed_sha256": "91a7dcda3f4fba67e07d2c58906e4e3f613cb468a61e164cf0a16c5d844afc54",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "bfcl",
   "decoding": {
@@ -310,15 +310,15 @@
    "max_tokens": 2048,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 2.2,
+  "generation_seconds": 3.9,
   "ids_file": null,
   "irrelevance_vs_live_simple": {
    "irrelevance": {
@@ -360,7 +360,7 @@
    "ok": 600
   },
   "task": "bfcl",
-  "timestamp": "2026-11-19T02:10:01",
+  "timestamp": "2026-11-19T04:58:07",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -374,12 +374,12 @@
   "client_stats": {
    "cache_hits": 0,
    "failures": 0,
-   "requests": 800,
-   "retries": 0
+   "requests": 300,
+   "retries": 1
   },
   "data_provenance": {
-   "processed_sha256": "1f3dab781ff16b26b2f5cee33c621e1db820301421a078cd278bbb706cf013e8",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "processed_sha256": "54a5b760ce2cbe77ab86d2a1d32b4cece834003ee8cc85bd68dfe956d6da8a79",
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "dapo_math",
   "decoding": {
@@ -387,32 +387,32 @@
    "max_tokens": 8192,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 0.4,
-  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_4af3adn2/e2e_run/draws/gen_00/ids/dapo_math.signal.json",
+  "generation_seconds": 1.9,
+  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_1qxp13zy/e2e_run/draws/gate/dapo_math.gate.json",
   "item_accuracy": 0.0,
-  "limit": null,
+  "limit": 300,
   "lora": null,
   "model": "oracle-model",
-  "n": 800,
+  "n": 300,
   "n_generation_errors": 0,
-  "n_items": 800,
+  "n_items": 300,
   "n_pending": 0,
-  "n_units": 800,
+  "n_units": 300,
   "pool": "pool",
   "served_model_name": "oracle-model",
   "status_counts": {
-   "ok": 800
+   "ok": 300
   },
   "task": "dapo_math",
-  "timestamp": "2026-11-19T02:10:13",
+  "timestamp": "2026-11-19T04:58:25",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -431,7 +431,7 @@
   },
   "data_provenance": {
    "processed_sha256": "7bb3eb151e2193e4aa7338798226de9437daa539941f1106311cccb346fa5a54",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "gpqa_diamond",
   "decoding": {
@@ -439,15 +439,15 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 0.1,
+  "generation_seconds": 0.2,
   "ids_file": null,
   "item_accuracy": 0.0,
   "limit": null,
@@ -464,7 +464,7 @@
    "ok": 198
   },
   "task": "gpqa_diamond",
-  "timestamp": "2026-11-19T02:09:50",
+  "timestamp": "2026-11-19T04:57:55",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -483,7 +483,7 @@
   },
   "data_provenance": {
    "processed_sha256": "8d5cb4d7ed95853cae452d8919bf39e0219e9b14885e9b1ca4eb7194b655328e",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "841bb9f3f0274499cc84965fed36500f2384b047272837d1c852ded35fc17b50"
   },
   "dataset": "gpqa_main",
   "decoding": {
@@ -491,13 +491,13 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:61817/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.2,
   "ids_file": null,
@@ -516,7 +516,7 @@
    "ok": 250
   },
   "task": "gpqa_main",
-  "timestamp": "2026-11-19T02:10:14",
+  "timestamp": "2026-11-19T02:38:07",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -531,11 +531,11 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 300,
-   "retries": 20
+   "retries": 1
   },
   "data_provenance": {
    "processed_sha256": "f3a329594211901eb5e8ef70fb9df6436ce95dc676b0a0caaff793054ca424e0",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "gsm8k",
   "decoding": {
@@ -543,15 +543,15 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 2.0,
+  "generation_seconds": 1.2,
   "ids_file": null,
   "item_accuracy": 0.0,
   "limit": 300,
@@ -568,7 +568,7 @@
    "ok": 300
   },
   "task": "gsm8k",
-  "timestamp": "2026-11-19T02:09:49",
+  "timestamp": "2026-11-19T04:57:54",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -583,11 +583,11 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 500,
-   "retries": 4
+   "retries": 0
   },
   "data_provenance": {
    "processed_sha256": "2949c13a291c250bc919203c8c237e136cd2e154faee8b6d2aa14f569ec46723",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "841bb9f3f0274499cc84965fed36500f2384b047272837d1c852ded35fc17b50"
   },
   "dataset": "gsm8k_train",
   "decoding": {
@@ -595,16 +595,16 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:61817/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 2.0,
-  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_4af3adn2/e2e_run/draws/gen_00/ids/gsm8k_train.signal.json",
+  "generation_seconds": 0.3,
+  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_e_9f9qom/e2e_run/draws/gen_00/ids/gsm8k_train.signal.json",
   "item_accuracy": 0.0,
   "limit": null,
   "lora": null,
@@ -620,7 +620,7 @@
    "ok": 500
   },
   "task": "gsm8k_train",
-  "timestamp": "2026-11-19T02:10:10",
+  "timestamp": "2026-11-19T02:38:03",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -639,7 +639,7 @@
   },
   "data_provenance": {
    "processed_sha256": "2dcbceb3fb5991fd806131eab3f1a6afcc387c795a0327ebb813831c443b6d2f",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "humanevalplus",
   "decoding": {
@@ -647,13 +647,13 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.1,
   "ids_file": null,
@@ -676,7 +676,7 @@
    "pending_sandbox": 164
   },
   "task": "humanevalplus",
-  "timestamp": "2026-11-19T02:10:07",
+  "timestamp": "2026-11-19T04:58:14",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -695,7 +695,7 @@
   },
   "data_provenance": {
    "processed_sha256": "e65bca40abd9bc0bd02e4d64c5a3e8e79f345a7459b893641fc8f513f0ecd359",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "ifbench",
   "decoding": {
@@ -703,13 +703,13 @@
    "max_tokens": 2048,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.0,
   "ids_file": "/Users/linghuazhang/Desktop/Project/RSIModelEdit/eval/tests/fixtures/ifbench_e2e_ids.json",
@@ -732,7 +732,7 @@
    "ok": 3
   },
   "task": "ifbench",
-  "timestamp": "2026-11-19T02:09:56",
+  "timestamp": "2026-11-19T04:58:00",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -746,12 +746,12 @@
   "client_stats": {
    "cache_hits": 0,
    "failures": 0,
-   "requests": 4,
+   "requests": 6,
    "retries": 0
   },
   "data_provenance": {
-   "processed_sha256": "e3c0be71399c7da6c95458b1d6b18c9e54d7793d835b5b51a8f4887c7713c7ba",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "processed_sha256": "791174b6059f1a7e6ac55ba135f0d6a3fe20bbefc893815e660be1121a531cae",
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "ifeval",
   "decoding": {
@@ -759,15 +759,15 @@
    "max_tokens": 2048,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 0.0,
+  "generation_seconds": 0.1,
   "ids_file": "/Users/linghuazhang/Desktop/Project/RSIModelEdit/eval/tests/fixtures/ifeval_e2e_ids.json",
   "inst_loose": 0.0,
   "inst_strict": 0.0,
@@ -775,20 +775,20 @@
   "limit": null,
   "lora": null,
   "model": "oracle-model",
-  "n": 4,
+  "n": 6,
   "n_generation_errors": 0,
-  "n_items": 4,
+  "n_items": 6,
   "n_pending": 0,
-  "n_units": 4,
-  "pool": "gate",
+  "n_units": 6,
+  "pool": "reserve",
   "prompt_loose": 0.0,
   "prompt_strict": 0.0,
   "served_model_name": "oracle-model",
   "status_counts": {
-   "ok": 4
+   "ok": 6
   },
   "task": "ifeval",
-  "timestamp": "2026-11-19T02:09:55",
+  "timestamp": "2026-11-19T04:57:59",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -803,11 +803,11 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 200,
-   "retries": 0
+   "retries": 14
   },
   "data_provenance": {
-   "processed_sha256": "bce8e3efd6e6f76cd936c32dce716838ec1ec59a3c5a1b99cb93032d1774da3f",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "processed_sha256": "92a0436e476aca4066e04794946dd2c87853b8c345494222e27e70a674dc7a61",
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "ifeval_train",
   "decoding": {
@@ -815,16 +815,16 @@
    "max_tokens": 2048,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 0.2,
-  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_4af3adn2/e2e_run/draws/gen_00/ids/ifeval_train.screen.json",
+  "generation_seconds": 2.1,
+  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_1qxp13zy/e2e_run/draws/gen_00/ids/ifeval_train.screen.json",
   "item_accuracy": 0.185,
   "limit": null,
   "lora": null,
@@ -837,79 +837,79 @@
   "per_constraint_type": {
    "All Lowercase": {
     "accuracy": 1.0,
-    "n": 6
+    "n": 7
    },
    "All Uppercase": {
     "accuracy": 0.0,
-    "n": 5
+    "n": 8
    },
    "Choose": {
-    "accuracy": 0.36363636363636365,
-    "n": 11
+    "accuracy": 0.6666666666666666,
+    "n": 9
    },
    "End Checker": {
     "accuracy": 0.0,
-    "n": 10
+    "n": 6
    },
    "Forbidden Words": {
     "accuracy": 1.0,
-    "n": 7
+    "n": 8
    },
    "Frequency of All-capital Words": {
-    "accuracy": 0.6,
-    "n": 10
+    "accuracy": 0.4166666666666667,
+    "n": 12
    },
    "Include Keywords": {
     "accuracy": 0.0,
-    "n": 5
+    "n": 9
    },
    "JSON Format": {
     "accuracy": 0.0,
-    "n": 9
+    "n": 11
    },
    "Keyword Frequency": {
     "accuracy": 0.0,
-    "n": 12
+    "n": 7
    },
    "Letter Frequency": {
     "accuracy": 0.0,
-    "n": 12
+    "n": 6
    },
    "Minimum Number Highlighted Section": {
     "accuracy": 0.0,
-    "n": 8
+    "n": 10
    },
    "Multiple Sections": {
-    "accuracy": 0.09090909090909091,
-    "n": 11
+    "accuracy": 0.0,
+    "n": 13
    },
    "No Commas": {
     "accuracy": 1.0,
-    "n": 8
+    "n": 6
    },
    "Number Bullets": {
     "accuracy": 0.0,
-    "n": 6
+    "n": 8
    },
    "Number Paragraphs": {
     "accuracy": 0.0,
-    "n": 7
+    "n": 8
    },
    "Number Paragraphs + First Word in i-th Paragraph": {
     "accuracy": 0.0,
-    "n": 9
+    "n": 7
    },
    "Number Placeholder": {
     "accuracy": 0.0,
-    "n": 9
+    "n": 8
    },
    "Number Sentences": {
-    "accuracy": 0.3,
-    "n": 10
+    "accuracy": 0.5,
+    "n": 4
    },
    "Number Words": {
     "accuracy": 0.3333333333333333,
-    "n": 6
+    "n": 9
    },
    "Postscript": {
     "accuracy": 0.0,
@@ -917,19 +917,19 @@
    },
    "Quotation": {
     "accuracy": 0.0,
-    "n": 7
+    "n": 13
    },
    "Repeat Prompt": {
     "accuracy": 0.0,
-    "n": 7
+    "n": 1
    },
    "Title": {
     "accuracy": 0.0,
-    "n": 10
+    "n": 7
    },
    "Two Responses": {
     "accuracy": 0.0,
-    "n": 7
+    "n": 15
    }
   },
   "pool": "pool",
@@ -938,7 +938,7 @@
    "ok": 200
   },
   "task": "ifeval_train",
-  "timestamp": "2026-11-19T02:10:19",
+  "timestamp": "2026-11-19T04:58:31",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -957,7 +957,7 @@
   },
   "data_provenance": {
    "processed_sha256": "e3ac79b08a5beae360628f408a58f1e16462fa6e5cf8b1b664f1fa8537825015",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "841bb9f3f0274499cc84965fed36500f2384b047272837d1c852ded35fc17b50"
   },
   "dataset": "math_train",
   "decoding": {
@@ -965,13 +965,13 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:61817/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.2,
   "ids_file": null,
@@ -990,7 +990,7 @@
    "ok": 350
   },
   "task": "math_train",
-  "timestamp": "2026-11-19T02:10:11",
+  "timestamp": "2026-11-19T02:38:05",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1009,7 +1009,7 @@
   },
   "data_provenance": {
    "processed_sha256": "7afa57e5a81b5f559bfd35767802c0e71f6ed2e2f4ee74aa942c20f9eb244991",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "metatool",
   "decoding": {
@@ -1017,13 +1017,13 @@
    "max_tokens": 512,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.2,
   "ids_file": null,
@@ -1048,7 +1048,7 @@
    "ok": 300
   },
   "task": "metatool",
-  "timestamp": "2026-11-19T02:10:02",
+  "timestamp": "2026-11-19T04:58:08",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1067,7 +1067,7 @@
   },
   "data_provenance": {
    "processed_sha256": "283ac4e558499ca4b950864eb627274b2b108e0bd5791800b3f83baf613826db",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "mmlu_pro",
   "decoding": {
@@ -1075,13 +1075,13 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.3,
   "ids_file": null,
@@ -1100,7 +1100,7 @@
    "ok": 500
   },
   "task": "mmlu_pro",
-  "timestamp": "2026-11-19T02:09:50",
+  "timestamp": "2026-11-19T04:57:55",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1115,11 +1115,11 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 160,
-   "retries": 0
+   "retries": 10
   },
   "data_provenance": {
    "processed_sha256": "c2671603e96c3f0a620b0da30226e937ab7baa5ae1b72b1d796af9065ef15217",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "mt_bench",
   "decoding": {
@@ -1127,15 +1127,15 @@
    "max_tokens": 2048,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 0.1,
+  "generation_seconds": 2.3,
   "ids_file": null,
   "item_accuracy": 1.0,
   "judge": {
@@ -1145,7 +1145,7 @@
     "requests": 160,
     "retries": 0
    },
-   "endpoint": "http://127.0.0.1:52253/v1",
+   "endpoint": "http://127.0.0.1:49826/v1",
    "model": "gpt-4.1-2025-04-14"
   },
   "limit": null,
@@ -1163,7 +1163,7 @@
    "judged": 160
   },
   "task": "mt_bench",
-  "timestamp": "2026-11-19T02:10:07",
+  "timestamp": "2026-11-19T04:58:16",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1178,11 +1178,11 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 300,
-   "retries": 11
+   "retries": 2
   },
   "data_provenance": {
    "processed_sha256": "644471bcfd5ab0520ee318d0fee7bf96f4134f878a2b5144c0d8b51f11b72970",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "sealtool",
   "decoding": {
@@ -1190,15 +1190,15 @@
    "max_tokens": 1024,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 2.0,
+  "generation_seconds": 2.1,
   "ids_file": null,
   "item_accuracy": 0.0,
   "limit": 300,
@@ -1215,7 +1215,7 @@
    "ok": 300
   },
   "task": "sealtool",
-  "timestamp": "2026-11-19T02:09:58",
+  "timestamp": "2026-11-19T04:58:03",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1230,11 +1230,11 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 200,
-   "retries": 1
+   "retries": 0
   },
   "data_provenance": {
-   "processed_sha256": "f566d4112e7a17059b06bd29d009b0f7c8dfb2d51b1c5f00a9d968631756cbf2",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "processed_sha256": "90592c2718c4372e7eec3df6119aa42478a3a300b673f162ce036049fd29a981",
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "sealtool_train",
   "decoding": {
@@ -1242,16 +1242,16 @@
    "max_tokens": 1024,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 1.3,
-  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_4af3adn2/e2e_run/draws/gen_00/ids/sealtool_train.screen.json",
+  "generation_seconds": 0.2,
+  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_1qxp13zy/e2e_run/draws/gen_00/ids/sealtool_train.screen.json",
   "item_accuracy": 0.0,
   "limit": null,
   "lora": null,
@@ -1267,7 +1267,7 @@
    "ok": 200
   },
   "task": "sealtool_train",
-  "timestamp": "2026-11-19T02:10:16",
+  "timestamp": "2026-11-19T04:58:27",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1282,12 +1282,12 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 974,
-   "retries": 0
+   "retries": 22
   },
   "contains": 0.0,
   "data_provenance": {
    "processed_sha256": "1a4bc9b1f87bc95933e7516ba5c83e978c2a5b33a98af4849cc62d5dda449ce9",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "squad_val",
   "decoding": {
@@ -1295,17 +1295,17 @@
    "max_tokens": 256,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
   "em": 0.0,
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "f1": 0.0,
   "generation_errors_sample": [],
-  "generation_seconds": 0.6,
+  "generation_seconds": 2.1,
   "ids_file": null,
   "item_accuracy": 0.0,
   "limit": null,
@@ -1322,7 +1322,7 @@
    "ok": 974
   },
   "task": "squad_closed_book_test",
-  "timestamp": "2026-11-19T02:09:54",
+  "timestamp": "2026-11-19T04:57:58",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1340,8 +1340,8 @@
    "retries": 0
   },
   "data_provenance": {
-   "processed_sha256": "18617c0a9df1db69b0a9338f0da15f24605f947cb21eb95b87b47f29a23cb07a",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "processed_sha256": "21f1e0eeff360cbb32fd90bd4c1000d44e134245f91e03e5f808c312442cc956",
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "taco_verified",
   "decoding": {
@@ -1349,16 +1349,16 @@
    "max_tokens": 4096,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
-  "generation_seconds": 0.1,
-  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_4af3adn2/e2e_run/draws/gen_00/ids/taco_verified.screen.json",
+  "generation_seconds": 0.2,
+  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_1qxp13zy/e2e_run/draws/gen_00/ids/taco_verified.screen.json",
   "item_accuracy": null,
   "limit": null,
   "lora": null,
@@ -1378,7 +1378,7 @@
    "pending_sandbox": 200
   },
   "task": "taco_verified",
-  "timestamp": "2026-11-19T02:10:20",
+  "timestamp": "2026-11-19T04:58:32",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1397,7 +1397,7 @@
   },
   "data_provenance": {
    "processed_sha256": "3c9dff43d73f65afff5cb6a332a51e9df4af1e965944743f2f7d54e5d31d41ee",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "teval",
   "decoding": {
@@ -1405,13 +1405,13 @@
    "max_tokens": 2048,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "generation_errors_sample": [],
   "generation_seconds": 0.4,
   "ids_file": null,
@@ -1436,7 +1436,7 @@
    "ok": 553
   },
   "task": "teval",
-  "timestamp": "2026-11-19T02:10:06",
+  "timestamp": "2026-11-19T04:58:13",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1451,12 +1451,12 @@
    "cache_hits": 0,
    "failures": 0,
    "requests": 500,
-   "retries": 1
+   "retries": 0
   },
   "contains": 0.0,
   "data_provenance": {
    "processed_sha256": "ed750b533f51d0862a67455ea2df0d73bd349447845405453a42010814d8b3a7",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "triviaqa",
   "decoding": {
@@ -1464,17 +1464,17 @@
    "max_tokens": 256,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
   "em": 0.0,
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "f1": 0.0,
   "generation_errors_sample": [],
-  "generation_seconds": 2.2,
+  "generation_seconds": 0.3,
   "ids_file": null,
   "item_accuracy": 0.0,
   "limit": 500,
@@ -1491,7 +1491,7 @@
    "ok": 500
   },
   "task": "triviaqa",
-  "timestamp": "2026-11-19T02:09:53",
+  "timestamp": "2026-11-19T04:57:56",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",
@@ -1505,13 +1505,13 @@
   "client_stats": {
    "cache_hits": 0,
    "failures": 0,
-   "requests": 100,
+   "requests": 200,
    "retries": 0
   },
   "contains": 0.0,
   "data_provenance": {
-   "processed_sha256": "8338200f16e791c2464c9bd14ddb4738fcfc83c72d0bff668fc9f012d6744081",
-   "split_manifest_sha256": "3c3dbc33888e085a03b5360a7f4803a039927cf7b052d4fde29f46720530226b"
+   "processed_sha256": "796a9c3034316a7f217a666eec483925d418c44795579aeefed175ab34e2aabd",
+   "split_manifest_sha256": "3b18d7215c5a09d8ee0c5b0466c5fd31e204dbbbc7317211a8782dc963e094c2"
   },
   "dataset": "triviaqa_train",
   "decoding": {
@@ -1519,34 +1519,34 @@
    "max_tokens": 256,
    "max_tokens_thinking": 32768,
    "n": 1,
-   "seed": 20261118,
+   "seed": 42,
    "send_chat_template_kwargs": true,
    "temperature": 0.0,
    "thinking": false,
    "top_p": 1.0
   },
   "em": 0.0,
-  "endpoint": "http://127.0.0.1:52253/v1",
+  "endpoint": "http://127.0.0.1:49826/v1",
   "f1": 0.0,
   "generation_errors_sample": [],
   "generation_seconds": 0.1,
-  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_4af3adn2/e2e_run/draws/gen_00/ids/triviaqa_train.screen.json",
+  "ids_file": "/var/folders/nx/hrfy7p3j5g91zdkf5tr4q4v00000gn/T/e2e_draw_1qxp13zy/e2e_run/draws/gen_00/ids/triviaqa_train.screen.json",
   "item_accuracy": 0.0,
   "limit": null,
   "lora": null,
   "model": "oracle-model",
-  "n": 100,
+  "n": 200,
   "n_generation_errors": 0,
-  "n_items": 100,
+  "n_items": 200,
   "n_pending": 0,
-  "n_units": 100,
+  "n_units": 200,
   "pool": "pool",
   "served_model_name": "oracle-model",
   "status_counts": {
-   "ok": 100
+   "ok": 200
   },
   "task": "triviaqa_train",
-  "timestamp": "2026-11-19T02:10:15",
+  "timestamp": "2026-11-19T04:58:26",
   "versions": {
    "bfcl-eval": "2026.3.23",
    "httpx": "0.28.1",

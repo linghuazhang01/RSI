@@ -1,0 +1,138 @@
+# Paper B (self-written LoRA) base config. Merged with configs/domains/<domain>.yaml and --set KEY=VALUE
+# by rsicore.config.load_run_config; locked in experiment_records/<run-id>/run_config.yaml.
+# Numbers marked [pilot] are assumptions to be fixed in B-P0 (RSI_LOOP_DESIGN §6).
+draw_config: data/draw/paper_b.yaml   # target/retention sizes (n, target_train_frac, retention_n, screen_n, retention_kl, gate_n)
+
+lora:
+  rank_cap: 64              # [pilot] max rank per module (vLLM --max-lora-rank)
+  norm_cap_tau: 0.1         # [pilot] per-module ||dW||_F / ||W0||_F cap
+  allowed_leaves: null      # null = every vLLM-LoRA-capable Qwen3.5 projection (see primitives/naming.py)
+  save_dtype: bfloat16      # adapter_model.safetensors dtype
+
+budget:
+  gpu_seconds: 7200         # [pilot] gradient budget per generation (grad / sgd / acts / regmean), = SFT budget
+
+search:
+  threads: 4
+  steps: 8
+  max_evaluate: 32          # evaluate calls per generation (every candidate costs 1)
+  top_full: 3               # top screened candidates re-scored on the full signal draw
+  rerun_seeds: 0
+  archive: true             # experience channel: show earlier generations' best programs
+
+editor:
+  temperature: 0.6
+  max_tokens: 8192
+
+sandbox:
+  timeout_s: 1800
+  mem_gb: 16
+
+feedback:
+  lambda_retention: 1.0     # [pilot] score = target_gain - lambda * mean retention drop - lambda_kl * KL
+  lambda_kl: 0.5
+  n_examples: 3             # error / regression examples per feedback (marked as shown -> never signal again)
+  mark_shown: true
+
+gate:
+  epsilon: 0.01             # [pilot] target gate >= SFT gate - epsilon
+  delta: 0.02               # [pilot] retention gate >= gen-0 - max(delta, noise band); learned targets >= post-learning - delta
+  use_noise_band: true
+  max_submissions: 3
+
+eval:                       # null = use the draw config sizes as they are
+  screen_limit: null
+  full_limit: null
+  gate_limit: null
+  kl_limit: null
+
+train_data:
+  mode: self_correct_then_gold   # rejection-sampled own correct answers, else the gold answer in eval format
+  samples: 4
+  temperature: 0.7
+
+train:
+  dtype: bfloat16
+  max_len: 4096
+  micro_batch: null         # forward at most this many sequences at once (gradient accumulation); null = whole batch
+
+sft:                        # fixed-recipe SFT baseline (also the non-LLM search's starting recipe)
+  rank: 16
+  lr: 1.0e-4
+  epochs: 1.0
+  steps: null               # null = epochs over the train items (capped by budget.gpu_seconds)
+  batch_size: 4
+  ckpt_fracs: [0.25, 0.5, 0.75, 1.0]
+  leaves: [q_proj, k_proj, v_proj, o_proj, in_proj_qkv, in_proj_z, out_proj, gate_proj, up_proj, down_proj]
+
+nonllm:
+  evaluate: 32              # same evaluate budget as the editor
+  n_configs: 4              # SFT hyper-parameter samples sharing budget.gpu_seconds
+  search_scales: [0.5, 0.75, 1.0, 1.25]
+  frontiers: true
+  scales: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
+
+diagnostics:
+  svd_k: 8
+
+e_t:
+  enabled: true
+  task: tool_calling                       # E-Seal: sealtool_train -> Seal-Tools test + BFCL
+  task_when_target_is_tool_calling: code   # taco_verified -> LiveCodeBench
+  branches: [parent, sft, llm, nonllm]
+  evaluate: 16
+  gpu_seconds: 3600         # [pilot]
+  threads: 4
+  steps: 4
+  top_full: 1
+  n_train: 1600
+  n_signal: 200
+  items_seed: 20261118
+  test_limit: null
+
+heldout:
+  enabled: true
+  limit: null
+
+baseline:
+  noise_repeats: 3          # sampled gate re-runs of M_0 (rsicore.gate.measure_noise_band)
+  noise_temperature: 0.6
+
+merge:
+  gpu: true                 # accumulate W + dW on gpu1 (else CPU)
+
+server:
+  max_loras: 8
+  main_args: ["--gpu-memory-utilization", "0.85", "--max-logprobs", "20"]
+  theta0_args: ["--gpu-memory-utilization", "0.45", "--max-logprobs", "20"]
+  mock_tasks: null
+
+# Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
+# cards. A profile is merged on top of everything else (before mock_overrides).
+hardware: b300
+hardware_profiles:
+  b300: {}
+  h20:                      # 80 GB H20, Qwen3.8-27B (BF16 ~52 GB): one full model per card, 3 cards per run
+    gpu_roles: {main: [0], theta0: [1], train: [2]}   # 4 cards: train: [2, 3] (HF model split across both)
+    server:
+      max_loras: 4          # vLLM reserves GPU memory for max_loras adapters of rank_cap
+      main_args: ["--gpu-memory-utilization", "0.92", "--max-model-len", "20480", "--max-num-seqs", "32", "--max-logprobs", "20"]
+      theta0_args: ["--gpu-memory-utilization", "0.92", "--max-model-len", "20480", "--max-num-seqs", "32", "--max-logprobs", "20"]
+    train:
+      micro_batch: 1        # 52 GB weights + one 4k-token sequence (activations, fp32 logits) per forward
+
+mock:
+  base_quality: 0.6
+  sec_per_example: 0.6
+
+# Applied on top of everything when --mock is given: small budgets so a laptop run takes minutes.
+mock_overrides:
+  search: {threads: 2, steps: 2, max_evaluate: 4, top_full: 1}
+  budget: {gpu_seconds: 600}
+  eval: {screen_limit: 20, full_limit: 30, gate_limit: 30, kl_limit: 4}
+  train_data: {mode: gold}
+  nonllm: {evaluate: 2, n_configs: 2, search_scales: [0.75, 1.0], scales: [0.5, 1.0]}
+  e_t: {evaluate: 2, threads: 1, steps: 2, n_train: 64, n_signal: 20, test_limit: 10, gpu_seconds: 300}
+  heldout: {limit: 20}
+  baseline: {noise_repeats: 3}
+  sandbox: {timeout_s: 120, mem_gb: 4}

@@ -1,0 +1,2 @@
+# Target: Seal-Tools train (sealtool_train). E_t switches to the code task (taco_verified -> LiveCodeBench).
+# Sizes (n, gate_n, retention_n, ...) come from data/draw/paper_b.yaml; override here only what differs.

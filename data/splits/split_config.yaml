@@ -6,7 +6,7 @@
 #   * benchmarks are HELD-OUT: evaluated after each generation, never fed back, never used to select.
 #
 # Pools (revised again 2026-11-18: per-generation draws)
-#   gate    = fixed GATE slice of a training set (size per domain set in `gate_domains` below):
+#   gate    = (training sets no longer have a static gate; draw.py splits it per run from the config)
 #             pass/fail only, limited submissions,
 #             identical in every generation so thresholds stay relative to generation 0
 #   pool    = DRAW POOL = rest of a training set. Every generation draws a fresh sample
@@ -25,25 +25,17 @@
 # then sliced in the order search -> gate -> test. Stratified pools use largest-remainder rounding.
 seed: 20261118
 
-# ---------------------------------------------------------------- fixed gate size (config knob)
-# Total gate items per domain, split over the domain's training sets by weight (largest remainder).
-# Training sets with `gate: domain` take their size from here. Changing a size re-splits the data:
-# every existing draw run is then refused by data/scripts/draw.py (pool hash check) -> start new runs.
-# The per-generation draw size is set separately in data/draw/paper_{a,b}.yaml (`n` per domain).
-# Extra fixed gates outside this table: gpqa_main (all 250) and ifeval (135, WSP-Scope split).
-gate_domains:
-  math:                  {size: 1000, datasets: {gsm8k_train: 0.25, math_train: 0.35, dapo_math: 0.40}}
-  code:                  {size: 1000, datasets: {taco_verified: 1.0}}
-  knowledge:             {size: 1000, datasets: {triviaqa_train: 0.5, arc: 0.5}}
-  instruction_following: {size: 1000, datasets: {ifeval_train: 1.0}}
-  tool_calling:          {size: 1000, datasets: {sealtool_train: 1.0}}
+# Fixed gates are no longer split here (2026-11-19): every training set is one whole draw pool, and
+# data/scripts/draw.py splits the fixed gate dynamically from the sizes in data/draw/paper_{a,b}.yaml
+# (`gate_n` per domain). Only five training sets are used: dapo_math, taco_verified, triviaqa_train,
+# ifeval_train, sealtool_train.
 
 datasets:
   # ================================================================ math
   # training sets (ReST-EM, WSP blog / WSP-Scope; DAPO from WHALE)
-  gsm8k_train:  {role: train, gate: domain, rest: pool}
-  math_train:   {role: train, gate: domain, rest: pool}
-  dapo_math:    {role: train, gate: domain, rest: pool}
+  gsm8k_train:  {role: train, all: reserve}   # not used (2026-11-19): math uses DAPO-Math only
+  math_train:   {role: train, all: reserve}   # not used (2026-11-19): math uses DAPO-Math only
+  dapo_math:    {role: train, all: pool}      # math training set (gate split per run by draw.py)
   # held-out
   math:            # MATH test (5,000): MATH-500 -> test, the other 4,500 -> reserve
     subset_rule: "MATH-500 items (metadata.is_math500) -> test; others -> reserve"
@@ -59,7 +51,7 @@ datasets:
   # data/processed/aux/apps_tests.jsonl. Gate stratified by difficulty.
   apps:         {role: train, all: reserve}   # no longer used (2026-11-19): one code training set only -> TACO-verified
   # TACO-verified: the only code training set (2026-11-19). Precedents: EvoTrainer, ReVeal (both LCB v6).
-  taco_verified: {role: train, gate: domain, stratify_by: difficulty, rest: pool}
+  taco_verified: {role: train, all: pool}     # code training set (gate split per run by draw.py)
   # held-out
   humanevalplus: {all: test}
   mbppplus:     {all: test}
@@ -71,9 +63,9 @@ datasets:
 
   # ================================================================ knowledge
   # training sets (Transformer2: ARC; WSP-Scope: GPQA Main minus Diamond; TriviaQA train for closed-book recall)
-  arc:          {role: train, gate: domain, rest: pool}
-  gpqa_main:    {role: train, all: gate}                       # 250 items: Main minus Diamond (gate only)
-  triviaqa_train: {role: train, gate: domain, rest: pool}
+  arc:          {role: train, all: reserve}   # not used (2026-11-19): knowledge uses TriviaQA train only
+  gpqa_main:    {role: train, all: reserve}   # not used (2026-11-19)
+  triviaqa_train: {role: train, all: pool}    # knowledge training set (gate split per run by draw.py)
   # held-out
   mmlu_pro:     {test: 2000, rest: reserve}
   gpqa_diamond: {all: test}
@@ -85,7 +77,7 @@ datasets:
   # one IFEval-style constraint each, graded by eval/evallib/graders/rlvr_if.py. 14,970 items after
   # dropping 3 exact duplicates; decontaminated against every held-out IF item before splitting.
   # This is the IF draw source (data/draw/paper_*.yaml).
-  ifeval_train: {role: train, gate: domain, stratify_by: constraint_type, rest: pool}
+  ifeval_train: {role: train, all: pool}      # IF training set (gate split per run by draw.py)
   # WSP-Scope split of IFEval: 270 for the loop (pool 135 + gate 135), 271 held-out.
   # IFEval gate 135 stays an IF gate; the 135-item IFEval pool is kept but no longer drawn from.
   ifeval:
@@ -93,6 +85,7 @@ datasets:
     pool: 135
     gate: 135
     test: 271
+    relabel: {pool: reserve, gate: reserve}   # 2026-11-19: the 270 non-test items are unused; test (271) unchanged
   ifbench:      {all: test}                   # OOD held-out (constraint types differ from IFEval)
   mt_bench:     {all: test}                   # optional, needs LLM judge
   alpaca_eval:  {all: test}                   # optional, needs LLM judge
@@ -100,7 +93,7 @@ datasets:
 
   # ================================================================ tool calling
   # training set (TT-SI SFT baseline: SealTool train)
-  sealtool_train: {role: train, gate: domain, rest: pool}
+  sealtool_train: {role: train, all: pool}    # tool-calling training set (gate split per run by draw.py)
   toolace:      {role: train, all: train}     # Paper A KL / calibration text only
   apibank_train: {role: train, all: reserve}  # superseded by SealTool; kept, unused
   # held-out

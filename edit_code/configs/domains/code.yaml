@@ -1,0 +1,6 @@
+# Paper A, single domain: signal, screen and gate use only this domain's training set
+# (rsicore.draws.DOMAIN_TRAIN["code"]); held-out evaluation still covers all five domains.
+# KL / calibration texts come from all five domains (kl.domains: all) unless overridden here.
+domain: code
+# TACO-verified is graded in the Docker sandbox; without Docker its items stay pending and the gate
+# has no scored items (set gate.allow_unscored only for dry runs).

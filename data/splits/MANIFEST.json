@@ -1,5 +1,5 @@
 {
- "config_sha256": "8416b26876762a85f760d5f0ba832bb7c2ef241256ed43aaca9fb11b84423fa9",
+ "config_sha256": "a65d6bc54c93c1b35cf6eb8befc4dc96417fd1d44567717ab3981f06f9e8aae4",
  "decontamination": {
   "apibank_train": {
    "exact_examples": [],
@@ -42,7 +42,7 @@
     "dapo/06865281-0468-468f-9f37-b45f411fbbdf",
     "dapo/071d2258-f634-4b2d-9f4d-1de31c1bfcb5"
    ],
-   "exact_match_removed": 984,
+   "exact_match_removed": 983,
    "near_dup_13gram_removed": 85,
    "near_dup_examples": [
     [
@@ -467,15 +467,7 @@
   }
  },
  "gate_sizes": {
-  "arc": 500,
-  "dapo_math": 400,
-  "gsm8k_train": 250,
-  "ifeval": 135,
-  "ifeval_train": 1000,
-  "math_train": 350,
-  "sealtool_train": 1000,
-  "taco_verified": 1000,
-  "triviaqa_train": 500
+  "ifeval": 135
  },
  "processed": {
   "aime24.jsonl": {
@@ -508,15 +500,15 @@
   },
   "arc.jsonl": {
    "n": 3370,
-   "sha256": "c8017756c252e36f9f59f5bb5fa70f4c7599164b955ae9b2f9384dea75f7f1bf"
+   "sha256": "d204fdc53f79c83c01d946c5d116788c42350a4878004e291e650a23a8a9897b"
   },
   "bfcl.jsonl": {
    "n": 4696,
    "sha256": "91a7dcda3f4fba67e07d2c58906e4e3f613cb468a61e164cf0a16c5d844afc54"
   },
   "dapo_math.jsonl": {
-   "n": 17398,
-   "sha256": "1f3dab781ff16b26b2f5cee33c621e1db820301421a078cd278bbb706cf013e8"
+   "n": 17382,
+   "sha256": "54a5b760ce2cbe77ab86d2a1d32b4cece834003ee8cc85bd68dfe956d6da8a79"
   },
   "freebaseqa.jsonl": {
    "n": 3996,
@@ -528,7 +520,7 @@
   },
   "gpqa_main.jsonl": {
    "n": 250,
-   "sha256": "8d5cb4d7ed95853cae452d8919bf39e0219e9b14885e9b1ca4eb7194b655328e"
+   "sha256": "ab450dced4dac5300eba05240eb68d141efbc8d7146a2f1d4b0121edf5fb6b26"
   },
   "gsm8k.jsonl": {
    "n": 1319,
@@ -536,7 +528,7 @@
   },
   "gsm8k_train.jsonl": {
    "n": 7473,
-   "sha256": "2949c13a291c250bc919203c8c237e136cd2e154faee8b6d2aa14f569ec46723"
+   "sha256": "7c93d60096b9a863ff4fc3a8a149e78930bf069362335fa1e01c001f6b2430fd"
   },
   "humanevalplus.jsonl": {
    "n": 164,
@@ -548,11 +540,11 @@
   },
   "ifeval.jsonl": {
    "n": 541,
-   "sha256": "e3c0be71399c7da6c95458b1d6b18c9e54d7793d835b5b51a8f4887c7713c7ba"
+   "sha256": "791174b6059f1a7e6ac55ba135f0d6a3fe20bbefc893815e660be1121a531cae"
   },
   "ifeval_train.jsonl": {
    "n": 14970,
-   "sha256": "bce8e3efd6e6f76cd936c32dce716838ec1ec59a3c5a1b99cb93032d1774da3f"
+   "sha256": "92a0436e476aca4066e04794946dd2c87853b8c345494222e27e70a674dc7a61"
   },
   "livecodebench.jsonl": {
    "n": 131,
@@ -568,7 +560,7 @@
   },
   "math_train.jsonl": {
    "n": 7500,
-   "sha256": "e3ac79b08a5beae360628f408a58f1e16462fa6e5cf8b1b664f1fa8537825015"
+   "sha256": "ef28f2c70c155a53bc94f15a9a4cd4bd24aa5d738fa57fee4f0913ad096bd131"
   },
   "mbppplus.jsonl": {
    "n": 378,
@@ -596,7 +588,7 @@
   },
   "sealtool_train.jsonl": {
    "n": 12022,
-   "sha256": "f566d4112e7a17059b06bd29d009b0f7c8dfb2d51b1c5f00a9d968631756cbf2"
+   "sha256": "90592c2718c4372e7eec3df6119aa42478a3a300b673f162ce036049fd29a981"
   },
   "squad_train.jsonl": {
    "n": 18891,
@@ -608,7 +600,7 @@
   },
   "taco_verified.jsonl": {
    "n": 10806,
-   "sha256": "18617c0a9df1db69b0a9338f0da15f24605f947cb21eb95b87b47f29a23cb07a"
+   "sha256": "21f1e0eeff360cbb32fd90bd4c1000d44e134245f91e03e5f808c312442cc956"
   },
   "teval.jsonl": {
    "n": 4358,
@@ -624,7 +616,7 @@
   },
   "triviaqa_train.jsonl": {
    "n": 76523,
-   "sha256": "8338200f16e791c2464c9bd14ddb4738fcfc83c72d0bff668fc9f012d6744081"
+   "sha256": "796a9c3034316a7f217a666eec483925d418c44795579aeefed175ab34e2aabd"
   },
   "tulu3_if.jsonl": {
    "n": 29980,
@@ -661,29 +653,21 @@
    "n": 4449,
    "sha256": "8cd32828d15a73e506dcaecd8a69c7e548689bdde765ea9f9502ad74f361b888"
   },
-  "arc/gate.json": {
-   "n": 500,
-   "sha256": "076eccae1a8ac319f8b4e7eea9972748da864c7b30962007f9d7eb3b04b08aa5"
-  },
-  "arc/pool.json": {
-   "n": 2870,
-   "sha256": "d0c5473efb9d5e037a8d35b4376b8e8a10964fa256654456f07d94c1b2717000"
+  "arc/reserve.json": {
+   "n": 3370,
+   "sha256": "5f7a81075dca8d1ccdf7e23b336d521ba3c6bafb9bb41711f4e30124fa6decb5"
   },
   "bfcl/test.json": {
    "n": 4696,
    "sha256": "ca9cc3ecd72b9935af0cdafaf1a725b96a3e3b9fdeec2bf5361026af9fd80067"
   },
-  "dapo_math/gate.json": {
-   "n": 400,
-   "sha256": "923e67e12669d1ff51343326c4dea74fbd82fa73f6cb53a390000b76c235ec64"
-  },
   "dapo_math/pool.json": {
-   "n": 15929,
-   "sha256": "c037b45b9e40b2d1b01e1b0e8b33f8ce84b92c672d3ca2c8c8d9ff4cdc4b9475"
+   "n": 16314,
+   "sha256": "7e2aaabd422a6efe64afa45f959f58407ab5967f36f2f9f8e348f1a2f0cdc16b"
   },
   "dapo_math/train_excluded.json": {
-   "n": 1069,
-   "sha256": "3de58b3c32df0f4baed92ba7877cac4c35f4ce73d898137d22449614c813e78d"
+   "n": 1068,
+   "sha256": "d8b9a83c9c5892d7b1bd9542a2007d48f13e17407140dd4329d3fa512f26c4d5"
   },
   "freebaseqa/test.json": {
    "n": 3996,
@@ -693,7 +677,7 @@
    "n": 198,
    "sha256": "070279ea6128eab84f3942f4d41fdf399851b8bb7aaf7efeb6cccd9404481dae"
   },
-  "gpqa_main/gate.json": {
+  "gpqa_main/reserve.json": {
    "n": 250,
    "sha256": "60cdfc7f750dcfbfc2d52741a2773c7959eb57e27988879c838837e704fbbb9c"
   },
@@ -701,13 +685,9 @@
    "n": 1319,
    "sha256": "988bfde749e622fd9f961f3873518d88ed6bc0a6efdda27dd4cfe3cafa05fb44"
   },
-  "gsm8k_train/gate.json": {
-   "n": 250,
-   "sha256": "cf615ec7afdec59ffd2c69d2d63c89ea81b205c6c651de0a54d9b88048d7a9b0"
-  },
-  "gsm8k_train/pool.json": {
-   "n": 7221,
-   "sha256": "e402172e85bdd99a25197d0fa0b76b69b4ae01a79c05d90fe043737c8d013ab3"
+  "gsm8k_train/reserve.json": {
+   "n": 7471,
+   "sha256": "20cf498eed3ef2271370b4e232f276e3e182804d85d820ee0e00b7cbcaf86ab5"
   },
   "gsm8k_train/train_excluded.json": {
    "n": 2,
@@ -721,25 +701,17 @@
    "n": 300,
    "sha256": "4b47b279a6479f00c53e2b9044751440b5c282e617d4beca9213273714ada90a"
   },
-  "ifeval/gate.json": {
-   "n": 135,
-   "sha256": "5b2723118ea0925c3bc229c04cd1a529f3e4286765d5495febde691b4d995102"
-  },
-  "ifeval/pool.json": {
-   "n": 135,
-   "sha256": "de62be5ab314ba583ff790402a09f47b05ba545c5c527ae77cd6e4ebeb333b70"
+  "ifeval/reserve.json": {
+   "n": 270,
+   "sha256": "1bf1b1a8b70228b7fdd3b56c73c43135d63b7318c1094b4925d7987db81a5fe2"
   },
   "ifeval/test.json": {
    "n": 271,
    "sha256": "dc3ab2924c5e5d1fdcc7e94a52f251f2caefa4b9c8bb8965c74efe72df479fc0"
   },
-  "ifeval_train/gate.json": {
-   "n": 1000,
-   "sha256": "40b7221bfd444c5ae3f20bfde49f2220b56d8d6e25a96f859003596152dda938"
-  },
   "ifeval_train/pool.json": {
-   "n": 13954,
-   "sha256": "4ae730bd5e513a56dea556e339c9f4bd272ed7bfa1211d46163504a7096f9bdd"
+   "n": 14954,
+   "sha256": "c17ddbeb20b691ad52c35ed4d698f52b13f1eeaf03cbc18001b1bf7280156ec5"
   },
   "ifeval_train/train_excluded.json": {
    "n": 16,
@@ -761,13 +733,9 @@
    "n": 500,
    "sha256": "f626c6944619cda914e51631b05e1c7cf8302ba2db3aac6428d310dcc0c7722f"
   },
-  "math_train/gate.json": {
-   "n": 350,
-   "sha256": "d3bff4ad1e74d2999e4567fa68349151e4e7298c8cca2dbb5e19d9dde4a397e4"
-  },
-  "math_train/pool.json": {
-   "n": 7116,
-   "sha256": "bb1ebf1ef67e2c190ccbc12509bc9f9652ad2e47b58710ce30df8bf167b980f4"
+  "math_train/reserve.json": {
+   "n": 7466,
+   "sha256": "9271d702b637819b95bf1aa83f5bbcb5fbcce32595751ee9f75790cda3de6915"
   },
   "math_train/train_excluded.json": {
    "n": 34,
@@ -805,13 +773,9 @@
    "n": 1354,
    "sha256": "75e88b14559c14bbfabb69f16a5d598d86ec9b17df97f67ffe7e9cd0be8c3077"
   },
-  "sealtool_train/gate.json": {
-   "n": 1000,
-   "sha256": "abe6a2189da0c70dc1a3a0966ba15fb2fcf5a46ccdc0eda3268b012ead633909"
-  },
   "sealtool_train/pool.json": {
-   "n": 11019,
-   "sha256": "8748af4cd02adbfa5db5a462614fa6e6521efc6c8687d7dc4c319949b3437c96"
+   "n": 12019,
+   "sha256": "bddd91ded17c671d20b1fd53e5034d971dcb759a7dfbb51a39fb600c5c74d018"
   },
   "sealtool_train/train_excluded.json": {
    "n": 3,
@@ -841,13 +805,9 @@
    "n": 200,
    "sha256": "dcce0ed0a067d62bae3bdb4ae38e924de7cf84a5bf377269d0fc6bbd77cff39f"
   },
-  "taco_verified/gate.json": {
-   "n": 1000,
-   "sha256": "5228e3bbb7127e2ad1bbd446bf2ef363b629ab11b9ef041c156a7316624c3915"
-  },
   "taco_verified/pool.json": {
-   "n": 9806,
-   "sha256": "ce685958dcb18862cf7ae3f8dd84a7ffb290eeaab114319f713296c80eb46d0e"
+   "n": 10806,
+   "sha256": "5912f5ab326996602ca6828fd9b169f5bfacfbf74079ad4b5125be6147217fd9"
   },
   "teval/test.json": {
    "n": 4358,
@@ -865,13 +825,9 @@
    "n": 2000,
    "sha256": "2bcde2a36366b1a27ea0bbabd5e1cc75df3bd40e63a11dea5616cb1878586aa1"
   },
-  "triviaqa_train/gate.json": {
-   "n": 500,
-   "sha256": "3a2f2d9b2b6e2cf05d0b55e31440ba737bc90430b8a31adc91c42297afccaf4d"
-  },
   "triviaqa_train/pool.json": {
-   "n": 73225,
-   "sha256": "27b6dbc1c5894ea999c91bcf3525f8631dfab1d570e26ae2dd21fec3536460ac"
+   "n": 73725,
+   "sha256": "bfa10164e9804eb1b4a0fd32cec5644d4633b28daa642f1371de6466458225be"
   },
   "triviaqa_train/train_excluded.json": {
    "n": 2798,

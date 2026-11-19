@@ -46,9 +46,9 @@
    "note": "BFCL v4 single-turn 3,641 + multi-turn 800 + agentic (memory 155, web_search 100); format_sensitivity excluded (re-uses ids)"
   },
   "dapo_math": {
-   "actual": 17398,
-   "expected": 17398,
-   "note": "1,791,700 rows = 17,398 unique prompts (WHALE reports 17,917)"
+   "actual": 17382,
+   "expected": 17382,
+   "note": "1,791,700 rows = 17,398 unique prompts (WHALE reports 17,917); 639 lost-backslash prompts repaired, 16 unrecoverable dropped -> 17,382"
   },
   "freebaseqa": {
    "actual": 3996,
@@ -197,12 +197,8 @@
  },
  "decontam": {
   "exact_match_hits": {
-   "arc": 0,
    "dapo_math": 0,
-   "gpqa_main": 0,
-   "gsm8k_train": 0,
    "ifeval_train": 0,
-   "math_train": 0,
    "sealtool_train": 0,
    "squad_train": 0,
    "taco_verified": 0,
@@ -251,7 +247,7 @@
      "dapo/06865281-0468-468f-9f37-b45f411fbbdf",
      "dapo/071d2258-f634-4b2d-9f4d-1de31c1bfcb5"
     ],
-    "exact_match_removed": 984,
+    "exact_match_removed": 983,
     "near_dup_13gram_removed": 85,
     "near_dup_examples": [
      [
@@ -679,183 +675,43 @@
  "failures": [],
  "ifeval_strata": {
   "change_case": {
-   "gate": 16,
-   "pool": 16,
+   "reserve": 32,
    "test": 33
   },
   "combination": {
-   "gate": 14,
-   "pool": 15,
+   "reserve": 29,
    "test": 29
   },
   "detectable_content": {
-   "gate": 8,
-   "pool": 8,
+   "reserve": 16,
    "test": 17
   },
   "detectable_format": {
-   "gate": 29,
-   "pool": 28,
+   "reserve": 57,
    "test": 57
   },
   "keywords": {
-   "gate": 22,
-   "pool": 22,
+   "reserve": 44,
    "test": 44
   },
   "language": {
-   "gate": 6,
-   "pool": 5,
+   "reserve": 11,
    "test": 10
   },
   "length_constraints": {
-   "gate": 19,
-   "pool": 19,
+   "reserve": 38,
    "test": 39
   },
   "punctuation": {
-   "gate": 8,
-   "pool": 9,
+   "reserve": 17,
    "test": 17
   },
   "startend": {
-   "gate": 13,
-   "pool": 13,
+   "reserve": 26,
    "test": 25
   }
  },
- "ngram13": {
-  "arc->gpqa_diamond": {
-   "eval_items_touched": 0,
-   "eval_total": 198,
-   "train_items_with_overlap": 0
-  },
-  "arc->mmlu_pro": {
-   "eval_items_touched": 0,
-   "eval_total": 12032,
-   "train_items_with_overlap": 0
-  },
-  "dapo_math->aime24": {
-   "eval_items_touched": 8,
-   "eval_total": 30,
-   "train_items_with_overlap": 382
-  },
-  "dapo_math->aime25": {
-   "eval_items_touched": 10,
-   "eval_total": 30,
-   "train_items_with_overlap": 363
-  },
-  "dapo_math->amc23": {
-   "eval_items_touched": 10,
-   "eval_total": 40,
-   "train_items_with_overlap": 29
-  },
-  "dapo_math->math": {
-   "eval_items_touched": 592,
-   "eval_total": 5000,
-   "train_items_with_overlap": 1022
-  },
-  "dapo_math->olympiadbench": {
-   "eval_items_touched": 36,
-   "eval_total": 674,
-   "train_items_with_overlap": 46
-  },
-  "gpqa_main->gpqa_diamond": {
-   "eval_items_touched": 8,
-   "eval_total": 198,
-   "train_items_with_overlap": 7
-  },
-  "gsm8k_train->gsm8k": {
-   "eval_items_touched": 2,
-   "eval_total": 1319,
-   "train_items_with_overlap": 2
-  },
-  "ifeval_train->ifbench": {
-   "eval_items_touched": 2,
-   "eval_total": 300,
-   "train_items_with_overlap": 803
-  },
-  "ifeval_train->ifeval": {
-   "eval_items_touched": 11,
-   "eval_total": 541,
-   "train_items_with_overlap": 2567
-  },
-  "math_train->aime24": {
-   "eval_items_touched": 7,
-   "eval_total": 30,
-   "train_items_with_overlap": 67
-  },
-  "math_train->aime25": {
-   "eval_items_touched": 10,
-   "eval_total": 30,
-   "train_items_with_overlap": 68
-  },
-  "math_train->amc23": {
-   "eval_items_touched": 3,
-   "eval_total": 40,
-   "train_items_with_overlap": 5
-  },
-  "math_train->math": {
-   "eval_items_touched": 495,
-   "eval_total": 5000,
-   "train_items_with_overlap": 705
-  },
-  "math_train->olympiadbench": {
-   "eval_items_touched": 6,
-   "eval_total": 674,
-   "train_items_with_overlap": 6
-  },
-  "sealtool_train->apibank": {
-   "eval_items_touched": 0,
-   "eval_total": 584,
-   "train_items_with_overlap": 0
-  },
-  "sealtool_train->bfcl": {
-   "eval_items_touched": 1,
-   "eval_total": 4696,
-   "train_items_with_overlap": 1
-  },
-  "sealtool_train->sealtool": {
-   "eval_items_touched": 1993,
-   "eval_total": 2054,
-   "train_items_with_overlap": 12015
-  },
-  "taco_verified->humanevalplus": {
-   "eval_items_touched": 1,
-   "eval_total": 164,
-   "train_items_with_overlap": 2
-  },
-  "taco_verified->livecodebench": {
-   "eval_items_touched": 62,
-   "eval_total": 131,
-   "train_items_with_overlap": 446
-  },
-  "taco_verified->mbppplus": {
-   "eval_items_touched": 0,
-   "eval_total": 378,
-   "train_items_with_overlap": 0
-  },
-  "toolace->apibank": {
-   "eval_items_touched": 0,
-   "eval_total": 584,
-   "train_items_with_overlap": 0
-  },
-  "toolace->bfcl": {
-   "eval_items_touched": 4,
-   "eval_total": 4696,
-   "train_items_with_overlap": 4
-  },
-  "toolace->metatool": {
-   "eval_items_touched": 0,
-   "eval_total": 5327,
-   "train_items_with_overlap": 0
-  },
-  "triviaqa_train->triviaqa": {
-   "eval_items_touched": 67,
-   "eval_total": 9960,
-   "train_items_with_overlap": 81
-  }
- },
+ "ngram13": {},
  "pools": {
   "aime24": {
    "test": 30
@@ -879,16 +735,14 @@
    "reserve": 4449
   },
   "arc": {
-   "gate": 500,
-   "pool": 2870
+   "reserve": 3370
   },
   "bfcl": {
    "test": 4696
   },
   "dapo_math": {
-   "gate": 400,
-   "pool": 15929,
-   "train_excluded": 1069
+   "pool": 16314,
+   "train_excluded": 1068
   },
   "freebaseqa": {
    "test": 3996
@@ -897,14 +751,13 @@
    "test": 198
   },
   "gpqa_main": {
-   "gate": 250
+   "reserve": 250
   },
   "gsm8k": {
    "test": 1319
   },
   "gsm8k_train": {
-   "gate": 250,
-   "pool": 7221,
+   "reserve": 7471,
    "train_excluded": 2
   },
   "humanevalplus": {
@@ -914,13 +767,11 @@
    "test": 300
   },
   "ifeval": {
-   "gate": 135,
-   "pool": 135,
+   "reserve": 270,
    "test": 271
   },
   "ifeval_train": {
-   "gate": 1000,
-   "pool": 13954,
+   "pool": 14954,
    "train_excluded": 16
   },
   "livecodebench": {
@@ -934,8 +785,7 @@
    "test": 500
   },
   "math_train": {
-   "gate": 350,
-   "pool": 7116,
+   "reserve": 7466,
    "train_excluded": 34
   },
   "mbppplus": {
@@ -959,8 +809,7 @@
    "test": 1354
   },
   "sealtool_train": {
-   "gate": 1000,
-   "pool": 11019,
+   "pool": 12019,
    "train_excluded": 3
   },
   "squad_train": {
@@ -974,8 +823,7 @@
    "test": 200
   },
   "taco_verified": {
-   "gate": 1000,
-   "pool": 9806
+   "pool": 10806
   },
   "teval": {
    "test": 4358
@@ -988,8 +836,7 @@
    "test": 2000
   },
   "triviaqa_train": {
-   "gate": 500,
-   "pool": 73225,
+   "pool": 73725,
    "train_excluded": 2798
   },
   "tulu3_if": {

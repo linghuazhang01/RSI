@@ -40,6 +40,8 @@ def parse_args(argv=None):
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--config", default=str(EVAL_DIR / "configs" / "tasks.yaml"))
     ap.add_argument("--temperature", type=float)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="override the task/default sampling seed sent to the server (only sent when temperature > 0)")
     ap.add_argument("--top-p", type=float)
     ap.add_argument("--n", type=int)
     ap.add_argument("--max-tokens", type=int)
@@ -66,6 +68,8 @@ def decoding_for(task_cfg, defaults, a):
           "send_chat_template_kwargs")}
     if a.temperature is not None:
         d["temperature"] = a.temperature
+    if a.seed is not None:
+        d["seed"] = a.seed
     if a.top_p is not None:
         d["top_p"] = a.top_p
     if a.n is not None:

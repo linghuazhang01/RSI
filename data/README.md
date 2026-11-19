@@ -31,25 +31,25 @@ $PY data/scripts/report_table.py       # 打印下表
 
 `make_splits.py` 只依赖 item id、`split_config.yaml` 和种子 `seed=20261118`，可重复生成；改划分规模时只需改 `split_config.yaml` 后重跑。
 
-## 当前配置（2026-11-18 修订）
+## 当前配置（2026-11-19 修订）
 
-每个领域：**训练集 + 1–3 个留出集**。自量化 / 自编辑循环**只看训练集**：
-- `gate` 池 = 固定的**验收**集（每个领域 1,000 题，按权重分到该领域的训练集；每代相同，只返回通过 / 不通过）；
-- `pool` 池 = **抽样池**（训练集其余部分）。每一代用 `scripts/draw.py` 从中抽 1,000–2,000 题/领域，作为这一代的信号（L1）、KL / 校准文本（Paper A）和梯度训练数据（Paper B）。训练数据可以跨代复用：先抽没用过的题，用完后按最久未用的顺序复用；训练过或展示给编辑者看过的题不再当信号。见下文"每代抽样"。
+每个领域**只用一个训练集**，配 1–3 个留出集。自量化 / 自编辑循环**只看训练集**：
+- 数据文件里每个训练集是一个整体的抽样池（`pool`）；
+- **固定验收集动态切分**：每次运行开始时，`scripts/draw.py` 按配置的 `gate_n` 从池里切出验收集，写到运行目录 `draws/gate/`，每代都用这一份；切分只由 `gate.seed`（20261118）和 `gate_n` 决定，验收集大小相同的运行验收集完全一样；
+- 每一代从验收集以外的池子里抽 1,000–2,000 题，作为信号、KL 文本（Paper A）和梯度训练数据（Paper B）。
 
-benchmark 全部是**留出集**（`test` 池），每一代结束后评测、只用于报告，不回传、不用来挑候选。依据见 `plan/research/DATA_CONFIG.md` 与 `plan/research/method-research/rsi-data/RSI_DATA.md`。
+benchmark 全部是**留出集**（`test` 池），每一代结束后评测、只用于报告。
 
-| 领域 | 训练集（每领域验收 1,000 固定 / 其余为抽样池） | 留出集（主表） | 来源论文 |
-|---|---|---|---|
-| 数学 | `gsm8k_train`、`math_train`、`dapo_math` | MATH-500（500）、GSM8K test（1,319）、AIME 2024+2025（60） | ReST-EM；WSP 博客 / WSP-Scope；WHALE（DAPO） |
-| 代码 | `taco_verified`（TACO-verified 10,806 题，参考解都跑过测试；**唯一的代码训练集**） | HumanEval+（164）、MBPP+（378）、LiveCodeBench（131） | EvoTrainer（TACO-verified 11,897 → LCB v6）；ReVeal（TACO 11,151 → LCB v6） |
-| 通用推理 / 知识 | `arc`（ARC-Easy+Challenge train）、`gpqa_main`（GPQA Main 去掉 Diamond，250 题全部作验收）、`triviaqa_train` | GPQA-Diamond（198）、MMLU-Pro（抽 2,000）、TriviaQA（抽 2,000） | Transformer²；WSP-Scope；TriviaQA train 无 RSI 先例 |
-| 指令遵循 | `ifeval_train`（RLVR-IFeval，14,970 题，每题 1 个可判分约束；验收 200 / 抽样池 14,754）；IFEval 的 135 题验收集保留为 IF 验收（IFEval 的 135 题抽样池保留但不再抽样） | IFEval 其余 271、IFBench（300，领域外） | Tülu 3 RLVR；WSP-Scope |
-| 工具调用 | `sealtool_train`（Seal-Tools train） | Seal-Tools test（in-domain 700 + out-domain 654）、API-Bank test（584）、BFCL（4,696） | TT-SI 的 SFT 基线 |
+| 领域 | 训练集 | 池（去污染后） | 默认验收 `gate_n` | 留出集（主表） |
+|---|---|---|---|---|
+| 数学 | `dapo_math`（DAPO-Math-17K） | 16,314 | 1,000 | MATH-500（500）、GSM8K test（1,319）、AIME 2024+2025（60） |
+| 代码 | `taco_verified`（TACO-verified） | 10,806 | 1,000（按难度分层） | HumanEval+（164）、MBPP+（378）、LiveCodeBench（131） |
+| 通用推理 / 知识 | `triviaqa_train`（TriviaQA train） | 73,725 | 3,000 | GPQA-Diamond（198）、MMLU-Pro（2,000）、TriviaQA（2,000） |
+| 指令遵循 | `ifeval_train`（RLVR-IFeval） | 14,954 | 1,000（按约束类型分层） | IFEval（271）、IFBench（300，领域外） |
+| 工具调用 | `sealtool_train`（Seal-Tools train） | 12,019 | 1,000 | Seal-Tools test（1,354）、API-Bank test（584）、BFCL（4,696） |
 
-额外留出集（不进主表）：AMC23、OlympiadBench、FreebaseQA、MetaTool、T-Eval、MT-Bench、AlpacaEval。
-保留但不再使用：`magicoder_oss`、`tulu3_if`、`apibank_train`（`reserve`）；IFEval 的 135 题抽样池（不再作为 IF 抽样来源）；`toolace` 只作 Paper A 的 KL 文本。
-SQuAD（SEAL 设定）保留为 Paper B 的可选知识注入任务。
+额外留出集（附录）：AMC23、OlympiadBench、FreebaseQA、MetaTool、T-Eval；MT-Bench、AlpacaEval 2 需要 LLM judge。
+不再使用（`reserve`）：GSM8K train、MATH train、ARC、GPQA Main、APPS、IFEval 的 270 个非测试题、Magicoder、Tulu-3 IF、API-Bank train。ToolACE 只作 Paper A 的 KL 文本。SQuAD 保留为 Paper B 的可选知识注入任务。
 
 ## 数据集总表
 
@@ -118,16 +118,11 @@ MetaTool：Task1 1040、Task2-Subtask1 995、Subtask2 1800、Subtask3 995、Subt
 
 规则写在 `splits/split_config.yaml`：`role: train` 的数据集是训练集，其余都是留出集。
 
-| 数据集 | pool（抽样池） | gate（验收，固定） | test（留出） | 其他 |
+| 数据集 | pool（整体抽样池） | 固定验收集 | test（留出） | 其他 |
 |---|---|---|---|---|
-| gsm8k_train / math_train / dapo_math | 7,221 / 7,116 / 15,929 | 250 / 350 / 400（数学共 1,000） | — | 去污染移除的 → train_excluded |
-| arc / triviaqa_train | 2,870 / 73,225 | 500 / 500（知识共 1,000） | — | |
-| taco_verified（10,806） | 9,806 | 1,000（按难度分层） | — | 唯一的代码训练集 |
-| apps（4,449） | — | — | — | 全部 reserve（2026-11-19 起不再使用） |
-| ifeval_train（RLVR-IFeval，14,970） | 13,954 | 1,000（按 constraint_type 分层） | — | 去污染移除 16 → train_excluded |
-| sealtool_train | 11,019 | 1,000 | — | |
-| gpqa_main（250） | — | 250 | — | |
-| IFEval（541） | 135 | 135 | 271 | 按首个指令类型分层（WSP-Scope 的 270/271） |
+| dapo_math / taco_verified / triviaqa_train / ifeval_train / sealtool_train | 16,314 / 10,806 / 73,725 / 14,954 / 12,019 | 运行时由 `draw.py` 按 `gate_n` 动态切分 | — | 去污染移除的 → train_excluded |
+| gsm8k_train / math_train / arc / gpqa_main / apps | — | — | — | 全部 reserve（2026-11-19 起不再使用） |
+| IFEval（541） | — | — | 271 | 其余 270 → reserve（按首个指令类型分层，测试集与之前相同） |
 | MATH test | — | — | 500（MATH-500） | 其余 4,500 → reserve |
 | GSM8K test / AIME24 / AIME25 / AMC23 / OlympiadBench | — | — | 全部 | |
 | HumanEval+ / MBPP+ / LiveCodeBench（2025-02-01 起） | — | — | 全部 | |
@@ -144,12 +139,14 @@ MetaTool：Task1 1040、Task2-Subtask1 995、Subtask2 1800、Subtask3 995、Subt
 - 采样方法：每个数据集（或层）内按 id 排序后用 `random.Random(f"{seed}:{dataset}:{stratum}")` 打乱，再依次切出固定池；分层按最大余数法分配名额。训练集先去污染、再切分，所以验收集和抽样池都是干净的。
 - `eval/run_eval.py` 中训练集任务（`gsm8k_train`、`math_train`、`dapo_math`、`taco_verified`、`arc`、`gpqa_main`、`triviaqa_train`、`sealtool_train`、`ifeval_train`）只允许 `--pool pool|gate`；用 `--pool pool` 时配合抽样结果 `--ids-file`。
 
-## 两个配置开关
+## 两个配置开关（都在 `draw/paper_{a,b}.yaml`）
 
-| 开关 | 位置 | 默认 | 说明 |
+| 开关 | 键 | 默认 | 说明 |
 |---|---|---|---|
-| 固定验收集大小 | `splits/split_config.yaml` 的 `gate_domains.<领域>.size` | 每领域 1,000 | 按权重分到该领域各训练集；改动后要重跑 `make_splits.py`（已有抽样运行会被拒绝，需要新开运行） |
-| 每代抽样量 | `draw/paper_a.yaml`、`draw/paper_b.yaml` 的 `domains.<领域>.n` | 数学 / 知识 / 指令 / 工具 2,000，代码 1,000 | Paper B 的目标领域再按 `target_train_frac` 分成训练 / 信号；其余领域用 `retention_n` |
+| 固定验收集大小 | `domains.<领域>.gate_n` | 数学 / 代码 / 指令 / 工具 1,000，知识 3,000 | 运行开始时从池里动态切分（`gate.seed` 固定为 20261118），写到 `draws/gate/`；改大小不用重切数据 |
+| 每代抽样量 | `domains.<领域>.n` | 数学 / 知识 / 指令 / 工具 2,000，代码 1,000 | 从验收集以外的池子抽；Paper B 的目标领域再按 `target_train_frac` 分成训练 / 信号；其余领域用 `retention_n` |
+
+评测验收集：`eval/run_eval.py --task <训练集> --pool pool --ids-file experiment_records/<run>/draws/gate/<训练集>.gate.json`。只切验收集、不抽题：`draw.py --run ... --gate-only --config ...`。
 
 ## 每代抽样（`scripts/draw.py`）
 

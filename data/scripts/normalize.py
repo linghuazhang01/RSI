@@ -526,17 +526,35 @@ def _apps_io_to_lcb(io: dict):
 def rsi_train():
     out = {}
     # DAPO-Math-17K (WHALE D_weight): dedupe the repeated prompts, strip the instruction template.
+    # Source defect (found 2026-11-19): some prompts lost the backslash of LaTeX commands, so Python
+    # escapes turned them into control characters (e.g. "\frac" -> form feed + "rac", 606 prompts).
+    # Unambiguous ones are restored; prompts whose lost escape became \n or \t inside a LaTeX command
+    # (e.g. "\nabla", "\text"), or that hold other control characters, are dropped.
     df = pd.read_parquet(RAW / "dapo_math/data/dapo-math-17k.parquet")
     rows, seen = [], set()
+    restore = {"\x0c": "\\f", "\x08": "\\b", "\x0b": "\\v", "\x07": "\\a"}
+    lost_nl_tab = re.compile(r"\n(abla|eq\b|exists|subseteq|ot\b|u\b)|\t(imes|heta|ext|frac|au\b|an\b|riangle|ilde)")
+    other_ctrl = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
+    from collections import Counter
+    fix = Counter()
     for _, r in df.iterrows():
         t = r["prompt"][0]["content"]
         if t in seen:
             continue
         seen.add(t)
         assert t.startswith(DAPO_PRE) and t.endswith(DAPO_SUF)
+        p = t[len(DAPO_PRE):-len(DAPO_SUF)]
+        if any(ch in p for ch in restore):
+            for ch, rep in restore.items():
+                p = p.replace(ch, rep)
+            fix["restored_backslash"] += 1
+        if lost_nl_tab.search(p) or other_ctrl.search(p):
+            fix["dropped_unrecoverable"] += 1
+            continue
         idx = r["extra_info"]["index"]
-        rows.append(rec(f"dapo/{idx}", "dapo_math", "math", prompt=t[len(DAPO_PRE):-len(DAPO_SUF)],
+        rows.append(rec(f"dapo/{idx}", "dapo_math", "math", prompt=p,
                         reference=str(r["reward_model"]["ground_truth"]), source=r["data_source"]))
+    print("  dapo_math control-character repair:", dict(fix))
     out["dapo_math"] = rows
 
     # APPS train, all difficulties (introductory = ReST-EM's set; interview + competition added

@@ -321,6 +321,9 @@ def main():
                 "near_dup_examples": [[k, near[k]] for k in sorted(near)[:20]]}
         else:
             pools = split_dataset(name, rows, c)
+        for old, new in (c.get("relabel") or {}).items():  # e.g. ifeval: pool/gate -> reserve
+            if old in pools:
+                pools.setdefault(new, []).extend(pools.pop(old))
         id2pool = {}
         for pool, ids in pools.items():
             for i in ids:
