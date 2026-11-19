@@ -7,6 +7,9 @@ budget, single seed. The best LoRA is scored on held-out Seal-Tools test + BFCL;
 domain is tool_calling the code task is used instead (taco_verified -> LiveCodeBench).
 E-task items are a fixed deterministic subset of the dataset's pool minus the run's gate (independent of
 generation and branch). E-ref = the fixed-recipe SFT LoRA on θ0 for the same task (computed once per run).
+method.mode applies here too: edit = the session edits a raw LoRA for θ0 (the `raw` recipe on the E task,
+computed once in e_ref; = E-ref when the recipes are identical), no sgd / grad; scratch = from zero, no
+sgd / grad; free = every tool.
 """
 from __future__ import annotations
 
@@ -70,7 +73,8 @@ def e_test(endpoint: str, served: str, task: dict, out_dir: Path, *, lora: str |
 
 
 def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str, editor_served: str,
-              editor_skill: float | None, theta0, task: dict, items: dict, make_workspace) -> dict:
+              editor_skill: float | None, theta0, task: dict, items: dict, make_workspace, mode: str = "free",
+              raw=None) -> dict:
     """One E_t measurement. `theta0` = dict(endpoint, served, server, store, hf, quality);
     make_workspace(out_dir, evaluator, budget, prefix) builds the θ0 workspace. Returns the result dict."""
     from rsicore.editor import Editor
@@ -95,16 +99,23 @@ def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str
                    registry=rc.run_dir / "mock_registry.json", parent_quality=theta0.get("quality"),
                    tag=f"E-{branch}")
     ev.mark_shown_examples = False
+    raw_info = None
+    if raw is not None:   # (LoRA, name): register the raw LoRA on this evaluator so feedback has vs_raw
+        ev.register(raw[0], raw[1])
+        ev.raw_name = raw[1]
     ws = make_workspace(out_dir, ev, budget, f"e{branch[:3]}")
     ws.build_api()
-    sysmsg = system_prompt(cfg, budget=budget, e_task=True)
+    if raw is not None:
+        raw_info = dict(ws.raw_info or {})
+    sysmsg = system_prompt(cfg, budget=budget, e_task=True, mode=mode)
     ctx = ContextRenderer(task_text=task_text(gen=0, target=task["domain"], dataset=ds, retention=[],
-                                              n_train=len(items["train"]), sft_info=None, e_task=True),
+                                              n_train=len(items["train"]), sft_info=None, e_task=True,
+                                              raw_info=raw_info),
                           diag_text="(Diagnostics are not provided for the E task; use api.modules(), api.svd(), "
                                     "api.acts().)")
     seed = rc.seed
     policy = M.make_mock_policy(seed, skill=editor_skill if editor_skill is not None else 0.7,
-                                tag=f"E{branch}") if rc.mock else None
+                                tag=f"E{branch}", mode=mode) if rc.mock else None
 
     def editor_factory(th):
         return Editor(editor_endpoint, editor_served, system_prompt=sysmsg, seed=seed + th,

@@ -2,6 +2,24 @@
 
 计划见 `plan/PLAN.md` §4、`plan/research/RSI_LOOP_DESIGN.md` §3、`plan/research/METHOD_DESIGN.md` §3。模型 Qwen3.8-27B（`Qwen3_5ForConditionalGeneration`）。共用运行时在 `eval/rsicore/`（契约 `eval/rsicore/INTERFACES.md`），本目录只写 Paper B 特有的部分。
 
+## 两种写 LoRA 的方式（`method.mode`，2026-11-19）
+
+| 模式 | LoRA 从哪来 | 改造者能用的工具 | 验收的目标参照 | 都不过时 |
+|---|---|---|---|---|
+| `edit`（默认） | 每代先按固定配方训练一个 raw LoRA，改造者在它的基础上迭代编辑（句柄 `RAW`，`api.raw_lora()`） | 没有 `sgd` / `grad` / `from_grad`；能用编辑算子、SVD、激活统计、构造工具、历史 adapter | 目标 ≥ raw − ε | 合并 raw LoRA |
+| `scratch` | 从零写，没有任何训练 | 没有 `sgd` / `grad` / `from_grad`，也没有 raw LoRA | 目标 ≥ 当前模型 + `gate.min_gain` | 保持原样（不引入任何训练） |
+| `free`（消融，旧设计） | 改造者自己决定，可以自己训练 | 全部工具 | 目标 ≥ SFT − ε | 合并 SFT LoRA |
+
+raw LoRA 的大小在 `raw` 里设置，空着的字段沿用 `sft` 配方；全部空着（默认）时 raw = SFT 基线，直接复用、不重复训练：
+
+```bash
+--set method.mode=edit --set raw.n_train=400 --set raw.steps=50 --set raw.rank=16   # 用 400 条 train 题、50 步训练 raw
+--set method.mode=scratch                                                            # 从零写
+--set method.mode=free                                                               # 旧设计（可以 sgd / grad）
+```
+
+`gate.reference` / `gate.fallback` 可以覆盖上表的默认值。非 LLM 分支随模式变化：edit = 对 raw LoRA 随机组合编辑规则（截断 / 剪枝 / intruder / RegMean / 正交化 / 缩放），scratch = 随机的无梯度构造（奇异方向缩放），free = SFT 超参随机搜索。ΔE_write 的参照分支：edit = M_t ⊕ raw（raw 与 SFT 不同时自动加一个 `raw` 分支），scratch = parent，free = SFT；另外总是报告 `dE_write_vs_sft`。E_t 会话用同一个模式（edit 时为 θ0 在 E 任务上按同一 raw 配方训练一个 raw LoRA，在 `e_ref` 里只算一次）。
+
 ## 启动
 
 ```bash
@@ -24,10 +42,11 @@
 | `genXX/train_data` | train 题的训练目标：先拒绝采样 M_g 自己答对的回答，否则用评测格式的金标（`train_data.mode`） | `train_data.json` |
 | `genXX/diagnostics` | 固定诊断表（每个 (层, 模块)：范数、奇异值、已合并 adapter 的范数 / 有效秩 / intruder / 相对变化分位 / 激活比） | `diagnostics.json` |
 | `genXX/sft` | SFT 基线（r16、同一梯度预算、25/50/75/100% checkpoint），screen / full / gate 评测 | `baselines/sft.json` |
+| `genXX/raw` | 仅 `edit`：按 `raw` 配方训练 raw LoRA（配方与 SFT 相同时直接用 SFT LoRA），screen / full / gate 评测 | `baselines/raw.json`、`baselines/raw_lora.*` |
 | `genXX/search` | `rsicore.search.inner_search`：4 线程 × 8 步、≤32 次 evaluate；改造者 = gpu0 上的 M_g（vLLM 多 LoRA），候选 LoRA 在 gpu1 上构建后热加载评测 | `candidates.jsonl`、`programs/`、`feedback/`、`loras/` |
-| `genXX/gate` | `submit_to_gate`（≤3 次）：目标 ≥ SFT − ε；每个保留领域 ≥ 第 0 代 − max(δ, 噪声带)；已学目标 ≥ 学完时 − δ；沙箱检查。都不过 → SFT LoRA（若能过）→ 否则保留 M_g | `gate.json`、`accepted.json`、`accepted_lora.*` |
+| `genXX/gate` | `submit_to_gate`（≤3 次）：目标对参照（edit：raw − ε；scratch：当前模型 + min_gain；free：SFT − ε）；每个保留领域 ≥ 第 0 代 − max(δ, 噪声带)；已学目标 ≥ 学完时 − δ；沙箱检查。都不过 → 按模式兜底（edit：raw LoRA；free：SFT LoRA；都要能过验收）→ 否则保留 M_g | `gate.json`、`accepted.json`、`accepted_lora.*`、`parent_gate.json`（scratch） |
 | `genXX/merge` | LoRA 合并进权重 → M_{g+1}（mock：更新 registry 中 `m{g+1}` 的 quality） | `model/`、`model.json` |
-| `genXX/nonllm` | 非 LLM 分支：SFT 超参 × checkpoint × 全局缩放的随机搜索（同 evaluate 预算、同梯度预算）；全局缩放前沿、checkpoint 前沿 | `baselines/nonllm.json` |
+| `genXX/nonllm` | 非 LLM 分支（同 evaluate 预算，按模式）：edit 随机编辑规则作用于 raw；scratch 随机无梯度构造；free SFT 超参 × checkpoint × 全局缩放随机搜索；另有 SFT 全局缩放前沿、checkpoint 前沿 | `baselines/nonllm.json` |
 | `genXX/e_t/<branch>` | E_t：parent / sft / llm / nonllm 四个分支模型各开新会话，为 θ0 在 Seal-Tools 上写 LoRA（16 次 evaluate），在 Seal-Tools test + BFCL 上测；`--domain tool_calling` 时换成代码任务（TACO → LiveCodeBench） | `e_t/<branch>/result.json` |
 | `genXX/heldout` | M_{g+1} 五个领域留出评测 | `heldout.json` |
 | `genXX/summary` | 记录展示过的错例（`draw.py --mark-shown`）；汇总 ΔE_train、ΔE_write、ΔE_nonLLM（按题配对 bootstrap） | `summary.json` |
@@ -55,7 +74,9 @@
 ## 改造者看到的工具
 
 程序形如 `def main(api): ...; return {"lora": handle}`（`{"lora": None}` = 保持原样），工具只能用关键字参数调用：
-`modules`、`diagnostics`、`train_ids`、`train_example`、`svd`、`acts`、`grad`、`new_lora`、`rank1`、`from_direction`、`scale_singular`、`from_grad`、`sgd`、`scale`、`interpolate`、`combine`、`drop`、`truncate_rank`、`intruder_scale`、`relchange_prune`、`regmean_preserve`、`orthogonalize`、`ties`、`inspect`、`stack`、`candidate`、`evaluate`、`budget`（说明见 `tools.py` 的 `TOOL_DOCS`）。
+`modules`、`diagnostics`、`train_ids`、`train_example`、`svd`、`acts`、`grad`、`new_lora`、`rank1`、`from_direction`、`scale_singular`、`from_grad`、`sgd`、`scale`、`interpolate`、`combine`、`drop`、`truncate_rank`、`intruder_scale`、`relchange_prune`、`regmean_preserve`、`orthogonalize`、`ties`、`inspect`、`stack`、`raw_lora`、`candidate`、`evaluate`、`budget`（说明见 `tools.py` 的 `TOOL_DOCS`）。
+
+按模式过滤（`tools.tools_for_mode`）：`edit` 去掉 `sgd` / `grad` / `from_grad`、加上 `raw_lora`；`scratch` 去掉 `sgd` / `grad` / `from_grad`；`free` 全部（没有 `raw_lora`）。没注册的工具调用会被 ToolAPI 拒绝。
 
 - `acts` / `grad` / `sgd` / `train_example` 只接受本代 `train` 题号，其他题号抛 `PermissionError`。
 - `regmean_preserve` 的保留集 Gram 矩阵由可信运行时用保留领域的 `kl` 题面算出，改造者只拿到结果 LoRA。

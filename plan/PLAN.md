@@ -74,14 +74,15 @@
 
 | 项 | 内容 |
 |---|---|
-| 每代做什么 | M_t 写程序直接生成 LoRA，通过验收后**合并进自己的权重**，得到 M_{t+1} |
-| 程序能用的工具 | 不用梯度的构造（奇异方向缩放、激活方向、秩 1 编辑）；梯度工具（只能用训练数据，计入预算）；对 LoRA 的缩放、截断、合并 |
+| 每代做什么 | M_t 写程序得到 LoRA，通过验收后**合并进自己的权重**，得到 M_{t+1} |
+| 两种方式（`method.mode`，2026-11-19） | **edit（主线）**：每代先按固定配方训练一个 raw LoRA（大小由 `raw.n_train` / 步数 / 秩设置），改造者不能训练、不能算梯度，只对 raw LoRA 和历史 adapter 写编辑程序；**scratch**：从零写，没有任何训练和梯度；**free**（消融）：旧设计，改造者可以自己调用 `sgd` / `grad` |
+| 程序能用的工具 | 对 LoRA 的缩放、丢弃、截断、intruder 缩放、剪枝、RegMean、正交化、合并；不用梯度的构造（奇异方向缩放、激活方向、秩 1 编辑）；只有 free 有梯度工具 |
 | 任务序列 | T1 SQuAD 知识注入 → T2 数学 → T3 代码（→ T4 DAPO 难题） |
-| L1 反馈 | 目标任务信号切片分数（同时和 SFT 基线比）；保留领域上相对 M_t 的逐 token KL 和分数；写入前对、写入后错的样例；LoRA 范数和 intruder 分数 |
-| L2 验收 | 目标 ≥ SFT 基线 − ε；每个保留领域 ≥ 第 0 代 − δ；已学任务不掉超过 δ |
-| E_t | 固定任务：为原始基座在 Seal-Tools 上写一个 LoRA，看 Seal-Tools test 和 BFCL |
-| 四个分支 | 原模型 / SFT 基线 / 自己写的 LoRA / 非 LLM 搜索。核心指标 ΔE_write = 自己写 − SFT 基线 |
-| 对照 | 冻结改造者 M_0；不带搜索记录；去掉梯度工具 |
+| L1 反馈 | 目标任务信号切片分数（和当前模型、SFT 基线、raw LoRA 比）；保留领域上相对 M_t 的逐 token KL 和分数；写入前对、写入后错的样例；LoRA 范数和 intruder 分数 |
+| L2 验收 | 目标：edit ≥ raw − ε，scratch ≥ 当前模型 + min_gain，free ≥ SFT − ε；每个保留领域 ≥ 第 0 代 − δ；已学任务不掉超过 δ。都不过时 edit 合并 raw、scratch 保持原样、free 合并 SFT |
+| E_t | 固定任务：为原始基座在 Seal-Tools 上写一个 LoRA（同一模式），看 Seal-Tools test 和 BFCL |
+| 四个分支 | 原模型 / SFT 基线（edit 下 raw 与 SFT 不同时另加 raw 分支）/ 自己写的 LoRA / 非 LLM 搜索。核心指标 ΔE_write = 自己写 − 参照分支（edit：raw；scratch：原模型；free：SFT） |
+| 对照 | 冻结改造者 M_0；不带搜索记录；edit / scratch / free 三种模式互为对照 |
 | 基线 | SFT、全局缩放前沿、checkpoint 前沿、SLoRA、TIES、随机搜索 / CMA-ES、规则组合 |
 
 ---

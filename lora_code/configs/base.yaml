@@ -3,6 +3,28 @@
 # Numbers marked [pilot] are assumptions to be fixed in B-P0 (RSI_LOOP_DESIGN §6).
 draw_config: data/draw/paper_b.yaml   # target/retention sizes (n, target_train_frac, retention_n, screen_n, retention_kl, gate_n)
 
+# How the editor gets its LoRA each generation (2026-11-19):
+#   edit    : a raw LoRA is trained once per generation with the fixed `raw` recipe below (size set by
+#             raw.n_train / steps / epochs / rank); the editor may NOT train or take gradients (no sgd / grad /
+#             from_grad) and writes a program that edits the raw LoRA (handle "RAW") and the earlier adapters.
+#             Gate reference = the raw LoRA; fallback = the raw LoRA.
+#   scratch : no raw LoRA and no gradients; the editor builds the LoRA from zero with SVD / activation
+#             statistics / constructions. Gate reference = the parent model (+ gate.min_gain); fallback = keep.
+#   free    : the earlier design (every tool incl. sgd / grad); gate reference = SFT; fallback = SFT. Ablation.
+method:
+  mode: edit                # edit | scratch | free
+
+raw:                        # mode=edit: recipe of the LoRA the editor starts from; null = take the `sft` value
+  n_train: null             # train items used for the raw LoRA (null = all of this generation's train items)
+  rank: null
+  lr: null
+  epochs: null
+  steps: null               # null = epochs over the n_train items
+  batch_size: null
+  leaves: null
+  gpu_seconds: null         # null = budget.gpu_seconds
+  # all null (the default) = identical to the SFT baseline -> the SFT LoRA is reused, nothing trained twice
+
 lora:
   rank_cap: 64              # [pilot] max rank per module (vLLM --max-lora-rank)
   norm_cap_tau: 0.1         # [pilot] per-module ||dW||_F / ||W0||_F cap
@@ -38,7 +60,10 @@ retention:
   domains: null            # null = all non-target domains; [] = target-domain training/evaluation only
 
 gate:
-  epsilon: 0.01             # [pilot] target gate >= SFT gate - epsilon
+  reference: auto           # auto = by method.mode (edit: raw, scratch: parent, free: sft) | raw | sft | parent
+  fallback: auto            # auto = by method.mode (edit: raw, scratch: keep, free: sft) | raw | sft | keep
+  min_gain: 0.01            # [pilot] reference=parent: target gate >= parent gate + min_gain
+  epsilon: 0.01             # [pilot] reference=raw/sft: target gate >= reference gate - epsilon
   delta: 0.02               # [pilot] retention gate >= gen-0 - max(delta, noise band); learned targets >= post-learning - delta
   use_noise_band: true
   max_submissions: 3
@@ -68,7 +93,10 @@ sft:                        # fixed-recipe SFT baseline (also the non-LLM search
   ckpt_fracs: [0.25, 0.5, 0.75, 1.0]
   leaves: [q_proj, k_proj, v_proj, o_proj, in_proj_qkv, in_proj_z, out_proj, gate_proj, up_proj, down_proj]
 
-nonllm:
+nonllm:                     # 4th branch, same evaluate budget as the editor; what it searches depends on method.mode:
+                            #   edit: random rule-based edits of the raw LoRA (scale / truncate / intruder / prune / regmean)
+                            #   scratch: random gradient-free constructions (singular-direction scaling)
+                            #   free: random search over SFT hyper-parameters x checkpoint x global scale
   evaluate: 32              # same evaluate budget as the editor
   n_configs: 4              # SFT hyper-parameter samples sharing budget.gpu_seconds
   search_scales: [0.5, 0.75, 1.0, 1.25]

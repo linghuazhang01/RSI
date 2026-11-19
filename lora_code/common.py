@@ -145,6 +145,34 @@ def prompt_text(dataset: str, item: dict) -> str:
         return "\n\n".join(m.get("content", "") for m in (item.get("messages") or []))
 
 
+MODES = ("edit", "scratch", "free")
+GRADIENT_TOOLS = ("sgd", "grad", "from_grad")   # training / gradient tools, only in mode=free
+
+
+def method_mode(cfg: dict) -> str:
+    m = str((cfg.get("method") or {}).get("mode") or "edit")
+    if m not in MODES:
+        raise SystemExit(f"method.mode must be one of {MODES}, got {m!r}")
+    return m
+
+
+def gate_policy(cfg: dict) -> tuple[str, str]:
+    """(reference, fallback) of the gate: 'auto' resolves by method.mode."""
+    mode = method_mode(cfg)
+    g = cfg.get("gate") or {}
+    ref = g.get("reference") or "auto"
+    fb = g.get("fallback") or "auto"
+    if ref == "auto":
+        ref = {"edit": "raw", "scratch": "parent", "free": "sft"}[mode]
+    if fb == "auto":
+        fb = {"edit": "raw", "scratch": "keep", "free": "sft"}[mode]
+    if ref not in ("raw", "sft", "parent") or fb not in ("raw", "sft", "keep"):
+        raise SystemExit(f"gate.reference must be raw|sft|parent and gate.fallback raw|sft|keep, got {ref!r} / {fb!r}")
+    if mode != "edit" and "raw" in (ref, fb):
+        raise SystemExit(f"gate reference/fallback 'raw' needs method.mode=edit (mode is {mode!r})")
+    return ref, fb
+
+
 def role_gpus(rc, cfg: dict, role: str) -> list[int]:
     """GPU ids for a role, from cfg["gpu_roles"][role] = indices into --gpus (negative = from the end).
     Paper B roles: main (vLLM: M_t + candidate LoRAs, the editor), theta0 (vLLM: original model, E_t and

@@ -54,14 +54,19 @@ Paper A（2026-11-19 修订：改造者冻结、体积固定、迭代被量化�
     4. 只把分数高于 incumbent 的候选交验收（≤3 次）：在验收集上逐题配对，显著超过 incumbent 才替换
     5. 替换了就导出新 incumbent、做五个领域留出评测；连续 2 代没替换就停
 
-Paper B（每代 M_t 写 LoRA，合并进自己）
+Paper B（每代 M_t 写 LoRA，合并进自己；2026-11-19 起分两种方式，method.mode）
+  edit（默认）：每代先按固定配方训练 raw LoRA（--set raw.n_train=... raw.steps=... raw.rank=...），
+               改造者不能训练、不能算梯度，只编辑 raw LoRA；验收和 raw 比
+  scratch    ：从零写，没有训练和梯度；验收和当前模型比（目标至少涨 gate.min_gain）
+  free（消融）：旧设计，改造者可以自己 sgd / grad
   main 卡：vLLM 加载 M_t（改造者）+ 候选 LoRA 热切换评测
   theta0 卡：vLLM 加载原模型（E_t 和参照）
-  train 卡：执行程序里的奇异分解 / 激活统计 / 梯度工具（只能用本代 train 题）、合并 LoRA
+  train 卡：SFT 基线和 raw LoRA 训练、程序里的奇异分解 / 激活统计（只能用本代 train 题）、合并 LoRA
     1. draw.py 抽本代的题（目标领域 train / signal，其余领域保留探针）
-    2. 改造者写程序 → 生成 LoRA → 评测（快速筛 + 前 3 名完整），≤32 个候选
-    3. 交固定验收集 → 通过后把 LoRA 合并进权重，得 M_{t+1}
-    4. 四个分支（原模型 / SFT 基线 / 自写 LoRA / 非 LLM 搜索）各测 E_t；M_{t+1} 跑留出评测
+    2. SFT 基线；edit 模式再训练 raw LoRA（配方和 SFT 相同时直接复用）
+    3. 改造者写程序 → 得到 LoRA → 评测（快速筛 + 前 3 名完整），≤32 个候选
+    4. 交固定验收集 → 通过后把 LoRA 合并进权重，得 M_{t+1}
+    5. 四个分支（原模型 / SFT 基线 / 自写 LoRA / 非 LLM 搜索）各测 E_t；M_{t+1} 跑留出评测
 ```
 
 ## 4. 需要几张卡（Qwen3.8-27B，BF16 约 52 GB）

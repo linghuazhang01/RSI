@@ -4,12 +4,16 @@
   python -I lora_code/run.py --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id B_math_s42 [--mock]
 
 Generation g (editor M_g -> successor M_{g+1}; the target domain is --domain in every generation):
-  draw (target=domain) -> train data -> diagnostics -> SFT baseline (+ screen/full/gate) -> inner search
-  (editor = M_g on gpu0 with multi-LoRA; candidate LoRAs built on gpu1, hot-loaded for evaluation)
-  -> gate (target >= SFT - eps; retention >= gen-0 - delta; learned targets >= post-learning - delta;
-  sandbox checks) -> accept (fallback: SFT LoRA if it passes, else keep M_g) -> merge into weights
-  (gen_XX/model) -> non-LLM branch (random search) + global-scale / checkpoint frontiers -> E_t for each
-  branch -> held-out evaluation of M_{g+1} -> summary (ΔE_train, ΔE_write, ΔE_nonLLM with paired CIs).
+  draw (target=domain) -> train data -> diagnostics -> SFT baseline (+ screen/full/gate)
+  -> [method.mode=edit] raw LoRA (fixed `raw` recipe, size raw.n_train / steps / rank; = the SFT LoRA when
+     the recipes are identical) -> inner search (editor = M_g on the main GPU with multi-LoRA; candidates
+     built on the train GPU, hot-loaded for evaluation; tools by mode: edit = edit RAW, no sgd / grad;
+     scratch = from zero, no sgd / grad; free = everything)
+  -> gate (target vs the reference: edit raw - eps, free SFT - eps, scratch parent + min_gain; retention >=
+     gen-0 - delta; learned targets >= post-learning - delta; sandbox checks) -> accept (fallback by mode:
+     edit raw, free SFT, scratch keep) -> merge into weights (gen_XX/model) -> non-LLM branch (by mode)
+  + global-scale / checkpoint frontiers -> E_t for each branch -> held-out evaluation of M_{g+1}
+  -> summary (ΔE_train, ΔE_write = E(LLM) - E(reference branch), ΔE_nonLLM, with paired CIs).
 Baseline first: M_0 on the fixed gate (noise band) and held-out; E-ref (SFT LoRA for θ0 on the E task).
 Every step is recorded in state.json (rsicore.state.RunState); rerunning the same run-id resumes.
 """
@@ -22,8 +26,9 @@ from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / "eval")]
 
-from lora_code.common import (DOMAIN_DATASET, DOMAINS, deep_merge, gold_target, load_records,  # noqa: E402
-                              prompt_text, read_json, render_messages, retention_domains, role_gpus, write_json)
+from lora_code.common import (DOMAIN_DATASET, DOMAINS, deep_merge, gate_policy, gold_target,  # noqa: E402
+                              load_records, method_mode, prompt_text, read_json, render_messages,
+                              retention_domains, role_gpus, write_json)
 
 
 # ============================================================================ servers
@@ -89,6 +94,8 @@ class Run:
         self.datasets = [DOMAIN_DATASET[d] for d in DOMAINS
                          if d == self.target or d in self.retention_domains]
         self.mcfg = cfg.get("mock", {})
+        self.mode = method_mode(cfg)
+        self.gate_ref, self.gate_fallback = gate_policy(cfg)
         self._stores = {}
         self._hf = {}
 
@@ -274,12 +281,14 @@ class Run:
                          registry=self.registry, parent_quality=self.quality_value(served),
                          max_loaded=int(self.cfg.get("server", {}).get("max_loras", 8)) - 2)
 
-    def workspace(self, out_dir, ev, store, hf, train, budget, prefix, stack=(), diag=None, ret_texts=()):
+    def workspace(self, out_dir, ev, store, hf, train, budget, prefix, stack=(), diag=None, ret_texts=(),
+                  raw=None, raw_info=None):
         from lora_code.primitives.train import TrainData
         from lora_code.tools import Workspace
         return Workspace(mock=self.rc.mock, store=store, train=TrainData(train), cfg=self.cfg, out_dir=out_dir,
                          evaluator=ev, hf=hf, stack=stack, retention_texts=ret_texts, budget=budget,
-                         name_prefix=prefix, diagnostics=diag, seed=self.rc.seed)
+                         name_prefix=prefix, diagnostics=diag, seed=self.rc.seed, mode=self.mode, raw=raw,
+                         raw_info=raw_info)
 
     # ================================================================== baseline
     def baseline(self):
@@ -359,15 +368,43 @@ class Run:
         ws = self.workspace(out, ev, th["store"], th["hf"], tdata, {"evaluate": 1e9, "gpu_seconds": gb}, "eref")
         lo, _, info = baselines.train_sft(ws, baselines.recipe(self.cfg), gb, seed=self.rc.seed)
         name = f"E-{self.rc.run_id}-ref"
+        self.save_lora(lo, out / "sft_lora")
         ev.register(lo, name)
         ev.ensure_loaded(name)
-        base = e_test(th["endpoint"], "theta0", task, out / "base", lora=None, mock=self.rc.mock,
-                      limit=self.cfg.get("e_t", {}).get("test_limit"))
-        ref = e_test(th["endpoint"], "theta0", task, out / "sft", lora=name, mock=self.rc.mock,
-                     limit=self.cfg.get("e_t", {}).get("test_limit"))
-        write_json(out / "result.json", {"task": task, "theta0": base, "sft_ref": ref, "train": info})
-        self.st.mark("e_ref", {"theta0": base["score"], "sft_ref": ref["score"], "task": task["key"]})
+        lim = self.cfg.get("e_t", {}).get("test_limit")
+        base = e_test(th["endpoint"], "theta0", task, out / "base", lora=None, mock=self.rc.mock, limit=lim)
+        ref = e_test(th["endpoint"], "theta0", task, out / "sft", lora=name, mock=self.rc.mock, limit=lim)
+        res = {"task": task, "theta0": base, "sft_ref": ref, "train": info}
+        if self.mode == "edit":   # the E-task editor edits a raw LoRA for θ0 made with the same raw recipe
+            rrec, n, rgb, same = baselines.raw_recipe(self.cfg)
+            if same:
+                res["raw"] = {"name": name, "same_as_sft": True, "train": info, "test": ref}
+            else:
+                rids = baselines.subset_ids(tdata.keys(), n, self.rc.seed)
+                rlo, _, rinfo = baselines.train_sft(ws, rrec, float(self.cfg.get("e_t", {}).get("gpu_seconds", rgb)),
+                                                    seed=self.rc.seed, ids=rids)
+                rinfo["n_train"] = len(rids)
+                rname = f"E-{self.rc.run_id}-raw"
+                self.save_lora(rlo, out / "raw_lora")
+                ev.register(rlo, rname)
+                ev.ensure_loaded(rname)
+                rt = e_test(th["endpoint"], "theta0", task, out / "raw", lora=rname, mock=self.rc.mock, limit=lim)
+                res["raw"] = {"name": rname, "same_as_sft": False, "train": rinfo, "test": rt}
+        write_json(out / "result.json", res)
+        self.st.mark("e_ref", {"theta0": base["score"], "sft_ref": ref["score"], "task": task["key"],
+                               "raw_ref": ((res.get("raw") or {}).get("test") or {}).get("score")})
         self.release_hf()
+
+    def e_raw(self):
+        """mode=edit: (raw LoRA for θ0 on the E task, its name, info) from e_ref; None otherwise."""
+        if self.mode != "edit":
+            return None
+        out = self.rc.run_dir / "e_ref"
+        r = (read_json(out / "result.json", {}) or {}).get("raw")
+        if not r:
+            return None
+        f = self.lora_file(out / ("sft_lora" if r["same_as_sft"] else "raw_lora"))
+        return (self.load_lora(f), r["name"], r["train"]) if f else None
 
     # ================================================================== one generation
     def generation(self, g: int):
@@ -416,24 +453,43 @@ class Run:
                   "gpu_seconds": float(cfg.get("budget", {}).get("gpu_seconds", 7200))}
         state = {}
 
+        def get_ev():
+            """Evaluator on the main server; knows the SFT / raw LoRAs once they exist (also after a resume)."""
+            if "ev" not in state:
+                srv = main_srv()
+                state.update(ev=self.evaluator(g, gd, srv, served, ids, kl_texts, store), srv=srv)
+            ev = state["ev"]
+            for key, attr in (("sft", "sft_name"), ("raw", "raw_name")):
+                info = read_json(gd / "baselines" / f"{key}.json")
+                if info and info.get("name") and getattr(ev, attr) != info["name"]:
+                    f = self.lora_file(gd / "baselines" / f"{'sft' if info.get('same_as_sft') else key}_lora")
+                    if f is not None and not ev.known(info["name"]):
+                        ev.register(self.load_lora(f), info["name"])
+                    setattr(ev, attr, info["name"])
+            return ev
+
         def ctx_objects():
+            """(evaluator, editor workspace). In mode=edit the workspace holds the raw LoRA (step raw first)."""
+            ev = get_ev()
             if "ws" in state:
-                return state["ev"], state["ws"]
-            srv = main_srv()
-            ev = self.evaluator(g, gd, srv, served, ids, kl_texts, store)
+                return ev, state["ws"]
+            raw, raw_info = None, None
+            if self.mode == "edit":
+                rj = read_json(gd / "baselines" / "raw.json")
+                if rj is None:
+                    raise RuntimeError(f"{P}: mode=edit needs the raw LoRA (step {P}/raw) before the workspace")
+                raw = self.load_lora(self.lora_file(gd / "baselines" / ("sft_lora" if rj["same_as_sft"] else "raw_lora")))
+                raw_info = rj["train"]
             ws = self.workspace(gd, ev, store, self.hf(parent), tdata, budget, f"g{g:02d}", stack=stack, diag=diag,
-                                ret_texts=kl_texts)
+                                ret_texts=kl_texts, raw=raw, raw_info=raw_info)
             ws.build_api()
-            sft = read_json(gd / "baselines" / "sft.json")
-            if sft:
-                ev.sft_name = sft["name"]
-            state.update(ev=ev, ws=ws, srv=srv)
+            state["ws"] = ws
             return ev, ws
 
         # ---- SFT baseline
         from lora_code import baselines as BL
         if not st.done(f"{P}/sft"):
-            ev, ws = ctx_objects()
+            ev = get_ev()
             bws = self.workspace(gd, ev, store, self.hf(parent), tdata, {"evaluate": 1e9, "gpu_seconds": budget["gpu_seconds"]},
                                  f"g{g:02d}", stack=stack, ret_texts=kl_texts)
             lo, ck, info = BL.train_sft(bws, BL.recipe(cfg), budget["gpu_seconds"], seed=rc.seed)
@@ -452,10 +508,39 @@ class Run:
             st.mark(f"{P}/sft", {"name": name, "screen": pts["screen"]["score"], "check_ok": ok})
         sft = read_json(gd / "baselines" / "sft.json")
 
+        # ---- raw LoRA (mode=edit): the LoRA the editor edits
+        raw = None
+        if self.mode == "edit":
+            if not st.done(f"{P}/raw"):
+                rrec, n_raw, rgb, same = BL.raw_recipe(cfg)
+                if same:
+                    info = dict(sft.get("train") or {}, n_train=len(train_ids))
+                    rj = {"name": sft["name"], "same_as_sft": True, "train": info, "check_ok": sft.get("check_ok"),
+                          "points": sft.get("points"), "gate": sft.get("gate")}
+                else:
+                    ev = get_ev()
+                    bws = self.workspace(gd, ev, store, self.hf(parent), tdata, {"evaluate": 1e9, "gpu_seconds": rgb},
+                                         f"g{g:02d}", stack=stack, ret_texts=kl_texts)
+                    rids = BL.subset_ids(bws.train.ids(), n_raw, rc.seed)
+                    lo, _, info = BL.train_sft(bws, rrec, rgb, seed=rc.seed, ids=rids)
+                    info.update({"n_train": len(rids), "rank": int(rrec["rank"])})
+                    self.save_lora(lo, gd / "baselines" / "raw_lora")
+                    ok, chk = bws.check(lo)
+                    pts = {lvl: BL.point(bws, lo, "raw", lvl) for lvl in ("screen", "full")}
+                    gate = ev.run(bws.lora_name(lo), "gate") if ok else None
+                    rj = {"name": bws.lora_name(lo), "same_as_sft": False, "train": info, "check_ok": ok,
+                          "check_errors": chk.get("errors", [])[:10], "points": pts,
+                          "gate": {ds: r["score"] for ds, r in (gate or {}).items()}}
+                write_json(gd / "baselines" / "raw.json", rj)
+                st.mark(f"{P}/raw", {"name": rj["name"], "same_as_sft": rj["same_as_sft"],
+                                     "n_train": rj["train"].get("n_train"),
+                                     "screen": ((rj.get("points") or {}).get("screen") or {}).get("score")})
+            raw = read_json(gd / "baselines" / "raw.json")
+
         # ---- inner search
         ranked = None
         if not st.done(f"{P}/search"):
-            ranked = self.search(g, gd, ctx_objects, diag, sft, budget)
+            ranked = self.search(g, gd, ctx_objects, diag, sft, budget, raw)
             st.mark(f"{P}/search", {"candidates": len(ranked), "built": sum(1 for c in ranked if c.artifact),
                                     "best": ranked[0].cid if ranked else None})
         # ---- gate
@@ -465,23 +550,33 @@ class Run:
                 ranked = rank_fn(load_candidates(rc, g).values())
             ev, ws = ctx_objects()
             learned = (st.get("learned") or {}).get("scores", {})
+            ref = self.gate_reference(gd, ev, sft, raw)
 
             def gate_fn(c):
                 lo = ws.load_candidate(c.artifact["cid"])
-                return self.gate_check(ev, ws, lo, sft, learned)
+                return self.gate_check(ev, ws, lo, ref, learned)
 
             acc = submit_to_gate(rc, g, ranked, gate_fn, max_submissions=int(cfg.get("gate", {}).get("max_submissions", 3)))
             if acc is not None:
                 lo = ws.load_candidate(acc.cid)
-                rec = {"source": "llm", "cid": acc.cid, "name": ws.lora_name(lo) if lo.modules() else None}
-            else:
-                lo = self.load_lora(self.lora_file(gd / "baselines" / "sft_lora"))
-                ok, info = self.gate_check(ev, ws, lo, sft, learned) if sft.get("check_ok") else (False, {"reason": "sft failed checks"})
+                rec = {"source": "llm", "cid": acc.cid, "name": ws.lora_name(lo) if lo.modules() else None,
+                       "gate_reference": ref["kind"]}
+            elif self.gate_fallback in ("sft", "raw"):
+                fb = sft if self.gate_fallback == "sft" else raw
+                fname = "sft_lora" if (self.gate_fallback == "sft" or raw.get("same_as_sft")) else "raw_lora"
+                lo = self.load_lora(self.lora_file(gd / "baselines" / fname))
+                ok, info = (self.gate_check(ev, ws, lo, ref, learned) if fb.get("check_ok")
+                            else (False, {"reasons": [f"{self.gate_fallback} LoRA failed checks"]}))
                 if ok:
-                    rec = {"source": "sft_fallback", "cid": None, "name": sft["name"], "gate": info}
+                    rec = {"source": f"{self.gate_fallback}_fallback", "cid": None, "name": fb["name"], "gate": info,
+                           "gate_reference": ref["kind"]}
                 else:
-                    lo, rec = None, {"source": "keep", "cid": None, "name": None,
-                                     "reason": "no candidate and no SFT LoRA passed the gate", "sft_gate": info}
+                    lo, rec = None, {"source": "keep", "cid": None, "name": None, "gate_reference": ref["kind"],
+                                     "reason": f"no candidate and no {self.gate_fallback} LoRA passed the gate",
+                                     "fallback_gate": info}
+            else:
+                lo, rec = None, {"source": "keep", "cid": None, "name": None, "gate_reference": ref["kind"],
+                                 "reason": "no candidate passed the gate (fallback: keep)"}
             if lo is not None and lo.modules():
                 self.save_lora(lo, gd / "accepted_lora")
                 g_res = ev.run(rec["name"], "gate")
@@ -531,9 +626,18 @@ class Run:
                 ck = [(f, self.load_lora(self.lora_file(gd / "baselines" / f"sft_ckpt_{int(round(f * 100)):03d}")))
                       for f in sft.get("ckpt_fracs", [])]
                 out["frontiers"] = BL.frontiers(bws, fin, ck, nc.get("scales", [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]))
-            best, log = BL.random_search(bws, BL.recipe(cfg), evals=int(nc.get("evaluate", budget["evaluate"])),
-                                         gpu_budget_s=budget["gpu_seconds"], n_configs=int(nc.get("n_configs", 4)),
-                                         scales=nc.get("search_scales", [0.5, 0.75, 1.0, 1.25]), seed=rc.seed)
+            n_ev = int(nc.get("evaluate", budget["evaluate"]))
+            if self.mode == "edit":
+                rlo = self.load_lora(self.lora_file(gd / "baselines" / ("sft_lora" if raw["same_as_sft"] else "raw_lora")))
+                best, log = BL.random_edit_search(bws, rlo, evals=n_ev, seed=rc.seed,
+                                                  scales=nc.get("search_scales", [0.5, 0.75, 1.0, 1.25]))
+            elif self.mode == "scratch":
+                best, log = BL.random_construct_search(bws, evals=n_ev, seed=rc.seed)
+            else:
+                best, log = BL.random_search(bws, BL.recipe(cfg), evals=n_ev, gpu_budget_s=budget["gpu_seconds"],
+                                             n_configs=int(nc.get("n_configs", 4)),
+                                             scales=nc.get("search_scales", [0.5, 0.75, 1.0, 1.25]), seed=rc.seed)
+            out["kind"] = {"edit": "random_edit_search", "scratch": "random_construct_search"}.get(self.mode, "random_search")
             out["random_search"] = log
             name = None
             if best is not None and best.modules():
@@ -548,19 +652,27 @@ class Run:
         if cfg.get("e_t", {}).get("enabled", True):
             self.release_hf()
             branches = {"parent": None, "sft": sft.get("name"), "llm": acc.get("name") if acc.get("source") == "llm" else None,
-                        "nonllm": nonllm.get("name")}
-            if acc.get("source") == "sft_fallback":
-                branches["llm"] = sft.get("name")
-            for b in cfg.get("e_t", {}).get("branches", ["parent", "sft", "llm", "nonllm"]):
+                        "nonllm": nonllm.get("name"), "raw": (raw or {}).get("name")}
+            if acc.get("source") in ("sft_fallback", "raw_fallback"):
+                branches["llm"] = acc.get("name")
+            blist = list(cfg.get("e_t", {}).get("branches", ["parent", "sft", "llm", "nonllm"]))
+            if raw and not raw.get("same_as_sft") and "raw" not in blist:
+                blist.insert(blist.index("sft") + 1 if "sft" in blist else 0, "raw")
+            for b in blist:
                 key = f"{P}/e_t/{b}"
                 if st.done(key):
                     continue
-                ev, ws = ctx_objects()
+                ev = get_ev()
                 lname = branches.get(b)
                 if b != "parent" and lname is None:
                     st.mark(key, {"skipped": f"no {b} LoRA"})
                     continue
                 if lname is not None:
+                    if not ev.known(lname):   # resumed run: register the branch LoRA from disk
+                        f = self.lora_file(gd / {"llm": "accepted_lora", "nonllm": "baselines/nonllm_lora",
+                                                 "sft": "baselines/sft_lora",
+                                                 "raw": "baselines/raw_lora"}.get(b, "accepted_lora"))
+                        ev.register(self.load_lora(f), lname)
                     ev.ensure_loaded(lname)
                 res = self.e_branch(g, b, ev.endpoint, lname or served,
                                     self.quality(lname) if lname else self.quality(served))
@@ -609,7 +721,7 @@ class Run:
         return {k: sorted(v) for k, v in shown.items()}
 
     # ------------------------------------------------------------------ search
-    def search(self, g, gd, ctx_objects, diag, sft, budget):
+    def search(self, g, gd, ctx_objects, diag, sft, budget, raw=None):
         from rsicore.editor import Editor
         from rsicore.search import inner_search
 
@@ -623,12 +735,19 @@ class Run:
         sp = (sft.get("points") or {}).get("screen") or {}
         sftinfo = {"rank": (sft.get("train") or {}).get("rank"), "target_gain": sp.get("target_gain"),
                    "worst_retention": sp.get("worst_retention_delta")}
+        rawinfo = None
+        if raw:
+            rp = (raw.get("points") or {}).get("screen") or {}
+            tr = raw.get("train") or {}
+            rawinfo = {"n_train": tr.get("n_train"), "rank": tr.get("rank"), "steps": tr.get("steps") or tr.get("steps_done"),
+                       "target_gain": rp.get("target_gain"), "worst_retention": rp.get("worst_retention_delta")}
         ctx = ContextRenderer(task_text=task_text(gen=g, target=self.target, dataset=self.tds,
                                                   retention=self.retention_domains, n_train=len(ws.train.ids()),
-                                                  sft_info=sftinfo),
+                                                  sft_info=sftinfo, raw_info=rawinfo),
                               diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "")
-        sysmsg = system_prompt(cfg, budget=budget)
-        policy = M.make_mock_policy(rc.seed, skill=self.quality(self.served(g)) or 0.7, tag=f"g{g}") if rc.mock else None
+        sysmsg = system_prompt(cfg, budget=budget, mode=self.mode)
+        policy = (M.make_mock_policy(rc.seed, skill=self.quality(self.served(g)) or 0.7, tag=f"g{g}", mode=self.mode)
+                  if rc.mock else None)
 
         def editor_factory(th):
             return Editor(ev.endpoint, self.served(g), system_prompt=sysmsg, seed=rc.seed + 1000 * g + th,
@@ -670,9 +789,25 @@ class Run:
         return "\n".join(parts)
 
     # ------------------------------------------------------------------ gate
-    def gate_check(self, ev, ws, lo, sft, learned) -> tuple[bool, dict]:
+    def gate_reference(self, gd, ev, sft, raw) -> dict:
+        """Target reference of the gate by gate.reference (auto: edit raw, scratch parent, free sft):
+        {"kind", "scores": {dataset: gate score}}. The parent's gate scores are computed once per generation."""
+        kind = self.gate_ref
+        if kind == "sft":
+            return {"kind": "sft", "scores": dict(sft.get("gate") or {})}
+        if kind == "raw":
+            return {"kind": "raw", "scores": dict((raw or {}).get("gate") or {})}
+        pg = read_json(gd / "parent_gate.json")
+        if pg is None:
+            pg = {ds: r["score"] for ds, r in ev.run(None, "gate").items()}
+            write_json(gd / "parent_gate.json", pg)
+        return {"kind": "parent", "scores": pg}
+
+    def gate_check(self, ev, ws, lo, ref, learned) -> tuple[bool, dict]:
+        """ref = gate_reference(...). Target: raw/sft -> >= ref - epsilon; parent -> >= ref + min_gain."""
         gcfg = self.cfg.get("gate", {})
         eps, delta = float(gcfg.get("epsilon", 0.01)), float(gcfg.get("delta", 0.02))
+        min_gain = float(gcfg.get("min_gain", 0.01))
         use_nb = bool(gcfg.get("use_noise_band", True))
         ok, rep = ws.check(lo)
         info = {"check_ok": ok, "reasons": []}
@@ -684,14 +819,19 @@ class Run:
             ev.register(lo, name)
         res = ev.run(name, "gate")
         g0 = self.gen0_gate()
-        sft_gate = sft.get("gate") or {}
         scores = {ds: r["score"] for ds, r in res.items()}
         info["scores"] = scores
-        t, s = scores.get(self.tds), sft_gate.get(self.tds)
+        info["reference"] = ref["kind"]
+        t, s = scores.get(self.tds), (ref.get("scores") or {}).get(self.tds)
         if t is None:
             info["reasons"].append("target gate score unavailable")
+        elif ref["kind"] == "parent":
+            if s is None:
+                info["reasons"].append("parent target gate score unavailable")
+            elif t < s + min_gain:
+                info["reasons"].append(f"target {t:.4f} < parent {s:.4f} + min_gain {min_gain}")
         elif s is not None and t < s - eps:
-            info["reasons"].append(f"target {t:.4f} < SFT {s:.4f} - eps {eps}")
+            info["reasons"].append(f"target {t:.4f} < {ref['kind']} {s:.4f} - eps {eps}")
         info["pending"] = []
         for ds in self.datasets:
             if ds == self.tds:
@@ -716,12 +856,15 @@ class Run:
         th = self.theta0()
         out = self.gdir(g) / "e_t" / branch
 
+        er = self.e_raw()   # mode=edit: the E-task raw LoRA for θ0 (from e_ref)
+
         def make_ws(out_dir, ev, budget, prefix):
-            return self.workspace(out_dir, ev, th["store"], th["hf"], tdata, budget, prefix)
+            return self.workspace(out_dir, ev, th["store"], th["hf"], tdata, budget, prefix,
+                                  raw=er[0] if er else None, raw_info=er[2] if er else None)
 
         return run_etask(self.rc, self.cfg, out_dir=out, branch=branch, editor_endpoint=endpoint,
                          editor_served=served_name, editor_skill=skill, theta0=th, task=task, items=items,
-                         make_workspace=make_ws)
+                         make_workspace=make_ws, mode=self.mode, raw=(er[0], er[1]) if er else None)
 
     # ------------------------------------------------------------------ summary
     def summarize(self, g: int, gd: Path) -> dict:
@@ -730,12 +873,18 @@ class Run:
         gate = read_json(gd / "gate.json", {}) or {}
         sft = read_json(gd / "baselines" / "sft.json", {}) or {}
         non = read_json(gd / "baselines" / "nonllm.json", {}) or {}
-        info = {"gen": g, "editor": self.served(g), "successor": self.served(g + 1),
+        raw = read_json(gd / "baselines" / "raw.json", {}) or {}
+        info = {"gen": g, "editor": self.served(g), "successor": self.served(g + 1), "method": self.mode,
+                "gate_reference": self.gate_ref, "gate_fallback": self.gate_fallback,
                 "accepted": {k: acc.get(k) for k in ("source", "cid", "name", "gate_scores")},
                 "gate_submissions": [{"cid": s["cid"], "passed": s["passed"], "reasons": (s.get("info") or {}).get("reasons")}
                                      for s in gate.get("submissions", [])],
                 "sft": {"name": sft.get("name"), "gate": sft.get("gate"), "screen": (sft.get("points") or {}).get("screen")},
-                "nonllm": {"name": non.get("name"), "best": (non.get("random_search") or {}).get("best")},
+                "nonllm": {"name": non.get("name"), "kind": non.get("kind"),
+                           "best": (non.get("random_search") or {}).get("best")},
+                "raw": ({"name": raw.get("name"), "same_as_sft": raw.get("same_as_sft"), "gate": raw.get("gate"),
+                         "n_train": (raw.get("train") or {}).get("n_train"),
+                         "screen": (raw.get("points") or {}).get("screen")} if raw else None),
                 "model": read_json(gd / "model.json"), "heldout": read_json(gd / "heldout.json")}
         from rsicore.search import load_candidates
         cands = list(load_candidates(self.rc, g).values())
@@ -747,7 +896,7 @@ class Run:
                           "failed": sum(1 for c in cands if c.error), "strategies": strat,
                           "best_screen": max((c.screen or {}).get("score") or -1e9 for c in cands) if cands else None}
         E = {}
-        for b in ("parent", "sft", "llm", "nonllm"):
+        for b in ("parent", "sft", "raw", "llm", "nonllm"):
             r = read_json(gd / "e_t" / b / "result.json")
             if r:
                 E[b] = r
@@ -755,15 +904,21 @@ class Run:
         ref_score = (eref.get("sft_ref") or {}).get("score")
         info["E"] = {b: {"score": r["score"], "vs_sft_ref": (r["score"] - ref_score) if (r["score"] is not None and ref_score is not None) else None,
                          "per_task": r["per_task"], "best_cid": r["best_cid"]} for b, r in E.items()}
-        info["E_ref"] = {"theta0": (eref.get("theta0") or {}).get("score"), "sft_ref": ref_score}
+        info["E_ref"] = {"theta0": (eref.get("theta0") or {}).get("score"), "sft_ref": ref_score,
+                         "raw_ref": (((eref.get("raw") or {}).get("test")) or {}).get("score")}
 
         def d(a, b):
             if a in E and b in E:
                 return paired_delta(E[a]["records"], E[b]["records"], seed=self.rc.seed)
             return None
+        # reference branch of ΔE_write by mode: edit = M_t ⊕ raw (the SFT branch when raw = SFT recipe),
+        # scratch = parent (no training anywhere in the lineage), free = SFT
+        refb = {"edit": "raw" if "raw" in E else "sft", "scratch": "parent", "free": "sft"}[self.mode]
+        info["dE_reference_branch"] = refb
         info["dE_train"] = d("parent", "sft")      # E(SFT) - E(Parent)
-        info["dE_write"] = d("sft", "llm")         # E(LLM-written) - E(SFT)
-        info["dE_nonLLM"] = d("sft", "nonllm")     # E(Non-LLM) - E(SFT)
+        info["dE_write"] = d(refb, "llm")          # E(LLM-written) - E(reference branch)
+        info["dE_nonLLM"] = d(refb, "nonllm")      # E(Non-LLM) - E(reference branch)
+        info["dE_write_vs_sft"] = d("sft", "llm")  # always reported
         return info
 
     # ------------------------------------------------------------------ main
@@ -790,7 +945,9 @@ def main(argv=None):
     if rc.mock:
         cfg = deep_merge(cfg, cfg.get("mock_overrides", {}) or {})
     roles = {r: role_gpus(rc, cfg, r) for r in ("main", "theta0", "train")}   # fail fast: enough --gpus?
-    print(f"[lora_code] hardware={hw} gpu roles {roles}", flush=True)
+    mode, (gref, gfb) = method_mode(cfg), gate_policy(cfg)                      # fail fast: valid method / gate
+    print(f"[lora_code] hardware={hw} gpu roles {roles} method={mode} gate reference={gref} fallback={gfb}",
+          flush=True)
     try:
         Run(rc, cfg).run()
     except Exception:  # noqa: BLE001

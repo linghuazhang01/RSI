@@ -48,6 +48,7 @@ class Evaluator:
         self.registry = registry
         self.parent_quality = parent_quality
         self.sft_name: str | None = None
+        self.raw_name: str | None = None    # mode=edit: the raw LoRA (feedback adds vs_raw)
         self.shown: dict[str, set] = {}
         self._loaded: OrderedDict = OrderedDict()
         self._paths: dict[str, Path] = {}
@@ -181,6 +182,11 @@ class Evaluator:
         if sft is not None and self.target in sft:
             tgt["sft"] = sft[self.target]["score"]
             tgt["vs_sft"] = self._paired(t.get("records", []), sft[self.target]["records"])
+        raw = (self.run(self.raw_name, level) if (self.raw_name and level != "gate" and self.raw_name != self.sft_name)
+               else (sft if self.raw_name and self.raw_name == self.sft_name else None))
+        if raw is not None and self.target in raw:
+            tgt["raw"] = raw[self.target]["score"]
+            tgt["vs_raw"] = self._paired(t.get("records", []), raw[self.target]["records"])
         tgt["significant"] = _sig(tgt["vs_parent"])
         tgt["errors"] = self._examples(t.get("records", []), par.get(self.target, {}).get("records", []),
                                        self.target, mode="errors") if name else []

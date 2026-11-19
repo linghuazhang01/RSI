@@ -14,6 +14,9 @@ also between program calls and the search's screen evaluation, which goes throug
 GPU tools = cost {"gpu_seconds": 0} (refused once exhausted) + cost_fn (measured seconds, capped at what
 was left before the call so a successful call keeps its result; the uncapped total is ws.gpu_measured).
 Data access: acts / grad / sgd / train_example only accept this generation's `train` ids (TrainData).
+Tool set by method.mode (tools_for_mode): free = all; edit = no sgd / grad / from_grad, plus raw_lora (the
+raw LoRA under handle "RAW"); scratch = no sgd / grad / from_grad and no raw LoRA. Unregistered tools are
+refused by the ToolAPI.
 """
 from __future__ import annotations
 
@@ -52,10 +55,25 @@ TOOL_DOCS = {
     "ties": "ties(loras, weights=None, density=0.2) -> {lora}",
     "inspect": "inspect(lora) -> {modules, max_rank, check, top, intruder_mean}",
     "stack": "stack() -> list of {handle, gen, modules, max_rank} (adapters merged in earlier generations)",
+    "raw_lora": "raw_lora() -> {lora: 'RAW', modules, max_rank, train}: the LoRA trained for you this generation "
+                "with the fixed recipe (the starting point you edit)",
     "candidate": "candidate(cid) -> {lora} of an earlier candidate of this generation",
     "evaluate": "evaluate(lora) -> structured screen feedback (costs 1 evaluate; identical LoRAs are free)",
     "budget": "budget() -> {spent, left}",
 }
+
+
+def tools_for_mode(mode: str) -> dict:
+    """TOOL_DOCS available to the editor in method.mode: free = everything except raw_lora; edit = no
+    training / gradient tools, plus raw_lora; scratch = no training / gradient tools, no raw_lora."""
+    from .common import GRADIENT_TOOLS
+    out = dict(TOOL_DOCS)
+    if mode in ("edit", "scratch"):
+        for t in GRADIENT_TOOLS:
+            out.pop(t, None)
+    if mode != "edit":
+        out.pop("raw_lora", None)
+    return out
 
 
 class BudgetError(Exception):
@@ -73,8 +91,12 @@ def _budget_exc():
 class Workspace:
     def __init__(self, *, mock: bool, store, train, cfg: dict, out_dir: Path, evaluator=None, hf=None,
                  stack=None, retention_texts=None, budget: dict | None = None, name_prefix: str = "c",
-                 diagnostics: dict | None = None, seed: int = 42):
+                 diagnostics: dict | None = None, seed: int = 42, mode: str = "free", raw=None,
+                 raw_info: dict | None = None):
         self.mock = mock
+        self.mode = mode                        # method.mode: which tools are registered (tools_for_mode)
+        self.raw = raw                          # mode=edit: the raw LoRA (handle "RAW")
+        self.raw_info = dict(raw_info or {})
         self.store = store
         self.train = train
         self.cfg = cfg
@@ -105,6 +127,8 @@ class Workspace:
         self.allowed = self.lcfg.get("allowed_leaves")
         for g, lo in self.stack:
             self._h[f"H{g}"] = lo
+        if raw is not None:
+            self._h["RAW"] = raw
 
     # ------------------------------------------------------------------ bookkeeping
     @property
@@ -228,7 +252,10 @@ class Workspace:
     def build_api(self):
         if self._registered:
             return self.api
-        for name, doc in TOOL_DOCS.items():
+        docs = tools_for_mode(self.mode)
+        if self.mode == "edit" and self.raw is None:
+            docs.pop("raw_lora", None)
+        for name, doc in docs.items():
             fn = self._wrap(name, getattr(self, "t_" + name))
             if name == "evaluate":
                 self.api.register(name, fn, cost={"evaluate": 0}, cost_fn=self._eval_cost,
@@ -293,6 +320,12 @@ class Workspace:
     def t_stack(self):
         return [{"handle": f"H{g}", "gen": g, "modules": len(lo.modules()), "max_rank": lo.max_rank()}
                 for g, lo in self.stack]
+
+    def t_raw_lora(self):
+        if self.raw is None:
+            raise KeyError("no raw LoRA in this session")
+        return {"lora": "RAW", "modules": len(self.raw.modules()), "max_rank": self.raw.max_rank(),
+                "train": self.raw_info}
 
     def t_candidate(self, cid):
         lo = self.load_candidate(cid)
@@ -752,6 +785,12 @@ def classify(tools) -> str:
     train = "sgd" in s
     stack_ops = s & {"interpolate", "combine", "truncate_rank", "intruder_scale", "relchange_prune",
                      "regmean_preserve", "orthogonalize", "ties", "scale", "drop"}
+    if "raw_lora" in s:   # mode=edit: what was done to the raw LoRA
+        if construct and stack_ops:
+            return "raw+construct+ops"
+        if construct:
+            return "raw+construct"
+        return "raw+ops" if stack_ops else "raw_as_is"
     if not (construct or train or stack_ops):
         return "keep"
     if train and not construct and not stack_ops:
