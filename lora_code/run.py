@@ -778,12 +778,8 @@ def main(argv=None):
     ap = build_arg_parser("B")
     args = ap.parse_args(argv)
     rc = load_run_config("B", args)
-    cfg = rc.paper_cfg
-    hw = cfg.get("hardware") or "b300"
-    profiles = cfg.get("hardware_profiles") or {}
-    if hw not in profiles:
-        raise ValueError(f"unknown hardware profile {hw!r}; known: {sorted(profiles)}")
-    cfg = deep_merge(cfg, profiles[hw] or {})
+    cfg = rc.paper_cfg   # hardware profile already merged by rsicore.config (before --set)
+    hw = cfg.get("hardware", "b300")
     if rc.mock:
         cfg = deep_merge(cfg, cfg.get("mock_overrides", {}) or {})
     roles = {r: role_gpus(rc, cfg, r) for r in ("main", "theta0", "train")}   # fail fast: enough --gpus?

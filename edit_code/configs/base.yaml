@@ -132,7 +132,7 @@ vllm:
 
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
-# cards. A profile is merged on top of everything else (before mock_overrides).
+# cards. rsicore.config merges the profile over base/domain config and BEFORE --set (--set wins).
 hardware: b300
 hardware_profiles:
   b300: {}

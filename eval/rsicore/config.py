@@ -94,6 +94,24 @@ def _apply_set(cfg: dict, items) -> dict:
     return cfg
 
 
+def _apply_hardware(cfg: dict, sets) -> dict:
+    """Merge cfg["hardware_profiles"][hw] (hw = --set hardware=... or cfg["hardware"]) BEFORE the --set
+    overrides, so `--set gpu_roles...` etc. win over the profile. The result is locked in run_config.yaml."""
+    profiles = cfg.get("hardware_profiles") or {}
+    if not profiles:
+        return cfg
+    hw = cfg.get("hardware") or "b300"
+    for it in sets:
+        k, _, v = it.partition("=")
+        if k.strip() == "hardware":
+            hw = str(yaml.safe_load(v))
+    if hw not in profiles:
+        raise SystemExit(f"unknown hardware profile {hw!r}; known: {sorted(profiles)}")
+    cfg = _deep_merge(cfg, profiles[hw] or {})
+    cfg["hardware"] = hw
+    return cfg
+
+
 def resolve_model(model: str) -> Path:
     p = Path(model).expanduser()
     if p.exists() or "/" in model or model.startswith("."):
@@ -117,7 +135,9 @@ def load_run_config(paper: str, args) -> RunConfig:
     if not (cdir / "base.yaml").exists():
         print(f"[rsicore] warning: {cdir / 'base.yaml'} not found; using empty paper config", file=sys.stderr)
     cfg = _deep_merge(_load_yaml(cdir / "base.yaml"), _load_yaml(cdir / "domains" / f"{args.domain}.yaml"))
-    cfg = _apply_set(cfg, getattr(args, "set", []))
+    sets = list(getattr(args, "set", []) or [])
+    cfg = _apply_hardware(cfg, sets)
+    cfg = _apply_set(cfg, sets)
     draw_cfg = cfg.get("draw_config")
     draw_cfg = (ROOT / draw_cfg).resolve() if draw_cfg else DRAW_CONFIGS[paper]
     run_id = args.run_id or f"{paper}_{args.domain}_s{args.seed}" + ("_mock" if args.mock else "")

@@ -87,12 +87,7 @@ class LazyServer:
 
 
 def effective_config(rc, args) -> dict:
-    cfg = dict(rc.paper_cfg)
-    hw = cfg.get("hardware") or "b300"
-    profiles = cfg.get("hardware_profiles") or {}
-    if hw not in profiles:
-        raise ValueError(f"unknown hardware profile {hw!r}; known: {sorted(profiles)}")
-    cfg = deep_merge(cfg, profiles[hw] or {})
+    cfg = dict(rc.paper_cfg)   # hardware profile already merged by rsicore.config (before --set)
     if rc.mock:
         cfg = deep_merge(cfg, cfg.get("mock_overrides") or {})
     if getattr(args, "budget_gib", None):
@@ -116,6 +111,8 @@ class Runner:
         self.kl_datasets = [ds for d in (ALL_DOMAINS if kd == "all" else doms) for ds in D.DOMAIN_TRAIN[d]]
         self.registry = self.run_dir / "mock_registry.json"
         self.gpu_editor, self.gpu_cand = role_gpus(rc, cfg, "editor"), role_gpus(rc, cfg, "candidate")
+        print(f"[edit_code] hardware={cfg.get('hardware', 'b300')} gpu roles editor={self.gpu_editor} "
+              f"candidate={self.gpu_cand}", flush=True)
         self.editor_mode = (cfg.get("loop") or {}).get("editor", "frozen")
         if self.editor_mode not in ("frozen", "current"):
             raise ValueError(f"loop.editor must be frozen or current, got {self.editor_mode!r}")
