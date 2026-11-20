@@ -1,13 +1,14 @@
 #!/usr/bin/env python
-"""Build the eval-set target dataset (objective eval_overfit, 2026-11-20): the evaluation sets themselves, merged
-into one dataset that the RSI runs optimise on directly (no train / signal / gate split; the editor sees it all).
+"""Build an eval-set target dataset (objective eval_overfit): an evaluation set copied into one dataset that the
+RSI runs optimise on directly (no train / signal / gate split; the editor sees it all).
 
-    python -I data/scripts/build_eval_target.py [--name math_eval]
+    python -I data/scripts/build_eval_target.py [--name math] [--all]
 
-math_eval = MATH-500 (data/processed/math.jsonl, split pool `test`) + GSM8K test (data/processed/gsm8k.jsonl,
-pool `test`) = 1819 items, graded by the math grader (eval/configs/tasks.yaml task `math_eval`). Written to
-data/processed/<name>.jsonl (dataset = <name>, every item in split pool `pool`, ids and fields unchanged) and
-data/splits/<name>/pool.json. Deterministic and idempotent: rebuilt only when missing or a source changed.
+The targets are eval/configs/tasks.yaml `eval_targets` (2026-11-21: any single eval set, e.g. humanevalplus,
+ifeval, gpqa_diamond): key K -> source (task, pool) pairs -> dataset K_eval. math -> math_eval = MATH-500
+(data/processed/math.jsonl, pool `test`) + GSM8K test = 1819 items. Written to data/processed/K_eval.jsonl
+(dataset = K_eval, every item in split pool `pool`, ids and fields unchanged) and data/splits/K_eval/pool.json.
+--name takes K or K_eval. Deterministic and idempotent: rebuilt only when missing or a source changed.
 """
 import argparse
 import hashlib
@@ -17,7 +18,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PROC, SPLITS = ROOT / "data" / "processed", ROOT / "data" / "splits"
-TARGETS = {"math_eval": [("math", "test"), ("gsm8k", "test")]}
+TASKS_YAML = ROOT / "eval" / "configs" / "tasks.yaml"
+
+
+def targets() -> dict:
+    """{K_eval: [(source dataset, pool)]} from tasks.yaml eval_targets."""
+    import yaml
+    cfg = yaml.safe_load(TASKS_YAML.read_text())
+    tasks = cfg["tasks"]
+    return {f"{k}_eval": [(tasks[t]["dataset"], str(p)) for t, p in v] for k, v in (cfg.get("eval_targets") or {}).items()}
 
 
 def _sources_sha(sources) -> str:
@@ -31,9 +40,12 @@ def _sources_sha(sources) -> str:
 
 def build(name: str = "math_eval", force: bool = False) -> dict:
     """Write the merged dataset if needed; returns {"name", "n", "by_source", "rebuilt"}."""
-    if name not in TARGETS:
-        raise SystemExit(f"unknown eval target {name!r}; known: {sorted(TARGETS)}")
-    sources = TARGETS[name]
+    tg = targets()
+    if name not in tg and f"{name}_eval" in tg:
+        name = f"{name}_eval"
+    if name not in tg:
+        raise SystemExit(f"unknown eval target {name!r}; known: {sorted(tg)}")
+    sources = tg[name]
     for ds, pool in sources:
         if not (PROC / f"{ds}.jsonl").exists() or not (SPLITS / ds / f"{pool}.json").exists():
             raise SystemExit(f"missing source data {ds} / {pool} (./download_data.sh)")
@@ -47,7 +59,7 @@ def build(name: str = "math_eval", force: bool = False) -> dict:
     rows, by = [], {}
     for ds, pool in sources:
         keep = set(json.loads((SPLITS / ds / f"{pool}.json").read_text()))
-        for line in (PROC / f"{ds}.jsonl").read_text().splitlines():
+        for line in (PROC / f"{ds}.jsonl").read_text().split("\n"):   # not splitlines(): U+2028 inside text
             if not line.strip():
                 continue
             r = json.loads(line)
@@ -70,7 +82,16 @@ def build(name: str = "math_eval", force: bool = False) -> dict:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--name", default="math_eval")
+    ap.add_argument("--all", action="store_true", help="build every target whose source data is present")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
-    print(json.dumps(build(a.name, a.force)))
+    if a.all:
+        for n in targets():
+            try:
+                r = build(n, a.force)
+                print(json.dumps({k: r[k] for k in ("name", "n", "rebuilt")}))
+            except SystemExit as e:
+                print(f"{n}: skipped ({e})")
+    else:
+        print(json.dumps(build(a.name, a.force)))
     sys.exit(0)

@@ -39,7 +39,8 @@ def set_max_tokens(spec: dict | None) -> dict[str, int]:
     eval/configs/tasks.yaml for this process; null / {} = keep tasks.yaml. Returns the installed table."""
     import yaml
     spec = {k: v for k, v in (spec or {}).items() if v is not None}
-    known = set((yaml.safe_load(TASKS_YAML.read_text()) or {}).get("tasks") or {})
+    from .evalsets import task_names
+    known = task_names()                                # tasks.yaml tasks + the eval-set targets K_eval
     bad = sorted(set(spec) - known)
     if bad:
         raise SystemExit(f"max_tokens: unknown task(s) {bad} (see eval/configs/tasks.yaml)")

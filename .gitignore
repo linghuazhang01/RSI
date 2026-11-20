@@ -13,8 +13,9 @@ eval/.nltk_data/
 # Datasets (rebuild with ./download_data.sh); keep scripts, splits and docs
 data/raw/
 data/processed/
-# eval-set target, built on demand by data/scripts/build_eval_target.py
-data/splits/math_eval/
+# eval-set targets (K_eval), built on demand by data/scripts/build_eval_target.py
+data/splits/*_eval/
+!data/splits/alpaca_eval/
 
 # Pinned third-party harness repos (cloned by eval/setup_env.sh); keep pins.yaml
 eval/third_party/*/

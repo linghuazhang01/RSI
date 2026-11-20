@@ -409,7 +409,24 @@ KIND = {"math": MathTask, "mcq": MCQTask, "short_qa": ShortQATask, "squad_closed
         "apibank": APIBankTask, "mt_bench_judge": MTBenchTask, "alpaca_eval_judge": AlpacaEvalTask}
 
 
+def eval_target_tasks(cfg: dict) -> dict:
+    """Task entries of the eval-set targets (configs/tasks.yaml `eval_targets`, objective eval_overfit): key K ->
+    task K_eval = the first source task's entry with dataset K_eval and allowed_pools [pool]. Entries `tasks`
+    defines itself (math_eval) are left out."""
+    tasks, out = cfg.get("tasks") or {}, {}
+    for key, sources in (cfg.get("eval_targets") or {}).items():
+        name = f"{key}_eval"
+        if name in tasks:
+            continue
+        src = [tasks[t] for t, _ in sources]
+        if len({s["grader"] for s in src}) != 1:
+            raise ValueError(f"eval target {key}: sources must share one grader")
+        out[name] = dict(src[0], dataset=name, allowed_pools=["pool"])
+    return out
+
+
 def load_tasks(cfg: dict) -> dict:
     TEMPLATES.clear()
     TEMPLATES.update(cfg["templates"])
-    return {name: KIND[t["grader"]](name, t) for name, t in cfg["tasks"].items()}
+    entries = dict(cfg["tasks"], **eval_target_tasks(cfg))
+    return {name: KIND[t["grader"]](name, t) for name, t in entries.items()}

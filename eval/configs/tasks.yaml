@@ -40,6 +40,7 @@ tasks:
   math_train:     {dataset: math_train, category: math, grader: math, allowed_pools: [reserve]}  # not used since 2026-11-19
   dapo_math:      {dataset: dapo_math, category: math, grader: math, max_tokens: 4096, allowed_pools: [pool]}
   # objective eval_overfit (2026-11-20): MATH-500 + GSM8K test merged (data/scripts/build_eval_target.py), optimised on
+  # (eval target `math`, see eval_targets at the end)
   math_eval:      {dataset: math_eval, category: math, grader: math, max_tokens: 4096, allowed_pools: [pool]}  # 4096 since 2026-11-20 (was 8192)
   # held-out
   gsm8k:          {dataset: gsm8k, category: math, grader: math}               # pool: test (all 1,319)
@@ -84,3 +85,31 @@ tasks:
                    subsets: [instruct_v2, review_str_v2, retrieve_str_v2, understand_str_v2]}
   metatool:       {dataset: metatool, category: tool_calling, grader: metatool, max_tokens: 512}
   apibank:        {dataset: apibank, category: tool_calling, grader: apibank, max_tokens: 512}
+
+# objective eval_overfit (2026-11-21): the eval sets a run can optimise on directly, one per run (paper config
+# eval_target.dataset = a key below, e.g. humanevalplus; ./launch.sh --eval-set humanevalplus). Key K -> dataset and
+# task K_eval: data/scripts/build_eval_target.py copies the source items (ids and fields unchanged) into
+# data/processed/K_eval.jsonl, split pool `pool`; the task K_eval inherits the source task's entry (grader, template,
+# max_tokens) with dataset K_eval and allowed_pools [pool], unless `tasks` defines it (math_eval above). The run's
+# domain = the source task's category. Several sources must share one grader.
+eval_targets:
+  math: [[math500, test], [gsm8k, test]]       # math_eval, 1819 items
+  math500: [[math500, test]]
+  gsm8k: [[gsm8k, test]]
+  aime24: [[aime24, test]]
+  aime25: [[aime25, test]]
+  amc23: [[amc23, test]]
+  humanevalplus: [[humanevalplus, test]]
+  mbppplus: [[mbppplus, test]]
+  livecodebench: [[livecodebench, test]]
+  gpqa_diamond: [[gpqa_diamond, test]]
+  mmlu_pro: [[mmlu_pro, test]]
+  triviaqa: [[triviaqa, test]]
+  ifeval: [[ifeval, test]]
+  ifbench: [[ifbench, test]]
+  sealtool: [[sealtool, test]]
+  apibank: [[apibank, test]]
+  bfcl: [[bfcl, test]]
+# eval_target.dataset null -> the domain's default
+eval_target_defaults: {math: math, code: humanevalplus, knowledge: gpqa_diamond, instruction_following: ifeval,
+                       tool_calling: sealtool}

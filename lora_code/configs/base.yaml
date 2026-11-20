@@ -62,21 +62,25 @@ scope_profiles:
     e_t: {enabled: false}   # (no E_t -> no theta0 server: the GPU layout needs only main + train)
 
 # Objective (2026-11-20; --set objective=eval_overfit, or ./launch.sh --eval-overfit). train_gate = the train /
-# signal / gate split above. eval_overfit = optimise directly on the eval sets: the run's target dataset is
-# math_eval (MATH-500 + GSM8K test, 1819 items, data/scripts/build_eval_target.py); train / signal / gate are all
-# of it (the editor sees every item: train_example, acts, train_loss), scored greedily; a candidate is accepted
-# when its eval-set score is strictly higher than the current model's (no significance test, no separate gate
-# set). Run ids end in _evalfit. Merged before --set (explicit --set values still win).
+# signal / gate split above. eval_overfit = optimise directly on ONE eval set (eval_target.dataset, e.g. math =
+# MATH-500 + GSM8K test, 1819 items; humanevalplus; ifeval; built by data/scripts/build_eval_target.py as K_eval);
+# train / signal / gate and the held-out evaluation are all of it (the editor sees every item: train_example, acts,
+# train_loss), scored greedily; a candidate is accepted when its eval-set score is strictly higher than the current
+# model's (no significance test, no separate gate set). Run ids end in _evalfit (math) or _evalfit_<set>. Merged before --set (explicit --set values still win).
 objective: train_gate
 objective_profiles:
   train_gate: {}
   eval_overfit:
-    eval_target: {enabled: true, dataset: math_eval}
+    # dataset: the eval set (2026-11-21: any single one, a key of eval/configs/tasks.yaml eval_targets, e.g. math
+    # = MATH-500 + GSM8K test, humanevalplus, ifeval, gpqa_diamond); null = the domain's default
+    # (math -> math, code -> humanevalplus, knowledge -> gpqa_diamond, instruction_following -> ifeval,
+    # tool_calling -> sealtool). Must belong to the run's --domain.
+    eval_target: {enabled: true, dataset: null}
     retention: {domains: []}
     search: {top_full: 0}                   # screen = full = the whole set
     gate: {min_gain: 1.0e-6, require_significant: false}         # accept any strictly higher eval-set score
     feedback: {n_examples: 5, lambda_kl: 0.0}
-    heldout: {domains: eval_target, decoding: null}   # evaluated on the same 1819 items, greedy (2026-11-21)
+    heldout: {domains: eval_target, decoding: null}   # evaluated on the same eval set, greedy (2026-11-21)
     e_t: {enabled: false}
 
 raw:                        # mode=edit only: recipe of the raw LoRA (trained once, generation 0; the only training)

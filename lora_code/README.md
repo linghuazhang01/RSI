@@ -40,6 +40,17 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 - edit 模式第 0 代的 raw LoRA 也直接在评测题上训练（自己答对的回答，4 个都错就跳过）；scratch 不训练。
 - 留出评测也直接在这 1819 道上做（`heldout.domains: eval_target`，贪心，2026-11-21）：报告的就是过拟合的那份分数，不再单独测 MATH-500 / GSM8K / AIME。
 
+### 自定义数据角色 `data_roles`（2026-11-21）
+
+每个角色可以单独指定数据集（`--set data_roles.train=... --set data_roles.gate=... --set data_roles.eval=...`，由 `rsicore.config` 校验、`rsicore.draws.train_dataset / gate_dataset` 解析）：
+- **train**：改造者干活用的数据。train 题（`train_example` / `acts` / `train_loss`、edit 第 0 代 raw LoRA 的训练数据）、快速筛 / 完整评测的信号题、"只送比当前模型好的候选"这一步，都用它。
+- **gate**：决定接不接受候选的数据。基线验收分数、和参照（parent / raw）的逐题配对比较、`gate_scores`，都用它。
+- **eval**：留出评测报告（逗号分隔）：领域（`math` = math500,gsm8k,aime24,aime25）、留出任务（`math500`、`humanevalplus`……，用 test 池）、评测集（`math`、`math500`、`ifeval`……，即 K_eval 副本），或 `train` / `gate`（该角色的数据集，须是评测集）。
+- train / gate 可填训练集名（`dapo_math` 等，按代抽题 / 固定验收切分，和以前一样）或评测集（`tasks.yaml` 的 `eval_targets` 键，如 `math500`、`ifeval`，或 `math500_eval`：全部题都用，不抽题，不标记展示过的题）。
+- 不设时：train = gate = 该领域的训练集（`dapo_math` 等）；`eval_overfit` 时两者都是那份评测集；eval 用 `heldout.domains`。
+- train / gate 必须属于这次运行的 `--domain`；用评测集当 train / gate 需要 `scope: single`。和默认不同的角色写进运行名，例如 `B_math_s42_single_gate-math500`、`B_math_s42_single_train-math500`。
+- 例子：`--set data_roles.gate=math500 --set data_roles.eval=math500`（在 dapo_math 上改、在全部 MATH-500 上验收、只报 MATH-500）；`--set data_roles.train=math500 --set data_roles.gate=dapo_math`（看着 MATH-500 改、用 dapo_math 的固定验收集把关）。
+
 ## 单领域实验（`scope`）
 
 **默认 `scope: single`（2026-11-19 起）**：只用这次运行的 `--domain`，训练、验收、评测都只在这个领域上做，不考虑别的领域。

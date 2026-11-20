@@ -3,6 +3,8 @@
 Levels: `screen` (target screen + retention screen, ~200 items each), `full` (whole signal draw of the
 generation), `gate` (fixed gate of every domain). Every result is cached on disk per (name, level), so a
 resumed run never re-evaluates. Feedback follows RSI_LOOP_DESIGN §3.4.
+data roles (2026-11-21): the screen / full levels hold the train dataset (`target_dataset`), the gate level the gate
+dataset (`gate_dataset`, default the same); a level's target is the one it holds.
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ class Evaluator:
     def __init__(self, rc, cfg: dict, *, out_dir: Path, endpoint: str, served: str, server, ids: dict,
                  target_dataset: str, kl_texts: list[str], store, mock: bool, registry: Path | None,
                  parent_quality: float | dict | None = None, max_loaded: int = 6, tag: str = "",
-                 replicas: list | None = None, weights_scorer=None):
+                 replicas: list | None = None, weights_scorer=None, gate_dataset: str | None = None):
         self.rc, self.cfg = rc, cfg
         self.out_dir = Path(out_dir)
         self.endpoint, self.served, self.server = endpoint, served, server
@@ -54,7 +56,8 @@ class Evaluator:
         self.weights_scorer = weights_scorer
         self._kinds: dict[str, str] = {}
         self.ids = ids                      # level -> {dataset: [ids]}
-        self.target = target_dataset
+        self.target = target_dataset        # screen / full target (data_roles.train)
+        self.gate_target = gate_dataset or target_dataset   # gate target (data_roles.gate)
         self.kl_texts = kl_texts
         self.store = store
         self.mock = mock
@@ -89,8 +92,11 @@ class Evaluator:
                 path = self.out_dir / "adapters" / f"{name}.json"
                 write_json(path, lora.to_json())
                 # per-domain mock quality: the target domain gains, retention domains take the damage
+                # (train and gate datasets differ: the gain goes to the domain, so both of them see it)
+                tkey = DATASET_DOMAIN.get(self.target, self.target) if self.gate_target == self.target \
+                    else (DATASET_DOMAIN.get(self.target) or getattr(self.rc, "domain", None) or self.target)
                 q = lora.quality(self.parent_quality if self.parent_quality is not None else 0.7, salt=name,
-                                 target=DATASET_DOMAIN.get(self.target, self.target))
+                                 target=tkey)
                 reg = read_json(self.registry, {}) or {}
                 reg[name] = q
                 write_json(self.registry, reg)
@@ -153,8 +159,7 @@ class Evaluator:
         if weights_real:                            # every uncached dataset in one export + serve
             todo, dirs = {}, {}
             for ds, ids in sorted(self.ids[level].items()):
-                lv = "screen" if (level != "screen" and sorted(ids) == sorted((self.ids.get("screen") or {}).get(ds, []))) \
-                    else level
+                lv = self._cache_level(level, ds, ids)
                 if read_json(self.out_dir / "evals" / key / lv / f"{ds}.json") is None:
                     todo[ds] = list(ids)
                     dirs[ds] = self.out_dir / "evals" / key / lv / f"{ds}_raw"
@@ -163,10 +168,7 @@ class Evaluator:
                     raise RuntimeError("weight-edit candidate but no weights_scorer (method.mode weights)")
                 pre = self.weights_scorer(name, self._paths[name], todo, dirs)
         for ds, ids in sorted(self.ids[level].items()):
-            # a level with the same items as the screen level (objective eval_overfit: every level is the whole
-            # eval set) shares the screen result instead of scoring them again
-            lv = "screen" if (level != "screen" and sorted(ids) == sorted((self.ids.get("screen") or {}).get(ds, []))) \
-                else level
+            lv = self._cache_level(level, ds, ids)
             cache = self.out_dir / "evals" / key / lv / f"{ds}.json"
             got = read_json(cache)
             if got is None:
@@ -194,12 +196,21 @@ class Evaluator:
             res[ds] = got
         return res
 
+    def _cache_level(self, level: str, ds: str, ids) -> str:
+        """Cache directory level of (level, ds): a level with the same dataset AND the same items as the screen
+        level (objective eval_overfit: every level is the whole eval set) shares the screen result instead of
+        scoring them again; a different dataset (data_roles: gate != train) never does."""
+        scr = self.ids.get("screen") or {}
+        if level != "screen" and ds in scr and sorted(ids) == sorted(scr[ds]):
+            return "screen"
+        return level
+
     def cached(self, name: str | None, level: str) -> dict | None:
         """run()'s result if every dataset of `level` is already on disk; None otherwise (never evaluates)."""
         key = name or "__parent__"
         res = {}
-        for ds in sorted(self.ids.get(level, {})):
-            got = read_json(self.out_dir / "evals" / key / level / f"{ds}.json")
+        for ds, ids in sorted(self.ids.get(level, {}).items()):
+            got = read_json(self.out_dir / "evals" / key / self._cache_level(level, ds, ids) / f"{ds}.json")
             if got is None:
                 return None
             res[ds] = got
@@ -251,20 +262,21 @@ class Evaluator:
         kl = self.kl(name)
         vs_par = self.compare(cand, par)
         fb = {"level": level, "lora": name}
-        t = cand.get(self.target, {})
-        tgt = {"dataset": self.target, "score": t.get("score"), "ci": t.get("ci"), "n": t.get("n_scored"),
-               "parent": par.get(self.target, {}).get("score"), "vs_parent": vs_par.get(self.target)}
+        T = self.gate_target if level == "gate" else self.target
+        t = cand.get(T, {})
+        tgt = {"dataset": T, "score": t.get("score"), "ci": t.get("ci"), "n": t.get("n_scored"),
+               "parent": par.get(T, {}).get("score"), "vs_parent": vs_par.get(T)}
         raw = self.run(self.raw_name, level) if (self.raw_name and level != "gate") else None
-        if raw is not None and self.target in raw:
-            tgt["raw"] = raw[self.target]["score"]
-            tgt["vs_raw"] = self._paired(t.get("records", []), raw[self.target]["records"])
+        if raw is not None and T in raw:
+            tgt["raw"] = raw[T]["score"]
+            tgt["vs_raw"] = self._paired(t.get("records", []), raw[T]["records"])
         tgt["significant"] = _sig(tgt["vs_parent"])
-        tgt["errors"] = self._examples(t.get("records", []), par.get(self.target, {}).get("records", []),
-                                       self.target, mode="errors") if name else []
+        tgt["errors"] = self._examples(t.get("records", []), par.get(T, {}).get("records", []),
+                                       T, mode="errors") if name else []
         fb["target"] = tgt
         ret, drops = {}, []
         for ds, r in cand.items():
-            if ds == self.target:
+            if ds == T:
                 continue
             d = vs_par.get(ds) or {}
             ret[DATASET_DOMAIN.get(ds, ds)] = {"dataset": ds, "score": r.get("score"),
@@ -277,7 +289,7 @@ class Evaluator:
         regs = []
         if name:
             for ds, r in cand.items():
-                if ds != self.target:
+                if ds != T:
                     regs += self._examples(r.get("records", []), par.get(ds, {}).get("records", []), ds,
                                            mode="regressions")
         fb["regressions"] = regs[: self.n_examples]

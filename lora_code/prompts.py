@@ -189,7 +189,7 @@ class ContextRenderer:
 
 
 def task_text(*, gen: int, target: str, dataset: str, retention: list[str], n_train: int,
-              e_task: bool = False, raw_info: dict | None = None) -> str:
+              e_task: bool = False, raw_info: dict | None = None, gate_dataset: str | None = None) -> str:
     if e_task:
         return (f"Task (fixed editing-skill measurement): write a LoRA for the ORIGINAL base model that improves "
                 f"{target} ({dataset}); {n_train} training items are available through api.train_ids(). "
@@ -197,6 +197,8 @@ def task_text(*, gen: int, target: str, dataset: str, retention: list[str], n_tr
     s = (f"Generation {gen}. Target domain: {target} (training set {dataset}; {n_train} train items via "
          f"api.train_ids()). " + (f"Retention domains (must not get worse): {', '.join(retention)}." if retention
                                   else "Single-domain run: only the target domain is evaluated and gated."))
+    if gate_dataset and gate_dataset != dataset:     # data_roles.gate (2026-11-21): a different gate set
+        s += f" The gate accepts a candidate on {gate_dataset} (scores only; its items are not readable)."
     return s + _raw_line(raw_info)
 
 

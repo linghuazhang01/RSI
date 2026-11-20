@@ -239,16 +239,23 @@ class Run:
         self.wslots = WeightSlots(self) if method_mode(cfg) == "weights" else None
         self.registry = rc.run_dir / "mock_registry.json"
         self.target = rc.domain
-        self.tds = DOMAIN_DATASET[rc.domain]
+        # data roles (2026-11-21, paper config data_roles, rsicore.draws.train_dataset / gate_dataset):
+        #   tds = train role: what the editor works from (train ids / train_example / acts / train_loss, the raw
+        #         LoRA's data, signal = screen / full items, the "beats the current model" pre-gate check);
+        #   gds = gate role: what accepts a candidate (baseline gate scores, the paired gate vs the reference).
+        # Defaults: both = the domain's training set; objective eval_overfit -> both = the eval set (K_eval).
         from rsicore import draws as _dr
-        if _dr.eval_target(rc):                     # objective eval_overfit: the eval sets are the target dataset
-            self.tds = _dr.eval_dataset(rc)         # (train / signal / gate = all of it, see rsicore.draws)
+        self.tds = _dr.train_dataset(rc) or DOMAIN_DATASET[rc.domain]
+        self.gds = _dr.gate_dataset(rc) or self.tds
         retention = cfg.get("retention", {}).get("domains")
         self.retention_domains = retention_domains(self.target) if retention is None else list(retention)
         if any(d not in DOMAINS or d == self.target for d in self.retention_domains):
             raise ValueError("retention.domains must contain only non-target domains")
+        # screen / full levels: the train dataset + retention; gate level: the gate dataset + retention
         self.datasets = [self.tds if d == self.target else DOMAIN_DATASET[d] for d in DOMAINS
                          if d == self.target or d in self.retention_domains]
+        self.gate_datasets = [self.gds if d == self.target else DOMAIN_DATASET[d] for d in DOMAINS
+                              if d == self.target or d in self.retention_domains]
         self.mcfg = cfg.get("mock", {})
         self.mode = method_mode(cfg)
         self.gate_ref, self.gate_fallback = gate_policy(cfg)
@@ -408,13 +415,13 @@ class Run:
         for ds in self.datasets:
             ids["screen"][ds] = limit_ids(draws.ids(self.rc, g, ds, "screen"), ec.get("screen_limit"))
             ids["full"][ds] = limit_ids(draws.ids(self.rc, g, ds, "signal"), ec.get("full_limit"))
-            ids["gate"][ds] = limit_ids(draws.gate_ids(self.rc, ds), ec.get("gate_limit"))
+        ids["gate"] = self.gate_level()             # the gate dataset (data_roles.gate) may differ from the train one
         return ids
 
     def gate_level(self) -> dict:
         from rsicore import draws
         lim = self.cfg.get("eval", {}).get("gate_limit")
-        return {ds: limit_ids(draws.gate_ids(self.rc, ds), lim) for ds in self.datasets}
+        return {ds: limit_ids(draws.gate_ids(self.rc, ds), lim) for ds in self.gate_datasets}
 
     def kl_texts(self, g: int) -> list[str]:
         from rsicore import draws
@@ -486,7 +493,8 @@ class Run:
         from lora_code.evaluator import Evaluator
         return Evaluator(self.rc, self.cfg, out_dir=out_dir, endpoint=srv.endpoint, served=served, server=srv,
                          replicas=self.servers.replicas("main"),
-                         ids=ids, target_dataset=self.tds, kl_texts=kl_texts, store=store, mock=self.rc.mock,
+                         ids=ids, target_dataset=self.tds, gate_dataset=self.gds, kl_texts=kl_texts, store=store,
+                         mock=self.rc.mock,
                          registry=self.registry, parent_quality=self.quality_value(served),
                          max_loaded=int(self.cfg.get("server", {}).get("max_loras", 8)) - 2,
                          weights_scorer=self.wslots.score if (self.wslots is not None and not self.rc.mock) else None)
@@ -552,12 +560,12 @@ class Run:
                 s.stop()
             self.st.mark(key, {ds: {k: v[k] for k in ("score", "noise_band")} for ds, v in res.items()})
         if self.cfg.get("heldout", {}).get("enabled", True) and not self.st.done("baseline/heldout"):
-            from rsicore.heldout import run_heldout
+            from rsicore.heldout import heldout_domains, run_heldout
             self.servers.get("main", self.model_path(0), self.served(0))
             tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
             try:
                 h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(0), bdir / "heldout",
-                                domains=self.cfg.get("heldout", {}).get("domains", "all"), mock=self.rc.mock,
+                                domains=heldout_domains(self.cfg), mock=self.rc.mock,
                                 limit=self.cfg.get("heldout", {}).get("limit"),
                                 decoding=self.cfg.get("heldout", {}).get("decoding"))
             finally:
@@ -804,8 +812,8 @@ class Run:
                 g_res = ev.run(rec["name"], "gate")
                 rec["gate_scores"] = {ds: r["score"] for ds, r in g_res.items()}
                 sc = dict(learned)
-                if rec["gate_scores"].get(self.tds) is not None:
-                    sc[self.tds] = rec["gate_scores"][self.tds]
+                if rec["gate_scores"].get(self.gds) is not None:
+                    sc[self.gds] = rec["gate_scores"][self.gds]
                 st.mark("learned", {"scores": sc})
             write_json(gd / "accepted.json", rec)
             st.mark(f"{P}/gate", {"source": rec["source"], "cid": rec.get("cid")})
@@ -917,7 +925,7 @@ class Run:
 
         # ---- held-out evaluation of M_{g+1}
         if cfg.get("heldout", {}).get("enabled", True) and not st.done(f"{P}/heldout"):
-            from rsicore.heldout import run_heldout
+            from rsicore.heldout import heldout_domains, run_heldout
             if self.chain:   # M_{g+1} = M_0 + L_{g+1}: the same M_0 server, the adapter as the model
                 ev = get_ev()
                 nxt = self.current_lora(g + 1)
@@ -926,7 +934,7 @@ class Run:
                         ev.register(nxt[0], nxt[1])
                     ev.ensure_loaded(nxt[1])
                 h = run_heldout(ev.endpoints, served, gd / "heldout", lora=nxt[1] if nxt else None,
-                                domains=cfg.get("heldout", {}).get("domains", "all"), mock=rc.mock,
+                                domains=heldout_domains(cfg), mock=rc.mock,
                                 limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
             else:
                 nxt = self.model_path(g + 1)
@@ -937,7 +945,7 @@ class Run:
                 tmp = self.servers.extra_main(nxt, self.served(g + 1))   # weights mode: the slots too
                 try:
                     h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(g + 1),
-                                    gd / "heldout", domains=cfg.get("heldout", {}).get("domains", "all"), mock=rc.mock,
+                                    gd / "heldout", domains=heldout_domains(cfg), mock=rc.mock,
                                     limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
                 finally:
                     for s in tmp:
@@ -1006,7 +1014,7 @@ class Run:
                        "source": raw.get("source"), "gen": g}
         ctx = ContextRenderer(task_text=task_text(gen=g, target=self.target, dataset=self.tds,
                                                   retention=self.retention_domains, n_train=len(ws.train.ids()),
-                                                  raw_info=rawinfo),
+                                                  raw_info=rawinfo, gate_dataset=self.gds),
                               diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "")
         has_ret = bool(ws.retention_texts)
         sysmsg = system_prompt(cfg, budget=budget, mode=self.mode, retention=has_ret)
@@ -1109,13 +1117,14 @@ class Run:
         scores = {ds: r["score"] for ds, r in res.items()}
         info["scores"] = scores
         info["reference"] = ref["kind"]
-        t, s = scores.get(self.tds), (ref.get("scores") or {}).get(self.tds)
+        gds = self.gds                               # the gate dataset (data_roles.gate; default = the train one)
+        t, s = scores.get(gds), (ref.get("scores") or {}).get(gds)
         if t is None:
             info["reasons"].append("target gate score unavailable")
         elif ref["kind"] == "parent":
             from rsicore.evaluate import paired_delta
-            par = (ev.run(None, "gate").get(self.tds) or {}).get("records") or []
-            cand = (res.get(self.tds) or {}).get("records") or []
+            par = (ev.run(None, "gate").get(gds) or {}).get("records") or []
+            cand = (res.get(gds) or {}).get("records") or []
             d = paired_delta([r for r in par if r.get("score") is not None],
                              [r for r in cand if r.get("score") is not None], seed=self.rc.seed)
             info["paired_gain"], info["paired_ci"] = d["delta"], d["ci"]
@@ -1129,8 +1138,8 @@ class Run:
         elif s is not None and t < s - eps:
             info["reasons"].append(f"target {t:.4f} < {ref['kind']} {s:.4f} - eps {eps}")
         info["pending"] = []
-        for ds in self.datasets:
-            if ds == self.tds:
+        for ds in self.gate_datasets:
+            if ds == gds:
                 continue
             c, b = scores.get(ds), (g0.get(ds) or {}).get("score")
             if c is None or b is None:
@@ -1172,6 +1181,7 @@ class Run:
         info = {"gen": g, "editor": self.editor_name(g), "successor": (read_json(gd / "model.json") or {}).get("lora")
                 if self.chain else self.served(g + 1), "method": self.mode,
                 "scope": self.cfg.get("scope", "all"), "retention_domains": list(self.retention_domains),
+                "data_roles": {"train": self.tds, "gate": self.gds},
                 "gate_reference": acc.get("gate_reference") or self.gate_ref,
                 "gate_fallback": "keep" if (self.chain and g > 0) else self.gate_fallback,
                 "accepted": {k: acc.get(k) for k in ("source", "cid", "name", "gate_scores")},

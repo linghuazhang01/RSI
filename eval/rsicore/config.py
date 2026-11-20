@@ -138,6 +138,44 @@ def _apply_objective(cfg: dict, sets) -> dict:
     return _apply_profile(cfg, sets, "objective", "train_gate")
 
 
+def _resolve_eval_target(cfg: dict, domain: str) -> dict:
+    """objective eval_overfit (2026-11-21: any single eval set): eval_target.dataset = a key of tasks.yaml
+    eval_targets (e.g. humanevalplus) or its dataset name (humanevalplus_eval); null = the domain's default
+    (eval_target_defaults). Resolved to the dataset name; the eval set must belong to the run's --domain."""
+    et = cfg.get("eval_target") or {}
+    if cfg.get("objective") != "eval_overfit" or not et.get("enabled"):
+        return cfg
+    if domain == "all":
+        raise SystemExit("objective eval_overfit needs one --domain (the eval set's domain), not 'all'")
+    from . import evalsets
+    _, t = evalsets.resolve(et.get("dataset"), domain)
+    et["dataset"] = t["dataset"]
+    return cfg
+
+
+def _resolve_data_roles(cfg: dict, domain: str, scope_single: bool) -> dict:
+    """data_roles (2026-11-21; see rsicore.evalsets): train / gate -> dataset names (validated), eval -> heldout_tasks
+    tokens. Only keys the user set are written (defaults stay implicit, so older locked configs still match)."""
+    dr = cfg.get("data_roles")
+    if not dr or not any(dr.values()):              # absent, or every role null = the defaults
+        return cfg
+    from . import evalsets
+    if domain == "all":
+        raise SystemExit("data_roles needs one --domain, not 'all'")
+    unknown = sorted(set(dr) - {"train", "gate", "eval"})
+    if unknown:
+        raise SystemExit(f"data_roles: unknown key(s) {unknown}; known: train, gate, eval")
+    for role in ("train", "gate"):
+        if dr.get(role):
+            dr[role] = evalsets.resolve_set(dr[role], domain, role)
+    roles = dict(evalsets.default_roles(cfg, domain), **{k: dr[k] for k in ("train", "gate") if dr.get(k)})
+    if not scope_single and any(evalsets.is_eval_set(roles[k]) for k in ("train", "gate")):
+        raise SystemExit("data_roles: an eval-set train / gate needs scope single")
+    if dr.get("eval"):
+        dr["eval"] = evalsets.eval_tokens(dr["eval"], roles)
+    return cfg
+
+
 def _resolve_run_domain(cfg: dict, domain: str) -> dict:
     """heldout.domains: run -> the run's domain ('all' for Paper A's --domain all)."""
     h = cfg.get("heldout")
@@ -251,6 +289,8 @@ def load_run_config(paper: str, args) -> RunConfig:
     cfg = _apply_objective(cfg, sets)
     cfg = _apply_set(cfg, sets)
     cfg = _resolve_run_domain(cfg, args.domain)
+    cfg = _resolve_eval_target(cfg, args.domain)
+    cfg = _resolve_data_roles(cfg, args.domain, cfg.get("scope") == "single" and args.domain != "all")
     # one experiment seed (2026-11-20): the held-out decoding seed null = the run's --seed
     hd = (cfg.get("heldout") or {}).get("decoding")
     if isinstance(hd, dict) and hd.get("seed") is None:
@@ -263,9 +303,20 @@ def load_run_config(paper: str, args) -> RunConfig:
     seed_differs = int(_load_yaml(base_draw).get("seed", args.seed)) != int(args.seed)
     sized = kl_doms is not None or seed_differs or any(v is not None for v in (cfg.get("data") or {}).values())
     single = cfg.get("scope") == "single" and args.domain != "all"
-    evalfit = cfg.get("objective") == "eval_overfit"
+    evalfit = ""
+    if cfg.get("objective") == "eval_overfit":
+        from . import evalsets
+        evalfit = evalsets.run_suffix(evalsets.key_of((cfg.get("eval_target") or {}).get("dataset") or "") or "math")
+    roles_sfx = ""
+    if cfg.get("data_roles") and any(cfg["data_roles"].values()) and args.domain != "all":   # roles that differ from the objective's default
+        from . import evalsets
+        dflt = evalsets.default_roles(cfg, args.domain)
+        for role in ("train", "gate"):
+            v = cfg["data_roles"].get(role)
+            if v and v != dflt[role]:
+                roles_sfx += f"_{role}-{evalsets.short(v)}"
     run_id = args.run_id or (f"{paper}_{args.domain}_s{args.seed}" + ("_single" if single else "")
-                             + ("_evalfit" if evalfit else "") + ("_mock" if args.mock else ""))
+                             + evalfit + roles_sfx + ("_mock" if args.mock else ""))
     run_dir = Path(getattr(args, "runs_dir", None) or ROOT / "experiment_records").resolve() / run_id
     if sized:
         draw_cfg = run_dir / "draw_config.effective.yaml"   # written below, once the lock check passed

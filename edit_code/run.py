@@ -42,7 +42,7 @@ from rsicore import search as S  # noqa: E402
 from rsicore.editor import Editor  # noqa: E402
 from rsicore.evaluate import score, score_split  # noqa: E402
 from rsicore.gate import fixed_noise_band, measure_noise_band, noise_ids  # noqa: E402
-from rsicore.heldout import HELDOUT, HELDOUT_EXTRA, run_heldout  # noqa: E402
+from rsicore.heldout import HELDOUT, heldout_domains, run_heldout  # noqa: E402
 from rsicore.sandbox import run_program  # noqa: E402
 from rsicore.servers import VLLMServer  # noqa: E402
 from rsicore.state import RunState  # noqa: E402
@@ -155,12 +155,22 @@ class Runner:
         self.st = RunState(rc.run_dir)
         self.run_dir = Path(rc.run_dir)
         doms = ALL_DOMAINS if rc.domain == "all" else [rc.domain]
+        # data roles (2026-11-21, paper config data_roles, rsicore.draws.roles): self.datasets = the TRAIN role
+        # (screen / full / signal items, noise band, feedback examples), self.gate_datasets = the GATE role
+        # (baseline gate of M_0 / Q_0, the incumbent's gate records, candidate gate scoring, gate.json). Defaults:
+        # the domain's training set for both; objective eval_overfit -> its eval set for both. --domain all: every
+        # domain's training set for both (unchanged).
         self.datasets = [ds for d in doms for ds in D.DOMAIN_TRAIN[d]]
+        self.gate_datasets = list(self.datasets)
         kd = cfg["kl"].get("domains", "all")
         self.kl_datasets = [ds for d in (ALL_DOMAINS if kd == "all" else doms) for ds in D.DOMAIN_TRAIN[d]]
-        if D.eval_target(rc):                       # objective eval_overfit: the eval sets are the data (signal,
-            self.datasets = [D.eval_dataset(rc)]    # gate and KL / calibration texts), see rsicore.draws
-            self.kl_datasets = list(self.datasets)
+        if rc.domain != "all":
+            tds, gds = D.train_dataset(rc), D.gate_dataset(rc)
+            self.datasets, self.gate_datasets = [tds], [gds]
+            if D.is_eval_set(tds):                  # an eval-set train role: KL / calibration texts are its prompts
+                self.kl_datasets = [tds]            # (the kl role: a fixed seeded subset, rsicore.draws.ids)
+            elif kd != "all":                       # scope single: the train role's own texts
+                self.kl_datasets = [tds]
         self.registry = self.run_dir / "mock_registry.json"
         roles, unused = gpu_layout(rc, cfg)
         self.gpu_editor, self.gpu_cand = roles["editor"], roles["candidate"]
@@ -241,7 +251,7 @@ class Runner:
         """Held-out evaluation with the tasks spread over the given replicas (started together)."""
         cfg = self.cfg
         srvs = start_lazy(servers)
-        return run_heldout([s.endpoint for s in srvs], servers[0].name, out_dir, domains=cfg["heldout"].get("domains", "all"),
+        return run_heldout([s.endpoint for s in srvs], servers[0].name, out_dir, domains=heldout_domains(cfg),
                            mock=self.rc.mock, lora=lora, limit=cfg["heldout"].get("limit"),
                            decoding=cfg["heldout"].get("decoding"))
 
@@ -291,6 +301,7 @@ class Runner:
         return QuantProblem(self.rc, self.cfg, tag=tag, gen=gen, out_dir=out_dir, prep_dir=self.prep_dir,
                             source_dir=Path(self.rc.model_path) if not self.rc.mock else None,
                             source_state=self.source_state(), budget_gib=budget, datasets=self.datasets, data=data,
+                            gate_datasets=self.gate_datasets,
                             kl_texts=kl_texts, kl_heldout=kl_heldout, refs_dir=refs_dir,
                             noise=read_json(self.run_dir / "baseline" / "noise.json", {}),
                             gate_baseline=read_json(self.run_dir / "baseline" / "gate.json", {}),
@@ -401,7 +412,7 @@ class Runner:
                 if todo:
                     eps = [s.endpoint for s in start_lazy(reps)]
                     res = {}
-                    for ds in self.datasets:
+                    for ds in self.gate_datasets:      # the gate role
                         r = score_split(eps, m0.name, ds, pool="pool", ids=D.gate_ids(rc, ds),
                                         out_dir=bdir / "gate", mock=rc.mock)
                         res[ds] = _acc(r.records)
@@ -536,7 +547,7 @@ class Runner:
             hk = prob.heldout_kl(best.artifact)
             with prob.serve(best.artifact, f"{rc.run_id}-e{g:02d}-best") as srv:
                 h = run_heldout(srv.endpoint, srv.served_name, out / "heldout",
-                                domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
+                                domains=heldout_domains(cfg), mock=rc.mock,
                                 limit=ec.get("heldout_limit"), decoding=cfg["heldout"].get("decoding"))
             res["best"] = {"cid": best.cid, "score": best.score, "bytes_gib": best.artifact["bytes_gib"],
                            "config": best.artifact["config"], "heldout_kl": hk, "heldout": h,
@@ -745,7 +756,8 @@ class Runner:
         rc = self.rc
         self.log(f"[run] {rc.run_id} paper A domain={rc.domain} gens={rc.gens} editor={self.editor_mode} "
                  f"mock={rc.mock} scope={self.cfg.get('scope', 'all')} datasets={self.datasets} "
-                 f"kl_datasets={self.kl_datasets} heldout={self.cfg['heldout'].get('domains', 'all')}")
+                 f"gate_datasets={self.gate_datasets} kl_datasets={self.kl_datasets} "
+                 f"heldout={heldout_domains(self.cfg)}")
         write_json(self.run_dir / "edit_config.json", self.cfg)
         self.baseline()
         for g in range(1, rc.gens + 1):
@@ -777,10 +789,11 @@ def _acc(records: list[dict]):
 
 def _by_domain(h: dict) -> dict:
     out = {}
-    for dom, tasks in {**HELDOUT, **HELDOUT_EXTRA}.items():
+    known = {t for tasks in HELDOUT.values() for t, _ in tasks}
+    extra = [(t, "pool") for t in h if t not in known]          # objective eval_overfit: the eval set itself
+    for dom, tasks in {**HELDOUT, **({"eval_target": extra} if extra else {})}.items():
         vals = [h[t]["accuracy"] for t, _ in tasks if t in h and h[t].get("accuracy") is not None]
-        if vals or dom in HELDOUT:                  # eval_target only when it was evaluated
-            out[dom] = round(sum(vals) / len(vals), 4) if vals else None
+        out[dom] = round(sum(vals) / len(vals), 4) if vals else None
     return out
 
 

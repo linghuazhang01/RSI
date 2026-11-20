@@ -46,6 +46,24 @@
 - KL / 校准文本 = 400 道评测题的题目 + M_0 的回答（GPTQ / AWQ 的 Hessian 也在评测题上算）；反馈例题额外给出标准答案。
 - 留出评测也直接在这 1819 道上做（`heldout.domains: eval_target`，贪心，2026-11-21）：报告的就是过拟合的那份分数，不再单独测 MATH-500 / GSM8K / AIME。
 
+**自定义数据角色 `data_roles`（2026-11-21）**：三个角色各自指定用哪份数据（`--set data_roles.train=... --set data_roles.gate=... --set data_roles.eval=...`，或 `./launch.sh --train-set / --gate-set / --eval-on`），由 rsicore 解析（`rsicore.evalsets`、`rsicore.draws.train_dataset / gate_dataset`）。
+- `train`：改造者用来工作的数据：快速筛 / 完整评测的题、本代 incumbent 的对照分数、噪声带、KL / 校准文本（kl 角色）、反馈例题、`compare`。
+- `gate`：决定是否接受候选的数据：M_0 / Q_0 的验收基线分（`baseline/gate.json`）、incumbent 的验收记录、候选的验收评测（`gen_XX/gate.json`）。
+- `eval`：留出评测报告（逗号分隔）：领域（`math` = math500,gsm8k,aime24,aime25）、留出任务（`math500`、`humanevalplus`、`ifeval`……，test 池，按 `heldout.decoding` 采样）、评测集（`math`、`humanevalplus`……的 K_eval 副本，即 `math_eval`、`humanevalplus_eval`）、或 `train` / `gate`（该角色是评测集时）。
+- `train` / `gate` 可取：本领域的训练集（`dapo_math`、`taco_verified`、`triviaqa_train`、`ifeval_train`、`sealtool_train`：照常每代抽题 / 固定验收切分）或评测集（`eval/configs/tasks.yaml` 的 `eval_targets` 键，如 `math`、`math500`、`gsm8k`、`humanevalplus`、`ifeval`，或其数据集名 `math500_eval`：用全部题，不抽题，不标记展示过的题，反馈例题额外给出标准答案）。
+- 默认（不设 `data_roles`）：`train` = `gate` = 本领域的训练集；`objective: eval_overfit` 时都是该评测集；`eval` 按 `heldout.domains`。和原来完全一样。
+- 限制：`train` / `gate` 必须属于本次的 `--domain`；评测集做 `train` 或 `gate` 需要 `scope: single`；`--domain all` 不能用 `data_roles`。和默认不同的 `train` / `gate` 会让运行名多出 `_train-<x>` / `_gate-<x>`。
+- 验收和训练在不同数据上时，验收一定真的评测（只有数据集和题号都和快速筛一样时才复用快速筛的逐题结果）。
+
+```bash
+# 照常用 dapo_math 抽题训练，用全部 MATH-500 验收，只报告 MATH-500
+--domain math --set data_roles.gate=math500 --set data_roles.eval=math500
+# 在 MATH-500 全部题上训练，用 dapo_math 的固定验收集验收
+--domain math --set data_roles.train=math500 --set data_roles.gate=dapo_math
+# 指令遵循：ifeval_train 训练，IFEval 评测集验收和报告
+--domain instruction_following --set data_roles.gate=ifeval --set data_roles.eval=gate
+```
+
 ## 分析工具与保存的数据（2026-11-20）
 
 改造者除了评测，还可以用几个**免费**（不扣 evaluate）的分析工具：

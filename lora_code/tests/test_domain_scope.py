@@ -223,6 +223,52 @@ class DataSizeAndNoiseTest(unittest.TestCase):
         self.assertIsNone(draws.eval_target(rc))
         self.assertEqual(rc.paper_cfg["objective"], "train_gate")
 
+    def test_eval_overfit_any_single_eval_set(self):
+        """2026-11-21: any single eval set (code / instruction following / knowledge ...), one per run."""
+        import json as _json
+        from rsicore import draws, evalsets
+        from rsicore.config import build_arg_parser, load_run_config
+        from rsicore.heldout import heldout_domains, heldout_tasks
+
+        def load(paper, domain, *sets):
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+            argv = ["--domain", domain, "--mock", "--runs-dir", tmp, "--set", "objective=eval_overfit"]
+            for x in sets:
+                argv += ["--set", x]
+            return load_run_config(paper, build_arg_parser(paper).parse_args(argv))
+        cases = [("code", "eval_target.dataset=humanevalplus", "humanevalplus_eval", "_evalfit_humanevalplus"),
+                 ("code", "eval_target.dataset=mbppplus_eval", "mbppplus_eval", "_evalfit_mbppplus"),
+                 ("instruction_following", None, "ifeval_eval", "_evalfit_ifeval"),          # domain default
+                 ("knowledge", "eval_target.dataset=gpqa_diamond", "gpqa_diamond_eval", "_evalfit_gpqa_diamond"),
+                 ("math", "eval_target.dataset=aime24", "aime24_eval", "_evalfit_aime24"),
+                 ("math", "eval_target.dataset=math", "math_eval", "_evalfit")]
+        for paper in ("A", "B"):
+            for domain, s, ds, suffix in cases:
+                rc = load(paper, domain, *([s] if s else []))
+                self.assertTrue(rc.run_id.endswith(f"_single{suffix}_mock"), rc.run_id)
+                self.assertEqual(draws.eval_dataset(rc), ds)
+                self.assertEqual(rc.paper_cfg["heldout"]["domains"], "eval_target")    # locked config unchanged
+                self.assertEqual(heldout_tasks(heldout_domains(rc.paper_cfg)), [(ds, "pool")])
+        rc = load("B", "code", "eval_target.dataset=humanevalplus")
+        allids = draws.gate_ids(rc, "humanevalplus_eval")
+        src = _json.loads((ROOT / "data" / "splits" / "humanevalplus" / "test.json").read_text())
+        self.assertEqual(sorted(allids), sorted(src))                                   # the whole test set
+        self.assertEqual(draws.ids(rc, 2, "humanevalplus_eval", "train"), allids)
+        self.assertEqual(len(draws.ids(rc, 0, "humanevalplus_eval", "kl")), len(allids))   # kl_n > n: all
+        for bad in [("code", "eval_target.dataset=ifeval"), ("math", "eval_target.dataset=nope")]:
+            with self.assertRaises(SystemExit):
+                load("A", *bad)
+        self.assertEqual(evalsets.targets()["livecodebench"]["domain"], "code")
+        from evallib.tasks import load_tasks
+        import yaml as _yaml
+        tasks = load_tasks(_yaml.safe_load((ROOT / "eval" / "configs" / "tasks.yaml").read_text()))
+        t, base = tasks["humanevalplus_eval"], tasks["humanevalplus"]
+        self.assertEqual((t.dataset, t.cfg["grader"], t.cfg["allowed_pools"]), ("humanevalplus_eval", "humanevalplus", ["pool"]))
+        self.assertEqual(type(t), type(base))
+        self.assertEqual(tasks["math_eval"].cfg["max_tokens"], 4096)                    # explicit entry kept
+        self.assertEqual(tasks["livecodebench_eval"].cfg["max_tokens"], 8192)           # inherited
+
     def test_no_data_sizes_keeps_the_draw_config(self):
         from rsicore.config import DRAW_CONFIGS
         rc, _ = self.rc("B")

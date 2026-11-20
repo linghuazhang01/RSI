@@ -39,20 +39,25 @@ scope_profiles:
     heldout: {domains: run}
 
 # Objective (2026-11-20; --set objective=eval_overfit, or ./launch.sh --eval-overfit). train_gate = the train /
-# signal / gate split above. eval_overfit = optimise directly on the eval sets: the run's dataset is math_eval
-# (MATH-500 + GSM8K test, 1819 items, data/scripts/build_eval_target.py), every stage (screen, full, gate) is all
-# of it, scored greedily; a candidate is accepted when its eval-set score is strictly higher than the incumbent's
-# (no significance test, no separate gate set); the editor may see every item. Run ids end in _evalfit. Merged
+# signal / gate split above. eval_overfit = optimise directly on ONE eval set (eval_target.dataset, e.g. math =
+# MATH-500 + GSM8K test, 1819 items; humanevalplus; ifeval; built by data/scripts/build_eval_target.py as K_eval);
+# every stage (screen, full, gate) and the held-out evaluation are all of it, scored greedily; a candidate is
+# accepted when its eval-set score is strictly higher than the incumbent's (no significance test, no separate gate
+# set); the editor may see every item. Run ids end in _evalfit (math) or _evalfit_<set>. Merged
 # before --set (explicit --set values still win).
 objective: train_gate
 objective_profiles:
   train_gate: {}
   eval_overfit:
-    eval_target: {enabled: true, dataset: math_eval, kl_n: 400}   # kl_n: KL / calibration texts (eval prompts)
+    # dataset: the eval set (2026-11-21: any single one, a key of eval/configs/tasks.yaml eval_targets, e.g. math
+    # = MATH-500 + GSM8K test, humanevalplus, ifeval, gpqa_diamond); null = the domain's default
+    # (math -> math, code -> humanevalplus, knowledge -> gpqa_diamond, instruction_following -> ifeval,
+    # tool_calling -> sealtool). Must belong to the run's --domain. kl_n: KL / calibration texts (eval prompts).
+    eval_target: {enabled: true, dataset: null, kl_n: 400}
     search: {kl_weight: 0.0, top_full: 0}   # score = eval accuracy / incumbent's; screen = full = the whole set
     gate: {min_delta: 1.0e-6, require_significant: false}        # accept any strictly higher eval-set score
     feedback: {examples: 5}
-    heldout: {domains: eval_target, decoding: null}   # evaluated on the same 1819 items, greedy (2026-11-21)
+    heldout: {domains: eval_target, decoding: null}   # evaluated on the same eval set, greedy (2026-11-21)
 
 # One fixed size for every generation. Every candidate quantizes the ORIGINAL BF16 model M_0 (the layer
 # cache is built once); generation g must beat the incumbent (best accepted quantization so far).

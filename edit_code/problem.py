@@ -63,7 +63,7 @@ class QuantProblem:
                  datasets: list[str], data: dict, kl_texts: list[tuple[str, str]], kl_heldout: list[tuple[str, str]] = (),
                  refs_dir: Path, noise: dict | None = None, gate_baseline: dict | None = None,
                  eval_budget: int = 24, show_examples: int = 2, incumbent: dict | None = None, log=print,
-                 prep_gpus: list[int] | None = None):
+                 prep_gpus: list[int] | None = None, gate_datasets: list[str] | None = None):
         from rsicore import evaluate as _ev  # noqa: F401  (fail early if rsicore is missing)
         self.rc, self.cfg, self.tag, self.gen = rc, cfg, tag, gen
         self.mock = bool(rc.mock)
@@ -72,7 +72,10 @@ class QuantProblem:
         self.source_dir = Path(source_dir) if source_dir else None
         self.source_state = source_state
         self.budget_gib = float(budget_gib)
+        # data roles (2026-11-21, rsicore.draws.roles): datasets = the train role (screen / full items, feedback,
+        # compare), gate_datasets = the gate role (gate stage; default: the same datasets)
         self.datasets = list(datasets)
+        self.gate_datasets = list(gate_datasets) if gate_datasets else list(self.datasets)
         self.data = data                                  # {dataset: {"screen": ids, "signal": ids}}
         self.kl_texts = list(kl_texts)                    # [(domain, text)]
         self.kl_heldout = list(kl_heldout)
@@ -97,8 +100,10 @@ class QuantProblem:
         self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
         self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
         self.prep_gpus = list(prep_gpus) if prep_gpus else None   # generation-0 prep on these GPUs (one worker each)
-        from rsicore.draws import eval_target
-        self._eval_mode = bool(eval_target(rc))   # objective eval_overfit: examples also show the reference answer
+        from rsicore.draws import is_eval_set
+        # an eval-set train role (objective eval_overfit, or data_roles.train = an eval set): the editor may see
+        # every item, so feedback examples also show the reference answer
+        self._eval_mode = any(is_eval_set(ds) for ds in self.datasets)
         self._pool: queue.Queue = queue.Queue()
         for i in range(len(self.slots)):
             self._pool.put(i)
@@ -503,6 +508,10 @@ class QuantProblem:
             self._pool.put(slot)
 
     # ------------------------------------------------------------------ evaluation
+    def stage_datasets(self, stage: str) -> list[str]:
+        """Datasets scored at `stage`: the gate role for gate, the train role for screen / full."""
+        return self.gate_datasets if stage == "gate" else self.datasets
+
     def _ids(self, ds: str, stage: str) -> list[str]:
         if stage == "gate":
             from rsicore.draws import gate_ids
@@ -577,17 +586,20 @@ class QuantProblem:
         name = f"{self.rc.run_id}-{self.tag}-{art['config_hash']}"
         edir = self.out_dir / "evals" / f"{cid}" / stage
         probes, regressions, scored = {}, [], {}
-        # the same items as an existing screen evaluation of this config (objective eval_overfit: every stage is
-        # the whole eval set): reuse its records instead of scoring them again
+        # the same datasets AND items as an existing screen evaluation of this config (objective eval_overfit: every
+        # stage is the whole eval set): reuse its records instead of scoring them again. A gate on another dataset
+        # than the train role (data_roles) is always scored.
+        dsets = self.stage_datasets(stage)
         scr = self._evals.get((art["config_hash"], "screen")) if stage != "screen" else None
         reuse = None
-        if scr is not None and all(sorted(self._ids(ds, stage)) == sorted(self._ids(ds, "screen")) for ds in self.datasets):
-            src = {ds: self.records_path(scr["cid"], "screen", ds) for ds in self.datasets}
+        if scr is not None and dsets == self.datasets \
+                and all(sorted(self._ids(ds, stage)) == sorted(self._ids(ds, "screen")) for ds in dsets):
+            src = {ds: self.records_path(scr["cid"], "screen", ds) for ds in dsets}
             if all(p.exists() for p in src.values()):
                 reuse = {ds: read_jsonl(p) for ds, p in src.items()}
         from contextlib import nullcontext
         with (nullcontext() if reuse else self.serve(art, name)) as srv:
-            for ds in self.datasets:
+            for ds in dsets:
                 ids = self._ids(ds, stage)
                 if reuse:
                     edir.mkdir(parents=True, exist_ok=True)
@@ -776,7 +788,7 @@ class QuantProblem:
         (other right -> cid wrong = broken, other wrong -> cid right = fixed) with their ids, flips by the
         reference's output length (tercile buckets), truncation rate and mean output length of both."""
         out = {"cid": cid, "other": other, "stage": stage, "datasets": {}}
-        for ds in self.datasets:
+        for ds in self.stage_datasets(stage):
             pa, pb = self.records_path(cid, stage, ds), self.records_path(other, stage, ds)
             if not pa.exists() or not pb.exists():
                 missing = [c for c, q in ((cid, pa), (other, pb)) if not q.exists()]

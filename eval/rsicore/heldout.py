@@ -20,9 +20,24 @@ HELDOUT = {"math": [("math500", "test"), ("gsm8k", "test"), ("aime24", "test"), 
            "instruction_following": [("ifeval", "test"), ("ifbench", "test")],
            "tool_calling": [("sealtool", "test"), ("apibank", "test"), ("bfcl", "test")]}
 
-# Not part of "all": selected by name only. eval_target = the merged eval set an eval_overfit run optimises on
-# (2026-11-21: the run is evaluated on exactly those 1819 items, MATH-500 + GSM8K test).
-HELDOUT_EXTRA = {"eval_target": [("math_eval", "pool")]}
+# objective eval_overfit (2026-11-21): heldout.domains `eval_target` = the run's eval set itself (eval_target.dataset,
+# e.g. math_eval = MATH-500 + GSM8K test, humanevalplus_eval), task K_eval on pool `pool`, greedy. heldout_domains(cfg)
+# turns it into "eval:<dataset>", which heldout_tasks understands (never part of "all").
+
+
+def heldout_domains(cfg: dict):
+    """The `domains` argument of run_heldout for a paper config: heldout.domains, with eval_target resolved."""
+    ev = (cfg.get("data_roles") or {}).get("eval")
+    if ev:                                          # data_roles.eval (normalised by rsicore.config) wins
+        return ev
+    d = (cfg.get("heldout") or {}).get("domains", "all")
+    if d == "eval_target":
+        ds = (cfg.get("eval_target") or {}).get("dataset")
+        if not ds:
+            raise ValueError("heldout.domains eval_target needs eval_target.dataset")
+        return f"eval:{ds}"
+    return d
+
 
 _KEYS = ("accuracy", "n", "n_pending", "prompt_strict", "avg_at_n", "pass_at_n", "maj_at_n", "em", "f1")
 
@@ -34,7 +49,13 @@ def heldout_tasks(domains="all") -> list[tuple[str, str]]:
         doms = [d.strip() for d in domains.split(",") if d.strip()]
     else:
         doms = list(domains)
-    return [tp for d in doms for tp in (HELDOUT[d] if d in HELDOUT else HELDOUT_EXTRA[d])]
+    by_task = {t: (t, p) for v in HELDOUT.values() for t, p in v}
+    out = []
+    for d in doms:                                  # a domain, a held-out task, or eval:<K_eval> (pool `pool`)
+        tps = HELDOUT[d] if d in HELDOUT else [(d.split(":", 1)[1], "pool")] if d.startswith("eval:") \
+            else [by_task[d]] if d in by_task else HELDOUT[d]
+        out += [tp for tp in tps if tp not in out]
+    return out
 
 
 def decoding_args(decoding: dict | None, task: str) -> dict:
@@ -58,7 +79,7 @@ def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=Non
                 decoding: dict | None = None) -> dict:
     """endpoint: one URL, or a list of URLs of replicas of the same model (2026-11-20): the tasks are then run
     in parallel, one replica per task (each task in out_dir/_par/<task>/, merged into out_dir afterwards).
-    A single task (eval_target: the 1819 math_eval items, 2026-11-21) is instead split item-wise over all
+    A single task (eval_target: the run's eval set, 2026-11-21) is instead split item-wise over all
     replicas (score_split), so every GPU works on it."""
     if isinstance(endpoint, (list, tuple)) and len(endpoint) > 1:
         tasks = heldout_tasks(domains)

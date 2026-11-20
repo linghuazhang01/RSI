@@ -10,6 +10,8 @@
   in a temp runs dir, then a second invocation of the same run-id must skip everything.
 - test_mock_run_scratch: mode=scratch for 1 generation (gate vs the parent, fallback keep, nothing trained,
   no sampled training answers).
+- test_mock_data_roles_*: data_roles (2026-11-21): a gate dataset different from the train dataset (eval-set gate
+  next to dapo_math draws; eval-set train next to dapo_math's gate split).
 """
 import json
 import os
@@ -321,6 +323,62 @@ def test_mock_eval_overfit_scratch(tmp_path):
     assert summ["accepted"]["source"] in ("llm", "keep")
     assert set(json.loads((run / "baseline" / "heldout.json").read_text())) == {"math_eval"}   # same 1819 items
     assert set(summ["heldout"]) == {"math_eval"}
+
+
+def _run_b(tmp_path, *sets):
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
+           "--runs-dir", str(tmp_path)]
+    for s in sets:
+        cmd += ["--set", s]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    return r
+
+
+def test_mock_data_roles_eval_set_gate(tmp_path):
+    """data_roles (2026-11-21): train = dapo_math draws, gate = all of math500_eval, held-out = math500 alone."""
+    _run_b(tmp_path, "method.mode=scratch", "data_roles.gate=math500", "data_roles.eval=math500")
+    run = tmp_path / "B_math_s42_single_gate-math500_mock"
+    assert run.exists() and (run / "draws" / "gen_00" / "ids" / "dapo_math.train.json").exists()
+    train_ids = json.loads((run / "draws" / "gen_00" / "ids" / "dapo_math.train.json").read_text())
+    td = json.loads((run / "gen_00" / "train_data.json").read_text())
+    assert sorted(td) == sorted(train_ids)                                        # the editor works on dapo_math
+    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
+    assert list(gate) == ["math500_eval"] and gate["math500_eval"]["n"] == 30     # gate_limit 30 in mock
+    assert set(json.loads((run / "baseline" / "heldout.json").read_text())) == {"math500"}
+    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
+    assert summ["data_roles"] == {"train": "dapo_math", "gate": "math500_eval"}
+    assert set(summ["heldout"]) == {"math500"} and summ["accepted"]["source"] in ("llm", "keep")
+    assert set(summ["accepted"].get("gate_scores") or {"math500_eval": 0}) == {"math500_eval"}
+    assert set(json.loads((run / "gen_00" / "parent_gate.json").read_text())) == {"math500_eval"}
+    evals = run / "gen_00" / "evals"
+    assert {p.name for p in evals.glob("*/screen/*.json")} <= {"dapo_math.json"}
+    assert {p.name for p in evals.glob("*/gate/*.json")} <= {"math500_eval.json"}
+    for s in json.loads((run / "gen_00" / "gate.json").read_text())["submissions"]:
+        assert set(s["info"]["scores"]) == {"math500_eval"} and "paired_gain" in s["info"]
+    prompt = (run / "gen_00" / "editor" / "thread_0.jsonl").read_text()
+    assert "The gate accepts a candidate on math500_eval" in prompt
+
+
+def test_mock_data_roles_eval_set_train(tmp_path):
+    """data_roles: train = all 500 items of math500_eval (visible to the editor), gate = dapo_math's fixed split."""
+    _run_b(tmp_path, "method.mode=scratch", "data_roles.train=math500", "data_roles.gate=dapo_math")
+    run = tmp_path / "B_math_s42_single_train-math500_mock"
+    td = json.loads((run / "gen_00" / "train_data.json").read_text())
+    pool = json.loads((REPO / "data" / "splits" / "math500_eval" / "pool.json").read_text())
+    assert len(td) == 500 and sorted(td) == sorted(pool) and all(v["target"] for v in td.values())
+    assert json.loads((run / "state.json").read_text())["gen00/draw"]["train"] == 500
+    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
+    assert list(gate) == ["dapo_math"]
+    assert (run / "draws" / "gate" / "dapo_math.gate.json").exists()
+    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
+    assert summ["data_roles"] == {"train": "math500_eval", "gate": "dapo_math"}
+    assert set(summ["accepted"].get("gate_scores") or {"dapo_math": 0}) == {"dapo_math"}
+    evals = run / "gen_00" / "evals"
+    assert {p.name for p in evals.glob("*/screen/*.json")} <= {"math500_eval.json"}
+    assert {p.name for p in evals.glob("*/gate/*.json")} <= {"dapo_math.json"}
 
 
 def test_mock_weights_mode(tmp_path):

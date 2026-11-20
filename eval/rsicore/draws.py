@@ -7,6 +7,11 @@ objective eval_overfit (2026-11-20, paper config `eval_target`): no draws at all
 eval-set target (data/scripts/build_eval_target.py, e.g. math_eval = MATH-500 + GSM8K test, built on demand);
 every role (signal, screen, train) and the gate are ALL of its items, the kl role a fixed seeded subset of
 eval_target.kl_n items; nothing is marked shown (the editor may see everything).
+
+data roles (2026-11-21, paper config `data_roles`, rsicore.evalsets): train_dataset(rc) / gate_dataset(rc) say which
+dataset the editor works from (signal / screen / train / kl) and which one accepts candidates. Each is a training set
+(per-generation draws / the fixed gate split, as before) or an eval set K_eval (every item, nothing drawn or marked
+shown). Defaults: the domain's training set for both; objective eval_overfit -> the eval set for both.
 """
 import hashlib
 import json
@@ -36,8 +41,41 @@ def eval_dataset(rc) -> str | None:
     return et.get("dataset", "math_eval") if et else None
 
 
-def _eval_ids(rc) -> list[str]:
-    name = eval_dataset(rc)
+def roles(rc) -> dict:
+    """{"train": dataset, "gate": dataset} of the run (data_roles over the objective's defaults)."""
+    from .evalsets import default_roles
+    cfg = getattr(rc, "paper_cfg", None) or {}
+    dr = cfg.get("data_roles") or {}
+    base = default_roles(cfg, rc.domain) if rc.domain != "all" else {"train": None, "gate": None}
+    return {k: dr.get(k) or base[k] for k in ("train", "gate")}
+
+
+def train_dataset(rc) -> str | None:
+    return roles(rc)["train"]
+
+
+def gate_dataset(rc) -> str | None:
+    return roles(rc)["gate"]
+
+
+def is_eval_set(dataset) -> bool:
+    from .evalsets import is_eval_set as _is
+    return _is(dataset)
+
+
+def _needs_draws(rc) -> bool:
+    """A training set in the train or gate role (or no single domain): draw.py runs."""
+    r = roles(rc)
+    return rc.domain == "all" or not (is_eval_set(r["train"]) and is_eval_set(r["gate"]))
+
+
+def _kl_n(rc) -> int:
+    cfg = getattr(rc, "paper_cfg", None) or {}
+    return int((cfg.get("eval_target") or {}).get("kl_n", 400))
+
+
+def _eval_ids(rc, name: str | None = None) -> list[str]:
+    name = name or eval_dataset(rc)
     split = ROOT / "data" / "splits" / name / "pool.json"
     import importlib.util
     spec = importlib.util.spec_from_file_location("build_eval_target", ROOT / "data" / "scripts" / "build_eval_target.py")
@@ -57,18 +95,23 @@ def _run(args: list[str]) -> str:
 
 def ensure_gate(rc) -> dict:
     """Split (first call) or reuse the fixed gate. Returns {domain: {dataset: [ids]}}."""
-    if eval_target(rc):
-        return {rc.domain: {eval_dataset(rc): _eval_ids(rc)}}
+    gds = gate_dataset(rc)
+    if not _needs_draws(rc):
+        return {rc.domain: {gds: _eval_ids(rc, gds)}}
     man = _ddir(rc) / "gate" / "manifest.json"
     if not (man.exists() and (_ddir(rc) / "draw_config.yaml").exists()):
         _run(["--run", rc.run_dir, "--gate-only", "--config", rc.draw_config])
-    return json.loads(man.read_text())["domains"]
+    doms = json.loads(man.read_text())["domains"]
+    if is_eval_set(gds):                             # an eval-set gate next to a drawn training set
+        doms = dict(doms, **{rc.domain: dict(doms.get(rc.domain) or {}, **{gds: _eval_ids(rc, gds)})})
+    return doms
 
 
 def draw_gen(rc, gen: int, target: str | None = None) -> dict:
     """Draw generation `gen` (idempotent: an existing draw with the same target is reused). Returns the manifest."""
-    if eval_target(rc):
-        return {"gen": int(gen), "target": target, "eval_target": eval_dataset(rc), "n": len(_eval_ids(rc))}
+    tds = train_dataset(rc) if rc.domain != "all" else None
+    if is_eval_set(tds) and not _needs_draws(rc):
+        return {"gen": int(gen), "target": target, "eval_target": tds, "n": len(_eval_ids(rc, tds))}
     man = _ddir(rc) / f"gen_{int(gen):02d}" / "manifest.json"
     if man.exists():
         m = json.loads(man.read_text())
@@ -88,13 +131,13 @@ def ids_file(rc, gen: int, dataset: str, role: str) -> Path:
 
 
 def ids(rc, gen: int, dataset: str, role: str) -> list[str]:
-    if eval_target(rc) and dataset == eval_dataset(rc):
+    if is_eval_set(dataset):
         if role not in ROLES:
             raise ValueError(f"role must be one of {ROLES}")
-        allids = _eval_ids(rc)
+        allids = _eval_ids(rc, dataset)
         if role == "kl":                             # fixed seeded subset (the same in every generation)
             import random
-            n = int(eval_target(rc).get("kl_n", 400))
+            n = _kl_n(rc)
             return sorted(random.Random(f"{getattr(rc, 'seed', 42)}:eval_kl").sample(allids, min(n, len(allids))))
         return allids
     p = ids_file(rc, gen, dataset, role)
@@ -106,16 +149,16 @@ def gate_ids_file(rc, dataset: str) -> Path:
 
 
 def gate_ids(rc, dataset: str) -> list[str]:
-    if eval_target(rc) and dataset == eval_dataset(rc):
-        return _eval_ids(rc)
+    if is_eval_set(dataset):
+        return _eval_ids(rc, dataset)
     p = gate_ids_file(rc, dataset)
     return json.loads(p.read_text()) if p.exists() else []
 
 
 def mark_shown(rc, gen: int, shown: dict[str, list[str]]) -> None:
     """Record items whose content was shown to the editor in generation `gen` (never signal again)."""
-    shown = {ds: sorted(set(v)) for ds, v in (shown or {}).items() if v}
-    if not shown or eval_target(rc):
+    shown = {ds: sorted(set(v)) for ds, v in (shown or {}).items() if v and not is_eval_set(ds)}
+    if not shown:                                    # eval sets: the editor may see everything
         return
     blob = json.dumps(shown, sort_keys=True)
     p = _ddir(rc) / f"gen_{int(gen):02d}" / f"shown_req_{hashlib.sha256(blob.encode()).hexdigest()[:12]}.json"

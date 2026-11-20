@@ -47,8 +47,24 @@
 ## 3. 一代的流程
 
 ```
-直接在评测集上优化（`./launch.sh --eval-overfit`）：两篇的数据都换成 math_eval（MATH-500 + GSM8K test，1819 道），
-每个阶段都是全部 1819 道（贪心），评测集分数严格更高就接受，没有单独的验收集；留出评测也是这 1819 道（贪心）；运行名带 _evalfit。
+直接在评测集上优化（`./launch.sh --eval-overfit` / `--eval-set X`，2026-11-21 起可选任意一个评测集）：一次运行只用一个评测集，
+数学 math（MATH-500 + GSM8K test 合并，1819 道）/ math500 / gsm8k / aime24 / aime25 / amc23，代码 humanevalplus / mbppplus /
+livecodebench，知识 gpqa_diamond / mmlu_pro / triviaqa，指令遵循 ifeval / ifbench，工具 sealtool / apibank / bfcl
+（eval/configs/tasks.yaml 的 eval_targets；复制成数据集 X_eval，判分沿用原任务）。每个阶段都是这个集的全部题目（贪心），
+分数严格更高就接受，没有单独的验收集；留出评测也是这个集（贪心）。运行的领域跟着评测集走；运行名带 _evalfit（math）或 _evalfit_<集>。
+只给 --eval-overfit 时用各领域默认：math → math，code → humanevalplus，knowledge → gpqa_diamond，
+instruction_following → ifeval，tool_calling → sealtool。代码集需要 Docker 沙盒判分。
+
+自定义三个数据角色（2026-11-21，配置 data_roles，launch.sh --train-set / --gate-set / --eval-on）：
+  训练（train）：改造者看的数据（信号 / 快速筛题，Paper B 的 train_example / acts / train_loss，Paper A 的 KL / 校准文本）。
+          领域训练集（dapo_math / taco_verified / triviaqa_train / ifeval_train / sealtool_train，每代抽题）或评测集（全部题目）。
+  验收（gate）：决定是否接受候选。训练集（固定验收切分）或评测集（全部题目）。
+  评测（eval）：留出评测报告，逗号分隔：领域、留出任务（math500、humanevalplus ……，test 全集）、评测集（math_eval 等）、
+          train / gate（该角色是评测集时）。
+  默认：train = gate = 领域训练集（--eval-overfit 时 = 评测集），eval = 运行的领域。训练和验收必须属于运行的领域；
+  用评测集当训练或验收时要 scope single。和默认不同的 train / gate 会让运行名多 _train-<x> / _gate-<x>。
+  例：./launch.sh --paper B --domains math --gate-set math500 --eval-on math500,gsm8k
+      （DAPO-Math 抽题训练，全部 MATH-500 验收，报告 MATH-500 + GSM8K → B_math_s42_single_gate-math500）
 
 解码（2026-11-20）：搜索、验收、噪声都是贪心（噪声重评因此不再执行，噪声带 = 0）；留出评测用采样（Qwen 非思考模式推荐：
 temperature 0.7、top_p 0.8、top_k 20，种子 42，avg@n：AIME / AMC 8 个、MATH-500 / GPQA 4 个、其余 1 个，`heldout.decoding`）；

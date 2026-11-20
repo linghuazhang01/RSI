@@ -237,6 +237,63 @@ class TestMockFlow(unittest.TestCase):
             if e["stage"] in ("full", "gate"):                                        # reused, not re-scored
                 self.assertFalse((rd / "gen_01" / "evals" / e["cid"] / e["stage"] / "summary.json").exists())
 
+    def test_data_roles_eval_set_gate(self):
+        """data_roles: train stays the dapo_math draws, the gate is every item of math500_eval (really scored, not
+        reused from screen), the held-out report is math500 alone."""
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_roles_gate",
+                    "--set", "data_roles.gate=math500", "--set", "data_roles.eval=math500"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        rd = self.runs / "A_mock_roles_gate"
+        self.assertIn("datasets=['dapo_math'] gate_datasets=['math500_eval']", r.stdout)
+        self.assertTrue((rd / "draws" / "gen_01" / "ids" / "dapo_math.screen.json").exists())
+        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"math500_eval"})
+        self.assertEqual(set(json.loads((rd / "baseline" / "heldout.json").read_text())), {"math500"})
+        q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
+        self.assertEqual(set(q0["gate_scores"]), {"math500_eval"})
+        q0e = [e for e in jl(rd / "baseline" / "q0" / "evals.jsonl") if e["stage"] == "gate"]
+        self.assertEqual(q0e[0]["feedback"]["probes"]["math500_eval"]["n"], 500)
+        ev = jl(rd / "gen_01" / "evals.jsonl")
+        scr = [e for e in ev if e["stage"] == "screen" and e["origin"] == "candidate"]
+        self.assertTrue(scr)
+        self.assertEqual(set(scr[0]["feedback"]["probes"]), {"math"})            # dapo_math -> domain math
+        self.assertEqual(scr[0]["feedback"]["probes"]["math"]["dataset"], "dapo_math")
+        for e in ev:
+            if e["stage"] == "gate":                                              # scored on all of math500_eval
+                pr = e["feedback"]["probes"]["math500_eval"]
+                self.assertEqual(pr["n"], 500)
+                self.assertTrue((rd / "gen_01" / "evals" / e["cid"] / "gate" / "math500_eval.jsonl").exists())
+        inc = json.loads((rd / "gen_01" / "incumbent.json").read_text())
+        self.assertEqual(set(inc["gate_scores"]), {"math500_eval"})
+        summ = json.loads((rd / "summary.json").read_text())
+        self.assertIsNotNone(summ["gens"]["0"]["m0_heldout_by_domain"]["math"])
+
+    def test_data_roles_eval_set_train(self):
+        """data_roles: the editor works from all of math500_eval (screen n 500), the gate is the fixed dapo_math
+        split; feedback examples show the reference answer (eval-set train)."""
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_roles_train",
+                    "--set", "data_roles.train=math500", "--set", "data_roles.gate=dapo_math",
+                    "--set", "heldout.limit=2"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        rd = self.runs / "A_mock_roles_train"
+        self.assertIn("datasets=['math500_eval'] gate_datasets=['dapo_math'] kl_datasets=['math500_eval']", r.stdout)
+        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"dapo_math"})
+        self.assertEqual(json.loads((rd / "baseline" / "noise.json").read_text()), {"math500_eval": 0.0})
+        ev = jl(rd / "gen_01" / "evals.jsonl")
+        scr = [e for e in ev if e["stage"] == "screen" and e["origin"] == "candidate"]
+        self.assertTrue(scr)
+        pr = scr[0]["feedback"]["probes"]["math500_eval"]
+        self.assertEqual(pr["n"], 500)
+        gates = [e for e in ev if e["stage"] == "gate"]
+        self.assertTrue(gates)
+        for e in gates:
+            self.assertEqual(set(e["feedback"]["probes"]), {"math"})
+            self.assertEqual(e["feedback"]["probes"]["math"]["dataset"], "dapo_math")
+            self.assertTrue((rd / "gen_01" / "evals" / e["cid"] / "gate" / "dapo_math.jsonl").exists())
+        regs = [x for e in ev for x in (e["feedback"].get("regressions") or [])]
+        self.assertTrue(all("reference" in x for x in regs))
+        led = json.loads((rd / "draws" / "ledger.json").read_text())
+        self.assertNotIn("math500_eval", led.get("items") or {})                  # eval sets: nothing marked shown
+
     def test_budget_below_reference_is_refused(self):
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_small", "--budget-gib", "5",
                     "--set", "heldout.limit=2"], self.runs)
