@@ -66,6 +66,10 @@ instruction_following → ifeval，tool_calling → sealtool。代码集需要 D
   例：./launch.sh --paper B --domains math --gate-set math500 --eval-on math500,gsm8k
       （DAPO-Math 抽题训练，全部 MATH-500 验收，报告 MATH-500 + GSM8K → B_math_s42_single_gate-math500）
 
+simple（2026-11-21，./launch.sh --simple，配置 objective=simple）：simple_data/<领域>/ 的 1,500 道训练（每代全部用、不抽题）+
+500 道验收（照常的配对验收），留出评测也是这 500 道（贪心，data_roles.eval = gate）；改造者每个候选最多 20 轮工具调用，上下文 131072；五个领域、两篇都可以。运行名 <A|B>_<领域>_s42_single_simple；
+合并后的配置快照 plan/configs/{A,B}_<领域>_simple.yaml。例：./launch.sh --hw h20 --paper both --simple --gens 5（10 个运行，20 张卡）。
+
 解码（2026-11-20）：搜索、验收、噪声都是贪心（噪声重评因此不再执行，噪声带 = 0）；留出评测用采样（Qwen 非思考模式推荐：
 temperature 0.7、top_p 0.8、top_k 20，种子 42，avg@n：AIME / AMC 8 个、MATH-500 / GPQA 4 个、其余 1 个，`heldout.decoding`）；
 Paper B 的训练答案用同一组采样参数（每题 4 个，取第一个判对的，4 个都错就跳过这道题）；改造者写程序时 temperature 0.6。

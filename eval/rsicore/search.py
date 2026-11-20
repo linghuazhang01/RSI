@@ -2,7 +2,9 @@
 
 inner_search(): steps are run round-robin over threads (step 0 of every thread, then step 1, ...), so
 every thread sees all candidates recorded so far. For each (thread, step):
-    msg = render_context(history, thread); program = editor.propose(msg)
+    msg = render_context(history, thread)
+    program = editor.propose(msg, ctx={"cid", "gen_dir", "visible_cids"})   # ctx only if propose accepts it
+    (rsicore.editor.EditorReplyError -> empty program, error "editor failed: ..."; other exceptions propagate)
     artifact, error = build_fn(program, cid)          # exceptions are caught and recorded as errors
     score, feedback = screen_fn(artifact, cid)        # only if built; exceptions propagate (infra)
 After all steps: full_fn(artifact, cid) on the `top_full` best by screen score; with rerun_seeds=k,
@@ -13,6 +15,7 @@ cid = g{gen:02d}_t{thread}_s{step:02d}.
 Output directory: gen_dir(rc, gen) by default; pass out_dir=... (same value to inner_search,
 load_candidates and submit_to_gate) for additional searches of one generation (e.g. E_t, one per branch).
 """
+import inspect
 import json
 import os
 import time
@@ -21,7 +24,21 @@ import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .editor import EditorReplyError, describe_stop
 from .records import gen_dir, read_json, read_jsonl, write_json
+
+EMPTY_PROGRAM = "no ```python block in the reply"
+STAT_COST = {"rounds": "editor_rounds", "tool_calls": "editor_tool_calls", "tool_s": "editor_tool_s",
+             "prompt_tokens": "editor_prompt_tokens", "completion_tokens": "editor_completion_tokens",
+             "stop": "editor_stop"}
+
+
+def _takes_ctx(fn) -> bool:
+    try:
+        ps = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "ctx" in ps or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in ps.values())
 
 
 @dataclass
@@ -105,21 +122,36 @@ def inner_search(rc, gen: int, *, editor_factory, render_context, build_fn, scre
     cands = load_candidates(rc, gen, gd)
     editors = {}
 
-    def propose(th: int, cid: str, history: list) -> tuple[str, dict]:
+    def propose(th: int, cid: str, history: list) -> tuple[str, dict, str | None]:
         msg = render_context(history, th)
         t0 = time.time()
-        program = editors[th].propose(msg)
+        ed, perr = editors[th], None
+        try:
+            if _takes_ctx(ed.propose):
+                program = ed.propose(msg, ctx={"cid": cid, "gen_dir": str(gd), "visible_cids": [c.cid for c in history]})
+            else:
+                program = ed.propose(msg)
+        except EditorReplyError as e:      # this candidate only; dead servers (RuntimeError) stay fatal
+            program, perr = "", f"editor failed: {e}"
+        program = program or ""
         (gd / "programs" / f"{cid}.py").write_text(program)
-        return program, {"propose_s": round(time.time() - t0, 2)}
+        cost = {"propose_s": round(time.time() - t0, 2)}
+        stats = getattr(ed, "last_stats", None) if perr is None else None
+        if isinstance(stats, dict):
+            cost.update({ck: stats.get(k) for k, ck in STAT_COST.items() if k in stats})
+        if perr is None and not program.strip():
+            why = describe_stop(stats) if isinstance(stats, dict) and stats.get("stop") not in (None, "no_code") else ""
+            perr = EMPTY_PROGRAM + (f" ({why})" if why else "")
+        return program, cost, perr
 
     def one(th: int, step: int, cid: str, history: list) -> Candidate:
         return evaluate(th, step, cid, *propose(th, cid, history))
 
-    def evaluate(th: int, step: int, cid: str, program: str, cost: dict) -> Candidate:
+    def evaluate(th: int, step: int, cid: str, program: str, cost: dict, perr: str | None = None) -> Candidate:
         cost = dict(cost)
         t0 = time.time()
         try:
-            artifact, error = build_fn(program, cid) if program.strip() else (None, "no ```python block in the reply")
+            artifact, error = build_fn(program, cid) if program.strip() else (None, perr or EMPTY_PROGRAM)
         except Exception as e:  # noqa: BLE001 - a failing program must not stop the search
             artifact, error = None, f"build_fn raised {type(e).__name__}: {e}\n{traceback.format_exc(limit=5)[-3000:]}"
         cost["build_s"] = round(time.time() - t0, 2)

@@ -19,6 +19,9 @@ mode). Tool set by method.mode (tools_for_mode): edit = every LoRA tool plus raw
 tools (WEIGHT_TOOLS: structured, any-rank edits of the dense weights, a WeightEdit / MockWeightEdit with
 kind "weights"; programs return {"edit": handle}; per-module cap ||W'-W||_F/||W||_F <= weights.norm_cap_tau).
 Unregistered tools are refused by the ToolAPI.
+Exploration (2026-11-21): ws.explore_api(tag) is the `api` of the editor's run_python chat tool (rsicore.chat_tools)
+while it writes a candidate: a separate ToolAPI without evaluate / raw_lora and (unless editor.explore.gpu_tools)
+without the GPU tools; it never charges the generation's budgets, and its handles are freed after each call.
 """
 from __future__ import annotations
 
@@ -299,8 +302,13 @@ class Workspace:
         lst.append(name)
 
     def _gpu(self, fn, est_seconds: float):
-        """Run fn and record its gpu seconds (mock: the estimate) for the tool's cost_fn."""
-        if self.left("gpu_seconds") <= 0:
+        """Run fn and record its gpu seconds (mock: the estimate) for the tool's cost_fn. Inside explore_api the
+        exploration budget is checked instead of the generation's."""
+        if getattr(self._local, "explore", False):
+            xb, xs = getattr(self, "_xbudget", None) or {}, getattr(self, "_xspent", None) or {}
+            if xs.get("gpu_seconds", 0.0) >= xb.get("gpu_seconds", 0.0) - 1e-9:
+                raise _budget_exc()("exploration gpu_seconds budget exhausted (editor.explore.gpu_seconds)")
+        elif self.left("gpu_seconds") <= 0:
             raise _budget_exc()("gpu_seconds budget exhausted")
         if self.mock:
             self._local.gpu = getattr(self._local, "gpu", 0.0) + est_seconds
@@ -359,6 +367,60 @@ class Workspace:
                 self.api.register(name, fn, doc=doc)
         self._registered = True
         return self.api
+
+    # ------------------------------------------------------------------ exploration (editor chat tools)
+    EXPLORE_NEVER = ("evaluate", "raw_lora")   # evaluate spends the generation's evaluate budget; raw_lora: the raw LoRA
+
+    def explore_tool_names(self, gpu_tools: bool = False) -> list[str]:
+        """Tools of explore_api: the program's tool set without EXPLORE_NEVER, and without GPU_TOOLS unless
+        gpu_tools."""
+        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts), cfg=self.cfg)
+        drop = set(self.EXPLORE_NEVER) | (set() if gpu_tools else set(self.GPU_TOOLS))
+        return [n for n in docs if n not in drop]
+
+    def explore_api(self, tag: str, gpu_tools: bool = False, gpu_seconds: float = 300.0):
+        """(ToolAPI, cleanup) for one run_python call of the editor's tool loop (rsicore.chat_tools; 2026-11-21).
+
+        A separate ToolAPI over the same tensors and handles (the _wrap'ed t_* functions, serialised by ws._lock),
+        without evaluate / raw_lora (the handle 'RAW' still works) and, unless gpu_tools, without the GPU tools
+        (acts / regmean_preserve / train_loss). It never charges the generation's budgets (ws.api.spent,
+        gpu_measured): with gpu_tools the GPU tools are charged to a separate exploration budget of gpu_seconds per
+        workspace (shared by all threads; their gram / parent-loss caches are shared with the programs). Runs under
+        begin_program(tag) in the calling thread (the sandbox serves tool calls in it), so the handles made here
+        are freed by cleanup() and the tool log lives under the '~x' tag, which classify() never reads."""
+        from rsicore.sandbox import ToolAPI
+        with self._lock:
+            if getattr(self, "_xbudget", None) is None:
+                self._xbudget = {"gpu_seconds": float(gpu_seconds)}
+                self._xspent = {"gpu_seconds": 0.0}
+        api = ToolAPI({})
+        if gpu_tools:
+            api.budget, api.spent = self._xbudget, self._xspent   # shared by every exploration call of this workspace
+        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts), cfg=self.cfg)
+        for name in self.explore_tool_names(gpu_tools):
+            fn = self._wrap(name, getattr(self, "t_" + name))
+            if name in self.GPU_TOOLS:
+                api.register(name, fn, cost={"gpu_seconds": 0}, cost_fn=self._gpu_cost_explore, doc=docs[name])
+            else:
+                api.register(name, fn, doc=docs[name])
+        self.begin_program(tag)
+        self._local.explore = True
+        self._local.gpu = 0.0
+
+        def cleanup():
+            self._local.explore = False
+            self._local.gpu = 0.0
+            self.end_program(tag)
+        return api, cleanup
+
+    def _gpu_cost_explore(self, kwargs, result) -> dict:
+        """cost_fn of the GPU tools in explore_api: the measured seconds go to the exploration budget (never to
+        ws.api.spent or gpu_measured)."""
+        with self._lock:
+            used = float(getattr(self._local, "gpu", 0.0))
+            self._local.gpu = 0.0
+            self._xspent["gpu_seconds"] = self._xspent.get("gpu_seconds", 0.0) + used
+        return {}
 
     UNLOCKED_TOOLS = ("evaluate",)   # mode=weights: lock only their own bookkeeping (concurrent evaluations)
 
@@ -1133,3 +1195,49 @@ def classify(tools) -> str:
     if construct:
         return "pure_construct" if not stack_ops else "construct+ops"
     return "ops_only"
+
+
+# ============================================================================ editor wiring (2026-11-21)
+EXPLORE_MOCK_CODE = "print(api.budget())"   # the mock editor's run_python call (editor.mock_tool_rounds times)
+
+
+def explore_doc(ws: Workspace, gpu_tools: bool = False, gpu_seconds: float = 300.0) -> str:
+    """Description of the run_python chat tool for Paper B: the rsicore text plus what is missing in exploration."""
+    from rsicore.chat_tools import RUN_PYTHON_DOC
+    have = set(tools_for_mode(ws.mode, retention=bool(ws.retention_texts), cfg=ws.cfg))
+    missing = [n for n in Workspace.EXPLORE_NEVER + (() if gpu_tools else Workspace.GPU_TOOLS) if n in have]
+    out = RUN_PYTHON_DOC
+    if missing:
+        out += " Not available here: " + ", ".join(f"api.{n}" for n in missing) + "."
+    if "raw_lora" in missing:
+        out += " The raw LoRA is still usable as the handle 'RAW'."
+    if gpu_tools:
+        out += (f" The GPU tools here use a separate exploration budget ({gpu_seconds:.0f} GPU-seconds for the whole "
+                "search), not your program budget.")
+    return out + " Handles made here are freed after the call; the final program must build what it returns."
+
+
+def editor_chat_tools(ws: Workspace, cfg: dict):
+    """rsicore.chat_tools.ChatTools whose run_python runs on ws.explore_api (editor.explore.gpu_tools /
+    gpu_seconds, timeout_s / mem_gb, editor.tool_result_chars); None when editor.tool_rounds is 0."""
+    from rsicore.chat_tools import ChatTools, chat_tools_kwargs
+    from rsicore.editor import editor_settings
+    s = editor_settings(cfg)
+    if int(s.get("tool_rounds") or 0) <= 0:
+        return None
+    gpu, secs = bool(s["explore"].get("gpu_tools")), float(s["explore"].get("gpu_seconds") or 0)
+
+    def factory(tag, ctx):
+        return ws.explore_api(tag, gpu_tools=gpu, gpu_seconds=secs)
+    return ChatTools(factory, run_python_doc=explore_doc(ws, gpu, secs), **chat_tools_kwargs(cfg))
+
+
+def editor_mock_policy(policy, cfg: dict):
+    """Mock editor policy with editor.mock_tool_rounds run_python calls (EXPLORE_MOCK_CODE) before the program,
+    when the tool loop is on (editor.tool_rounds > 0); the program itself is the one of a run without tools."""
+    from rsicore.chat_tools import with_mock_exploration
+    from rsicore.editor import editor_settings
+    s = editor_settings(cfg)
+    if policy is None or int(s.get("tool_rounds") or 0) <= 0:
+        return policy
+    return with_mock_exploration(policy, int(s.get("mock_tool_rounds") or 0), EXPLORE_MOCK_CODE)

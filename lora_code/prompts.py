@@ -123,9 +123,44 @@ def system_prompt(cfg: dict, *, budget: dict, e_task: bool = False, mode: str = 
                max_modules_text=f", at most {int(mm)} modules per edit" if mm is not None else "")
     text = dict(MODE_TEXT[mode])
     text["limits"] = text["limits"].format(**lim)
-    return SYSTEM_PROMPT.format(who=who, whose=whose, timeout_s=cfg.get("sandbox", {}).get("timeout_s", 1800),
-                                evaluate=int(budget.get("evaluate", 32)),
-                                gpu_seconds=float(budget.get("gpu_seconds", 7200)), tools=tools, **text)
+    out = SYSTEM_PROMPT.format(who=who, whose=whose, timeout_s=cfg.get("sandbox", {}).get("timeout_s", 1800),
+                               evaluate=int(budget.get("evaluate", 32)),
+                               gpu_seconds=float(budget.get("gpu_seconds", 7200)), tools=tools, **text)
+    return _with_tool_protocol(out, cfg, mode=mode, retention=retention)
+
+
+REPLY_LINE = "Each turn, reply with a short plan and exactly ONE ```python code block defining"
+TOOL_PROTOCOL = """Before answering you may call functions for up to {rounds} rounds (one round = one reply with \
+function calls; at most {calls} calls in all):
+- run_python(code) runs exploratory code in the program sandbox with the same `api` (look at modules, diagnostics, \
+SVDs, train items, earlier candidates, compare, try constructions and inspect them). Not available there: \
+{missing}; only your final program's result is evaluated, and exploring spends none of the budgets below{gpu_note}.
+- read_record(cid, part) returns the full program or the full feedback of a candidate listed in the latest message.
+Nothing persists between run_python calls or into your final program (handles made there are freed): the final \
+program must be self-contained.
+
+When you are done, reply WITHOUT a function call: a short plan and exactly ONE ```python code block defining"""
+
+
+def _with_tool_protocol(text: str, cfg: dict, *, mode: str, retention: bool) -> str:
+    """The system prompt with the tool-loop protocol (2026-11-21) when editor.tool_rounds > 0; unchanged
+    (byte-identical to the prompt before the tool loop) when it is 0."""
+    from rsicore.editor import editor_settings
+    s = editor_settings(cfg)
+    rounds = int(s.get("tool_rounds") or 0)
+    if rounds <= 0:
+        return text
+    from .tools import Workspace
+    gpu = bool(s["explore"].get("gpu_tools"))
+    have = set(tools_for_mode(mode, retention=retention, cfg=cfg))
+    missing = [n for n in Workspace.EXPLORE_NEVER + (() if gpu else Workspace.GPU_TOOLS) if n in have]
+    miss = (", ".join(f"api.{n}" for n in missing) or "(none)") + \
+        (" (the handle 'RAW' still works)" if "raw_lora" in missing else "")
+    note = (f" (the GPU tools there have their own exploration budget of {float(s['explore'].get('gpu_seconds') or 0):.0f}"
+            " GPU-seconds)") if gpu else ""
+    para = TOOL_PROTOCOL.format(rounds=rounds, calls=int(s.get("max_tool_calls") or 0), missing=miss, gpu_note=note)
+    assert REPLY_LINE in text
+    return text.replace(REPLY_LINE, para, 1)
 
 
 def _num(x, nd=4):

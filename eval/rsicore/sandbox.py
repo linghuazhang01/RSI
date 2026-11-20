@@ -208,7 +208,10 @@ def _tail(p: Path, n: int = 65536) -> str:
     return b[-n:].decode("utf-8", "replace")
 
 
-def run_program(code: str, api: ToolAPI, *, timeout_s: int, mem_gb: int, workdir: Path) -> ProgramResult:
+def run_program(code: str, api: ToolAPI, *, timeout_s: int, mem_gb: int, workdir: Path,
+                save_output: bool = False) -> ProgramResult:
+    """save_output (2026-11-21): after the child has exited, copy its complete stdout / stderr to
+    workdir/stdout.txt and workdir/stderr.txt (ProgramResult keeps only the last 64 KiB)."""
     workdir = Path(workdir).resolve()
     (workdir / "tmp").mkdir(parents=True, exist_ok=True)
     (workdir / "program.py").write_text(code)
@@ -294,6 +297,13 @@ def run_program(code: str, api: ToolAPI, *, timeout_s: int, mem_gb: int, workdir
     secs = round(time.time() - t0, 3)
     info["returncode"] = proc.returncode
     stdout, stderr = _tail(ctl / "stdout.txt"), _tail(ctl / "stderr.txt")
+    if save_output:
+        for name in ("stdout.txt", "stderr.txt"):
+            try:
+                (workdir / name).unlink(missing_ok=True)
+                shutil.copyfile(ctl / name, workdir / name)
+            except OSError:
+                pass
     shutil.rmtree(ctl, ignore_errors=True)
     if timed_out:
         return ProgramResult(False, None, stdout, stderr, f"timeout: killed after {timeout_s}s", secs, info)

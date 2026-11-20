@@ -1,0 +1,256 @@
+# Paper A · self-quantization (frozen editor M_0, fixed W4 GPTQ budget) · tool_calling only · objective simple · B300 planned at 220 GB per card
+# Generated snapshot (2026-11-21) of the MERGED config: edit_code/configs/base.yaml + domains/tool_calling.yaml + hardware b300
+# + scope single + objective simple. Not read by the code (source of truth: base.yaml + --set); the run locks its own
+# copy in experiment_records/A_tool_calling_s42_single_simple/run_config.yaml.
+# Data (simple_data/tool_calling/, committed; data/scripts/make_simple_data.py): the decontaminated, de-duplicated sealtool_train pool,
+# 1,500 items sampled for training and 500 disjoint ones for the gate. Graded by the Seal-Tools call match (sealtool).
+#   train role = simple_tool_calling_train (all 1,500 items every generation, nothing drawn)
+#   gate role  = simple_tool_calling_eval (all 500 items)
+#   held-out evaluation: disabled (heldout.enabled false)
+# Each generation: the editor writes quantization programs; candidates are screened on ALL 1,500 train
+# items against the incumbent (greedy); the best go to the gate on the 500 gate items, paired with the
+# incumbent (gate.min_delta and the 95% CI lower bound > 0). KL / calibration texts = 400 of the 1,500
+# items + M_0's answers. Feedback examples also show the reference answer.
+# Editor (改造者): Qwen3 thinking mode (editor.extra_body enable_thinking, temperature 0.6 / top_p 0.95 / top_k 20);
+# per candidate up to editor.tool_rounds (50) rounds of tool calls (run_python with the explore api, read_record), then
+# a forced final turn; context editor.context_tokens (131072, also the editor server's --max-model-len).
+# Search / gate / noise decoding: greedy.
+# Start: ./launch.sh --paper A --domains tool_calling --simple --gens 5 --gpus <ids>   (run id A_tool_calling_s42_single_simple)
+draw_config: data/draw/paper_a.yaml
+data:
+  n: null
+  screen_n: null
+  kl_contexts: null
+  gate_n: null
+max_tokens:
+  dapo_math: 4096
+  taco_verified: 4096
+  ifeval_train: 2048
+  sealtool_train: 1024
+  triviaqa_train: 1024
+  math_eval: 4096
+scope: single
+objective: simple
+budget:
+  gib: null
+  reference:
+    default:
+      bits: 4
+      group_size: 128
+      quantizer: gptq
+    embed: 8
+    lm_head: 8
+loop:
+  editor: frozen
+  patience: 2
+action_space:
+  bits:
+  - 2
+  - 3
+  - 4
+  - 8
+  - 16
+  group_sizes:
+  - 32
+  - 64
+  - 128
+  quantizers:
+  - rtn
+  - gptq
+  - awq
+  embed:
+  - bf16
+  - 8
+  - 4
+  lm_head:
+  - bf16
+  - 8
+  - 4
+search:
+  threads: 4
+  steps: 6
+  max_evaluate: 24
+  program_evaluate_calls: 2
+  top_full: 3
+  rerun_seeds: 0
+  kl_weight: 0.5
+gate:
+  min_delta: 0.005
+  require_significant: true
+  max_submissions: 3
+  allow_unscored: false
+feedback:
+  examples: 2
+noise:
+  repeats: 3
+  temperature: 0.0
+  top_p: 1.0
+  n: null
+  fixed: null
+kl:
+  domains: run
+  top_k: 20
+  max_chars: 8000
+  self_generated: true
+  self_generated_max_tokens: 2048
+  self_generated_batch: 64
+  eval_texts: 400
+calibration:
+  max_texts: 256
+  max_len: 2560
+  layers_per_pass: 16
+diagnostics:
+  profile_bits:
+  - 2
+  - 3
+  - 4
+  profile_group_size: 128
+  profile_contexts: 64
+  profile_max_len: 512
+  hessian_quantizers:
+  - rtn
+  - gptq
+  - awq
+  hessian_bits: null
+cache:
+  device: cuda
+  lazy: true
+  gptq_damp: 0.01
+  warm:
+  - quantizer: rtn
+    bits: 2
+    group_size: 128
+  - quantizer: rtn
+    bits: 3
+    group_size: 128
+  - quantizer: rtn
+    bits: 4
+    group_size: 128
+  - quantizer: rtn
+    bits: 8
+    group_size: 128
+  - quantizer: gptq
+    bits: 2
+    group_size: 128
+  - quantizer: gptq
+    bits: 3
+    group_size: 128
+  - quantizer: gptq
+    bits: 4
+    group_size: 128
+  - quantizer: gptq
+    bits: 8
+    group_size: 128
+  - quantizer: awq
+    bits: 2
+    group_size: 128
+  - quantizer: awq
+    bits: 3
+    group_size: 128
+  - quantizer: awq
+    bits: 4
+    group_size: 128
+candidates:
+  keep_checkpoints: 1
+bytes:
+  count_visual: true
+tools:
+  profile_table: true
+  activation_table: true
+  solve_allocation: true
+  hessian_table: true
+  group_error: true
+  compare: true
+solver:
+  group_sizes:
+  - 128
+  group_size_factor:
+    128: 1.0
+    64: 0.8
+    32: 0.65
+editor:
+  temperature: 0.6
+  top_p: 0.95
+  max_tokens: 16384
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: true
+    top_k: 20
+    min_p: 0.0
+  tool_rounds: 20
+  turn_max_tokens: 8192
+  max_tool_calls: 100
+  proposal_tokens: 160000
+  proposal_wall_s: 2400
+  context_tokens: 131072
+  tool_result_chars: 6000
+  compact_at: 0.6
+  keep_tool_rounds: 8
+  keep_reasoning_rounds: 2
+  reasoning_passback: think_tag
+  history_keep: 2
+  timeout_s: 3600
+  mock_tool_rounds: 1
+  explore:
+    timeout_s: 300
+    mem_gb: 8
+    gpu_tools: false
+    gpu_seconds: 300
+sandbox:
+  timeout_s: 1800
+  mem_gb: 16
+archive:
+  enabled: true
+  top_candidates: 3
+heldout:
+  domains: tool_calling
+  limit: null
+  decoding: null
+  enabled: true
+e_task:
+  enabled: false
+  budget_gib: null
+  evaluate: 24
+  threads: 4
+  steps: 6
+  top_full: 1
+  heldout_limit: 200
+baselines:
+  methods: []
+  full: false
+  evo_evaluations: 24
+vllm:
+  editor_args:
+  - --rsi-gpu-memory-gib
+  - '220'
+  - --gpu-memory-utilization
+  - '0.81'
+  - --max-model-len
+  - '131072'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  candidate_args:
+  - --rsi-gpu-memory-gib
+  - '220'
+  - --gpu-memory-utilization
+  - '0.81'
+  - --max-model-len
+  - '20480'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+gpu_roles: null
+gpu_layout:
+  share_single_gpu: true
+  candidate_group_size: 1
+  editor_sleep: true
+  m0_replicas: true
+  parallel_heldout: true
+  prep_all_gpus: true
+hardware: b300
+domain: tool_calling
+data_roles:
+  eval: eval:simple_tool_calling_eval

@@ -12,6 +12,10 @@
   no sampled training answers).
 - test_mock_data_roles_*: data_roles (2026-11-21): a gate dataset different from the train dataset (eval-set gate
   next to dapo_math draws; eval-set train next to dapo_math's gate split).
+- editor tool loop (2026-11-21): test_explore_api_surface_and_budgets (Workspace.explore_api: no evaluate / raw_lora /
+  GPU tools, no generation budget spent, handles freed, gpu_tools budget), test_editor_context_tokens_sets_main_max_model_len
+  (editor.context_tokens -> main servers' --max-model-len), test_mock_tool_loop_scratch (one run_python round per
+  proposal; same programs / scores / evaluations as editor.tool_rounds=0).
 """
 import json
 import os
@@ -261,6 +265,14 @@ def test_mock_run_scratch(tmp_path):
     assert summ["nonllm"]["kind"] == "random_construct_search"
     assert all(k in ("pure_construct", "construct+ops", "keep", "error", "none") for k in summ["search"]["strategies"])
     assert (run / "gen_00" / "parent_gate.json").exists()
+    # E_t editor runs the tool loop too (run_python on the E task workspace's exploration api)
+    for b in ("parent", "llm"):
+        tr = run / "gen_00" / "e_t" / b / "editor" / "thread_0.jsonl"
+        if tr.exists():
+            lines = [json.loads(x) for x in tr.read_text().splitlines() if x.strip()]
+            assert [x for x in lines if x.get("role") == "tool" and x.get("ok")], b
+            assert list((run / "gen_00" / "e_t" / b / "explore").glob("*/r01_0/stdout.txt")), b
+    assert (run / "gen_00" / "e_t" / "parent" / "editor" / "thread_0.jsonl").exists()
 
 
 def test_mock_run_single_domain(tmp_path):
@@ -466,3 +478,167 @@ def test_mock_data_sizes_and_fixed_noise(tmp_path):
     gate = json.loads((run / "baseline" / "gate_scores.json").read_text())["dapo_math"]
     assert gate["noise_band"] == 0.05 and gate["noise_source"].startswith("fixed")
     assert not (run / "baseline" / "noise").exists()
+
+
+def test_mock_simple_objective(tmp_path):
+    """objective simple (2026-11-21): train = simple_data's 1,500 items (gold visible), gate = its 500, held-out = the
+    same 500 (greedy)."""
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
+           "--runs-dir", str(tmp_path), "--set", "objective=simple"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    run = tmp_path / "B_math_s42_single_simple_mock"
+    assert run.exists() and not (run / "draws").exists()
+    td = json.loads((run / "gen_00" / "train_data.json").read_text())
+    assert len(td) == 1500
+    assert list(json.loads((run / "baseline" / "gate_scores.json").read_text())) == ["simple_math_eval"]
+    assert set(json.loads((run / "baseline" / "heldout.json").read_text())) == {"simple_math_eval"}
+    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
+    assert summ["data_roles"] == {"train": "simple_math_train", "gate": "simple_math_eval"}
+
+
+# ============================================================================ editor tool loop (2026-11-21)
+def _explore(ws, code, tmp_path, cid="g00_t0_s00", r=1, i=0, cfg=None):
+    from lora_code.tools import editor_chat_tools
+    ct = editor_chat_tools(ws, cfg or {"editor": {"explore": {"timeout_s": 60, "mem_gb": 4}}})
+    out = ct.call("run_python", {"code": code}, {"cid": cid, "gen_dir": str(tmp_path / "gd")}, r, i)
+    return out, json.loads(out["content"])
+
+
+def test_explore_api_surface_and_budgets(tmp_path):
+    """Workspace.explore_api (2026-11-21): no evaluate / raw_lora / GPU tools, nothing charged to the generation's
+    budgets, handles freed after each call, tool log under '~x' tags, in scratch / edit / weights mode; with
+    editor.explore.gpu_tools the GPU tools are charged to their own exploration budget."""
+    from lora_code.mock import MockStore, m_sgd
+    from lora_code.tools import classify, editor_chat_tools
+    store = MockStore()
+    raw = m_sgd(None, [m for m in store.modules() if m.endswith("down_proj")][:4], [f"t/{i}" for i in range(10)],
+                20, 2e-4, 16)
+    for mode in ("scratch", "edit", "weights"):
+        ws = _ws(tmp_path / mode, {"evaluate": 2, "gpu_seconds": 100}, mode=mode, raw=raw if mode == "edit" else None)
+        api, cleanup = ws.explore_api("g00_t0_s00~x01_0")
+        names = set(api.names())
+        cleanup()
+        assert not names & {"evaluate", "raw_lora", "acts", "train_loss", "regmean_preserve"}, (mode, names)
+        assert {"svd", "budget", "modules", "candidate", "compare"} <= names
+        assert ("new_edit" in names) == (mode == "weights")
+        n_handles = len(ws._h)
+        code = ("print(api.budget())\ns = api.svd(module='layers.3.mlp.down_proj')\nlo = api.new_lora()['lora']\n"
+                + ("lo = api.truncate_rank(lora='RAW', k=4)['lora']\n" if mode == "edit" else "")
+                + "for t in ('evaluate', 'raw_lora', 'acts'):\n"
+                  "    try:\n        getattr(api, t)\n        print('HAS', t)\n    except AttributeError:\n        pass\n"
+                  "result = {'lo': lo, 'S': s['S'][:2]}")
+        out, res = _explore(ws, code, tmp_path / mode)
+        assert out["ok"] and res["ok"], res
+        assert "HAS" not in res.get("stdout", "") and res["result"]["lo"].startswith("L")
+        assert ws.api.spent == {"evaluate": 0.0, "gpu_seconds": 0.0} and ws.gpu_measured == 0.0
+        assert len(ws._h) == n_handles                                       # exploration handles freed
+        assert list(ws.tool_log) == ["g00_t0_s00~x01_0"] and ws._cid() == "_"
+        assert classify(ws.tool_log.get("g00_t0_s00", [])) == "keep"         # programs never see exploration calls
+        assert (tmp_path / mode / "gd" / "explore" / "g00_t0_s00" / "r01_0" / "stdout.txt").exists()
+    # gpu_tools: acts allowed, charged to the exploration budget only; exhausted -> refused in exploration
+    ws = _ws(tmp_path / "gpu", {"evaluate": 2, "gpu_seconds": 100})
+    cfg = {"editor": {"explore": {"timeout_s": 60, "mem_gb": 4, "gpu_tools": True, "gpu_seconds": 10}}}
+    assert "separate exploration budget" in editor_chat_tools(ws, cfg).run_python_doc
+    out, res = _explore(ws, "result = api.acts(module='layers.3.mlp.down_proj', ids=api.train_ids()[:4])['in_norm']",
+                        tmp_path / "gpu", cfg=cfg)
+    assert res["ok"] and res["result"] == 12.0, res
+    assert ws.api.spent["gpu_seconds"] == 0.0 and ws.gpu_measured == 0.0 and ws._xspent["gpu_seconds"] > 0
+    out, res = _explore(ws, "for _ in range(20):\n    api.acts(module='layers.3.mlp.down_proj')\n", tmp_path / "gpu",
+                        r=2, cfg=cfg)
+    assert not res["ok"] and "BudgetExceeded" in res["error"] and ws.api.spent["gpu_seconds"] == 0.0
+    ws.api.call("acts", {"module": "layers.3.mlp.down_proj", "ids": ws.t_train_ids()[:4]})   # program budget intact
+    assert ws.api.spent["gpu_seconds"] > 0
+    assert editor_chat_tools(ws, {"editor": {"tool_rounds": 0}}) is None
+
+
+def test_editor_context_tokens_sets_main_max_model_len(tmp_path, monkeypatch):
+    """editor.context_tokens is the one context knob: --max-model-len of every server started from server.main_args
+    (main replicas / weights slots; overrides main_args), the Editor's context_tokens; theta0_args unchanged;
+    hardware profiles b300 / h20 131072, h20_80 49152."""
+    import types
+
+    import rsicore.servers as S
+    import yaml
+    from rsicore.editor import editor_kwargs
+    from rsicore.servers import max_model_len
+
+    from lora_code.common import deep_merge, main_server_args
+    base = yaml.safe_load((REPO / "lora_code" / "configs" / "base.yaml").read_text())
+    for hw, n in (("b300", 131072), ("h20", 131072), ("h20_80", 49152)):
+        cfg = deep_merge(base, base["hardware_profiles"][hw] or {})
+        args = main_server_args(cfg)
+        assert max_model_len(args) == n and args.count("--max-model-len") == 1, (hw, args)
+        assert cfg["server"]["theta0_args"] == (base["hardware_profiles"][hw].get("server") or base["server"])["theta0_args"]
+        assert editor_kwargs(cfg, server_args=args)["context_tokens"] == n
+        assert editor_kwargs(cfg)["max_tokens"] == 16384 and editor_kwargs(cfg)["tool_rounds"] == 50
+        assert editor_kwargs(cfg)["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
+    cfg = {"server": {"main_args": ["--max-model-len", "20480", "--max-logprobs", "20"]},
+           "editor": {"context_tokens": 65536}}
+    assert main_server_args(cfg) == ["--max-model-len", "65536", "--max-logprobs", "20"]
+    cfg["editor"]["context_tokens"] = None                                   # null: main_args as written
+    assert main_server_args(cfg) == ["--max-model-len", "20480", "--max-logprobs", "20"]
+    assert editor_kwargs(cfg, server_args=main_server_args(cfg))["context_tokens"] == 20480
+    # the main replicas get it (real path, servers stubbed), the theta0 server does not
+    made = []
+
+    class FakeServer:
+        def __init__(self, model, served, gpus, **kw):
+            made.append((served, kw["extra_args"]))
+
+        def alive(self):
+            return True
+    monkeypatch.setattr(S, "VLLMServer", FakeServer)
+    monkeypatch.setattr(S, "start_all", lambda srvs: None)
+    from lora_code.run import Servers
+    cfg = deep_merge(base, base["hardware_profiles"]["h20"])
+    cfg = deep_merge(cfg, {"editor": {"context_tokens": 98304}})
+    rc = types.SimpleNamespace(gpus=[0, 1, 2, 3], mock=False, run_dir=tmp_path, seed=42)
+    srv = Servers(rc, cfg)
+    srv.replicas("main", "/m", "m0")
+    srv.replicas("theta0", "/m", "theta0")
+    main = [a for s, a in made if s == "m0"]
+    th0 = [a for s, a in made if s == "theta0"]
+    assert main and all(max_model_len(a) == 98304 for a in main)
+    assert th0 and all(max_model_len(a) == 20480 for a in th0)
+
+
+def _transcript(path):
+    return [json.loads(x) for x in Path(path).read_text().splitlines() if x.strip()]
+
+
+def test_mock_tool_loop_scratch(tmp_path):
+    """Default editor = thinking + tool loop: one mock run_python round per proposal on the exploration api
+    (transcript format 2, editor_rounds in the candidate costs, explore output on disk); the same programs, scores
+    and evaluations as with editor.tool_rounds=0 (one call per candidate, no tool lines)."""
+    _run_b(tmp_path / "loop", "method.mode=scratch")
+    _run_b(tmp_path / "single", "method.mode=scratch", "editor.tool_rounds=0")
+    runs = {k: next((tmp_path / k).iterdir()) for k in ("loop", "single")}
+    for k in ("loop", "single"):
+        assert runs[k].name == runs["loop"].name
+    gl, gs = runs["loop"] / "gen_00", runs["single"] / "gen_00"
+    tr = _transcript(gl / "editor" / "thread_0.jsonl")
+    assert tr[0]["role"] == "system" and tr[0].get("format") == 2
+    assert "Before answering you may call functions for up to 50 rounds" in tr[0]["content"]
+    tools = [l for l in tr if l.get("role") == "tool"]
+    finals = [l for l in tr if l.get("final")]
+    assert tools and all(l["name"] == "run_python" and l["ok"] for l in tools), tools[:1]
+    assert len(tools) == len(finals) and all(f["stats"]["rounds"] == 1 and f["stats"]["stop"] == "answer" for f in finals)
+    assert "'spent'" in json.loads(tools[0]["content"])["stdout"]
+    assert list((gl / "explore").glob("*/r01_0/stdout.txt"))
+    tr0 = _transcript(gs / "editor" / "thread_0.jsonl")
+    assert "Before answering" not in tr0[0]["content"] and "Each turn, reply with a short plan" in tr0[0]["content"]
+    assert not [l for l in tr0 if l.get("role") == "tool"] and all(l["stats"]["rounds"] == 0 for l in tr0 if l.get("final"))
+    assert not (gs / "explore").exists()
+    cl = {c["cid"]: c for c in (json.loads(x) for x in (gl / "candidates.jsonl").read_text().splitlines())}
+    cs = {c["cid"]: c for c in (json.loads(x) for x in (gs / "candidates.jsonl").read_text().splitlines())}
+    assert cl.keys() == cs.keys() and cl
+    for cid in cl:
+        assert cl[cid]["cost"]["editor_rounds"] == 1 and cl[cid]["cost"]["editor_tool_calls"] == 1
+        assert cs[cid]["cost"]["editor_rounds"] == 0
+        assert (gl / "programs" / f"{cid}.py").read_text() == (gs / "programs" / f"{cid}.py").read_text()
+        assert cl[cid]["score"] == cs[cid]["score"]                          # exploration spends no evaluate
+    ev = sorted(p.relative_to(gl / "evals") for p in (gl / "evals").rglob("*.json"))
+    assert ev == sorted(p.relative_to(gs / "evals") for p in (gs / "evals").rglob("*.json"))

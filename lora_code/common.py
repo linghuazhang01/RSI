@@ -240,3 +240,12 @@ def main_groups(rc, cfg: dict) -> list[list[int]]:
     groups = [main[i:i + tp] for i in range(0, len(main) - len(main) % tp, tp)]
     return groups or [main]
 
+
+def main_server_args(cfg: dict) -> list[str]:
+    """vLLM args of every server started from server.main_args (the main replicas, which also host the editor;
+    weights mode: the temporary servers on the candidate slots too, so every scoring server has the same context):
+    server.main_args with --max-model-len = editor.context_tokens (2026-11-21: the one knob for the editor's
+    context length; it overrides a --max-model-len written in main_args; null keeps main_args as written).
+    theta0_args are never changed."""
+    from rsicore.editor import apply_context_tokens
+    return apply_context_tokens(list((cfg.get("server") or {}).get("main_args", []) or []), cfg)

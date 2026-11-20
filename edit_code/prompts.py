@@ -37,11 +37,40 @@ Config schema (JSON object):
 Answer with a short plan, then exactly one ```python code block containing the full program."""
 
 
+FINAL_RULE = "Answer with a short plan, then exactly one ```python code block containing the full program."
+
+# editor.tool_rounds > 0 (2026-11-21): the editor may call chat tools before answering; replaces FINAL_RULE
+TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds:
+- run_python(code) runs exploratory code in the same sandbox with the same `api` (keyword arguments as above), so you can inspect and filter the tables and check configs before you commit to a program. api.evaluate is NOT available there (only your final program may evaluate){group_error}. print() what you need or set `result = ...`; output is cut to a few thousand characters, so filter big tables in the code.
+- read_record(cid, part) shows the full program ("program") or the full feedback ("feedback") of a candidate in the table.
+Nothing persists between run_python calls or into your final program: it must be self-contained.
+When you are done, reply WITHOUT a function call: a short plan, then exactly one ```python code block containing the full program."""
+
+
+def _tool_rounds(cfg: dict) -> tuple[int, bool]:
+    """(editor.tool_rounds, editor.explore.gpu_tools) with the rsicore.editor defaults."""
+    try:
+        from rsicore.editor import editor_settings
+        s = editor_settings(cfg)
+        return int(s["tool_rounds"] or 0), bool(s["explore"].get("gpu_tools"))
+    except ImportError:                      # pragma: no cover - rsicore not on sys.path
+        e = cfg.get("editor") or {}
+        return int(e.get("tool_rounds", 50) or 0), bool((e.get("explore") or {}).get("gpu_tools"))
+
+
 def system_prompt(problem, tool_doc: str, cfg: dict) -> str:
     sp = problem.space
     g = cfg["gate"]
-    return SYSTEM_PROMPT.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
+    text = SYSTEM_PROMPT.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
                                 quantizers=sp["quantizers"], min_delta=g.get("min_delta", 0.0))
+    rounds, gpu_tools = _tool_rounds(cfg)
+    if rounds > 0:                           # tool_rounds 0: byte-identical to the single-call prompt
+        ge = ("" if gpu_tools or not (cfg.get("tools") or {}).get("group_error", True)
+              else "; group_error there only accepts settings already cached (those of hessian_table)")
+        if text.endswith(FINAL_RULE):
+            text = text[:-len(FINAL_RULE)]
+        text += TOOL_PROTOCOL.format(rounds=rounds, group_error=ge)
+    return text
 
 
 def _fmt(x, nd=3):

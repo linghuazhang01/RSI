@@ -64,6 +64,8 @@
 --domain instruction_following --set data_roles.gate=ifeval --set data_roles.eval=gate
 ```
 
+**`simple`（2026-11-21，`--set objective=simple` / `./launch.sh --simple`）**：用 `simple_data/<领域>/`（`data/scripts/make_simple_data.py`，从去污染、去重后的训练集池子里抽）——训练 = 那 1,500 道（每代快速筛、完整评测都用全部 1,500 道，不抽题；KL / 校准文本取其中 400 道 + M_0 的回答；反馈例题带标准答案），验收 = 那 500 道（照常的配对验收：`gate.min_delta` 且 95% CI 下界 > 0，与 incumbent 比），**留出评测也是那 500 道**（`data_roles.eval: gate`，贪心，`heldout.decoding: null`）；改造者每个候选最多 20 轮工具调用（`editor.tool_rounds: 20`，上下文 `editor.context_tokens` 131072）。五个领域都可以用，数据集名 `simple_<领域>_train / simple_<领域>_eval`；运行名带 `_simple`。各领域合并后的配置见 `plan/configs/A_<领域>_simple.yaml`。服务器上需要先有 `simple_data/<领域>/train.jsonl`、`eval.jsonl`。
+
 ## 分析工具与保存的数据（2026-11-20）
 
 改造者除了评测，还可以用几个**免费**（不扣 evaluate）的分析工具：
@@ -77,6 +79,36 @@
 | `compare(cid, other="incumbent")` | 这个候选和 incumbent（或另一个候选）比，坏了哪些题、修好哪些题 | 逐题对比两份评测记录：翻转数和题号、按输出长度分组、截断率、平均输出长度；**只给题号和统计，不给题目内容**，所以不会用掉信号题 |
 
 每个候选每个阶段保存在 `gen_XX/evals/<cid>/<stage>/`：逐题记录（`<数据集>.jsonl`，含原始输出、解析答案、对错）、每段文本的 KL（`kl_per_text.json`）、每组 Hessian 加权误差（`group_error.json`）。incumbent 的 cid 是 `incumbent`。量化后的模型文件不保留（每个约 54 GB；配置已存，可从缓存几秒钟重新拼出）。
+
+## 改造者：thinking + 工具轮次（2026-11-21）
+
+改造者写每个候选时开 Qwen3 thinking（`editor.extra_body.chat_template_kwargs.enable_thinking: true`，temperature 0.6 / top_p 0.95 / top_k 20 / min_p 0），并且可以先调用工具再交程序（`rsicore.editor` + `rsicore.chat_tools`）：
+- **一轮** = 模型的一次回复里带了工具调用（并行的几个调用算一轮）。最多 `editor.tool_rounds` 轮（默认 50），之后再给一次 `tool_choice: "none"` 的最终回复。候选 = 不带工具调用、含一个 ```python 块的那次回复。
+- 工具：`run_python(code)` 在同一个沙箱里跑探索代码，`api` 和最终程序的一样，但**没有 `api.evaluate`**（`make_tool_api(explore=True)`），`group_error` 只能查已缓存的设置（`hessian_table` 那些；`editor.explore.gpu_tools: true` 才允许现算）；`read_record(cid, part)` 看表里某个候选的完整程序 / 反馈。探索**不扣**本代的 evaluate 预算，也不占候选槽。每次调用的完整输出在 `gen_XX/explore/<cid>/rNN_i/`。
+- 记录：`gen_XX/editor/thread_K.jsonl`（format 2，每轮的推理、工具调用和结果都在）；`candidates.jsonl` 的 cost 里有 `editor_rounds / editor_tool_calls / editor_tool_s / editor_prompt_tokens / editor_completion_tokens / editor_stop`。
+- E_t 用同一个改造者工厂，也一样。
+
+| 配置（`editor.*`） | 默认 | 作用 |
+|---|---|---|
+| `tool_rounds` | 50 | 每个候选最多几轮工具调用；**0 = 以前的单次调用**（请求里没有 tools，提示词逐字不变） |
+| `context_tokens` | 131072（`h20_80`: 49152） | **上下文长度的唯一旋钮**：客户端按它限制每轮 max_tokens、触发压缩，同时作为改造者 vLLM 服务的 `--max-model-len`（覆盖 `vllm.editor_args` 里写的值；候选服务的 20480 不变）。null = 用 `editor_args` 原样 |
+| `turn_max_tokens` / `max_tokens` | 8192 / 16384 | 工具轮 / 最终回复的 max_tokens |
+| `max_tool_calls` / `proposal_tokens` / `proposal_wall_s` | 100 / 160000 / 2400 | 任一到顶就强制进入最终回复 |
+| `tool_result_chars` | 6000 | 工具结果截断长度 |
+| `compact_at` / `keep_tool_rounds` / `keep_reasoning_rounds` | 0.6 / 8 / 2 | 提示超过 0.6 × context_tokens 时压缩：只留最近 8 轮的工具输出、最近 2 轮的推理 |
+| `reasoning_passback` | think_tag | 轮内推理怎么传回（think_tag / field / drop） |
+| `history_keep` | 2 | 跨步历史：第 0 步 + 最近 2 步完整，其余只留代码（null = 全部；tool_rounds 0 时总是全部） |
+| `explore` | timeout_s 300, mem_gb 8, gpu_tools false | run_python 的限制 |
+| `mock_tool_rounds` | 1 | `--mock` 时 mock 改造者先调几次 run_python（`api.profile_summary()`） |
+
+怎么改：
+```bash
+--set editor.tool_rounds=20              # 最多 20 轮
+--set editor.tool_rounds=0               # 关掉工具（单次调用）
+--set editor.context_tokens=65536        # 上下文 64K（改造者服务 --max-model-len 也跟着变）
+--set editor.extra_body={}               # 不显式开 thinking（用模板默认）
+```
+`context_tokens` 的默认值写在 `hardware_profiles`（b300 / h20: 131072，h20_80: 49152；硬件档在 `editor:` 块之后合并），所以改默认值要改那里，或用 `--set`（`--set` 优先）。真实服务器上 `rsicore.servers` 会把 `--max-model-len` 压到模型 `config.json` 的 `max_position_embeddings` 以内（打警告，不加 YaRN），工具解析器按聊天模板自动选（qwen3_coder / hermes）。这些键都在锁定的配置里：改了要用新的 `--run-id`。
 
 ## KL / 校准文本 = 题目 + M_0 自己的回答（2026-11-20）
 

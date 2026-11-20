@@ -5,13 +5,13 @@
 # Usage:
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20]
 #               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all] [--eval-overfit]
-#               [--eval-set humanevalplus,ifeval,...] [--train-set X] [--gate-set X] [--eval-on X,Y]
+#               [--eval-set humanevalplus,ifeval,...] [--simple] [--train-set X] [--gate-set X] [--eval-on X,Y]
 #               [--all-domains] [--set KEY=VALUE ...] [--dry-run] [--mock] [--skip-checks]
 #
 #   --paper     A, B or both (default both)
 #   --domains   all = math,code,knowledge,instruction_following,tool_calling (default all)
 #   --gens      generations per run (default 5)
-#   --hw        hardware profile (default b300): b300 (288 GB), h20 (H20 planned at 110 GB per card),
+#   --hw        hardware profile (default b300): b300 (B300 planned at 220 GB per card), h20 (H20 planned at 110 GB per card),
 #               h20_80 (80 GB H20). Qwen3.8-27B (one model per card): minimum GPUs per run
 #                 Paper A 2 (editor | candidates); Paper B 2 (main | training), 3 on h20 with --all-domains
 #                 (+ original-model server for E_t)
@@ -34,6 +34,10 @@
 #               aime25 amc23 | humanevalplus mbppplus livecodebench | gpqa_diamond mmlu_pro triviaqa |
 #               ifeval ifbench | sealtool apibank bfcl  (eval/configs/tasks.yaml eval_targets).
 #               Run ids end in _evalfit (math) or _evalfit_<set>, e.g. A_code_s42_single_evalfit_humanevalplus.
+#   --simple    objective simple (2026-11-21): train on simple_data/<domain>'s 1,500 items (all of them every
+#               generation), accept on its 500 (the usual paired gate), held-out report on the same 500 (greedy);
+#               editor at most 20 tool rounds per candidate. simple_data/ comes from data/scripts/make_simple_data.py.
+#               Run ids end in _simple, e.g. B_code_s42_single_simple. Merged configs: plan/configs/{A,B}_<domain>_simple.yaml.
 #   Data roles (2026-11-21, paper config data_roles; each run's train / gate must belong to its domain):
 #   --train-set what the editor works from (signal / screen items, Paper B's train_example / acts / train_loss,
 #               Paper A's KL / calibration prompts): the domain's training set (dapo_math, taco_verified,
@@ -42,7 +46,8 @@
 #   --eval-on   the held-out report, comma-separated: domains, held-out tasks (math500, humanevalplus, ...),
 #               eval sets (math_eval = MATH-500 + GSM8K merged), or train / gate (when that role is an eval set).
 #               Default: --eval-overfit -> the eval set; otherwise the run's domain (sampled avg@n, heldout.decoding).
-#               Defaults of train / gate: the domain's training set; with --eval-overfit / --eval-set the eval set.
+#               Defaults of train / gate: the domain's training set; with --eval-overfit / --eval-set the eval set;
+#               with --simple simple_<domain>_train / simple_<domain>_eval (also accepted: simple_train / simple_eval).
 #               A train / gate other than the default adds _train-<x> / _gate-<x> to the run id.
 #   --all-domains  the original design (scope all): the other four domains are retention probes / KL texts,
 #               held-out on all five domains, Paper B E_t on. Run ids without _single.
@@ -69,6 +74,7 @@
 #   ./launch.sh --hw h20 --paper B --domains math --gate-set math500 --eval-on math500,gsm8k --gens 5 --gpus 0,1,2,3
 #       # train on DAPO-Math draws, accept on all of MATH-500, report MATH-500 + GSM8K: B_math_s42_single_gate-math500
 #   ./launch.sh --hw h20 --paper A --domains code --train-set humanevalplus --gate-set mbppplus --eval-on livecodebench
+#   ./launch.sh --hw h20 --paper both --simple --gens 5          # 1,500 / 500 per domain, five domains, both papers
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -76,7 +82,7 @@ cd "$ROOT"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$ROOT/launch.sh"; }
 
 PAPER=both; DOMAINS=all; GENS=5; GPUS=""; PER_RUN=""; MODEL=qwen3.8-27b; SEED=42; HW=b300
-WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; EVALFIT=0; EVAL_SETS=""; TRAIN_SET=""; GATE_SET=""; EVAL_ON=""; SETS=()
+WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; EVALFIT=0; EVAL_SETS=""; SIMPLE=0; TRAIN_SET=""; GATE_SET=""; EVAL_ON=""; SETS=()
 need() { [ $# -ge 2 ] || { echo "ERROR: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -95,6 +101,7 @@ while [ $# -gt 0 ]; do
     --all-domains) SINGLE=0 ;;
     --eval-overfit) EVALFIT=1 ;;
     --eval-set|--eval-sets) need "$@"; EVAL_SETS="$2"; EVALFIT=1; shift ;;
+    --simple) SIMPLE=1 ;;
     --train-set) need "$@"; TRAIN_SET="$2"; shift ;;
     --gate-set) need "$@"; GATE_SET="$2"; shift ;;
     --eval-on) need "$@"; EVAL_ON="$2"; shift ;;
@@ -122,6 +129,12 @@ SUFFIX=""; [ "$SINGLE" -eq 1 ] && SUFFIX="_single"
 [ "$SINGLE" -eq 0 ] && SETS=(--set scope=all ${SETS[@]+"${SETS[@]}"})   # explicit --set values come later and win
 [ "$EVALFIT" -eq 1 ] && SETS=(--set objective=eval_overfit ${SETS[@]+"${SETS[@]}"})
 [ "$EVALFIT" -eq 1 ] && [ "$WITH_ALL" -eq 1 ] && { echo "ERROR: --with-all (domain all) cannot overfit an eval set" >&2; exit 2; }
+if [ "$SIMPLE" -eq 1 ]; then
+  [ "$EVALFIT" -eq 1 ] && { echo "ERROR: --simple and --eval-overfit / --eval-set are different objectives" >&2; exit 2; }
+  [ "$WITH_ALL" -eq 1 ] && { echo "ERROR: --with-all (domain all) cannot use --simple" >&2; exit 2; }
+  [ "$SINGLE" -eq 0 ] && { echo "ERROR: --simple needs scope single (drop --all-domains)" >&2; exit 2; }
+  SETS=(--set objective=simple ${SETS[@]+"${SETS[@]}"}); SUFFIX="${SUFFIX}_simple"
+fi
 
 # eval sets (objective eval_overfit; mirrors eval/configs/tasks.yaml eval_targets / eval_target_defaults)
 set_domain() {
@@ -137,15 +150,15 @@ set_sources() {  # eval set -> its source datasets (data/splits/<ds>/test.json)
   case "$1" in math) echo "math gsm8k" ;; math500) echo math ;; *) echo "$1" ;; esac
 }
 evalfit_suffix() { if [ "$1" = math ]; then echo _evalfit; else echo "_evalfit_$1"; fi; }
-norm_set() {  # math_eval -> math, humanevalplus_eval -> humanevalplus, training sets unchanged
-  case "$1" in *_eval) echo "${1%_eval}" ;; *) echo "$1" ;; esac
+norm_set() {  # math_eval -> math, humanevalplus_eval -> humanevalplus, training / simple sets unchanged
+  case "$1" in simple_*) echo "$1" ;; *_eval) echo "${1%_eval}" ;; *) echo "$1" ;; esac
 }
 train_of() {  # domain -> training set (same table as ds_of below)
   case "$1" in math) echo dapo_math ;; code) echo taco_verified ;; knowledge) echo triviaqa_train ;;
     instruction_following) echo ifeval_train ;; tool_calling) echo sealtool_train ;; esac
 }
-any_domain() {  # training set or eval set -> its domain
-  case "$1" in dapo_math) echo math ;; taco_verified) echo code ;; triviaqa_train) echo knowledge ;;
+any_domain() {  # training set, simple set or eval set -> its domain
+  case "$1" in simple_*_train|simple_*_eval) s="${1#simple_}"; s="${s%_train}"; echo "${s%_eval}" ;; dapo_math) echo math ;; taco_verified) echo code ;; triviaqa_train) echo knowledge ;;
     ifeval_train) echo instruction_following ;; sealtool_train) echo tool_calling ;; *) set_domain "$1" ;; esac
 }
 
@@ -172,9 +185,11 @@ if [ -n "$TRAIN_SET$GATE_SET$EVAL_ON" ]; then
   NEW=()
   for r in "${RUNS[@]}"; do
     set -- $r; p=$1; d=$2; rid=$3; e=$4
-    dflt="$e"; [ "$e" = - ] && dflt="$(train_of "$d")"
     for pair in "train:$TRAIN_SET" "gate:$GATE_SET"; do
       role="${pair%%:*}"; v="$(norm_set "${pair#*:}")"; [ -n "$v" ] || continue
+      case "$v" in simple_train|simple_eval) v="simple_${d}_${v#simple_}" ;; esac
+      dflt="$e"; [ "$e" = - ] && dflt="$(train_of "$d")"
+      [ "$SIMPLE" -eq 1 ] && { if [ "$role" = train ]; then dflt="simple_${d}_train"; else dflt="simple_${d}_eval"; fi; }
       vd="$(any_domain "$v")"
       [ -n "$vd" ] || { echo "ERROR: --$role-set: unknown dataset $v (see --help)" >&2; exit 2; }
       [ "$vd" = "$d" ] || { echo "ERROR: --$role-set $v is a $vd dataset but run $rid is $d" >&2; exit 2; }
@@ -242,7 +257,8 @@ if [ "$SKIP" -eq 0 ]; then
   fi
   CHECK_DOMS="$DOMS"; [ "$WITH_ALL" -eq 1 ] && CHECK_DOMS="$ALL_DOMAINS"
   ESETS="$(for r in "${RUNS[@]}"; do set -- $r; [ "$4" != - ] && echo "$4"; done
-            for v in "$TRAIN_SET" "$GATE_SET"; do v="$(norm_set "$v")"; [ -n "$v" ] && [ -n "$(set_domain "$v")" ] && echo "$v"; done)"
+            for v in "$TRAIN_SET" "$GATE_SET"; do v="$(norm_set "$v")"; [ -n "$v" ] && [ -n "$(set_domain "$v")" ] && echo "$v"; done
+            true)"
   if [ -n "$ESETS" ]; then   # the eval sets' source data (the K_eval copy is built on demand)
     for e in $(echo "$ESETS" | sort -u); do
       for ds in $(set_sources "$e"); do
@@ -251,7 +267,12 @@ if [ "$SKIP" -eq 0 ]; then
       done
     done
   fi
-  if [ "$EVALFIT" -eq 0 ]; then
+  if [ "$SIMPLE" -eq 1 ]; then
+    for d in $CHECK_DOMS; do
+      if [ -s "simple_data/$d/train.jsonl" ] && [ -s "simple_data/$d/eval.jsonl" ]; then ok "simple_data/$d (1,500 train / 500 gate)"
+      else bad "simple_data/$d missing ($PY -I data/scripts/make_simple_data.py --only $d)"; fi
+    done
+  elif [ "$EVALFIT" -eq 0 ]; then
     for d in $CHECK_DOMS; do
       ds="$(ds_of "$d")"
       if [ -s "data/processed/$ds.jsonl" ] && [ -s "data/splits/$ds/pool.json" ]; then ok "data $ds"

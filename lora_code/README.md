@@ -51,6 +51,10 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 - train / gate 必须属于这次运行的 `--domain`；用评测集当 train / gate 需要 `scope: single`。和默认不同的角色写进运行名，例如 `B_math_s42_single_gate-math500`、`B_math_s42_single_train-math500`。
 - 例子：`--set data_roles.gate=math500 --set data_roles.eval=math500`（在 dapo_math 上改、在全部 MATH-500 上验收、只报 MATH-500）；`--set data_roles.train=math500 --set data_roles.gate=dapo_math`（看着 MATH-500 改、用 dapo_math 的固定验收集把关）。
 
+### `simple`（2026-11-21，`--set objective=simple` / `./launch.sh --simple`）
+
+用 `simple_data/<领域>/`（`data/scripts/make_simple_data.py`，从去污染、去重后的训练集池子里抽）：训练 = 那 1,500 道（改造者的 `train_example` / `acts` / `train_loss` 看到全部 1,500 道和标准答案；快速筛、完整评测都用全部 1,500 道，不抽题），验收 = 那 500 道（照常的配对验收：与当前模型 M_t 比，`gate.min_gain` 且 95% CI 下界 > 0；只送快速筛上提升 > 0 的候选），**留出评测也是那 500 道**（`data_roles.eval: gate`，贪心，`heldout.decoding: null`）；改造者每个候选最多 20 轮工具调用（`editor.tool_rounds: 20`，上下文 `editor.context_tokens` 131072），没有保留探针和 E_t。五个领域都可以用，数据集名 `simple_<领域>_train / simple_<领域>_eval`；运行名带 `_simple`。各领域合并后的配置见 `plan/configs/B_<领域>_simple.yaml`。服务器上需要先有 `simple_data/<领域>/train.jsonl`、`eval.jsonl`。
+
 ## 单领域实验（`scope`）
 
 **默认 `scope: single`（2026-11-19 起）**：只用这次运行的 `--domain`，训练、验收、评测都只在这个领域上做，不考虑别的领域。
@@ -94,7 +98,7 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 
 测出来的值在 `baseline/gate_scores.json`（`noise_band`、`noise_source`）里，下次可以直接填进 `noise_fixed`。
 
-**解码（2026-11-20）**：搜索、验收、噪声都用贪心（temperature 0、每题 1 个回答、关闭思考），保证结果确定、可以逐题配对；留出评测用采样，按 Qwen 非思考模式的推荐（temperature 0.7、top_p 0.8、top_k 20，种子 42），每题采 n 个取平均（avg@n：AIME 24/25、AMC23 各 8 个，MATH-500、GPQA-Diamond 各 4 个，其余 1 个；`heldout.decoding`，null = 用 tasks.yaml 的贪心）。噪声重评用贪心时结果完全一样，所以不重跑，噪声带 = 0。训练答案（只在 edit 第 0 代）用同一组采样参数（0.7 / 0.8 / top_k 20），每题采 4 个，取第一个判对的，4 个都错就跳过这道题。只有改造者写程序时用自己的采样参数（`editor.temperature` 0.6）。最大生成长度按任务，在运行配置的 `max_tokens` 里设（覆盖 `eval/configs/tasks.yaml`，对这次运行的所有模型调用生效）：math 4096、code 4096、指令遵循 2048、工具调用 1024、知识（triviaqa_train）1024 token，例如 `--set max_tokens.dapo_math=2048`。训练序列长度 `train.max_len` = 4608（回答最多 4096 + 题目留 512），KL 文本里 M_0 回答的长度见 Paper A 的 `kl.self_generated_max_tokens`。
+**解码（2026-11-20）**：搜索、验收、噪声都用贪心（temperature 0、每题 1 个回答、关闭思考），保证结果确定、可以逐题配对；留出评测用采样，按 Qwen 非思考模式的推荐（temperature 0.7、top_p 0.8、top_k 20，种子 42），每题采 n 个取平均（avg@n：AIME 24/25、AMC23 各 8 个，MATH-500、GPQA-Diamond 各 4 个，其余 1 个；`heldout.decoding`，null = 用 tasks.yaml 的贪心）。噪声重评用贪心时结果完全一样，所以不重跑，噪声带 = 0。训练答案（只在 edit 第 0 代）用同一组采样参数（0.7 / 0.8 / top_k 20），每题采 4 个，取第一个判对的，4 个都错就跳过这道题。只有改造者写程序时用自己的采样参数（thinking 模式：`editor.temperature` 0.6、top_p 0.95、top_k 20）。最大生成长度按任务，在运行配置的 `max_tokens` 里设（覆盖 `eval/configs/tasks.yaml`，对这次运行的所有模型调用生效）：math 4096、code 4096、指令遵循 2048、工具调用 1024、知识（triviaqa_train）1024 token，例如 `--set max_tokens.dapo_math=2048`。训练序列长度 `train.max_len` = 4608（回答最多 4096 + 题目留 512），KL 文本里 M_0 回答的长度见 Paper A 的 `kl.self_generated_max_tokens`。
 
 ## 启动
 
@@ -161,6 +165,17 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 - `regmean_preserve` 的保留集 Gram 矩阵由可信运行时用保留领域的 `kl` 题面算出，改造者只拿到结果 LoRA。
 - 预算：evaluate（相同 LoRA 只计一次）、gpu_seconds（`acts` / `regmean_preserve`，实测；mock 中估计）。
 
+## 改造者：thinking + 工具轮次（2026-11-21）
+
+改造者（主搜索和 E_t 都一样）写每个候选时开 Qwen3 thinking（`editor.extra_body: {chat_template_kwargs: {enable_thinking: true}, top_k: 20, min_p: 0.0}`，temperature 0.6、top_p 0.95），并且可以先调用函数再交程序：
+- 一轮 = 模型的一次回复里带了函数调用（同一回复里的多个调用算一轮）。最多 `editor.tool_rounds` = 50 轮，之后强制一次不带工具的最终回复（tool_choice none）。回复里**不带函数调用**、含一个 ```python 块，就是这次的程序。空回复、写到长度上限、把调用写成文本时最多提醒 2 次；最后还没有程序就用循环里写过的最后一个代码块（`stop: fallback`）。
+- 两个函数：`run_python(code)` 在同一个沙盒里跑探索代码，`api` 是 `Workspace.explore_api`：和程序的工具一样，但没有 `evaluate`、`raw_lora`（句柄 `RAW` 照样能用），默认也没有 GPU 工具 `acts` / `train_loss` / `regmean_preserve`（`editor.explore.gpu_tools: true` 时可用，记在单独的探索预算 `explore.gpu_seconds` 上）。探索**不花本代的 evaluate / gpu_seconds 预算**，句柄每次调用后释放，工具记录在 `<cid>~xRR_i` 下（不影响 `classify`），完整输出在 `gen_XX/explore/<cid>/rRR_i/`。`read_record(cid, part)` 读本步候选表里某个候选的完整程序或反馈。
+- 上限（都可配置，`editor:` 块）：`tool_rounds` 50、`max_tool_calls` 100、`turn_max_tokens` 8192（每个工具轮）、`max_tokens` 16384（最终轮，原来 8192）、`proposal_tokens` 160000、`proposal_wall_s` 2400、`tool_result_chars` 6000、`history_keep` 2，压缩 `compact_at` / `keep_tool_rounds` / `keep_reasoning_rounds` = 0.6 / 8 / 2，探索沙盒 `explore.timeout_s` 300、`mem_gb` 8。
+- **上下文长度只看 `editor.context_tokens`**：客户端用它截每轮 max_tokens、决定何时压缩，同时写成 main 副本（改造者就在上面；weights 模式下候选槽的临时服务器也一样，保证所有打分服务器上下文相同）的 `--max-model-len`，覆盖 `server.main_args` 里写的值（`lora_code.common.main_server_args`）。b300 / h20 = 131072，h20_80 = 49152；theta0 服务器不变（20480）。设成 null 就按 `main_args` 原样。真实服务器上若模型的 `max_position_embeddings` 更小，`rsicore.servers` 会截到它并警告，不加 YaRN。
+- `--set editor.tool_rounds=0`：回到每个候选一次请求，请求里没有 tools，system prompt 和以前逐字相同。
+- mock：改造者先调用 `editor.mock_tool_rounds` = 1 次 `run_python("print(api.budget())")`，再给出和不用工具时完全相同的程序。
+- 改了 `editor` / `server` 键，旧运行的 paper_cfg 锁会拒绝续跑，要用新的运行名。
+
 ## LoRA 格式（vLLM 0.24.0）
 
 - 键名用未打包的 HF 名：`base_model.model.model.language_model.layers.<i>.<self_attn|linear_attn|mlp>.<leaf>.lora_{A,B}.weight`；vLLM 自己打包成 `qkv_proj`、`gate_up_proj`、`in_proj_qkvz`、`in_proj_ba`，并用 `hf_to_vllm_mapper` 映射 `model.language_model.` 前缀。
@@ -197,7 +212,7 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 
 手动指定：`--set 'gpu_roles.train=[2,3]'`（--gpus 里的下标）把这个角色固定下来，其余角色在剩下的卡上自动分。B300 上 theta0 和 train 共用一张卡（显存比例 0.45）。
 
-H20 档（按每张卡 110 GB 规划，卡约 140 GB）另外：vLLM 显存用 `--rsi-gpu-memory-gib 110`（启动时换算成显存比例），`--max-num-seqs 128`、上下文 20480、8 个 LoRA 槽；训练 `train.micro_batch: 2`【试点值】（每次前向 2 条序列，梯度累积，结果等于整批的平均损失）。原模型服务和训练模型放不进同一张 110 GB 的卡，所以五领域（有 E_t）时原模型单独一张。80 GB 的卡用 `h20_80`（0.92、32 条序列、4 个 LoRA 槽、每次 1 条）。
+H20 档（按每张卡 110 GB 规划，卡约 140 GB）另外：vLLM 显存用 `--rsi-gpu-memory-gib 110`（启动时换算成显存比例），`--max-num-seqs 128`、上下文 main 131072（`editor.context_tokens`）/ theta0 20480、8 个 LoRA 槽；训练 `train.micro_batch: 2`【试点值】（每次前向 2 条序列，梯度累积，结果等于整批的平均损失）。原模型服务和训练模型放不进同一张 110 GB 的卡，所以五领域（有 E_t）时原模型单独一张。80 GB 的卡用 `h20_80`（0.92、32 条序列、4 个 LoRA 槽、每次 1 条，main 上下文 49152）。
 
 ## 只能在 GPU 上验证的部分（本机未实跑）
 

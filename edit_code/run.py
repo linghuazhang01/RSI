@@ -39,7 +39,8 @@ from rsicore import config as C  # noqa: E402
 from rsicore import draws as D  # noqa: E402
 from rsicore import records as R  # noqa: E402
 from rsicore import search as S  # noqa: E402
-from rsicore.editor import Editor  # noqa: E402
+from rsicore.chat_tools import RUN_PYTHON_DOC, ChatTools, chat_tools_kwargs, with_mock_exploration  # noqa: E402
+from rsicore.editor import Editor, apply_context_tokens, editor_kwargs, editor_settings  # noqa: E402
 from rsicore.evaluate import score, score_split  # noqa: E402
 from rsicore.gate import fixed_noise_band, measure_noise_band, noise_ids  # noqa: E402
 from rsicore.heldout import HELDOUT, heldout_domains, run_heldout  # noqa: E402
@@ -57,6 +58,15 @@ from edit_code.quant import schema, sizes  # noqa: E402
 from edit_code.tools import make_tool_api  # noqa: E402
 
 ALL_DOMAINS = ["math", "code", "knowledge", "instruction_following", "tool_calling"]
+MOCK_EXPLORE_CODE = "result = api.profile_summary()"     # the mock editor's run_python call (editor.mock_tool_rounds)
+
+
+def server_args(cfg: dict, args_key: str) -> list[str]:
+    """vLLM args of a real server: vllm.<args_key>. The editor's server (editor_args) gets
+    --max-model-len = editor.context_tokens (it overrides a --max-model-len written in editor_args; null keeps
+    editor_args as written). Candidate servers (candidate_args) keep their own --max-model-len."""
+    args = list((cfg.get("vllm") or {}).get(args_key) or [])
+    return apply_context_tokens(args, cfg) if args_key == "editor_args" else args
 
 
 class LazyServer:
@@ -181,6 +191,7 @@ class Runner:
         self.editor_sleep = bool(lay.get("editor_sleep", True)) and own
         self.m0_replicas = bool(lay.get("m0_replicas", True)) and own
         self.parallel_heldout = bool(lay.get("parallel_heldout", True))
+        self.heldout_enabled = bool(cfg["heldout"].get("enabled", True))
         self.prep_all_gpus = bool(lay.get("prep_all_gpus", True)) and own
         # every GPU group of the run: the editor's + one per candidate slot
         self.all_groups = ([list(self.gpu_editor)] if own else []) + [list(s) for s in self.cand_slots]
@@ -225,7 +236,7 @@ class Runner:
             extra = ["--tasks", ",".join(tasks)] if tasks else []
             path = "mock-" + name
         else:
-            extra = list(self.cfg["vllm"].get(args_key, []))
+            extra = server_args(self.cfg, args_key)
             path = model_dir
         return LazyServer(model_path=path, served_name=name, gpu_ids=list(gpus), mock=self.rc.mock,
                           mock_registry=self.registry, seed=self.rc.seed, log_dir=self.run_dir / "logs", extra_args=extra,
@@ -334,14 +345,18 @@ class Runner:
         per_prog = int(scfg.get("program_evaluate_calls", 2))
         doc_api = make_tool_api(prob, cfg, cid="doc", per_program_evaluate=per_prog)
         sys_prompt = system_prompt(prob, doc_api.describe(), cfg)
-        ecfg = cfg["editor"]
+        es = editor_settings(cfg)
+        ekw = editor_kwargs(cfg, server_args=server_args(cfg, "editor_args"))
+        tools = self.chat_tools(prob) if es["tool_rounds"] > 0 else None
+        policy = None
+        if rc.mock:                          # the mock editor explores only when the editor has tools
+            policy = with_mock_exploration(M.mock_policy, es["mock_tool_rounds"] if tools else 0, MOCK_EXPLORE_CODE)
 
         def editor_factory(th):
             srv = None if rc.mock else ed.get()
             return Editor(srv.endpoint if srv else "http://mock.invalid/v1", ed.name, system_prompt=sys_prompt,
                           seed=rc.seed + 1000 * prob.gen + th, transcript=gdir / "editor" / f"thread_{th}.jsonl",
-                          temperature=ecfg["temperature"], top_p=ecfg["top_p"], max_tokens=ecfg["max_tokens"],
-                          mock_policy=M.mock_policy if rc.mock else None, extra_body=ecfg.get("extra_body"))
+                          mock_policy=policy, tools=tools, **ekw)
 
         def build_fn(program, cid):
             if prob.evals_left <= 0:
@@ -376,6 +391,22 @@ class Runner:
         render = make_render_context(prob, cfg, task=task, archive=archive)
         return dict(editor_factory=editor_factory, render_context=render, build_fn=build_fn, screen_fn=screen_fn,
                     full_fn=full_fn)
+
+    def chat_tools(self, prob: QuantProblem) -> ChatTools:
+        """The editor's chat tools (editor.tool_rounds > 0): run_python with the exploration API
+        (make_tool_api(explore=True): no evaluate; group_error on cached settings only unless
+        editor.explore.gpu_tools) and read_record. Each run_python call gets a fresh API (thread-safe: the
+        editor threads propose at the same time); exploration never spends the generation's evaluate budget."""
+        cfg = self.cfg
+
+        def explore_api(tag, ctx):
+            return make_tool_api(prob, cfg, cid=tag, per_program_evaluate=0, explore=True)
+        names = explore_api("doc~x", {}).names()
+        doc = RUN_PYTHON_DOC + f" Tools on `api` here: {', '.join(names)}."
+        if "group_error" in names and not editor_settings(cfg)["explore"].get("gpu_tools"):
+            doc += (" group_error here only accepts settings whose error is cached (those of hessian_table); "
+                    "other settings raise an error.")
+        return ChatTools(explore_api, run_python_doc=doc, **chat_tools_kwargs(cfg))
 
     def run_search(self, prob, gen, gdir, ed, *, task, archive, scfg) -> list:
         """The search ends with the editor asleep and its GPU lent to `prob` as a candidate slot (editor_sleep):
@@ -422,7 +453,7 @@ class Runner:
                 if todo:
                     write_json(bdir / "noise.json", self.noise_band(m0, bdir))
             with st.step("baseline/heldout") as todo:
-                if todo:
+                if todo and self.heldout_enabled:   # heldout.enabled false (objective simple): no held-out report
                     h = self.heldout_on(reps, bdir / "heldout")
                     write_json(bdir / "heldout.json", h)
             kl0 = self.kl_texts(0, m0)       # calibration / KL texts (prompt + M_0 response with kl.self_generated)
@@ -450,7 +481,7 @@ class Runner:
                 write_json(bdir / "incumbent.json", inc)
                 self.log(f"[baseline] budget {budget:.3f} GiB; Q_0 (reference) gate scores {inc['gate_scores']}")
         with st.step("baseline/q0_heldout") as todo:
-            if todo:
+            if todo and self.heldout_enabled:
                 h = self.model_heldout(bdir / "q0" / "model", f"{rc.run_id}-q0", bdir / "q0" / "heldout")
                 write_json(bdir / "q0" / "heldout.json", h)
         if cfg["e_task"].get("enabled", False):
@@ -663,7 +694,7 @@ class Runner:
                     self.export(prob, art, gd / "model")
                     shutil.rmtree(gd / "ckpt", ignore_errors=True)
             with st.step(f"{p}/heldout") as todo:
-                if todo:                        # the editor is closed: every GPU group is free
+                if todo and self.heldout_enabled:   # the editor is closed: every GPU group is free
                     h = self.model_heldout(gd / "model", f"{rc.run_id}-q{g:02d}", gd / "heldout")
                     write_json(gd / "heldout.json", h)
             self.log(f"[gen {g}] new incumbent {new['cid']}: gate {new['gate_scores']}")

@@ -31,8 +31,8 @@ from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / "eval")]
 
 from lora_code.common import (DOMAIN_DATASET, DOMAINS, deep_merge, gate_policy, gold_target,  # noqa: E402
-                              gpu_layout, load_records, main_groups, method_mode, prompt_text, read_json,
-                              render_messages, retention_domains, role_gpus, write_json)
+                              gpu_layout, load_records, main_groups, main_server_args, method_mode, prompt_text,
+                              read_json, render_messages, retention_domains, role_gpus, write_json)
 
 
 # ============================================================================ servers
@@ -78,7 +78,7 @@ class Servers:
         if self.rc.mock:   # mock_server.py takes none of vLLM's flags
             extra = ["--tasks", ",".join(sc["mock_tasks"])] if sc.get("mock_tasks") else []
         else:
-            extra = list(sc.get("main_args" if slot == "main" else "theta0_args", []) or [])
+            extra = main_server_args(self.cfg) if slot == "main" else list(sc.get("theta0_args", []) or [])
         srvs = [VLLMServer(model_path, served, g, enable_lora=True, max_loras=int(sc.get("max_loras", 8)),
                            max_lora_rank=int(self.cfg.get("lora", {}).get("rank_cap", 64)), extra_args=extra,
                            mock=self.rc.mock, mock_registry=self.rc.run_dir / "mock_registry.json", seed=self.rc.seed,
@@ -94,8 +94,7 @@ class Servers:
         from rsicore.servers import VLLMServer, start_all
         if not self.slot_groups:
             return []
-        sc = self.cfg.get("server", {})
-        extra = [] if self.rc.mock else list(sc.get("main_args", []) or [])
+        extra = [] if self.rc.mock else main_server_args(self.cfg)
         srvs = [VLLMServer(model_path, served, g, extra_args=extra, mock=self.rc.mock,
                            mock_registry=self.rc.run_dir / "mock_registry.json", seed=self.rc.seed,
                            log_dir=self.rc.run_dir / "logs") for g in self.slot_groups]
@@ -174,7 +173,7 @@ class WeightSlots:
             with self.export_lock:              # one export at a time (train GPU + disk)
                 edit_into_model(WeightEdit.load_raw(path), self.parent, mdir, store=self.store,
                                 base_store=run.store(Path(run.rc.model_path)), device=run.train_device())
-            srv = VLLMServer(mdir, name, g, extra_args=list(run.cfg.get("server", {}).get("main_args", []) or []),
+            srv = VLLMServer(mdir, name, g, extra_args=main_server_args(run.cfg),
                              seed=run.rc.seed, log_dir=run.rc.run_dir / "logs")
             srv.start()
             try:
@@ -995,13 +994,13 @@ class Run:
 
     # ------------------------------------------------------------------ search
     def search(self, g, gd, ctx_objects, diag, budget, raw=None):
-        from rsicore.editor import Editor
+        from rsicore.editor import Editor, editor_kwargs
         from rsicore.search import inner_search
 
         from lora_code import diagnostics as D
         from lora_code import mock as M
         from lora_code.prompts import ContextRenderer, system_prompt, task_text
-        from lora_code.tools import program_build
+        from lora_code.tools import editor_chat_tools, editor_mock_policy, program_build
         rc, cfg = self.rc, self.cfg
         ev, ws = ctx_objects()
         sc = cfg.get("search", {})
@@ -1021,12 +1020,14 @@ class Run:
         editor = self.editor_name(g)   # M_g: in mode=edit the current LoRA's adapter on the M_0 server (pinned)
         policy = (M.make_mock_policy(rc.seed, skill=self.quality(editor) or 0.7, tag=f"g{g}", mode=self.mode,
                                      retention=has_ret) if rc.mock else None)
+        # 2026-11-21: Qwen3 thinking + the tool loop (editor.tool_rounds; 0 = one call per candidate) with run_python
+        # on the workspace's exploration api (no evaluate / raw_lora / GPU tools, no budget spent) and read_record
+        policy, tools = editor_mock_policy(policy, cfg), editor_chat_tools(ws, cfg)
+        ekw = editor_kwargs(cfg, server_args=main_server_args(cfg))
 
         def editor_factory(th):
             return Editor(ev.endpoints[th % len(ev.endpoints)], editor, system_prompt=sysmsg, seed=rc.seed + 1000 * g + th,
-                          transcript=gd / "editor" / f"thread_{th}.jsonl", mock_policy=policy,
-                          temperature=float(cfg.get("editor", {}).get("temperature", 0.6)),
-                          max_tokens=int(cfg.get("editor", {}).get("max_tokens", 8192)))
+                          transcript=gd / "editor" / f"thread_{th}.jsonl", mock_policy=policy, tools=tools, **ekw)
 
         sb = cfg.get("sandbox", {})
 

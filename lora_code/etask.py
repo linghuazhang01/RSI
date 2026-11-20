@@ -15,7 +15,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
-from .common import pool_ids, read_json, write_json
+from .common import main_server_args, pool_ids, read_json, write_json
 
 E_TASKS = {
     "tool_calling": {"dataset": "sealtool_train", "domain": "tool_calling", "test": ["sealtool", "bfcl"]},
@@ -79,13 +79,13 @@ def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str
               raw=None) -> dict:
     """One E_t measurement. `theta0` = dict(endpoint, served, server, store, hf, quality);
     make_workspace(out_dir, evaluator, budget, prefix) builds the θ0 workspace. Returns the result dict."""
-    from rsicore.editor import Editor
+    from rsicore.editor import Editor, editor_kwargs
     from rsicore.search import inner_search
 
     from . import mock as M
     from .evaluator import Evaluator
     from .prompts import ContextRenderer, system_prompt, task_text
-    from .tools import program_build
+    from .tools import editor_chat_tools, editor_mock_policy, program_build
 
     out_dir = Path(out_dir)
     res_path = out_dir / "result.json"
@@ -119,11 +119,13 @@ def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str
     policy = M.make_mock_policy(seed, skill=editor_skill if editor_skill is not None else 0.7,
                                 tag=f"E{branch}", mode=mode, retention=bool(ws.retention_texts)) if rc.mock else None
 
+    # 2026-11-21: thinking + tool loop as in the main search, run_python on the E task workspace's exploration api
+    policy, tools = editor_mock_policy(policy, cfg), editor_chat_tools(ws, cfg)
+    ekw = editor_kwargs(cfg, server_args=main_server_args(cfg))   # the editor runs on the main server
+
     def editor_factory(th):
         return Editor(editor_endpoint, editor_served, system_prompt=sysmsg, seed=seed + th,
-                      transcript=out_dir / "editor" / f"thread_{th}.jsonl", mock_policy=policy,
-                      temperature=float(cfg.get("editor", {}).get("temperature", 0.6)),
-                      max_tokens=int(cfg.get("editor", {}).get("max_tokens", 8192)))
+                      transcript=out_dir / "editor" / f"thread_{th}.jsonl", mock_policy=policy, tools=tools, **ekw)
 
     sb = cfg.get("sandbox", {})
 

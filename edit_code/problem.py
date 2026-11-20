@@ -236,6 +236,22 @@ class QuantProblem:
                 write_json(self.prep_dir / "diagnostics" / "herr_cache.json", self._herr_store())
                 self._herr_dirty = False
 
+    def herr_missing(self, config_or_norm) -> list[str]:
+        """Module settings ("module|quantizer|bits|gs") of a config whose Hessian-weighted error is not in the
+        herr cache yet (group_error would compute them: lazy quantization, GPU). bits 16 is never missing.
+        Used by the editor's exploration API (tools.make_tool_api(explore=True))."""
+        norm = self.normalize(config_or_norm) if "default" in config_or_norm else config_or_norm
+        groups = self.spec.groups()
+        out = []
+        with self._herr_lock:
+            store = self._herr_store()
+            for key, s in norm["groups"].items():
+                b, q, gs = int(s["bits"]), s.get("quantizer", "rtn"), int(s.get("group_size") or 128)
+                if b >= 16:
+                    continue
+                out.extend(k for k in (f"{m.name}|{q}|{b}|{gs}" for m in groups[key]) if k not in store)
+        return out
+
     def group_error(self, config_or_norm, top: int | None = None) -> dict:
         """Hessian-weighted output error of every linear module group under a config (no forward pass):
         {"groups": {key: {"setting", "herr_per_token", "herr_rel", "share"}}, "total_per_token", "top"}.

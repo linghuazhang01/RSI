@@ -110,6 +110,22 @@ eval_targets:
   sealtool: [[sealtool, test]]
   apibank: [[apibank, test]]
   bfcl: [[bfcl, test]]
+  # Fixed sets from simple_data/ (2026-11-21, data/scripts/make_simple_data.py): per domain 1,500 train + 500 eval
+  # items sampled from the decontaminated, de-duplicated training pool, graded like the domain's training set.
+  # Form {task, file, dataset}: the items of `file` become dataset / task `dataset` (pool `pool`). objective simple
+  # uses simple_<domain>_train as the train role and simple_<domain>_eval as the gate role.
+  simple_math_train: {task: dapo_math, file: simple_data/math/train.jsonl, dataset: simple_math_train}
+  simple_math_eval: {task: dapo_math, file: simple_data/math/eval.jsonl, dataset: simple_math_eval}
+  simple_code_train: {task: taco_verified, file: simple_data/code/train.jsonl, dataset: simple_code_train}
+  simple_code_eval: {task: taco_verified, file: simple_data/code/eval.jsonl, dataset: simple_code_eval}
+  simple_knowledge_train: {task: triviaqa_train, file: simple_data/knowledge/train.jsonl, dataset: simple_knowledge_train}
+  simple_knowledge_eval: {task: triviaqa_train, file: simple_data/knowledge/eval.jsonl, dataset: simple_knowledge_eval}
+  simple_instruction_following_train: {task: ifeval_train, file: simple_data/instruction_following/train.jsonl,
+                                       dataset: simple_instruction_following_train}
+  simple_instruction_following_eval: {task: ifeval_train, file: simple_data/instruction_following/eval.jsonl,
+                                      dataset: simple_instruction_following_eval}
+  simple_tool_calling_train: {task: sealtool_train, file: simple_data/tool_calling/train.jsonl, dataset: simple_tool_calling_train}
+  simple_tool_calling_eval: {task: sealtool_train, file: simple_data/tool_calling/eval.jsonl, dataset: simple_tool_calling_eval}
 # eval_target.dataset null -> the domain's default
 eval_target_defaults: {math: math, code: humanevalplus, knowledge: gpqa_diamond, instruction_following: ifeval,
                        tool_calling: sealtool}

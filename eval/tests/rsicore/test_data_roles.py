@@ -70,6 +70,26 @@ class DataRolesTest(unittest.TestCase):
         self.assertFalse((rc.run_dir / "draws").exists())                   # nothing drawn at all
         self.assertTrue(draws.is_eval_set("math_eval") and not draws.is_eval_set("dapo_math"))
 
+    def test_simple_objective(self):
+        """objective simple: simple_data's 1,500 train / 500 gate items per domain; the held-out report is the same 500
+        (data_roles.eval = gate, greedy); editor at most 20 tool rounds."""
+        for paper in ("A", "B"):
+            for d in ("math", "code", "knowledge", "instruction_following", "tool_calling"):
+                rc = self.load(paper, d, "objective=simple")
+                r = draws.roles(rc)
+                self.assertEqual(r, {"train": f"simple_{d}_train", "gate": f"simple_{d}_eval"})
+                self.assertTrue(rc.run_id.endswith("_single_simple_mock"), rc.run_id)
+                self.assertTrue(rc.paper_cfg["heldout"]["enabled"])
+                self.assertIsNone(rc.paper_cfg["heldout"]["decoding"])
+                self.assertEqual(heldout_tasks(heldout_domains(rc.paper_cfg)), [(f"simple_{d}_eval", "pool")])
+                self.assertEqual(rc.paper_cfg["editor"]["tool_rounds"], 20)
+                self.assertEqual(len(draws.ids(rc, 2, r["train"], "screen")), 1500)
+                self.assertEqual(len(draws.gate_ids(rc, r["gate"])), 500)
+                self.assertTrue(set(draws.ids(rc, 2, r["train"], "train")).isdisjoint(draws.gate_ids(rc, r["gate"])))
+        rc = self.load("B", "math", "objective=simple", "data_roles.gate=simple_train")      # shorthand
+        self.assertEqual(draws.roles(rc)["gate"], "simple_math_train")
+        self.assertTrue(rc.run_id.endswith("_simple_gate-simple_math_train_mock"), rc.run_id)
+
     def test_refusals(self):
         bad = [("A", "math", "data_roles.train=humanevalplus"),           # other domain
                ("B", "math", "data_roles.gate=nope"),                      # unknown

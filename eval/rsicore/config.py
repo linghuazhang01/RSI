@@ -134,7 +134,7 @@ def _apply_scope(cfg: dict, sets, domain: str) -> dict:
 
 def _apply_objective(cfg: dict, sets) -> dict:
     """objective: train_gate (default: train / signal / gate split) | eval_overfit (2026-11-20: optimise directly on
-    the eval sets, objective_profiles.eval_overfit)."""
+    the eval sets, objective_profiles.eval_overfit) | simple (2026-11-21: simple_data's 1,500 train / 500 gate items)."""
     return _apply_profile(cfg, sets, "objective", "train_gate")
 
 
@@ -303,7 +303,7 @@ def load_run_config(paper: str, args) -> RunConfig:
     seed_differs = int(_load_yaml(base_draw).get("seed", args.seed)) != int(args.seed)
     sized = kl_doms is not None or seed_differs or any(v is not None for v in (cfg.get("data") or {}).values())
     single = cfg.get("scope") == "single" and args.domain != "all"
-    evalfit = ""
+    evalfit = "_simple" if cfg.get("objective") == "simple" else ""
     if cfg.get("objective") == "eval_overfit":
         from . import evalsets
         evalfit = evalsets.run_suffix(evalsets.key_of((cfg.get("eval_target") or {}).get("dataset") or "") or "math")

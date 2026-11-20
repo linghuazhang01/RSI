@@ -58,6 +58,15 @@ objective_profiles:
     gate: {min_delta: 1.0e-6, require_significant: false}        # accept any strictly higher eval-set score
     feedback: {examples: 5}
     heldout: {domains: eval_target, decoding: null}   # evaluated on the same eval set, greedy (2026-11-21)
+  # simple (2026-11-21; ./launch.sh --simple): simple_data/<domain> (data/scripts/make_simple_data.py, sampled from the
+  # decontaminated training pool): train on its 1,500 items (signal / screen = all of them every generation, KL /
+  # calibration texts = 400 of them), accept on its 500 (the usual paired gate), and the held-out report is the same
+  # 500 items (data_roles.eval = gate, greedy like the gate). The editor gets at most 20 tool rounds per candidate
+  # (context editor.context_tokens = 131072 from the hardware profile). Run ids end in _simple.
+  simple:
+    data_roles: {eval: gate}          # held-out evaluation = simple_<domain>_eval (the 500 gate items)
+    heldout: {enabled: true, decoding: null}   # greedy (each task's tasks.yaml decoding)
+    editor: {tool_rounds: 20}
 
 # One fixed size for every generation. Every candidate quantizes the ORIGINAL BF16 model M_0 (the layer
 # cache is built once); generation g must beat the incumbent (best accepted quantization so far).
@@ -173,11 +182,42 @@ solver:
   group_sizes: [128]                  # group sizes solve_allocation chooses from by default (KL-greedy baseline)
   group_size_factor: {128: 1.0, 64: 0.8, 32: 0.65}   # damage scaling vs the profiled g128 [pilot]
 
+# The editor (2026-11-21): Qwen3 thinking mode + a tool loop while it writes each candidate (rsicore.editor /
+# rsicore.chat_tools). One round = one model turn with tool calls (run_python: exploratory code with the program's
+# api minus evaluate; read_record: an earlier candidate's full program / feedback). After tool_rounds rounds (or a
+# guard) one forced final turn with tool_choice "none"; the proposal is the reply without tool calls that holds a
+# ```python block. tool_rounds 0 = the single call of before (same payload and prompt text; history_keep is then
+# ignored = full history). Exploration never
+# spends the generation's evaluate budget. Changing any key here changes the locked config: use a new --run-id.
 editor:
-  temperature: 0.6
+  temperature: 0.6                    # Qwen3 thinking-mode sampling: 0.6 / 0.95 / top_k 20 / min_p 0
   top_p: 0.95
-  max_tokens: 16384
-  extra_body: {}
+  max_tokens: 16384                   # final turn (thinking + answer)
+  extra_body: {chat_template_kwargs: {enable_thinking: true}, top_k: 20, min_p: 0.0}   # {} = the template default
+  tool_rounds: 50                     # max tool rounds per candidate, then one forced final turn (0 = no tools)
+  turn_max_tokens: 8192               # max_tokens of a tool turn
+  max_tool_calls: 100                 # tool calls per candidate (parallel calls count one each)
+  proposal_tokens: 160000             # completion tokens per candidate (all turns) -> forced final turn
+  proposal_wall_s: 2400               # wall clock per candidate -> forced final turn
+  context_tokens: 131072              # THE context-length knob: client-side clamp of max_tokens / compaction AND
+                                      # --max-model-len of the editor's vLLM server (overrides the one in
+                                      # vllm.editor_args; null = keep editor_args). Candidate servers are unaffected.
+                                      # Set per GPU in hardware_profiles below (h20_80: 49152).
+  tool_result_chars: 6000             # a tool result is cut to this many characters (full output on disk:
+                                      # gen_XX/explore/<cid>/rNN_i/)
+  compact_at: 0.6                     # compact the loop when the prompt passes compact_at x context_tokens:
+  keep_tool_rounds: 8                 #   older tool outputs elided except the last keep_tool_rounds rounds,
+  keep_reasoning_rounds: 2            #   older reasoning dropped except the last keep_reasoning_rounds turns
+  reasoning_passback: think_tag       # in-loop reasoning sent back as <think>..</think> (think_tag | field | drop)
+  history_keep: 2                     # earlier steps kept in full: step 0 + the last 2 (null = all, the old view;
+                                      # tool_rounds 0 always sends all)
+  timeout_s: 3600                     # HTTP timeout per model call
+  mock_tool_rounds: 1                 # --mock: run_python calls of the mock editor before its program
+  explore:                            # run_python
+    timeout_s: 300                    # per call
+    mem_gb: 8
+    gpu_tools: false                  # true: group_error may compute uncached settings (lazy GPTQ / AWQ on the GPU)
+    gpu_seconds: 300                  # (Paper B only; kept for a shared editor block)
 
 sandbox:
   timeout_s: 1800                     # includes time inside api.evaluate calls
@@ -214,8 +254,8 @@ baselines:
   full: false
   evo_evaluations: 24
 
-vllm:
-  editor_args: [--gpu-memory-utilization, "0.90", --max-model-len, "32768", --max-logprobs, "20"]
+vllm:                                 # editor_args' --max-model-len is replaced by editor.context_tokens (see editor:)
+  editor_args: [--gpu-memory-utilization, "0.90", --max-model-len, "131072", --max-logprobs, "20"]
   candidate_args: [--gpu-memory-utilization, "0.55", --max-model-len, "20480", --max-logprobs, "20"]
 
 
@@ -239,30 +279,42 @@ gpu_layout:
   prep_all_gpus: true                 # generation-0 calibration / profile table / cache / hessian table on every GPU
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
-# cards. rsicore.config merges the profile over base/domain config and BEFORE --set (--set wins).
+# cards; the b300 profile plans them at 220 GB (2026-11-21). rsicore.config merges the profile over base/domain
+# config and BEFORE --set (--set wins).
 hardware: b300
 hardware_profiles:
-  b300: {}
+  b300:                               # B300 (~270 GB visible) PLANNED AT 220 GB per card (2026-11-21)
+    vllm:                             # --rsi-gpu-memory-gib 220 -> --gpu-memory-utilization = 220 GB / card total
+      # (rsicore.servers; 0.81 = 220/270 if nvidia-smi is unavailable). 220 - 52 GB weights - ~6 GB runtime leaves
+      # ~160 GB KV: 4 editor threads x 8 GiB at 131072 tokens fit easily. One model per card (>= 2 GPUs); on a
+      # single shared GPU the editor sleeps (weights to CPU) while the candidate server runs.
+      editor_args: [--rsi-gpu-memory-gib, "220", --gpu-memory-utilization, "0.81", --max-model-len, "131072",
+                    --max-num-seqs, "128", --max-logprobs, "20"]
+      candidate_args: [--rsi-gpu-memory-gib, "220", --gpu-memory-utilization, "0.81", --max-model-len, "20480",
+                       --max-num-seqs, "128", --max-logprobs, "20"]
+    editor: {context_tokens: 131072}
   h20:                                # H20 cards (~140 GB) PLANNED AT 110 GB each (2026-11-20); Qwen3.8-27B BF16 ~52 GB:
     gpu_layout: {share_single_gpu: false}   # still one model per card (editor + a candidate = 104 GB, no KV left)
     vllm:                             # --rsi-gpu-memory-gib 110 -> --gpu-memory-utilization = 110 GB / card total
       # (rsicore.servers; 0.78 = 110/140 if nvidia-smi is unavailable). 110 - 52 GB weights - ~6 GB runtime
       # leaves ~50 GB for KV cache + GDN states [estimate: ~64 KB/token on the 16 full-attention layers]
-      editor_args: [--rsi-gpu-memory-gib, "110", --gpu-memory-utilization, "0.78", --max-model-len, "32768",
+      editor_args: [--rsi-gpu-memory-gib, "110", --gpu-memory-utilization, "0.78", --max-model-len, "131072",
                     --max-num-seqs, "128", --max-logprobs, "20"]
       candidate_args: [--rsi-gpu-memory-gib, "110", --gpu-memory-utilization, "0.78", --max-model-len, "20480",
                        --max-num-seqs, "128", --max-logprobs, "20"]
     # calibration: the base 16 layers per pass fits (52 GB HF model + 16 x 1.6 GB fp32 Hessians + activations)
+    editor: {context_tokens: 131072}  # ~50 GB KV >= 4 threads x 8 GiB at 131072 tokens
   h20_80:                             # 80 GB H20 (the earlier plan): one model per card, ~15 GB KV
     gpu_layout: {share_single_gpu: false}
     vllm:
-      editor_args: [--gpu-memory-utilization, "0.92", --max-model-len, "32768", --max-num-seqs, "32", --max-logprobs, "20"]
+      editor_args: [--gpu-memory-utilization, "0.92", --max-model-len, "49152", --max-num-seqs, "32", --max-logprobs, "20"]
       candidate_args: [--gpu-memory-utilization, "0.92", --max-model-len, "20480", --max-num-seqs, "32", --max-logprobs, "20"]
     calibration:
       layers_per_pass: 4              # fp32 Hessians ~1.6 GB/layer next to the 52 GB HF model on the candidate card
       max_len: 2048
     diagnostics:
       profile_contexts: 16
+    editor: {context_tokens: 49152}   # ~15 GB KV: 4 threads x 3 GiB at 49152 tokens (65536 only with <= 3 threads)
 
 mock:
   base_quality: 0.8                   # mock accuracy of M_0
@@ -276,3 +328,4 @@ mock_overrides:                       # applied in --mock runs only (fast local 
   gate: {allow_unscored: true, min_delta: 0.002}
   baselines: {methods: [uniform, kl_greedy]}
   sandbox: {timeout_s: 300, mem_gb: 4}
+  editor: {proposal_wall_s: 600, explore: {timeout_s: 120, mem_gb: 4}}   # (mock_overrides win over --set)

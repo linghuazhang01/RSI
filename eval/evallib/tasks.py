@@ -415,10 +415,12 @@ def eval_target_tasks(cfg: dict) -> dict:
     defines itself (math_eval) are left out."""
     tasks, out = cfg.get("tasks") or {}, {}
     for key, sources in (cfg.get("eval_targets") or {}).items():
-        name = f"{key}_eval"
+        if isinstance(sources, dict):              # {task, file, dataset}: a fixed item file (simple_data)
+            name, src = sources["dataset"], [tasks[sources["task"]]]
+        else:
+            name, src = f"{key}_eval", [tasks[t] for t, _ in sources]
         if name in tasks:
             continue
-        src = [tasks[t] for t, _ in sources]
         if len({s["grader"] for s in src}) != 1:
             raise ValueError(f"eval target {key}: sources must share one grader")
         out[name] = dict(src[0], dataset=name, allowed_pools=["pool"])

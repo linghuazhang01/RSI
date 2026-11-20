@@ -18,6 +18,14 @@ Sleep mode (2026-11-20; sleep_mode=True): `--enable-sleep-mode` and VLLM_SERVER_
 exposes POST /sleep?level=1 (weights offloaded to CPU RAM, KV cache freed) and POST /wake_up. sleep() /
 wake_up() let another vLLM server use the GPU meanwhile (e.g. Paper A's editor while candidates are
 evaluated). Mock: state only. start_all() starts several servers at once (replicas, one per GPU group).
+
+Tool-call parser and context length (2026-11-21): tool_call_parser="auto" (default) reads the model's chat
+template (tokenizer_config.json "chat_template" or chat_template.jinja) and passes `--tool-call-parser
+qwen3_coder` when the template emits "<function=" (Qwen3.5 / Coder XML tool calls), else hermes; a
+--tool-call-parser in extra_args wins. --max-model-len (extra_args, else 40960) is clamped to the model's
+max_position_embeddings (config.json, or its text_config) when that is smaller, with a warning; YaRN is never
+added. Helpers: max_model_len(args), set_max_model_len(args, n), model_max_positions(path),
+detect_tool_call_parser(path). The mock path ignores all of this (and drops --max-model-len from extra_args).
 """
 import os
 import shutil
@@ -46,6 +54,97 @@ def _vllm_cmd() -> list[str]:
 
 
 MEM_FLAG = "--rsi-gpu-memory-gib"
+DEFAULT_MAX_MODEL_LEN = 40960
+
+
+def max_model_len(args, default: int | None = DEFAULT_MAX_MODEL_LEN) -> int | None:
+    """--max-model-len N (or --max-model-len=N) from a vLLM arg list; the last one wins; `default` if absent."""
+    args = [str(a) for a in (args or [])]
+    val = None
+    for i, a in enumerate(args):
+        if a == "--max-model-len" and i + 1 < len(args):
+            val = args[i + 1]
+        elif a.startswith("--max-model-len="):
+            val = a.split("=", 1)[1]
+    if val is None:
+        return default
+    v = str(val).strip().lower()
+    mult = 1
+    if v.endswith("k"):            # vLLM also accepts 32k / 128K
+        v, mult = v[:-1], 1024
+    return int(float(v) * mult)
+
+
+def _drop_max_model_len(args) -> list[str]:
+    out, i = [], 0
+    while i < len(args):
+        a = str(args[i])
+        if a == "--max-model-len":
+            i += 2
+            continue
+        if not a.startswith("--max-model-len="):
+            out.append(a)
+        i += 1
+    return out
+
+
+def set_max_model_len(args, n) -> list[str]:
+    """Copy of args with --max-model-len set to n: the first occurrence is replaced in place, later ones are
+    removed, appended when absent. n None -> args unchanged (as strings)."""
+    args = [str(a) for a in (args or [])]
+    if n is None:
+        return args
+    out, done, i = [], False, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--max-model-len" or a.startswith("--max-model-len="):
+            if not done:
+                out += ["--max-model-len", str(int(n))]
+                done = True
+            i += 1 if "=" in a else 2
+            continue
+        out.append(a)
+        i += 1
+    if not done:
+        out += ["--max-model-len", str(int(n))]
+    return out
+
+
+def _read_json(p: Path):
+    import json
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def model_max_positions(model_path) -> int | None:
+    """max_position_embeddings from <model_path>/config.json (top level, else text_config), None if unknown."""
+    cfg = _read_json(Path(model_path) / "config.json")
+    if not isinstance(cfg, dict):
+        return None
+    for d in (cfg, cfg.get("text_config") or {}, cfg.get("language_config") or {}):
+        v = d.get("max_position_embeddings") if isinstance(d, dict) else None
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v)
+    return None
+
+
+def detect_tool_call_parser(model_path) -> str:
+    """qwen3_coder when the model's chat template emits "<function=" (XML tool calls), else hermes."""
+    texts = []
+    tc = _read_json(Path(model_path) / "tokenizer_config.json")
+    t = tc.get("chat_template") if isinstance(tc, dict) else None
+    if isinstance(t, str):
+        texts.append(t)
+    elif isinstance(t, list):
+        texts += [x.get("template", "") for x in t if isinstance(x, dict)]
+    for name in ("chat_template.jinja", "chat_template.json"):
+        try:
+            texts.append((Path(model_path) / name).read_text())
+        except OSError:
+            pass
+    return "qwen3_coder" if any("<function=" in x for x in texts) else "hermes"
 
 
 def gpu_total_gib(gpu_ids) -> float | None:
@@ -93,17 +192,21 @@ class VLLMServer:
                  enable_lora: bool = False, max_loras: int = 8, max_lora_rank: int = 64,
                  extra_args: list[str] = (), mock: bool = False, mock_registry: Path | None = None,
                  seed: int = 42, log_dir: Path | None = None, ready_timeout_s: float = 3600,
-                 host: str = "127.0.0.1", sleep_mode: bool = False):
+                 host: str = "127.0.0.1", sleep_mode: bool = False, tool_call_parser: str = "auto"):
         self.model_path, self.served_name = Path(model_path), served_name
+        self.tool_call_parser = tool_call_parser
+        self.notes: list[str] = []      # resolved parser / context clamps (also written to the log)
         self.gpu_ids = list(gpu_ids or [])
         self.port = port or _net.free_port()
         self.host = host
         self.enable_lora, self.max_loras, self.max_lora_rank = enable_lora, max_loras, max_lora_rank
         self.extra_args = [str(a) for a in extra_args]
         self.memory = {}
-        if mock and MEM_FLAG in self.extra_args:     # the mock server takes none of vLLM's flags
-            i = self.extra_args.index(MEM_FLAG)
-            self.extra_args = self.extra_args[:i] + self.extra_args[i + 2:]
+        if mock:                                     # the mock server takes none of vLLM's flags
+            if MEM_FLAG in self.extra_args:
+                i = self.extra_args.index(MEM_FLAG)
+                self.extra_args = self.extra_args[:i] + self.extra_args[i + 2:]
+            self.extra_args = _drop_max_model_len(self.extra_args)
         elif MEM_FLAG in self.extra_args:            # plan GPU memory in GiB (e.g. 110 GB on a 140 GB card)
             self.extra_args, self.memory = apply_memory_budget(self.extra_args, self.gpu_ids)
         self.mock, self.mock_registry, self.seed = mock, mock_registry, seed
@@ -127,19 +230,49 @@ class VLLMServer:
             if self.enable_lora:
                 cmd += ["--enable-lora", "--max-loras", str(self.max_loras)]
             return cmd + self.extra_args
+        extra, parser = self._resolved()
         cmd = _vllm_cmd() + ["serve", str(self.model_path), "--served-model-name", self.served_name,
                              "--host", self.host, "--port", str(self.port), "--seed", str(self.seed),
-                             "--enable-auto-tool-choice", "--tool-call-parser", "hermes",
-                             "--reasoning-parser", "qwen3"]
-        if "--max-model-len" not in self.extra_args:   # as in eval/hpc/README.md (32k thinking + prompt)
-            cmd += ["--max-model-len", "40960"]
+                             "--enable-auto-tool-choice"]
+        if parser:
+            cmd += ["--tool-call-parser", parser]
+        cmd += ["--reasoning-parser", "qwen3"]
+        if max_model_len(extra, None) is None:   # as in eval/hpc/README.md (32k thinking + prompt)
+            cmd += ["--max-model-len", str(self._clamp_len(DEFAULT_MAX_MODEL_LEN))]
         if "--tensor-parallel-size" not in self.extra_args and "-tp" not in self.extra_args:
             cmd += ["--tensor-parallel-size", str(max(1, len(self.gpu_ids)))]
         if self.enable_lora:
             cmd += ["--enable-lora", "--max-loras", str(self.max_loras), "--max-lora-rank", str(self.max_lora_rank)]
         if self.sleep_mode and "--enable-sleep-mode" not in self.extra_args:
             cmd += ["--enable-sleep-mode"]
-        return cmd + self.extra_args
+        return cmd + extra
+
+    def _clamp_len(self, n: int) -> int:
+        mp = model_max_positions(self.model_path)
+        if mp and n > mp:
+            note = (f"WARNING {self.served_name}: --max-model-len {n} > max_position_embeddings {mp} of "
+                    f"{self.model_path}; clamped to {mp} (no YaRN)")
+            if note not in self.notes:
+                self.notes.append(note)
+                print(note, file=sys.stderr, flush=True)
+            return mp
+        return n
+
+    def _resolved(self) -> tuple[list[str], str | None]:
+        """(extra_args with --max-model-len clamped, tool-call parser or None when extra_args names one)."""
+        extra = list(self.extra_args)
+        n = max_model_len(extra, None)
+        if n is not None and self._clamp_len(n) != n:
+            extra = set_max_model_len(extra, self._clamp_len(n))
+        if any(a == "--tool-call-parser" or a.startswith("--tool-call-parser=") for a in extra):
+            return extra, None
+        parser = self.tool_call_parser or "auto"
+        if parser == "auto":
+            parser = detect_tool_call_parser(self.model_path)
+            note = f"{self.served_name}: tool_call_parser auto -> {parser}"
+            if note not in self.notes:
+                self.notes.append(note)
+        return extra, parser
 
     def start(self):
         if self.proc is not None:
@@ -153,9 +286,12 @@ class VLLMServer:
                 env["VLLM_SERVER_DEV_MODE"] = "1"          # exposes /sleep and /wake_up
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "ab")
-        log.write(f"\n==== {time.strftime('%F %T')} {' '.join(self.command())}\n".encode())
+        cmd = self.command()
+        log.write(f"\n==== {time.strftime('%F %T')} {' '.join(cmd)}\n".encode())
+        for note in self.notes:
+            log.write(f"==== {note}\n".encode())
         log.flush()
-        self.proc = subprocess.Popen(self.command(), stdout=log, stderr=subprocess.STDOUT, env=env,
+        self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
                                      start_new_session=True)
         log.close()
         self._wait_ready()

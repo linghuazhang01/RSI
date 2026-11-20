@@ -22,6 +22,11 @@ def targets() -> dict:
     """{key: {"dataset": K_eval, "domain", "sources": [(task, pool)], "source_datasets": [(dataset, pool)]}}."""
     tasks, out = _cfg().get("tasks") or {}, {}
     for key, sources in (_cfg().get("eval_targets") or {}).items():
+        if isinstance(sources, dict):              # a fixed item file (simple_data): {task, file, dataset}
+            t = sources["task"]
+            out[key] = {"dataset": sources["dataset"], "domain": tasks[t]["category"], "sources": [(t, "file")],
+                        "source_datasets": [], "file": sources["file"]}
+            continue
         src = [(str(t), str(p)) for t, p in sources]
         out[key] = {"dataset": f"{key}_eval", "domain": tasks[src[0][0]]["category"], "sources": src,
                     "source_datasets": [(tasks[t]["dataset"], p) for t, p in src]}
@@ -93,6 +98,8 @@ def is_eval_set(dataset: str | None) -> bool:
 def resolve_set(name: str, domain: str, role: str) -> str:
     """Dataset name of a train / gate role value: a training set (dapo_math, ...) or an eval set (key or K_eval)."""
     name = str(name)
+    if name in ("simple_train", "simple_eval"):    # simple_data's 1,500 / 500 items of the run's domain
+        name = f"simple_{domain}_{name.split('_')[1]}"
     d = train_set_domain(name)
     if d is None:
         key = key_of(name)
@@ -113,6 +120,8 @@ def short(dataset: str) -> str:
 def default_roles(cfg: dict, domain: str) -> dict:
     """{train, gate} datasets of the objective: eval_overfit -> the eval set for both; else the domain's training set."""
     et = cfg.get("eval_target") or {}
+    if cfg.get("objective") == "simple":           # simple_data: train on the 1,500, accept on the 500
+        return {"train": f"simple_{domain}_train", "gate": f"simple_{domain}_eval"}
     if cfg.get("objective") == "eval_overfit" and et.get("enabled"):
         ds = resolve(et.get("dataset"), domain)[1]["dataset"]
         return {"train": ds, "gate": ds}

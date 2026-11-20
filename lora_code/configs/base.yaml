@@ -82,6 +82,17 @@ objective_profiles:
     feedback: {n_examples: 5, lambda_kl: 0.0}
     heldout: {domains: eval_target, decoding: null}   # evaluated on the same eval set, greedy (2026-11-21)
     e_t: {enabled: false}
+  # simple (2026-11-21; ./launch.sh --simple): simple_data/<domain> (data/scripts/make_simple_data.py, sampled from the
+  # decontaminated training pool): train on its 1,500 items (train_example / acts / train_loss, signal / screen = all
+  # of them every generation), accept on its 500 (the usual paired gate vs the current model), and the held-out report
+  # is the same 500 items (data_roles.eval = gate, greedy like the gate). The editor gets at most 20 tool rounds per
+  # candidate (context editor.context_tokens = 131072 from the hardware profile). Run ids end in _simple.
+  simple:
+    data_roles: {eval: gate}  # held-out evaluation = simple_<domain>_eval (the 500 gate items)
+    retention: {domains: []}
+    heldout: {enabled: true, decoding: null}   # greedy (each task's tasks.yaml decoding)
+    e_t: {enabled: false}
+    editor: {tool_rounds: 20}
 
 raw:                        # mode=edit only: recipe of the raw LoRA (trained once, generation 0; the only training)
   n_train: null             # train items used (deterministic subset; null = all of generation 0's train items =
@@ -112,9 +123,39 @@ search:
   rerun_seeds: 0
   archive: true             # experience channel: show earlier generations' best programs
 
+# The editor (2026-11-21): Qwen3 thinking mode + a tool loop while it writes each candidate (rsicore.editor /
+# rsicore.chat_tools; also the E_t editor). One round = one model turn that made function calls; after tool_rounds
+# (or a guard) one forced final turn without tools. The proposal ends with a reply WITHOUT function calls holding one
+# ```python block. Chat tools: run_python(code) (sandbox, the workspace's exploration api: no evaluate / raw_lora,
+# no GPU tools unless explore.gpu_tools; spends no budget; handles freed after each call) and read_record(cid, part).
 editor:
-  temperature: 0.6
-  max_tokens: 8192
+  temperature: 0.6          # Qwen3 thinking-mode sampling
+  top_p: 0.95
+  extra_body: {chat_template_kwargs: {enable_thinking: true}, top_k: 20, min_p: 0.0}   # {} = template default
+  max_tokens: 16384         # final answer turn (thinking + plan + program); was 8192
+  tool_rounds: 50           # 0 = one call per candidate (no tools in the request, the old prompt text)
+  turn_max_tokens: 8192     # each tool turn (thinking + function calls)
+  max_tool_calls: 100       # individual calls per proposal (parallel calls count one by one)
+  proposal_tokens: 160000   # completion tokens per proposal, then the final turn is forced
+  proposal_wall_s: 2400     # wall clock per proposal (model + tools), then the final turn is forced
+  context_tokens: 131072    # THE context-length knob: clamps each turn's max_tokens, sets when to compact, and is
+                            # written as --max-model-len into server.main_args (the main replicas host the editor;
+                            # weights mode: the candidate-slot servers too). It overrides a --max-model-len in
+                            # main_args; null = read it from main_args. theta0_args unchanged. See hardware_profiles.
+  tool_result_chars: 6000   # each tool result is cut to this many chars in the chat (full output on disk)
+  compact_at: 0.6           # estimated prompt > 0.6 x context_tokens -> drop older reasoning / elide older tool output
+  keep_tool_rounds: 8
+  keep_reasoning_rounds: 2
+  reasoning_passback: think_tag   # in-loop reasoning sent back as <think>..</think> | field | drop
+  history_keep: 2           # cross-step history: step 0 + the last 2 steps in full, code only in between; null = all
+                            # (ignored when tool_rounds is 0: the full history, as before)
+  timeout_s: 3600           # per HTTP request
+  mock_tool_rounds: 1       # --mock: run_python calls of the mock editor before its program
+  explore:                  # run_python
+    timeout_s: 300
+    mem_gb: 8
+    gpu_tools: false        # true: acts / train_loss / regmean_preserve allowed while exploring, charged to
+    gpu_seconds: 300        # this separate budget (per search; never the generation's gpu_seconds)
 
 sandbox:
   timeout_s: 1800
@@ -240,19 +281,30 @@ gpu_layout:
                             # 4 GPUs, single domain: main [0, 1, 2] (3 replicas) | train [3]
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
-# cards. rsicore.config merges the profile over base/domain config and BEFORE --set (--set wins).
+# cards; the b300 profile plans them at 220 GB (2026-11-21). rsicore.config merges the profile over base/domain
+# config and BEFORE --set (--set wins).
 hardware: b300
 hardware_profiles:
-  b300: {}
+  b300:                     # B300 (~270 GB visible) PLANNED AT 220 GB per card (2026-11-21)
+    server:                 # --rsi-gpu-memory-gib -> --gpu-memory-utilization = GB / card total (rsicore.servers;
+      # the utilization given is the fallback without nvidia-smi, = GB / 270). main: 220 - 52 GB weights - ~6 GB
+      # runtime - LoRA slots leaves ~150 GB KV (editor threads at 131072 tokens + scoring). theta0 shares the train
+      # card (theta0_own_gpu false): 100 GB for theta0 (52 GB + ~40 GB KV), ~120 GB of the plan left for training.
+      main_args: ["--rsi-gpu-memory-gib", "220", "--gpu-memory-utilization", "0.81", "--max-model-len", "131072",
+                  "--max-num-seqs", "128", "--max-logprobs", "20"]   # --max-model-len = editor.context_tokens
+      theta0_args: ["--rsi-gpu-memory-gib", "100", "--gpu-memory-utilization", "0.37", "--max-model-len", "20480",
+                    "--max-num-seqs", "128", "--max-logprobs", "20"]
+    editor: {context_tokens: 131072}   # main replicas --max-model-len 131072
   h20:                      # H20 cards (~140 GB) PLANNED AT 110 GB each (2026-11-20); Qwen3.8-27B BF16 ~52 GB
     gpu_layout: {theta0_own_gpu: true}   # theta0 vLLM (52 GB + KV) and the training model (52 GB + activations)
                                          # do not fit on one 110 GB card: own card when E_t is on (scope all)
     server:                 # --rsi-gpu-memory-gib 110 -> --gpu-memory-utilization = 110 GB / card total (rsicore.servers)
       max_loras: 8          # ~0.8 GB per rank-64 adapter slot [estimate]
-      main_args: ["--rsi-gpu-memory-gib", "110", "--gpu-memory-utilization", "0.78", "--max-model-len", "20480",
-                  "--max-num-seqs", "128", "--max-logprobs", "20"]
+      main_args: ["--rsi-gpu-memory-gib", "110", "--gpu-memory-utilization", "0.78", "--max-model-len", "131072",
+                  "--max-num-seqs", "128", "--max-logprobs", "20"]   # --max-model-len = editor.context_tokens
       theta0_args: ["--rsi-gpu-memory-gib", "110", "--gpu-memory-utilization", "0.78", "--max-model-len", "20480",
                     "--max-num-seqs", "128", "--max-logprobs", "20"]
+    editor: {context_tokens: 131072}   # main replicas host the editor: 2 threads x 8 GiB KV fits (was 20480)
     train:
       micro_batch: 2        # [pilot] 52 GB weights + 2 x (4k tokens: fp32 logits + grad + log-softmax ~12 GB,
                             # checkpointed activations ~1.5 GB) ~ 80 GB; raise after the smoke run's memory peak
@@ -260,8 +312,9 @@ hardware_profiles:
     gpu_layout: {theta0_own_gpu: true}
     server:
       max_loras: 4          # vLLM reserves GPU memory for max_loras adapters of rank_cap
-      main_args: ["--gpu-memory-utilization", "0.92", "--max-model-len", "20480", "--max-num-seqs", "32", "--max-logprobs", "20"]
+      main_args: ["--gpu-memory-utilization", "0.92", "--max-model-len", "49152", "--max-num-seqs", "32", "--max-logprobs", "20"]
       theta0_args: ["--gpu-memory-utilization", "0.92", "--max-model-len", "20480", "--max-num-seqs", "32", "--max-logprobs", "20"]
+    editor: {context_tokens: 49152}    # ~15 GB KV per replica: 131072 does not fit (was 20480); compaction does the rest
     train:
       micro_batch: 1        # 52 GB weights + one 4k-token sequence (activations, fp32 logits) per forward
 
@@ -280,3 +333,4 @@ mock_overrides:
   heldout: {limit: 20}
   baseline: {noise_repeats: 3}
   sandbox: {timeout_s: 120, mem_gb: 4}
+  editor: {explore: {timeout_s: 60, mem_gb: 4}}   # mock_tool_rounds (1) run_python calls per proposal

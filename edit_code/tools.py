@@ -15,6 +15,11 @@
     evaluate(config)      build the candidate and run the screen evaluation -> L1 feedback   [cost: evaluate=1]
     solve_allocation(...) knapsack over the profile table -> config (removable: tools.solve_allocation=false)
 Invalid configs raise a tool error whose message lists every problem (schema.ConfigError).
+
+explore=True (2026-11-21): the API of the editor's run_python chat tool (rsicore.chat_tools), used while it
+writes a candidate. evaluate is NOT registered (it would take a candidate slot and spend the generation's
+evaluate budget; describe() does not list it), and group_error refuses settings whose Hessian-weighted error
+is not cached yet (lazy GPTQ / AWQ on the GPU) unless editor.explore.gpu_tools is true.
 """
 from __future__ import annotations
 
@@ -28,10 +33,11 @@ class ToolError(RuntimeError):
     pass
 
 
-def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_evaluate: int):
+def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_evaluate: int, explore: bool = False):
     from rsicore.sandbox import ToolAPI
     tcfg = cfg.get("tools", {})
-    api = ToolAPI({"evaluate": max(0, min(per_program_evaluate, problem.evals_left))})
+    gpu_tools = bool(((cfg.get("editor") or {}).get("explore") or {}).get("gpu_tools", False))
+    api = ToolAPI({} if explore else {"evaluate": max(0, min(per_program_evaluate, problem.evals_left))})
     spec = problem.spec
     calls = {"evaluate": 0}
 
@@ -75,6 +81,12 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         top: [(key, share)], groups: {key: {setting, herr_per_token, herr_rel, share}}}. Shows where a config's
         quantization error concentrates."""
         try:
+            if explore and not gpu_tools:
+                missing = problem.herr_missing(config)
+                if missing:
+                    raise ToolError(f"uncached setting: not available while exploring ({len(missing)} module "
+                                    f"settings not computed yet, e.g. {missing[0]}); the hessian_table settings "
+                                    "are cached, and your final program may call group_error on any config")
             return problem.group_error(config, top=int(top))
         except schema.ConfigError as e:
             raise ToolError(str(e)) from None
@@ -158,7 +170,8 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         api.register("compare", compare)
     api.register("bytes_table", bytes_table)
     api.register("bytes", bytes)
-    api.register("evaluate", evaluate, cost={"evaluate": 1})
+    if not explore:
+        api.register("evaluate", evaluate, cost={"evaluate": 1})
     if tcfg.get("solve_allocation", True):
         api.register("solve_allocation", solve_allocation)
     return api

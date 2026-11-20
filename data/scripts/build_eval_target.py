@@ -22,17 +22,26 @@ TASKS_YAML = ROOT / "eval" / "configs" / "tasks.yaml"
 
 
 def targets() -> dict:
-    """{K_eval: [(source dataset, pool)]} from tasks.yaml eval_targets."""
+    """{dataset: [(source dataset, pool)] | [("file", path)]} from tasks.yaml eval_targets (K -> K_eval; the
+    {task, file, dataset} form -> `dataset`, the items of `file`, e.g. simple_data/math/train.jsonl)."""
     import yaml
     cfg = yaml.safe_load(TASKS_YAML.read_text())
-    tasks = cfg["tasks"]
-    return {f"{k}_eval": [(tasks[t]["dataset"], str(p)) for t, p in v] for k, v in (cfg.get("eval_targets") or {}).items()}
+    tasks, out = cfg["tasks"], {}
+    for k, v in (cfg.get("eval_targets") or {}).items():
+        if isinstance(v, dict):
+            out[v["dataset"]] = [("file", str(v["file"]))]
+        else:
+            out[f"{k}_eval"] = [(tasks[t]["dataset"], str(p)) for t, p in v]
+    return out
 
 
 def _sources_sha(sources) -> str:
     h = hashlib.sha256()
     for ds, pool in sources:
         h.update(f"{ds}:{pool}:".encode())
+        if ds == "file":
+            h.update((ROOT / pool).read_bytes())
+            continue
         h.update((PROC / f"{ds}.jsonl").read_bytes())
         h.update((SPLITS / ds / f"{pool}.json").read_bytes())
     return h.hexdigest()
@@ -47,7 +56,10 @@ def build(name: str = "math_eval", force: bool = False) -> dict:
         raise SystemExit(f"unknown eval target {name!r}; known: {sorted(tg)}")
     sources = tg[name]
     for ds, pool in sources:
-        if not (PROC / f"{ds}.jsonl").exists() or not (SPLITS / ds / f"{pool}.json").exists():
+        if ds == "file":
+            if not (ROOT / pool).exists():
+                raise SystemExit(f"missing {pool} (eval/.venv/bin/python -I data/scripts/make_simple_data.py)")
+        elif not (PROC / f"{ds}.jsonl").exists() or not (SPLITS / ds / f"{pool}.json").exists():
             raise SystemExit(f"missing source data {ds} / {pool} (./download_data.sh)")
     sha = _sources_sha(sources)
     out, split = PROC / f"{name}.jsonl", SPLITS / name / "pool.json"
@@ -58,12 +70,16 @@ def build(name: str = "math_eval", force: bool = False) -> dict:
             return dict(meta, rebuilt=False)
     rows, by = [], {}
     for ds, pool in sources:
-        keep = set(json.loads((SPLITS / ds / f"{pool}.json").read_text()))
-        for line in (PROC / f"{ds}.jsonl").read_text().split("\n"):   # not splitlines(): U+2028 inside text
+        is_file = ds == "file"
+        keep = None if is_file else set(json.loads((SPLITS / ds / f"{pool}.json").read_text()))
+        src = (ROOT / pool) if is_file else (PROC / f"{ds}.jsonl")
+        for line in src.read_text().split("\n"):   # not splitlines(): U+2028 inside text
             if not line.strip():
                 continue
             r = json.loads(line)
-            if r["id"] in keep:
+            if is_file:
+                ds = r.get("dataset") or "file"         # the training set the item came from
+            if keep is None or r["id"] in keep:
                 r = dict(r, dataset=name, split_pool="pool", metadata=dict(r.get("metadata") or {}, source_dataset=ds))
                 rows.append(r)
                 by[ds] = by.get(ds, 0) + 1
