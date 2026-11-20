@@ -1,0 +1,32 @@
+{
+ "domain": "tool_calling",
+ "source": "data/processed/sealtool_train.jsonl (split_pool == pool)",
+ "eval_sets_checked": {
+  "sealtool": 2054,
+  "apibank": 584,
+  "bfcl": 4696,
+  "metatool": 5327,
+  "teval": 4358
+ },
+ "template_filter": true,
+ "seed": "20261118:simple_data:tool_calling",
+ "train_total": 12022,
+ "already_excluded_by_make_splits": 7,
+ "pool": 12015,
+ "removed_here": {
+  "exact_ws": 0,
+  "exact_strict": 0,
+  "near_13gram": 0,
+  "internal_dup": 0
+ },
+ "overlap_hits_by_eval_set": {},
+ "clean_after_dedup": 12015,
+ "train": 1500,
+ "eval": 500,
+ "removed_ids": {
+  "exact_ws": [],
+  "exact_strict": [],
+  "near_13gram": [],
+  "internal_dup": []
+ }
+}

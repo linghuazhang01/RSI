@@ -1,0 +1,31 @@
+{
+ "domain": "instruction_following",
+ "source": "data/processed/ifeval_train.jsonl (split_pool == pool)",
+ "eval_sets_checked": {
+  "ifeval": 541,
+  "ifbench": 300,
+  "mt_bench": 80,
+  "alpaca_eval": 805
+ },
+ "template_filter": true,
+ "seed": "20261118:simple_data:instruction_following",
+ "train_total": 14970,
+ "already_excluded_by_make_splits": 21,
+ "pool": 14949,
+ "removed_here": {
+  "exact_ws": 0,
+  "exact_strict": 0,
+  "near_13gram": 0,
+  "internal_dup": 0
+ },
+ "overlap_hits_by_eval_set": {},
+ "clean_after_dedup": 14949,
+ "train": 1500,
+ "eval": 500,
+ "removed_ids": {
+  "exact_ws": [],
+  "exact_strict": [],
+  "near_13gram": [],
+  "internal_dup": []
+ }
+}

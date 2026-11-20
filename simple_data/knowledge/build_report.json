@@ -1,0 +1,31 @@
+{
+ "domain": "knowledge",
+ "source": "data/processed/triviaqa_train.jsonl (split_pool == pool)",
+ "eval_sets_checked": {
+  "triviaqa": 9960,
+  "mmlu_pro": 12032,
+  "gpqa_diamond": 198,
+  "freebaseqa": 3996
+ },
+ "template_filter": false,
+ "seed": "20261118:simple_data:knowledge",
+ "train_total": 76523,
+ "already_excluded_by_make_splits": 3422,
+ "pool": 73101,
+ "removed_here": {
+  "exact_ws": 0,
+  "exact_strict": 0,
+  "near_13gram": 0,
+  "internal_dup": 0
+ },
+ "overlap_hits_by_eval_set": {},
+ "clean_after_dedup": 73101,
+ "train": 1500,
+ "eval": 500,
+ "removed_ids": {
+  "exact_ws": [],
+  "exact_strict": [],
+  "near_13gram": [],
+  "internal_dup": []
+ }
+}

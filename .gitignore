@@ -16,6 +16,7 @@ data/processed/
 # eval-set targets (K_eval), built on demand by data/scripts/build_eval_target.py
 data/splits/*_eval/
 !data/splits/alpaca_eval/
+data/splits/simple_*/
 
 # Pinned third-party harness repos (cloned by eval/setup_env.sh); keep pins.yaml
 eval/third_party/*/
@@ -36,3 +37,6 @@ checkpoints/
 eval/.cache/
 experiment_records/*/
 !experiment_records/README.md
+
+# full clean pools of simple_data (~210 MB), rebuilt by data/scripts/make_simple_data.py
+simple_data/*/pool.jsonl
