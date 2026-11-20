@@ -5,9 +5,11 @@
 # (data/scripts/draw.py); `gate.seed` keeps the same gate across runs with the same gate sizes.
 paper: A
 seed: 42                 # experiment seed (2026-11-19: single seed 42); data splits keep their own seed 20261118
-screen_n: 200          # per domain: stratified subset of `signal`, used for the cheap first-stage evaluation
-kl_contexts: 256       # total KL / calibration contexts per generation, split evenly over domains,
-                       # disjoint from `signal`
+screen_n: 400          # per domain: stratified subset of `signal`, used for the cheap first-stage evaluation (2026-11-20: was 200)
+kl_contexts: 400       # total KL / calibration contexts per generation, split evenly over `kl_domains` (2026-11-20: was 256;
+                       # every candidate's KL is scored on all of them, calibration uses the first 256)
+                       # (absent = every domain; a single-domain run sets it to its own domain through
+                       # <run>/draw_config.effective.yaml), disjoint from `signal`
 reuse:                   # revised 2026-11-19: training data is reusable across generations
   across_generations: true          # never-used items first, then least recently used
   never_signal_after: [train, shown] # once trained on (Paper B) or shown to the editor, never signal again

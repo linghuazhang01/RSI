@@ -29,8 +29,9 @@ Config schema (JSON object):
 - Module groups per layer. Full-attention layers: qk (q_proj+k_proj), v, o. Linear-attention (Gated DeltaNet) layers: gdn_qkv (in_proj_qkv), gdn_z (in_proj_z), gdn_ba (in_proj_b+in_proj_a, tiny gates), gdn_out (out_proj). Every layer: gate_up (gate_proj+up_proj), down (down_proj). Group keys look like "17.down".
 - Layer selectors: int (negative = from the end), "a-b", "all", or a list. Group selectors: name, "all" or list. "groups" keys may be "17.down", "down", "56-63.down" or "*.down".
 - The packed size (codes + fp16 scales + zero points + unquantized parts) must be <= the budget; check with api.bytes(config).
-- profile_table() gives, per group key and bit width, the whole-model KL increase when only that group is RTN-quantized (measured on the original model). Sensitivities are roughly additive at >= 3.5 average bits and underestimate damage at 2-3 bits; evaluate(config) measures the real thing.
-- Each program's returned config is evaluated on held-back training items (scores vs the original model, KL vs the original model); you then see the feedback and may improve. The incumbent is scored on the same items, so compare against it. api.evaluate(config) inside a program spends the same per-round evaluate budget.
+- profile_table() gives, per group key and bit width, the whole-model KL increase when only that group is RTN-quantized (forward pass on the original model, 64 texts). hessian_table() gives, per group, quantizer (rtn / gptq / awq) and bit width, the Hessian-weighted output error of that group alone (every calibration token, no forward pass): lower noise, local. Sensitivities are roughly additive at >= 3.5 average bits and underestimate damage at 2-3 bits; evaluate(config) measures the real thing.
+- Analysis (free, no evaluate): group_error(config) shows where a config's quantization error concentrates; compare(cid) compares an evaluated candidate with the incumbent (or another candidate) item by item: which items broke / got fixed (ids only), by output length, truncation.
+- Each program's returned config is evaluated on held-back training items and compared with the INCUMBENT on the same items (retention = your accuracy / the incumbent's; paired delta; KL vs the original BF16 model); you then see the feedback and may improve. api.evaluate(config) inside a program spends the same per-round evaluate budget.
 - Acceptance (after the search, not visible to you): size <= budget and a higher score than the incumbent on a fixed hidden test set (paired per item: mean gain >= {min_delta}, a statistically significant gain and no significant loss on any domain). Otherwise the incumbent stays.
 
 Answer with a short plan, then exactly one ```python code block containing the full program."""
@@ -70,8 +71,8 @@ def candidate_table(history, domains: list[str]) -> str:
         for d in domains:
             p = (fb.get("probes") or {}).get(d) or {}
             s = _fmt(p.get("score"))
-            if p.get("vs_parent") is not None:
-                s += f" ({p['vs_parent']:+.3f}{'*' if p.get('significant') else ''})"
+            if p.get("vs_incumbent") is not None:
+                s += f" ({p['vs_incumbent']:+.3f}{'*' if p.get('significant') else ''})"
             cells.append(s)
         status = "error: " + c.error.splitlines()[0][:80] if c.error else ("full" if c.full else "screen")
         lines.append(f"| {c.cid} | {c.thread} | {c.step} | {_fmt(art.get('bytes_gib'))} | {_fmt(art.get('linear_avg_bits'), 2)} "
@@ -100,12 +101,7 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
                              f"linear avg bits {inc.get('linear_avg_bits')}); its score on this round's items: "
                              + json.dumps(problem.incumbent_scores) + "; config (compressed form): "
                              + json.dumps(inc.get("config"))[:3000])
-            ref = {}
-            for stage, d in (problem.parent_refs or {}).items():
-                ref[stage] = {ds: _fmt(v.get("score")) for ds, v in d.items()}
-            if ref:
-                parts.append("Scores of the original BF16 model on this round's evaluation items: " + json.dumps(ref))
-            if problem.noise:
+            if problem.noise and any(v for v in problem.noise.values()):   # greedy decoding: band 0, not shown
                 parts.append("Noise band (max-min over repeated sampled runs of the original model): " + json.dumps(problem.noise))
             parts.append("Profile summary (KL increase if only that group is RTN-quantized):\n"
                          + json.dumps(summarize_profile(problem.tables["profile"], top=8))[:4000])
@@ -115,8 +111,8 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
             if archive:
                 parts.append("Archive of earlier generations:\n" + archive)
         if history:
-            parts.append("All candidates so far (score = mean retention vs the original model - KL penalty; "
-                         "(+/-delta vs the original model, * = significant beyond noise)):\n"
+            parts.append("All candidates so far (score = retention vs the incumbent - KL penalty; "
+                         "(+/-delta vs the incumbent on the same items, * = significant)):\n"
                          + candidate_table(history, problem.domains))
             ok = [c for c in history if c.score is not None]
             if ok:
@@ -133,7 +129,7 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
                     regs = fb.pop("regressions", [])[: n_examples * max(1, len(problem.datasets))]
                     parts.append(f"Feedback for your last candidate {last.cid}:\n" + json.dumps(fb)[:3500])
                     if regs:
-                        parts.append("Items the original model got right and your candidate got wrong:\n"
+                        parts.append("Items the incumbent got right and your candidate got wrong:\n"
                                      + json.dumps(regs, ensure_ascii=False)[:3000])
         parts.append("Beat the incumbent: improve on the best candidate (yours or another thread's) or try a different idea. "
                      "Return one ```python block with def main(api): ... return config.")

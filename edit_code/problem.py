@@ -6,6 +6,12 @@ cache + diagnostics (prepare), config validation / sizing, candidate build (arti
 fake-quant materialization, candidate serving, and staged evaluation (screen / full / gate) with
 structured L1 feedback (RSI_LOOP_DESIGN §2.2).
 
+References (2026-11-20): every candidate is compared with the INCUMBENT on the same items (it is what a
+candidate must beat): retention = candidate accuracy / incumbent accuracy, paired deltas and regression
+examples (incumbent right, candidate wrong) are vs the incumbent. M_0 is no longer scored on the signal
+items; it only provides the KL reference (prompt logprobs on the KL texts, compute_refs). Per candidate
+the per-text KL (kl_per_text.json) and the per-group Hessian-weighted error (group_error.json) are kept.
+
 Candidate serving (2026-11-19): the candidate GPUs are split into groups (common.candidate_groups); each
 group is one slot of a pool. serve() takes a free slot, exports the candidate's fake-quant checkpoint into
 that slot's directory on the slot's own GPU (exports are serialized: one shared layer cache), starts vLLM
@@ -93,7 +99,8 @@ class QuantProblem:
         self._evals = {}
         for r in read_jsonl(self.out_dir / "evals.jsonl"):
             self._evals[(r["hash"], r["stage"])] = r
-        self.parent_refs: dict = read_json(self.refs_dir / "refs.json", {}) or {}
+        self._herr_lock = threading.Lock()
+        self._herr: dict | None = None             # {"module|q|b|gs": [h_err, tr(W H W^T), tokens]} (persisted)
 
     # ------------------------------------------------------------------ bookkeeping
     @property
@@ -133,7 +140,111 @@ class QuantProblem:
                                                   self.space["group_sizes"]), meta)
         if not self.mock and self.cache is None:
             self.cache = self._open_cache()
+        if self.tables.get("hessian") is None:     # built after the layer cache (it reads cached entries)
+            self.tables["hessian"] = self.hessian_table()
+            write_json(self.prep_dir / "diagnostics" / "hessian_table.json", self.tables["hessian"])
         return self
+
+    # ------------------------------------------------------------------ Hessian-weighted error
+    def _herr_store(self) -> dict:
+        if self._herr is None:
+            self._herr = read_json(self.prep_dir / "diagnostics" / "herr_cache.json", {}) or {}
+        return self._herr
+
+    def herr_module(self, module: str, setting: dict) -> tuple[float, float, int]:
+        """(tr((W - Wq) H (W - Wq)^T), tr(W H W^T), calibration tokens) of one module under a resolved
+        setting; H = the module's input Hessian from the calibration pass (sum over tokens). Memoised and
+        persisted (prep/diagnostics/herr_cache.json). bits 16 -> 0 error."""
+        b, q, gs = int(setting["bits"]), setting.get("quantizer", "rtn"), int(setting.get("group_size") or 128)
+        key = f"{module}|{q}|{b}|{gs}"
+        with self._herr_lock:
+            got = self._herr_store().get(key)
+        if got is not None:
+            return tuple(got)
+        if b >= 16:
+            return (0.0, 1.0, 1)
+        if self.mock:
+            m = self.spec.module(module)
+            d = M.setting_damage(self.spec, f"{m.layer}.{m.group}", setting) * (0.9 + 0.2 * M._h("herr", module))
+            val = [d, 1.0, 1]
+        else:  # pragma: no cover - GPU path
+            import torch
+            from .quant import quantizers as Q
+            from .quant.hessian import load_hessian
+            m = self.spec.module(module)
+            with self._export_lock:                # the shared cache / GPU
+                H, n, _ = load_hessian(self.prep_dir / "hessians", m.layer, m.input_key, device=self.cache.device)
+                W = self.cache.weight(module).to(self.cache.device).float()
+                Wq = self.cache.dequant(module, {"bits": b, "quantizer": q, "group_size": gs},
+                                        dtype=torch.float32).to(self.cache.device)
+                err = Q.h_error(W, Wq, H)
+                ref = float(((W @ H.float()) * W).sum())
+                del H, W, Wq
+            val = [err, ref, int(n)]
+        with self._herr_lock:
+            self._herr_store()[key] = val
+            self._herr_dirty = True
+        return tuple(val)
+
+    def _herr_flush(self) -> None:
+        with self._herr_lock:
+            if getattr(self, "_herr_dirty", False):
+                write_json(self.prep_dir / "diagnostics" / "herr_cache.json", self._herr_store())
+                self._herr_dirty = False
+
+    def group_error(self, config_or_norm, top: int | None = None) -> dict:
+        """Hessian-weighted output error of every linear module group under a config (no forward pass):
+        {"groups": {key: {"setting", "herr_per_token", "herr_rel", "share"}}, "total_per_token", "top"}.
+        herr_per_token = tr(dW H dW^T) / calibration tokens (summed over the group's modules); herr_rel = that
+        / tr(W H W^T) (scale-free); share = fraction of the config's total. Embedding / lm_head not included."""
+        norm = self.normalize(config_or_norm) if "default" in config_or_norm else config_or_norm
+        groups = self.spec.groups()
+        out, total = {}, 0.0
+        for key, s in norm["groups"].items():
+            err = ref = 0.0
+            tok = 1
+            for m in groups[key]:
+                e, r, n = self.herr_module(m.name, s)
+                err, ref, tok = err + e, ref + r, max(1, n)
+            pt = err / tok
+            out[key] = {"setting": s, "herr_per_token": pt, "herr_rel": err / ref if ref > 0 else 0.0}
+            total += pt
+        for v in out.values():
+            v["share"] = v["herr_per_token"] / total if total > 0 else 0.0
+            v["herr_per_token"] = round(v["herr_per_token"], 8)
+            v["herr_rel"] = round(v["herr_rel"], 8)
+            v["share"] = round(v["share"], 5)
+        self._herr_flush()
+        ranked = sorted(out, key=lambda k: -out[k]["share"])
+        n = len(ranked) if top is None else int(top)
+        return {"total_per_token": round(total, 8), "top": [(k, out[k]["share"]) for k in ranked[:n]],
+                "groups": out}
+
+    def hessian_table(self) -> list[dict]:
+        """One row per (group key, quantizer, bits) at diagnostics.profile_group_size: the Hessian-weighted
+        error if ONLY that group is quantized (herr_per_token, herr_rel). Uses every calibration token and
+        the cached quantized weights; no forward pass. Quantizers: diagnostics.hessian_quantizers."""
+        d = self.cfg["diagnostics"]
+        gs = int(d.get("profile_group_size", 128))
+        qs = [q for q in d.get("hessian_quantizers", ["rtn", "gptq", "awq"]) if q in self.space["quantizers"]]
+        bits = [b for b in d.get("hessian_bits") or d.get("profile_bits", [2, 3, 4]) if b < 16]
+        rows, gp, t0 = [], self.spec.group_params(), time.time()
+        for key, mods in self.spec.groups().items():
+            layer, g = key.split(".", 1)
+            for q in qs:
+                for b in bits:
+                    s = {"bits": b, "group_size": gs, "quantizer": q}
+                    err = ref = 0.0
+                    tok = 1
+                    for m in mods:
+                        e, r, n = self.herr_module(m.name, s)
+                        err, ref, tok = err + e, ref + r, max(1, n)
+                    rows.append({"key": key, "layer": int(layer), "group": g, "quantizer": q, "bits": b,
+                                 "group_size": gs, "herr_per_token": round(err / tok, 8),
+                                 "herr_rel": round(err / ref, 8) if ref > 0 else 0.0, "params": gp[key]})
+        self._herr_flush()
+        self.log(f"[prep:{self.tag}] hessian table: {len(rows)} rows in {time.time() - t0:.0f}s")
+        return rows
 
     def _device(self) -> str:
         g = role_gpus(self.rc, self.cfg, "candidate")[0]
@@ -268,8 +379,17 @@ class QuantProblem:
             return gate_ids(self.rc, ds)
         return list(self.data[ds]["signal" if stage == "full" else "screen"])
 
+    def kl_eval_texts(self) -> list[tuple[str, str]]:
+        """The KL texts scored for every candidate: kl.eval_texts of them, evenly spaced over the list (so every
+        domain keeps its share); null = all. Calibration (prepare) always uses every text."""
+        n = self.cfg["kl"].get("eval_texts")
+        if n is None or int(n) >= len(self.kl_texts):
+            return self.kl_texts
+        step = len(self.kl_texts) / int(n)
+        return [self.kl_texts[int(i * step)] for i in range(int(n))]
+
     def _kl(self, srv, art: dict, stage: str, heldout: bool = False) -> dict | None:
-        texts = self.kl_heldout if heldout else self.kl_texts
+        texts = self.kl_heldout if heldout else self.kl_eval_texts()
         if not texts:
             return None
         if self.mock:
@@ -279,11 +399,14 @@ class QuantProblem:
             for d in sorted({d for d, _ in texts}):
                 out[d] = round(inc * M.DOMAIN_KL.get(d, 1.0), 5)
             out["vs_original"] = round(st["kl_vs_original"], 5)
+            out["per_text"] = [round(inc * M.DOMAIN_KL.get(d, 1.0) * (0.5 + M._h("klt", art["config_hash"], i)), 6)
+                               for i, (d, _) in enumerate(texts)]
             return out
         from rsicore.evaluate import token_kl  # pragma: no cover - GPU path
         ref = self.refs_dir / ("kl_ref_heldout.jsonl" if heldout else "kl_ref.jsonl")
         r = token_kl(ref, srv.endpoint, srv.served_name, [t for _, t in texts], top_k=self.cfg["kl"]["top_k"])
-        out = {"overall": round(r["mean"], 5), "token_mean": round(r["token_mean"], 5)}
+        out = {"overall": round(r["mean"], 5), "token_mean": round(r["token_mean"], 5),
+               "per_text": [None if v is None else round(v, 6) for v in r["per_text"]]}
         by = {}
         for (d, _), v in zip(texts, r["per_text"]):
             by.setdefault(d, []).append(v)
@@ -345,13 +468,15 @@ class QuantProblem:
                         p["incumbent"] = inc.get("score")
                         p["vs_incumbent"] = None if d["delta"] is None else round(d["delta"], 5)
                         p["delta_ci"] = [None if x is None else round(x, 5) for x in d["ci"]]
+                elif origin == "incumbent":           # the reference itself
+                    p.update(incumbent=p["score"], vs_incumbent=0.0, retention=1.0 if acc else None)
                 else:
-                    pref = self._parent_records(ds, stage)
+                    pref = self._ref_records(ds, stage)
                     if pref is not None:
                         pacc, _, _ = _mean_per_id(pref)
                         d = paired_delta(pref, res.records, seed=self.rc.seed)
-                        p["parent"] = None if pacc is None else round(pacc, 4)
-                        p["vs_parent"] = None if d["delta"] is None else round(d["delta"], 4)
+                        p["incumbent"] = None if pacc is None else round(pacc, 4)
+                        p["vs_incumbent"] = None if d["delta"] is None else round(d["delta"], 4)
                         p["delta_ci"] = [None if x is None else round(x, 4) for x in d["ci"]]
                         nb = self.noise.get(ds)
                         p["noise_band"] = nb
@@ -365,8 +490,17 @@ class QuantProblem:
                 probes[dom] = p
                 scored[ds] = acc
             kl = self._kl(srv, art, stage) if stage in ("screen", "full") else None
+        if kl and "per_text" in kl:                # kept on disk, not in the editor's feedback
+            kl = dict(kl)
+            per_text = kl.pop("per_text")
+            write_json(edir / "kl_per_text.json",
+                       [{"i": i, "domain": d, "kl": v} for i, ((d, _), v) in enumerate(zip(self.kl_eval_texts(), per_text))])
         fb = {"stage": stage, "bytes_gib": art["bytes_gib"], "budget_gib": art["budget_gib"],
               "linear_avg_bits": art["linear_avg_bits"], "kl": kl, "probes": probes}
+        if stage in ("screen", "full"):            # per-group Hessian-weighted error of this config
+            ge = self.group_error(self.norm_of(art), top=5)
+            write_json(edir / "group_error.json", ge)
+            fb["error_top_groups"] = ge["top"]
         if regressions:
             fb["regressions"] = regressions[: self.show_examples * max(1, len(self.datasets))]
             with self._lock:
@@ -421,8 +555,9 @@ class QuantProblem:
                 return False, f"no significant gain over the incumbent ({desc})"
         return True, f"beats the incumbent: mean delta {mean:+.4f} ({desc})"
 
-    def _regressions(self, ds: str, parent: list[dict], cand: list[dict]) -> list[dict]:
-        pp = {r["id"]: r for r in parent if r.get("score") is not None}
+    def _regressions(self, ds: str, ref: list[dict], cand: list[dict]) -> list[dict]:
+        """Items the incumbent got right and the candidate got wrong (first show_examples, by id)."""
+        pp = {r["id"]: r for r in ref if r.get("score") is not None}
         out = []
         recs = None
         for r in sorted(cand, key=lambda r: r["id"]):
@@ -434,48 +569,106 @@ class QuantProblem:
             item = recs.get(r["id"], {})
             q = item.get("prompt") or (item.get("messages") or [{}])[-1].get("content", "")
             out.append({"dataset": ds, "id": r["id"], "prompt": tail(str(q)[:400], 400),
-                        "parent_answer": str(p.get("parsed_answer"))[:200],
+                        "incumbent_answer": str(p.get("parsed_answer"))[:200],
                         "candidate_answer": str(r.get("parsed_answer"))[:200],
                         "candidate_output_tail": tail(r.get("raw_output") or "", 300)})
             if len(out) >= self.show_examples:
                 break
         return out
 
-    # ------------------------------------------------------------------ parent references
-    def _parent_records(self, ds: str, stage: str) -> list[dict] | None:
-        info = (self.parent_refs.get(stage) or {}).get(ds)
-        if not info:
-            return None
-        return read_jsonl(Path(info["records"]))
+    # ------------------------------------------------------------------ references
+    def records_path(self, cid: str, stage: str, ds: str) -> Path:
+        """Records of candidate `cid` at `stage`. A candidate whose config was already evaluated under another
+        cid (identical config hash) shares that cid's records."""
+        p = self.out_dir / "evals" / f"{cid}" / stage / f"{ds}.jsonl"
+        if p.exists() or cid == "incumbent":
+            return p
+        h = None
+        for r in read_jsonl(self.out_dir / "candidates.jsonl"):
+            if r.get("cid") == cid:
+                h = (r.get("artifact") or {}).get("config_hash")
+        rec = self._evals.get((h, stage)) if h else None
+        return self.out_dir / "evals" / f"{rec['cid']}" / stage / f"{ds}.jsonl" if rec else p
 
-    def compute_parent_refs(self, endpoint: str, served_name: str, stages=("screen", "full")) -> dict:
-        """Score the source model (served as the editor) on this problem's screen / signal items, and
-        cache its prompt logprobs on the KL texts (real mode)."""
-        from rsicore.evaluate import reference_logprobs, score
-        refs = dict(self.parent_refs)
-        for stage in stages:
-            refs.setdefault(stage, {})
-            for ds in self.datasets:
-                if ds in refs[stage]:
-                    continue
-                odir = self.refs_dir / stage
-                res = score(endpoint, served_name, ds, pool="pool", ids=self._ids(ds, stage), out_dir=odir,
-                            mock=self.mock)
-                acc, per, pending = _mean_per_id(res.records)
-                refs[stage][ds] = {"records": str(odir / f"{ds}.jsonl"), "score": acc, "n": len(per),
-                                   "pending": pending}
-                self.parent_refs = refs
-                write_json(self.refs_dir / "refs.json", refs)
-        if not self.mock:  # pragma: no cover - GPU path
-            k = self.cfg["kl"]["top_k"]
-            if self.kl_texts:
-                reference_logprobs(endpoint, served_name, [t for _, t in self.kl_texts], self.refs_dir / "kl_ref.jsonl", k)
-            if self.kl_heldout:
-                reference_logprobs(endpoint, served_name, [t for _, t in self.kl_heldout],
-                                   self.refs_dir / "kl_ref_heldout.jsonl", k)
-        self.parent_refs = refs
-        write_json(self.refs_dir / "refs.json", refs)
-        return refs
+    def _ref_records(self, ds: str, stage: str) -> list[dict] | None:
+        """The incumbent's records on this problem's `stage` items (evaluate_incumbent first)."""
+        p = self.records_path("incumbent", stage, ds)
+        return read_jsonl(p) if p.exists() else None
+
+    def compute_refs(self, endpoint: str, served_name: str) -> None:
+        """M_0 (served as the editor) is only the KL reference: cache its prompt logprobs on the KL texts
+        (real mode). It is not scored on the signal items (candidates are compared with the incumbent)."""
+        if self.mock:
+            return
+        from rsicore.evaluate import reference_logprobs  # pragma: no cover - GPU path
+        k = self.cfg["kl"]["top_k"]
+        if self.kl_texts:
+            reference_logprobs(endpoint, served_name, [t for _, t in self.kl_eval_texts()],
+                               self.refs_dir / "kl_ref.jsonl", k)
+        if self.kl_heldout:
+            reference_logprobs(endpoint, served_name, [t for _, t in self.kl_heldout],
+                               self.refs_dir / "kl_ref_heldout.jsonl", k)
+
+    def evaluate_incumbent(self, stages=("screen", "full")) -> dict:
+        """Score the incumbent on this problem's items (uncharged; cid 'incumbent'): the reference of every
+        candidate's retention, paired deltas and regression examples. -> {stage: score}."""
+        if not self.incumbent:
+            return {}
+        art = self.build(self.incumbent["config"], "incumbent")
+        self.incumbent_scores = {st: self.evaluate(art, st, "incumbent", charge=False, origin="incumbent")["score"]
+                                 for st in stages}
+        return self.incumbent_scores
+
+    # ------------------------------------------------------------------ analysis (editor tool)
+    def compare(self, cid: str, other: str = "incumbent", stage: str = "screen", max_ids: int = 50) -> dict:
+        """Item-level comparison of two evaluated candidates on the same items, WITHOUT item content (ids
+        and statistics only, so the signal items are not used up): per dataset, accuracy of both, flips
+        (other right -> cid wrong = broken, other wrong -> cid right = fixed) with their ids, flips by the
+        reference's output length (tercile buckets), truncation rate and mean output length of both."""
+        out = {"cid": cid, "other": other, "stage": stage, "datasets": {}}
+        for ds in self.datasets:
+            pa, pb = self.records_path(cid, stage, ds), self.records_path(other, stage, ds)
+            if not pa.exists() or not pb.exists():
+                missing = [c for c, q in ((cid, pa), (other, pb)) if not q.exists()]
+                raise ValueError(f"no {stage} records for {missing} on {ds} (evaluated candidate ids only; "
+                                 f"'incumbent' = the incumbent)")
+            A = {r["id"]: r for r in read_jsonl(pa) if r.get("score") is not None}
+            B = {r["id"]: r for r in read_jsonl(pb) if r.get("score") is not None}
+            ids = sorted(set(A) & set(B))
+            broken = [i for i in ids if B[i]["score"] > 0.5 >= A[i]["score"]]
+            fixed = [i for i in ids if A[i]["score"] > 0.5 >= B[i]["score"]]
+
+            def olen(r):
+                o = r.get("raw_output")
+                return len(o if isinstance(o, str) else " ".join(map(str, o or [])))
+
+            def trunc(r):
+                return any(f == "length" for f in (r.get("finish_reason") or []))
+            lens = sorted(olen(B[i]) for i in ids)
+            cut1, cut2 = (lens[len(lens) // 3], lens[2 * len(lens) // 3]) if lens else (0, 0)
+
+            def bucket(i):
+                n = olen(B[i])
+                return "short" if n <= cut1 else ("medium" if n <= cut2 else "long")
+            by = {k: {"n": 0, "broken": 0, "fixed": 0} for k in ("short", "medium", "long")}
+            for i in ids:
+                by[bucket(i)]["n"] += 1
+            for i in broken:
+                by[bucket(i)]["broken"] += 1
+            for i in fixed:
+                by[bucket(i)]["fixed"] += 1
+            n = max(len(ids), 1)
+            out["datasets"][ds] = {
+                "n": len(ids), "acc": round(sum(A[i]["score"] for i in ids) / n, 4),
+                "acc_other": round(sum(B[i]["score"] for i in ids) / n, 4),
+                "broken": len(broken), "fixed": len(fixed), "net": len(fixed) - len(broken),
+                "broken_ids": broken[:max_ids], "fixed_ids": fixed[:max_ids],
+                "by_reference_length": by,
+                "truncated": round(sum(trunc(A[i]) for i in ids) / n, 4),
+                "truncated_other": round(sum(trunc(B[i]) for i in ids) / n, 4),
+                "mean_output_chars": round(sum(olen(A[i]) for i in ids) / n, 1),
+                "mean_output_chars_other": round(sum(olen(B[i]) for i in ids) / n, 1)}
+        return out
 
     def heldout_kl(self, art: dict) -> dict | None:
         if not self.kl_heldout:
@@ -496,25 +689,38 @@ def kl_texts_for(rc, gen: int, datasets_all: list[str], cfg: dict) -> list[tuple
     return out
 
 
-def add_self_generated(texts: list[tuple[str, str]], endpoint: str, served_name: str, cfg: dict,
-                       cache: Path) -> list[tuple[str, str]]:  # pragma: no cover - needs a server
-    """Append the reference model's own greedy response to each KL prompt (2504.04823: reasoning-style
-    calibration text). Cached as jsonl {prompt_sha: response}."""
+def add_self_generated(texts: list[tuple[str, str]], endpoint, served_name: str, cfg: dict,
+                       cache: Path) -> list[tuple[str, str]]:
+    """prompt + response: append the reference model's own greedy response to each KL / calibration prompt
+    (2504.04823: reasoning-style calibration text), so KL and the calibration statistics also cover the answer
+    tokens. endpoint: a URL, or a callable returning one (called only when some response is not cached yet, so
+    a resume needs no server). Requests go in batches of kl.self_generated_batch prompts. Cached as jsonl
+    {sha, response, finish_reason}; <|im_end|> is appended only to responses that finished (not cut by
+    kl.self_generated_max_tokens)."""
     import hashlib
     import json
     import urllib.request
-    have = {r["sha"]: r["response"] for r in read_jsonl(cache)}
-    out = []
-    for d, t in texts:
-        sha = hashlib.sha256(t.encode()).hexdigest()
-        if sha not in have:
-            body = {"model": served_name, "prompt": t, "max_tokens": cfg["kl"]["self_generated_max_tokens"],
-                    "temperature": 0.0}
-            req = urllib.request.Request(endpoint.rstrip("/") + "/completions", data=json.dumps(body).encode(),
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=1800) as r:
+    kc = cfg["kl"]
+    have = {r["sha"]: r for r in read_jsonl(cache)}
+    shas = [hashlib.sha256(t.encode()).hexdigest() for _, t in texts]
+    todo = [(sha, t) for sha, (_, t) in zip(shas, texts) if sha not in have]
+    todo = list(dict(todo).items())                        # one request per distinct prompt
+    if todo:
+        url = (endpoint() if callable(endpoint) else endpoint).rstrip("/") + "/completions"
+        bs = max(1, int(kc.get("self_generated_batch", 64)))
+        for b in range(0, len(todo), bs):
+            chunk = todo[b:b + bs]
+            body = {"model": served_name, "prompt": [t for _, t in chunk], "temperature": 0.0,
+                    "max_tokens": int(kc.get("self_generated_max_tokens", 2048))}
+            req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=7200) as r:
                 resp = json.loads(r.read())
-            have[sha] = resp["choices"][0].get("text") or ""
-            append_jsonl(cache, {"sha": sha, "response": have[sha]})
-        out.append((d, t + have[sha] + "<|im_end|>"))
+            for ch in sorted(resp["choices"], key=lambda c: c.get("index", 0)):
+                sha = chunk[int(ch.get("index", 0))][0]
+                have[sha] = {"sha": sha, "response": ch.get("text") or "", "finish_reason": ch.get("finish_reason")}
+                append_jsonl(cache, have[sha])
+    out = []
+    for sha, (d, t) in zip(shas, texts):
+        r = have[sha]
+        out.append((d, t + r["response"] + ("<|im_end|>" if r.get("finish_reason") == "stop" else "")))
     return out

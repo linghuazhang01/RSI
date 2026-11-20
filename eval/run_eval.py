@@ -43,6 +43,7 @@ def parse_args(argv=None):
     ap.add_argument("--seed", type=int, default=None,
                     help="override the task/default sampling seed sent to the server (only sent when temperature > 0)")
     ap.add_argument("--top-p", type=float)
+    ap.add_argument("--top-k", type=int, help="top-k sampling (sent only when set and temperature > 0)")
     ap.add_argument("--n", type=int)
     ap.add_argument("--max-tokens", type=int)
     ap.add_argument("--thinking", choices=["on", "off"], default=None)
@@ -63,8 +64,8 @@ def parse_args(argv=None):
 
 
 def decoding_for(task_cfg, defaults, a):
-    d = {k: task_cfg.get(k, defaults[k]) for k in
-         ("temperature", "top_p", "n", "max_tokens", "max_tokens_thinking", "thinking", "seed",
+    d = {k: task_cfg.get(k, defaults.get(k)) for k in
+         ("temperature", "top_p", "top_k", "n", "max_tokens", "max_tokens_thinking", "thinking", "seed",
           "send_chat_template_kwargs")}
     if a.temperature is not None:
         d["temperature"] = a.temperature
@@ -72,6 +73,8 @@ def decoding_for(task_cfg, defaults, a):
         d["seed"] = a.seed
     if a.top_p is not None:
         d["top_p"] = a.top_p
+    if getattr(a, "top_k", None) is not None:
+        d["top_k"] = a.top_k
     if a.n is not None:
         d["n"] = a.n
     if a.thinking is not None:
@@ -87,6 +90,8 @@ def build_payload(req, dec, served_name):
          "top_p": dec["top_p"], "max_tokens": dec["effective_max_tokens"], "n": dec["n"]}
     if dec["temperature"] > 0 and dec.get("seed") is not None:
         p["seed"] = dec["seed"]
+    if dec["temperature"] > 0 and dec.get("top_k") is not None:   # vLLM extra sampling parameter
+        p["top_k"] = int(dec["top_k"])
     if req.get("tools"):
         p["tools"] = req["tools"]
         p["tool_choice"] = "auto"

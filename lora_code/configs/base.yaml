@@ -3,16 +3,43 @@
 # Numbers marked [pilot] are assumptions to be fixed in B-P0 (RSI_LOOP_DESIGN §6).
 draw_config: data/draw/paper_b.yaml   # target/retention sizes (n, target_train_frac, retention_n, screen_n, retention_kl, gate_n)
 
-# How the editor gets its LoRA each generation (2026-11-19):
-#   edit    : a raw LoRA is trained once per generation with the fixed `raw` recipe below (size set by
-#             raw.n_train / steps / epochs / rank); the editor may NOT train or take gradients (no sgd / grad /
-#             from_grad) and writes a program that edits the raw LoRA (handle "RAW") and the earlier adapters.
-#             Gate reference = the raw LoRA; fallback = the raw LoRA.
-#   scratch : no raw LoRA and no gradients; the editor builds the LoRA from zero with SVD / activation
+# Data size of every step (null = keep the draw config's value). The draw sizes below override
+# data/draw/paper_b.yaml for this run (written to <run>/draw_config.effective.yaml and locked with the run).
+# n / gate_n: a number (every domain) or {math: 1000, code: 500}. Other step sizes live next to their step:
+#   raw.n_train (edit-mode raw LoRA), baseline.noise_n (noise re-runs), eval.*_limit (screen /
+#   full / gate / KL items scored per candidate), heldout.limit, e_t.n_train / n_signal / test_limit.
+data:
+  n: null                   # items drawn per generation for the target domain (train + signal)
+  target_train_frac: null   # share of those items used for training (the rest = signal)
+  screen_n: null            # first-stage (screen) subset of the signal items
+  gate_n: null              # fixed gate items per domain
+  retention_n: null         # scope=all: signal items per retention domain
+  retention_kl: null        # scope=all: token-KL prompts per retention domain
+
+# Max generation length (tokens) per eval task, for EVERY model call of this run: candidates, gate, noise
+# re-runs, training-answer sampling. Overrides eval/configs/tasks.yaml (passed to run_eval as --max-tokens); tasks not
+# listed keep their tasks.yaml value. e.g. --set max_tokens.dapo_math=2048
+max_tokens:
+  dapo_math: 4096
+  taco_verified: 4096
+  ifeval_train: 2048
+  sealtool_train: 1024
+  triviaqa_train: 1024
+
+# How the editor gets its LoRA each generation (2026-11-19; SFT baseline and free mode removed 2026-11-20).
+# Nothing is ever trained except the raw LoRA of mode=edit in generation 0; the editor has no training or
+# gradient tools (no sgd / grad / from_grad) in either mode.
+#   edit    : ONE LoRA, trained ONCE: generation 0 trains a raw LoRA with the fixed `raw` recipe below (size
+#             set by raw.n_train / steps / epochs / rank); after that nothing is trained.
+#             Every generation the model M_g = M_0 + L_g (the current LoRA, an adapter on the M_0 server, never
+#             merged) writes a program that edits the LoRA it starts from (handle "RAW": the raw LoRA in
+#             generation 0, L_g later); the result replaces it.
+#             Gate: generation 0 vs the raw LoRA (fallback raw); later vs the current model + gate.min_gain
+#             (fallback keep L_g).
+#   scratch : no raw LoRA, no training at all; the editor builds the LoRA from zero with SVD / activation
 #             statistics / constructions. Gate reference = the parent model (+ gate.min_gain); fallback = keep.
-#   free    : the earlier design (every tool incl. sgd / grad); gate reference = SFT; fallback = SFT. Ablation.
 method:
-  mode: edit                # edit | scratch | free
+  mode: edit                # edit | scratch
 
 # Domain scope (default single since 2026-11-19; --set scope=all or ./launch.sh --all-domains for the original
 # design). single = ONLY the run's --domain: training, gate, feedback and token-KL use the target domain only
@@ -27,16 +54,16 @@ scope_profiles:
     heldout: {domains: run}
     e_t: {enabled: false}   # (no E_t -> no theta0 server: the GPU layout needs only main + train)
 
-raw:                        # mode=edit: recipe of the LoRA the editor starts from; null = take the `sft` value
-  n_train: null             # train items used for the raw LoRA (null = all of this generation's train items)
-  rank: null
-  lr: null
-  epochs: null
-  steps: null               # null = epochs over the n_train items
-  batch_size: null
-  leaves: null
+raw:                        # mode=edit only: recipe of the raw LoRA (trained once, generation 0; the only training)
+  n_train: null             # train items used (deterministic subset; null = all of generation 0's train items =
+                            # data.n x data.target_train_frac; raise data.n for more)
+  rank: 16
+  lr: 1.0e-4
+  epochs: 1.0
+  steps: null               # null = epochs over the n_train items (capped by gpu_seconds)
+  batch_size: 4
+  leaves: [q_proj, k_proj, v_proj, o_proj, in_proj_qkv, in_proj_z, out_proj, gate_proj, up_proj, down_proj]
   gpu_seconds: null         # null = budget.gpu_seconds
-  # all null (the default) = identical to the SFT baseline -> the SFT LoRA is reused, nothing trained twice
 
 lora:
   rank_cap: 64              # [pilot] max rank per module (vLLM --max-lora-rank)
@@ -45,7 +72,8 @@ lora:
   save_dtype: bfloat16      # adapter_model.safetensors dtype
 
 budget:
-  gpu_seconds: 7200         # [pilot] gradient budget per generation (grad / sgd / acts / regmean), = SFT budget
+  gpu_seconds: 7200         # [pilot] per generation: the editor's activation statistics (acts / regmean_preserve);
+                            # also the raw LoRA's training budget unless raw.gpu_seconds is set
 
 search:
   threads: 4
@@ -72,11 +100,20 @@ feedback:
 retention:
   domains: null            # null = all non-target domains; [] = target-domain training/evaluation only (scope=single)
 
+loop:
+  patience: 3               # stop after this many consecutive generations whose gate kept the current model
+                            # (2026-11-20; null = always run --gens generations)
+
+tools:                      # editor tools that can be switched off (ablations)
+  compare: true             # item-level comparison with the current model (ids / statistics only)
+  train_loss: true          # mean answer NLL on train items under a LoRA (forward only, costs gpu_seconds)
+
 gate:
-  reference: auto           # auto = by method.mode (edit: raw, scratch: parent, free: sft) | raw | sft | parent
-  fallback: auto            # auto = by method.mode (edit: raw, scratch: keep, free: sft) | raw | sft | keep
-  min_gain: 0.01            # [pilot] reference=parent: target gate >= parent gate + min_gain
-  epsilon: 0.01             # [pilot] reference=raw/sft: target gate >= reference gate - epsilon
+  reference: auto           # auto = by method.mode (edit: raw, scratch: parent) | raw | parent
+  fallback: auto            # auto = by method.mode (edit: raw, scratch: keep) | raw | keep
+  min_gain: 0.01            # [pilot] reference=parent: mean PAIRED gain on the gate items >= min_gain (2026-11-20)
+  require_significant: true # reference=parent: and the paired gain's 95% CI lower bound > 0 (like Paper A)
+  epsilon: 0.01             # [pilot] reference=raw: target gate >= raw gate - epsilon
   delta: 0.02               # [pilot] retention gate >= gen-0 - max(delta, noise band); learned targets >= post-learning - delta
   use_noise_band: true
   max_submissions: 3
@@ -87,34 +124,27 @@ eval:                       # null = use the draw config sizes as they are
   gate_limit: null
   kl_limit: null
 
-train_data:
-  mode: self_correct_then_gold   # rejection-sampled own correct answers, else the gold answer in eval format
-  samples: 4
-  temperature: 0.7
+train_data:                 # answers for training: used only when the raw LoRA is trained (mode=edit, generation 0);
+                            # otherwise the train items get gold answers and nothing is sampled
+  mode: self_correct        # 2026-11-20: rejection-sampled own correct answers only; an item with no correct
+                            # sample is skipped (self_correct_then_gold: use the gold answer instead; gold: no
+                            # sampling). Prompt = the evaluator's own chat messages + Qwen template, thinking off
+  samples: 4                # samples per train item; the first correct one is the training answer
+  temperature: 0.7          # 2026-11-20: Qwen's non-thinking sampling (0.7 / 0.8 / top_k 20), like the held-out
+  top_p: 0.8                # evaluation; search, gate and noise are greedy
+  top_k: 20
 
 train:
   dtype: bfloat16
-  max_len: 4096
+  max_len: 4608             # tokens per training sequence = prompt + answer; answers are capped at 4096 tokens
+                            # (dapo_math / taco_verified max_tokens), +512 for the prompt so no answer is cut
   micro_batch: null         # forward at most this many sequences at once (gradient accumulation); null = whole batch
-
-sft:                        # fixed-recipe SFT baseline (also the non-LLM search's starting recipe)
-  rank: 16
-  lr: 1.0e-4
-  epochs: 1.0
-  steps: null               # null = epochs over the train items (capped by budget.gpu_seconds)
-  batch_size: 4
-  ckpt_fracs: [0.25, 0.5, 0.75, 1.0]
-  leaves: [q_proj, k_proj, v_proj, o_proj, in_proj_qkv, in_proj_z, out_proj, gate_proj, up_proj, down_proj]
 
 nonllm:                     # 4th branch, same evaluate budget as the editor; what it searches depends on method.mode:
                             #   edit: random rule-based edits of the raw LoRA (scale / truncate / intruder / prune / regmean)
                             #   scratch: random gradient-free constructions (singular-direction scaling)
-                            #   free: random search over SFT hyper-parameters x checkpoint x global scale
   evaluate: 32              # same evaluate budget as the editor
-  n_configs: 4              # SFT hyper-parameter samples sharing budget.gpu_seconds
-  search_scales: [0.5, 0.75, 1.0, 1.25]
-  frontiers: true
-  scales: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
+  search_scales: [0.5, 0.75, 1.0, 1.25]   # edit: global scales the random edits draw from
 
 diagnostics:
   svd_k: 8
@@ -123,9 +153,9 @@ e_t:
   enabled: true
   task: tool_calling                       # E-Seal: sealtool_train -> Seal-Tools test + BFCL
   task_when_target_is_tool_calling: code   # taco_verified -> LiveCodeBench
-  branches: [parent, sft, llm, nonllm]
+  branches: [parent, llm, nonllm]         # mode=edit adds raw (M_t ⊕ raw, the ΔE_write reference)
   evaluate: 16
-  gpu_seconds: 3600         # [pilot]
+  gpu_seconds: 3600         # [pilot] per E session (acts / regmean); mode=edit: also the E-task raw LoRA's training
   threads: 4
   steps: 4
   top_full: 1
@@ -138,10 +168,24 @@ heldout:
   enabled: true
   domains: all             # all | run (= the run's --domain; scope=single) | a domain list, e.g. math
   limit: null
+  # Held-out decoding (2026-11-20): sampled, Qwen's non-thinking recommendation, same seed as the run; avg@n.
+  # (Search, gate and noise stay greedy.) null = each task's tasks.yaml decoding (greedy).
+  decoding:
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    seed: null                        # null = the run's --seed (one experiment seed for everything)
+    n: 1                              # samples per item (accuracy = avg@n)
+    n_by_task: {aime24: 8, aime25: 8, amc23: 8, math500: 4, gpqa_diamond: 4}   # small sets: more samples
 
 baseline:
-  noise_repeats: 3          # sampled gate re-runs of M_0 (rsicore.gate.measure_noise_band)
-  noise_temperature: 0.6
+  noise_repeats: 3          # sampled gate re-runs of M_0 (rsicore.gate.measure_noise_band), only when temperature > 0
+  noise_temperature: 0.0    # 2026-11-20: greedy, like every evaluation -> nothing is re-run, band 0, so the
+                            # retention margin is max(gate.delta, 2 SE of M_0's gate score)
+  noise_top_p: 1.0
+  noise_n: null             # gate items the re-runs score (deterministic subset; null = every gate item)
+  noise_fixed: null         # fixed noise band instead of the re-runs (used as is, no 2 SE floor): 0.03, or
+                            # {math: 0.03, default: 0.02} (keys: dataset, domain or default); unlisted datasets are measured
 
 merge:
   gpu: true                 # accumulate W + dW on gpu1 (else CPU)
@@ -197,7 +241,7 @@ mock_overrides:
   budget: {gpu_seconds: 600}
   eval: {screen_limit: 20, full_limit: 30, gate_limit: 30, kl_limit: 4}
   train_data: {mode: gold}
-  nonllm: {evaluate: 2, n_configs: 2, search_scales: [0.75, 1.0], scales: [0.5, 1.0]}
+  nonllm: {evaluate: 2, search_scales: [0.75, 1.0]}
   e_t: {evaluate: 2, threads: 1, steps: 2, n_train: 64, n_signal: 20, test_limit: 10, gpu_seconds: 300}
   heldout: {limit: 20}
   baseline: {noise_repeats: 3}

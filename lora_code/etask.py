@@ -1,15 +1,14 @@
 """E_t: the editor-capability measurement on a FIXED task (RSI_LOOP_DESIGN §3.5).
 
-A fresh editor session (no archive) run by a branch model (parent M_t, M_t ⊕ SFT, M_t ⊕ self-written LoRA,
-M_t ⊕ non-LLM LoRA) writes a LoRA for the ORIGINAL base model θ0 on Seal-Tools (sealtool_train train
+A fresh editor session (no archive) run by a branch model (parent M_t, M_t ⊕ raw LoRA in mode=edit,
+M_t ⊕ self-written LoRA, M_t ⊕ non-LLM LoRA) writes a LoRA for the ORIGINAL base model θ0 on Seal-Tools (sealtool_train train
 items; screen feedback on a fixed sealtool_train signal slice), with 16 evaluate calls and a fixed GPU
 budget, single seed. The best LoRA is scored on held-out Seal-Tools test + BFCL; when the run's target
 domain is tool_calling the code task is used instead (taco_verified -> LiveCodeBench).
 E-task items are a fixed deterministic subset of the dataset's pool minus the run's gate (independent of
-generation and branch). E-ref = the fixed-recipe SFT LoRA on θ0 for the same task (computed once per run).
+generation and branch). E-ref = θ0 itself on the E test (computed once per run; no SFT baseline).
 method.mode applies here too: edit = the session edits a raw LoRA for θ0 (the `raw` recipe on the E task,
-computed once in e_ref; = E-ref when the recipes are identical), no sgd / grad; scratch = from zero, no
-sgd / grad; free = every tool.
+trained once in e_ref; the only training of the E task); scratch = from zero. No session trains.
 """
 from __future__ import annotations
 
@@ -49,9 +48,11 @@ def e_items(rc, task: dict, cfg: dict) -> dict:
 
 
 def e_test(endpoint: str, served: str, task: dict, out_dir: Path, *, lora: str | None, mock: bool,
-           limit: int | None) -> dict:
-    """Score θ0 (+lora) on the held-out E-test tasks. Records get ids '<task>:<id>' for pairing."""
+           limit: int | None, decoding: dict | None = None) -> dict:
+    """Score θ0 (+lora) on the held-out E-test tasks. Records get ids '<task>:<id>' for pairing.
+    decoding: heldout.decoding (sampled avg@n, like every held-out evaluation); None = tasks.yaml decoding."""
     from rsicore.evaluate import score
+    from rsicore.heldout import decoding_args
 
     cache = Path(out_dir) / "e_test.json"
     got = read_json(cache)
@@ -59,9 +60,10 @@ def e_test(endpoint: str, served: str, task: dict, out_dir: Path, *, lora: str |
         return got
     recs, per = [], {}
     for t in task["test"]:
-        extra = ["--limit", str(limit)] if limit else []
+        dec = decoding_args(decoding, t)
+        extra = (["--limit", str(limit)] if limit else []) + dec["extra"]
         er = score(endpoint, served, t, pool="test", ids=None, out_dir=Path(out_dir) / f"test_{t}", lora=lora,
-                   extra=extra, mock=mock)
+                   extra=extra, mock=mock, **dec["kw"])
         rr = [{"id": f"{t}:{r.get('id')}", "score": r.get("score")} for r in er.records]
         sc = [r["score"] for r in rr if r["score"] is not None]
         per[t] = {"score": sum(sc) / len(sc) if sc else None, "n": len(rr), "n_scored": len(sc)}
@@ -73,7 +75,7 @@ def e_test(endpoint: str, served: str, task: dict, out_dir: Path, *, lora: str |
 
 
 def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str, editor_served: str,
-              editor_skill: float | None, theta0, task: dict, items: dict, make_workspace, mode: str = "free",
+              editor_skill: float | None, theta0, task: dict, items: dict, make_workspace, mode: str = "scratch",
               raw=None) -> dict:
     """One E_t measurement. `theta0` = dict(endpoint, served, server, store, hf, quality);
     make_workspace(out_dir, evaluator, budget, prefix) builds the θ0 workspace. Returns the result dict."""
@@ -109,7 +111,7 @@ def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str
         raw_info = dict(ws.raw_info or {})
     sysmsg = system_prompt(cfg, budget=budget, e_task=True, mode=mode, retention=bool(ws.retention_texts))
     ctx = ContextRenderer(task_text=task_text(gen=0, target=task["domain"], dataset=ds, retention=[],
-                                              n_train=len(items["train"]), sft_info=None, e_task=True,
+                                              n_train=len(items["train"]), e_task=True,
                                               raw_info=raw_info),
                           diag_text="(Diagnostics are not provided for the E task; use api.modules(), api.svd(), "
                                     "api.acts().)")
@@ -148,7 +150,7 @@ def run_etask(rc, cfg: dict, *, out_dir: Path, branch: str, editor_endpoint: str
         ev.register(lo, name)
         ev.ensure_loaded(name)
     test = e_test(theta0["endpoint"], theta0["served"], task, out_dir, lora=name, mock=rc.mock,
-                  limit=ec.get("test_limit"))
+                  limit=ec.get("test_limit"), decoding=(cfg.get("heldout") or {}).get("decoding"))
     res = {"branch": branch, "editor": editor_served, "best_cid": best.cid if best else None,
            "best_screen": best.score if best else None, "lora": name, "score": test["score"],
            "per_task": test["per_task"], "records": test["records"],

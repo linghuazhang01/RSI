@@ -6,8 +6,9 @@
 # (data/scripts/draw.py); `gate.seed` keeps the same gate across runs with the same gate sizes.
 paper: B
 seed: 42                 # experiment seed (2026-11-19: single seed 42); data splits keep their own seed 20261118
-screen_n: 200            # per domain: stratified subset of `signal` for the first-stage evaluation
-target_train_frac: 0.8   # target domain: 80% of the draw -> `train` (gradient-tool data), 20% -> `signal`
+screen_n: 400            # per domain: stratified subset of `signal` for the first-stage evaluation (2026-11-20: was 200)
+target_train_frac: 0.5   # target domain: 50% of the draw -> `train`, 50% -> `signal` (2026-11-20: was 0.8; nothing is
+                         # trained except edit mode's raw LoRA in generation 0, so more items go to the evaluation)
 retention_n: 400         # every other domain: `signal` items used as retention probes
 retention_kl: 64         # every other domain: prompts for token-KL vs the current model, disjoint from signal
 reuse:                   # revised 2026-11-19: training data is reusable across generations

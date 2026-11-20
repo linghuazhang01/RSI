@@ -2,8 +2,8 @@
 model, synthetic diagnostics with the real schema, and a mock editor policy that writes valid programs.
 
 Quality model (deterministic): a mock LoRA carries `gain` (target improvement) and `damage` (retention
-damage); every primitive / operator changes them the way the literature suggests (short SFT adds gain
-with growing damage; truncation, intruder scaling, RegMean, pruning and orthogonalisation trade a little
+damage); every primitive / operator changes them the way the literature suggests (training the raw LoRA
+adds gain with growing damage; truncation, intruder scaling, RegMean, pruning and orthogonalisation trade a little
 gain for less damage; a global scale trades both). The mock server answers with probability `quality`
 (registry: lora / served name -> quality, a float or a per-domain dict, see eval/rsicore/mock_quality.py).
 Per-domain quality of a model with a LoRA for target domain T: q[T] = parent[T] + gain + noise,
@@ -177,16 +177,6 @@ def m_construct(base, mod, strength, kind):
     return lo
 
 
-def m_from_grad(base, mods, lr, k):
-    lo = base.copy()
-    x = lr * 1e3
-    lo.gain += 0.012 * min(1.0, x) * min(1.0, len(mods) / 8)
-    lo.damage += 0.012 * x ** 2
-    lo.touch(mods, k, 0.01 * x)
-    lo.ops.append(["from_grad", lr, k, len(mods)])
-    return lo
-
-
 def m_scale(base, s):
     lo = base.copy()
     lo.gain *= s if s <= 1 else 1 + 0.25 * (s - 1)
@@ -290,16 +280,11 @@ def mock_diagnostics(store: MockStore, stack: list, seed: int = 42) -> dict:
 
 
 # ============================================================================ mock editor policy
-RECIPES = ["sgd", "sgd_trunc", "sgd_intruder", "construct_sgd", "sgd_regmean", "grad_step", "sgd_scale",
-           "sgd_prune_orth", "keep"]
-
-
-def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "free", retention: bool = True):
+def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "scratch", retention: bool = True):
     """Return policy(history) -> program text. Choices vary with (thread, step) parsed from the last user
     message ("[thread=K step=S]"); a higher `skill` (the editor model's mock quality) picks better
-    hyper-parameters and protective operators more often. mode (method.mode): free = SFT-based recipes
-    (PROGRAM); edit = edits of the raw LoRA (EDIT_PROGRAM, no sgd / grad); scratch = gradient-free
-    constructions from zero (SCRATCH_PROGRAM)."""
+    hyper-parameters and protective operators more often. mode (method.mode): edit = edits of the raw LoRA
+    (EDIT_PROGRAM); scratch = gradient-free constructions from zero (SCRATCH_PROGRAM)."""
 
     def policy(history):
         last = ""
@@ -320,79 +305,21 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
                                        lam=rng.choice([0.3, 0.5] if good else [0.1, 0.9]),
                                        alpha=rng.choice([1.0, 2.0] if good else [0.2]),
                                        s=rng.choice([0.8, 0.9] if good else [0.5, 1.4]),
+                                       boost=rng.choice([1.6, 2.0] if good else [1.05]),
                                        lo=rng.choice([0, 8, 16]), hi=rng.choice([48, 56, 64]))
-        if mode == "scratch":
-            recipe = SCRATCH_RECIPES[(th + st + rng.randrange(len(SCRATCH_RECIPES))) % len(SCRATCH_RECIPES)]
-            if recipe == "singular_regmean" and not retention:
-                recipe = "singular_scale"
-            return SCRATCH_PROGRAM.format(recipe=recipe, th=th, st=st, n=rng.choice([8, 16] if good else [2, 32]),
-                                          f=rng.choice([1.04, 1.06] if good else [1.3, 0.7]),
-                                          alpha=rng.choice([0.3, 0.5] if good else [2.0]),
-                                          lo=rng.choice([8, 16]), hi=rng.choice([48, 56]))
-        recipe = RECIPES[(th * 3 + st + rng.randrange(len(RECIPES))) % len(RECIPES)]
-        if recipe == "sgd_regmean" and not retention:
-            recipe = "sgd_intruder"
-        if recipe == "keep" and (st == 0 or rng.random() < 0.7):
-            recipe = "sgd_trunc"
-        lr = rng.choice([1e-4, 2e-4, 3e-4] if good else [5e-5, 1e-3, 2e-3])
-        steps = rng.choice([30, 40, 60] if good else [10, 120])
-        rank = rng.choice([8, 16, 32])
-        lo, hi = (16, 56) if good else (0, 64)
-        leaf = rng.choice(["mlp", "attn+mlp", "down_proj"])
-        return PROGRAM.format(recipe=recipe, lr=lr, steps=steps, rank=rank, lo=lo, hi=hi, leaf=leaf,
-                              k=rng.choice([4, 8, 16]), lam=rng.choice([0.3, 0.5, 0.7]),
-                              alpha=rng.choice([0.5, 1.0, 2.0]), s=rng.choice([0.6, 0.8, 1.0, 1.2]),
-                              th=th, st=st)
+        recipe = SCRATCH_RECIPES[(th + st + rng.randrange(len(SCRATCH_RECIPES))) % len(SCRATCH_RECIPES)]
+        if recipe == "singular_regmean" and not retention:
+            recipe = "singular_scale"
+        return SCRATCH_PROGRAM.format(recipe=recipe, th=th, st=st, n=rng.choice([8, 16] if good else [2, 32]),
+                                      f=rng.choice([1.04, 1.06] if good else [1.3, 0.7]),
+                                      alpha=rng.choice([0.3, 0.5] if good else [2.0]),
+                                      lo=rng.choice([8, 16]), hi=rng.choice([48, 56]))
 
     return policy
 
 
-PROGRAM = '''\
-# mock editor program: thread {th} step {st}, recipe {recipe}
-def main(api):
-    recipe = "{recipe}"
-    if recipe == "keep":
-        return {{"lora": None}}
-    mods = []
-    for m in api.modules():
-        if not ({lo} <= m["layer"] < {hi}):
-            continue
-        if "{leaf}" == "mlp" and m["group"] == "mlp":
-            mods.append(m["module"])
-        elif "{leaf}" == "down_proj" and m["leaf"] == "down_proj":
-            mods.append(m["module"])
-        elif "{leaf}" == "attn+mlp" and m["leaf"] in ("down_proj", "o_proj", "out_proj"):
-            mods.append(m["module"])
-    ids = api.train_ids()
-    base = None
-    if recipe == "construct_sgd":
-        tgt = mods[len(mods) // 2]
-        s = api.svd(module=tgt, k=4)
-        base = api.scale_singular(lora=api.new_lora()["lora"], module=tgt, svd=s["handle"], idx=[0, 1],
-                                  factors=[1.05, 1.03])["lora"]
-    if recipe == "grad_step":
-        g = api.grad(ids=ids[:64], modules=mods[:8], k=4)
-        lora = api.from_grad(lora=api.new_lora()["lora"], grad=g["handle"], lr={lr} * 2)["lora"]
-        return {{"lora": lora}}
-    lora = api.sgd(lora=base, ids=ids, steps={steps}, lr={lr}, rank={rank}, modules=mods)["lora"]
-    if recipe == "sgd_trunc":
-        lora = api.truncate_rank(lora=lora, k={k})["lora"]
-    elif recipe == "sgd_intruder":
-        lora = api.intruder_scale(lora=lora, lam={lam})["lora"]
-    elif recipe == "sgd_regmean":
-        lora = api.regmean_preserve(lora=lora, alpha={alpha})["lora"]
-    elif recipe == "sgd_scale":
-        lora = api.scale(lora=lora, s={s})["lora"]
-    elif recipe == "sgd_prune_orth":
-        lora = api.relchange_prune(lora=lora, frac=0.03)["lora"]
-        lora = api.orthogonalize(lora=lora)["lora"]
-    info = api.inspect(lora=lora)
-    print("modules", info["modules"], "max_rank", info["max_rank"])
-    return {{"lora": lora}}
-'''
-
-
-EDIT_RECIPES = ["trunc_scale", "intruder", "regmean", "prune_orth", "drop_attn", "layer_scale", "trunc_intruder"]
+EDIT_RECIPES = ["trunc_scale", "intruder", "regmean", "prune_orth", "drop_attn", "layer_scale", "trunc_intruder",
+                "boost", "boost"]
 
 EDIT_PROGRAM = '''\
 # mock editor program (mode=edit): thread {th} step {st}, recipe {recipe}
@@ -415,6 +342,8 @@ def main(api):
             lora = api.drop(lora=lora, modules=mods)["lora"]
     if recipe in ("trunc_scale", "layer_scale"):
         lora = api.scale(lora=lora, s={s})["lora"]
+    if recipe == "boost":                       # strengthen the LoRA (raises the target, costs retention)
+        lora = api.scale(lora=lora, s={boost})["lora"]
     info = api.inspect(lora=lora)
     print("modules", info["modules"], "max_rank", info["max_rank"])
     return {{"lora": lora}}
@@ -436,5 +365,11 @@ def main(api):
         lora = api.regmean_preserve(lora=lora, alpha={alpha})["lora"]
     if recipe == "singular_scale":
         lora = api.scale(lora=lora, s=0.8)["lora"]
+    try:                                    # cheap screening + item flips vs the current model (free tools)
+        tl = api.train_loss(lora=lora, n=16)
+        print("train_loss delta", tl["delta"])
+        print("compare parent", api.compare(cid="parent")["datasets"].keys())
+    except Exception as e:  # noqa: BLE001  (e.g. nothing evaluated yet, tool switched off)
+        print("analysis tools:", type(e).__name__, str(e)[:120])
     return {{"lora": lora}}
 '''

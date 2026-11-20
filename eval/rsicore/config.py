@@ -140,6 +140,82 @@ def _resolve_run_domain(cfg: dict, domain: str) -> dict:
     return cfg
 
 
+DATA_TOP = {"A": ("screen_n", "kl_contexts"), "B": ("screen_n", "target_train_frac", "retention_n", "retention_kl")}
+DATA_DOMAIN = ("n", "gate_n")
+
+
+def kl_domains_for(cfg: dict, paper: str, domain: str) -> list[str] | None:
+    """Paper A: the domains whose KL / calibration texts the run uses. kl.domains other than `all` (e.g. `run`,
+    set by scope=single) with one --domain -> [domain], so the draw puts every kl_contexts text in that domain.
+    None = the draw's default (kl_contexts split over all five domains)."""
+    if paper != "A" or domain == "all":
+        return None
+    return None if (cfg.get("kl") or {}).get("domains", "all") == "all" else [domain]
+
+
+def apply_data_sizes(draw: dict, data: dict | None, paper: str, kl_domains: list[str] | None = None) -> dict:
+    """Draw config with the run config's `data:` sizes applied (null = keep the draw config's value).
+    Top-level sizes (DATA_TOP) are numbers; per-domain sizes (n, gate_n) are a number (every domain) or
+    {domain: number} (the domains not listed keep theirs). kl_domains (Paper A, kl_domains_for) restricts the
+    domains kl_contexts is split over."""
+    out = copy.deepcopy(draw)
+    if kl_domains:
+        out["kl_domains"] = list(kl_domains)
+    data = {k: v for k, v in (data or {}).items() if v is not None}
+    known = DATA_TOP[paper] + DATA_DOMAIN
+    bad = sorted(set(data) - set(known))
+    if bad:
+        raise SystemExit(f"data: unknown size key(s) {bad} for Paper {paper}; known: {list(known)}")
+
+    def num(key, v, frac=False):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise SystemExit(f"data.{key} must be a number, got {v!r}")
+        if frac:
+            if not 0 < float(v) < 1:
+                raise SystemExit(f"data.{key} must be in (0, 1), got {v!r}")
+            return float(v)
+        if int(v) != v or int(v) < 1:
+            raise SystemExit(f"data.{key} must be a positive integer, got {v!r}")
+        return int(v)
+
+    for k in DATA_TOP[paper]:
+        if k in data:
+            out[k] = num(k, data[k], frac=(k == "target_train_frac"))
+    doms = out.get("domains") or {}
+    for k in DATA_DOMAIN:
+        if k not in data:
+            continue
+        spec = data[k]
+        if isinstance(spec, dict):
+            unknown = sorted(set(spec) - set(doms))
+            if unknown:
+                raise SystemExit(f"data.{k}: unknown domain(s) {unknown}; known: {sorted(doms)}")
+            vals = {d: num(f"{k}.{d}", v) for d, v in spec.items() if v is not None}
+        else:
+            vals = {d: num(k, spec) for d in doms}
+        for d, v in vals.items():
+            doms[d][k] = v
+    return out
+
+
+def _effective_draw_config(base: Path, data: dict | None, paper: str, run_dir: Path,
+                           kl_domains: list[str] | None = None, seed: int | None = None) -> Path:
+    """Write run_dir/draw_config.effective.yaml: `base` with the `data:` sizes, kl_domains and the run's seed
+    (the per-generation draws; the gate split keeps gate.seed) applied
+    (deterministic content, so a resume with the same settings matches the copy data/scripts/draw.py locked in
+    draws/draw_config.yaml; different settings are refused there)."""
+    eff = apply_data_sizes(_load_yaml(base), data, paper, kl_domains)
+    if seed is not None:
+        eff["seed"] = int(seed)
+    eff["data_sizes_from"] = {"draw_config": str(base), "run_config_data": copy.deepcopy(data or {}),
+                              "kl_domains": kl_domains}
+    p = run_dir / "draw_config.effective.yaml"
+    txt = yaml.safe_dump(eff, sort_keys=True, allow_unicode=True)
+    if not p.exists() or p.read_text() != txt:
+        p.write_text(txt)
+    return p
+
+
 def resolve_model(model: str) -> Path:
     p = Path(model).expanduser()
     if p.exists() or "/" in model or model.startswith("."):
@@ -168,12 +244,23 @@ def load_run_config(paper: str, args) -> RunConfig:
     cfg = _apply_scope(cfg, sets, args.domain)
     cfg = _apply_set(cfg, sets)
     cfg = _resolve_run_domain(cfg, args.domain)
+    # one experiment seed (2026-11-20): the held-out decoding seed null = the run's --seed
+    hd = (cfg.get("heldout") or {}).get("decoding")
+    if isinstance(hd, dict) and hd.get("seed") is None:
+        hd["seed"] = int(args.seed)
     draw_cfg = cfg.get("draw_config")
-    draw_cfg = (ROOT / draw_cfg).resolve() if draw_cfg else DRAW_CONFIGS[paper]
+    draw_cfg = base_draw = (ROOT / draw_cfg).resolve() if draw_cfg else DRAW_CONFIGS[paper]
+    apply_data_sizes(_load_yaml(base_draw), cfg.get("data"), paper)   # validate the `data:` sizes early
+    kl_doms = kl_domains_for(cfg, paper, args.domain)
+    # the per-generation draws use the run's --seed too: a seed other than the draw config's -> effective copy
+    seed_differs = int(_load_yaml(base_draw).get("seed", args.seed)) != int(args.seed)
+    sized = kl_doms is not None or seed_differs or any(v is not None for v in (cfg.get("data") or {}).values())
     single = cfg.get("scope") == "single" and args.domain != "all"
     run_id = args.run_id or (f"{paper}_{args.domain}_s{args.seed}" + ("_single" if single else "")
                              + ("_mock" if args.mock else ""))
     run_dir = Path(getattr(args, "runs_dir", None) or ROOT / "experiment_records").resolve() / run_id
+    if sized:
+        draw_cfg = run_dir / "draw_config.effective.yaml"   # written below, once the lock check passed
     gpus = [int(g) for g in str(args.gpus).split(",") if str(g).strip() != ""]
     common = {"domain", "gens", "model", "seed", "gpus", "run_id", "mock", "runs_dir", "paper_dir", "set"}
     extra = {k: v for k, v in vars(args).items() if k not in common}
@@ -196,6 +283,8 @@ def load_run_config(paper: str, args) -> RunConfig:
         new["created"] = old.get("created")
     else:
         new["created"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if sized:
+        _effective_draw_config(base_draw, cfg.get("data"), paper, run_dir, kl_doms, seed=int(args.seed))
     tmp = lock.with_suffix(".yaml.tmp")
     tmp.write_text(yaml.safe_dump(new, sort_keys=False, allow_unicode=True))
     os.replace(tmp, lock)

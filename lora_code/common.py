@@ -145,8 +145,7 @@ def prompt_text(dataset: str, item: dict) -> str:
         return "\n\n".join(m.get("content", "") for m in (item.get("messages") or []))
 
 
-MODES = ("edit", "scratch", "free")
-GRADIENT_TOOLS = ("sgd", "grad", "from_grad")   # training / gradient tools, only in mode=free
+MODES = ("edit", "scratch")   # 2026-11-20: no SFT baseline, no free mode; only edit trains (one raw LoRA, gen 0)
 
 
 def method_mode(cfg: dict) -> str:
@@ -157,17 +156,17 @@ def method_mode(cfg: dict) -> str:
 
 
 def gate_policy(cfg: dict) -> tuple[str, str]:
-    """(reference, fallback) of the gate: 'auto' resolves by method.mode."""
+    """(reference, fallback) of the gate: 'auto' resolves by method.mode (edit: raw / raw, scratch: parent / keep)."""
     mode = method_mode(cfg)
     g = cfg.get("gate") or {}
     ref = g.get("reference") or "auto"
     fb = g.get("fallback") or "auto"
     if ref == "auto":
-        ref = {"edit": "raw", "scratch": "parent", "free": "sft"}[mode]
+        ref = {"edit": "raw", "scratch": "parent"}[mode]
     if fb == "auto":
-        fb = {"edit": "raw", "scratch": "keep", "free": "sft"}[mode]
-    if ref not in ("raw", "sft", "parent") or fb not in ("raw", "sft", "keep"):
-        raise SystemExit(f"gate.reference must be raw|sft|parent and gate.fallback raw|sft|keep, got {ref!r} / {fb!r}")
+        fb = {"edit": "raw", "scratch": "keep"}[mode]
+    if ref not in ("raw", "parent") or fb not in ("raw", "keep"):
+        raise SystemExit(f"gate.reference must be raw|parent and gate.fallback raw|keep, got {ref!r} / {fb!r}")
     if mode != "edit" and "raw" in (ref, fb):
         raise SystemExit(f"gate reference/fallback 'raw' needs method.mode=edit (mode is {mode!r})")
     return ref, fb

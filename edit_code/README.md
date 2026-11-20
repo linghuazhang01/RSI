@@ -4,13 +4,60 @@
 
 **设计（2026-11-19 修订）**：改造者的权重冻结，不断迭代的是被量化的模型。
 - 改造者：原始 BF16 模型 M_0（`loop.editor: frozen`）；消融 `loop.editor: current` 让当前最好的量化模型来写。
-- 每个候选都从 **M_0 的原始权重**出发量化，所有代用**同一个体积**（默认 = 统一 3 bit GPTQ g128、词嵌入和输出层 8 bit 那份配置的打包大小，它也是起点 Q_0）。
+- 每个候选都从 **M_0 的原始权重**出发量化，所有代用**同一个体积**（默认 = 统一 4 bit GPTQ g128（2026-11-20 起；原为 3 bit）、词嵌入和输出层 8 bit 那份配置的打包大小，它也是起点 Q_0）。
 - 第 g 代的目标是超过当前最好的量化 Q_{g-1}（incumbent）：在固定验收集上逐题配对比较，平均提升 ≥ `gate.min_delta`，至少一个领域显著变好、没有领域显著变差，才换成新的 incumbent；否则保留。连续 `loop.patience` 代没有新的 incumbent 就停。
 - 改造者能看到：incumbent 的配置和它在本代题目上的分数、往代每代最好的几个候选（经验通道）、诊断表。
 
 ## 单领域实验（`scope`）
 
-**默认 `scope: single`（2026-11-19 起）**：只用这次运行的 `--domain`。信号和验收只用这个领域，KL / 校准文本（`kl.domains: run`）和留出评测（`heldout.domains: run`）也只用这个领域，不考虑别的领域。运行名默认带 `_single`。原设计（KL / 校准文本和留出评测覆盖五个领域）用 `--set scope=all`（`launch.sh --all-domains`）；`--domain all` 总是 `scope=all`。
+**默认 `scope: single`（2026-11-19 起）**：只用这次运行的 `--domain`。信号和验收只用这个领域，KL / 校准文本（`kl.domains: run`）和留出评测（`heldout.domains: run`）也只用这个领域，不考虑别的领域。`kl_contexts` 段 KL / 校准文本全部从本领域抽（2026-11-20 起；之前平均分给五个领域，单领域只用到约 1/5）。运行名默认带 `_single`。原设计（KL / 校准文本和留出评测覆盖五个领域）用 `--set scope=all`（`launch.sh --all-domains`）；`--domain all` 总是 `scope=all`。
+
+## 每一步的数据量和固定噪声带（2026-11-20）
+
+空着就用 `data/draw/paper_a.yaml` 的值；`data:` 里的抽题数写成 `<run>/draw_config.effective.yaml`，和运行一起锁定（同一个 run-id 改数据量会被拒绝）。
+
+| 步骤 | 键 | 默认 |
+|---|---|---|
+| 每代每个领域的 signal 题数（完整评测） | `data.n`（一个数 = 每个领域；或 `{math: 1000}`） | math 2000 |
+| 快速筛的题数 | `data.screen_n` | 400（`data/draw/paper_a.yaml`，2026-11-20 起；原为 200） |
+| 每代 KL / 校准文本数 | `data.kl_contexts` | 400（`data/draw/paper_a.yaml`，2026-11-20 起；原为 256。单领域时全部来自本领域；五领域时平均分给五个领域） |
+| 固定验收集题数 | `data.gate_n` | math 1000 |
+| 每个候选算 KL 用的文本数 | `kl.eval_texts` | 400（= 快速筛题数；原为 64。每条文本的 KL 存在 `evals/<cid>/<stage>/kl_per_text.json`） |
+| 噪声重评用的题数 | `noise.n` | 空 = 第 0 代全部 screen 题 |
+| 每个任务的最大生成长度 | `max_tokens.<任务>`（覆盖 `eval/configs/tasks.yaml`） | dapo_math 4096、taco_verified 4096、ifeval_train 2048、sealtool_train 1024、triviaqa_train 1024 |
+| 噪声重评的解码参数 | `noise.temperature` / `noise.top_p` | 0.0 / 1.0（贪心：重跑结果完全一样，所以不重跑，噪声带 = 0；> 0 才做采样重评） |
+| 留出评测的解码参数 | `heldout.decoding` | temperature 0.7、top_p 0.8、top_k 20、种子 42，avg@n（AIME / AMC 8 个，MATH-500 / GPQA 4 个，其余 1 个）；搜索、验收、噪声都是贪心 |
+| 校准文本 / 诊断表 / 留出评测 | `calibration.max_texts`、`diagnostics.profile_contexts`、`heldout.limit`、`e_task.heldout_limit` | |
+
+**固定噪声带**：`noise.fixed` 给了值就跳过 M_0 的采样重评，直接写进 `baseline/noise.json`：
+
+```bash
+--set noise.fixed=0.03                       # 所有数据集
+--set 'noise.fixed={math: 0.03}'             # 按领域 / 数据集名 / default；没给值的数据集照常测
+--set noise.n=100                            # 照常测，只用 100 道 screen 题
+```
+
+## 分析工具与保存的数据（2026-11-20）
+
+改造者除了评测，还可以用几个**免费**（不扣 evaluate）的分析工具：
+
+| 工具 | 回答什么问题 | 怎么算的 |
+|---|---|---|
+| `profile_table()` / `profile_summary()` | 哪些组对量化敏感（整模型 KL） | 第 0 代：每次只把一个组 RTN 量化到 2/3/4 bit，在 64 段 KL 文本上前向，和 BF16 比全词表 KL |
+| `hessian_table()` | 同上，但噪声小、覆盖 rtn / gptq / awq | 第 0 代：每组单独量化的 Hessian 加权误差 tr(ΔW H ΔWᵀ)，用缓存里的量化权重和全部校准 token 的 Hessian，不做前向 |
+| `activation_table()` | 哪些层的输入激活离群严重（适合 AWQ / 更高比特） | 校准时顺便统计 |
+| `group_error(config)` | 一个配置的误差集中在哪些组 | 同 `hessian_table` 的算法，逐组查表 / 按需计算（结果缓存在 `prep/diagnostics/herr_cache.json`） |
+| `compare(cid, other="incumbent")` | 这个候选和 incumbent（或另一个候选）比，坏了哪些题、修好哪些题 | 逐题对比两份评测记录：翻转数和题号、按输出长度分组、截断率、平均输出长度；**只给题号和统计，不给题目内容**，所以不会用掉信号题 |
+
+每个候选每个阶段保存在 `gen_XX/evals/<cid>/<stage>/`：逐题记录（`<数据集>.jsonl`，含原始输出、解析答案、对错）、每段文本的 KL（`kl_per_text.json`）、每组 Hessian 加权误差（`group_error.json`）。incumbent 的 cid 是 `incumbent`。量化后的模型文件不保留（每个约 54 GB；配置已存，可从缓存几秒钟重新拼出）。
+
+## KL / 校准文本 = 题目 + M_0 自己的回答（2026-11-20）
+
+每段 KL / 校准文本是"题目（聊天格式）+ M_0 对这道题的贪心回答"（`kl.self_generated: true`，回答最多 `kl.self_generated_max_tokens` = 2048 token）。这样 KL 和 GPTQ / AWQ 的校准统计都覆盖答题部分，不只是读题。
+- 回答每代生成一次，缓存在 `<run>/kl_selfgen/gen_XX.jsonl`；续跑时直接读缓存，不再起服务。回答被长度上限截断时不加 `<|im_end|>`。
+- 第 0 代的校准用前 `calibration.max_texts` = 256 段（每段截到 `calibration.max_len` = 2560 token）。
+- 每个候选的 KL 在 `kl.eval_texts` = 400 段上算（和快速筛题数一致）。
+- 回到只用题目：`--set kl.self_generated=false`。
 
 ## 启动
 
@@ -27,7 +74,7 @@
 ## 流程（run.py）
 
 - **第 0 代**（`baseline/`）：切固定验收集 → M_0 在验收集上的分数 → screen 子集重复 3 次得噪声带 → M_0 五个领域留出评测 → 对 M_0 做一次校准（Hessian + 激活统计）、诊断表、逐层量化缓存（`prep/`，之后每代复用）→ 定体积（`budget.json`）→ Q_0 = 参照配置，在验收集上打分（第一个 incumbent，`incumbent.json`）并做留出评测。
-- **第 g 代**（`gen_XX/`）：draw → M_0（卡 0）在本代 screen/signal 题上的参照分数和 KL 参照 logprob → incumbent 在同样的题上打分（不扣预算，`incumbent_scores.json`）→ `rsicore.search.inner_search`（改造者 = M_0；4 线程 × 6 步，每代 ≤24 次 evaluate；前 3 名跑完整 signal；候选在卡 1 上服务）→ 可选基线 → 只把在本代题目上分数高于 incumbent 的候选交验收（≤3 次）→ 通过：导出新 incumbent（fake-quant 检查点）+ 五个领域留出评测；不通过：incumbent 不变 → `summary.json`。
+- **第 g 代**（`gen_XX/`）：draw → M_0（卡 0）只算 KL 参照 logprob（2026-11-20 起不再在本代题上给 M_0 打分）→ incumbent 在同样的题上打分（不扣预算，`incumbent_scores.json`），它是所有候选的参照：保持率 = 候选准确率 / incumbent 准确率，逐题配对差和例题（incumbent 对、候选错）都相对 incumbent → `rsicore.search.inner_search`（改造者 = M_0；4 线程 × 6 步，每代 ≤24 次 evaluate；前 3 名跑完整 signal；候选在卡 1 上服务）→ 可选基线 → 只把在本代题目上分数高于 incumbent 的候选交验收（≤3 次）→ 通过：导出新 incumbent（fake-quant 检查点）+ 五个领域留出评测；不通过：incumbent 不变 → `summary.json`。
 - **主要指标**（`summary.json` 的 `final`）：验收集平均分 M_0 / Q_0 / 最终 incumbent、相对 Q_0 的提升 `gain_vs_q0`、追回的差距 `gap_closed` =（最终 − Q_0）/（M_0 − Q_0）、哪些代换了 incumbent；每代的留出分数和相对 M_0 的比例。
 - **E_t**（默认关）：新会话、不带档案，用第 g 代的改造者在同一体积下从 Q_0 开始做一遍；只在 `loop.editor: current` 时有意义（冻结的改造者不会变）。
 
@@ -37,10 +84,10 @@
 |---|---|
 | `run.py` | 编排（上面的流程）、断点续跑、汇总 |
 | `problem.py` | 一个搜索问题（源模型 + 预算 + 数据 + 参照）：prepare（缓存/诊断）、配置校验与大小、候选构建、fake-quant 落盘、候选服务、screen/full/gate 评测与 L1 反馈 |
-| `tools.py` | 程序可调用的工具（注册到 `rsicore.sandbox.ToolAPI`）：`model_info`、`profile_table`、`profile_summary`、`activation_table`、`bytes_table`、`bytes(config)`、`evaluate(config)`（扣 1 次）、`solve_allocation(...)`（可在配置里关掉做消融） |
+| `tools.py` | 程序可调用的工具（注册到 `rsicore.sandbox.ToolAPI`）：`model_info`、`profile_table`、`profile_summary`、`hessian_table`、`activation_table`、`bytes_table`、`bytes(config)`、`group_error(config)`、`compare(cid, other)`、`evaluate(config)`（扣 1 次）、`solve_allocation(...)`（`tools.*` 可关掉做消融） |
 | `allocation.py` | 多选背包（每组 (字节, 损伤) 下凸包 + 贪心），给 `solve_allocation`、KL 贪心基线和 mock 改造者用 |
-| `prompts.py` | 系统提示（配置 schema、工具、规则）和 `render_context(history, thread)`：incumbent 及其本代分数、候选表（大小、KL、各领域分数及相对原模型的差和显著性）、最好配置、本线程上次反馈、2–3 个退化样例、剩余预算、往代档案 |
-| `diagnostics.py` | `profile_table`（只把一个模块组 RTN 到 b 比特时整模型 ΔKL，参照=原模型，KL 文本子样本）、`activation_table`、`bytes_table`；只算一次，存在 `prep/diagnostics/` |
+| `prompts.py` | 系统提示（配置 schema、工具、规则）和 `render_context(history, thread)`：incumbent 及其本代分数、候选表（大小、KL、各领域分数及相对 incumbent 的配对差和显著性）、最好配置、本线程上次反馈、2–3 个退化样例、剩余预算、往代档案 |
+| `diagnostics.py` | `profile_table`（只把一个模块组 RTN 到 2/3/4 bit 时整模型 ΔKL，参照 = M_0，前 64 段第 0 代 KL 文本做前向）、`activation_table`（校准时顺便统计的输入激活）、`bytes_table`、`hessian_table`（每组单独用 rtn/gptq/awq 量化到 2/3/4 bit 的 Hessian 加权误差，来自缓存和校准 Hessian，用到全部校准 token，不做前向）；只算一次，存在 `prep/diagnostics/` |
 | `baselines.py` | 统一量化、KL 贪心、EvoPress 式进化搜索（同一构建/评测路径，不占改造者预算）；`--set 'baselines.methods=[uniform,kl_greedy,evo]'` |
 | `mock.py` | mock 模式：合成"真实损伤"模型、合成诊断表、mock registry 登记候选质量、mock 改造者策略 |
 | `quant/spec.py` | 从 safetensors 头读模块名和形状（不加载张量）；Qwen3.5 dense 的分组 |
@@ -83,7 +130,7 @@ H20 档（按每张卡 110 GB 规划，卡约 140 GB）：至少 2 张（每张�
 ## 验证状态（2026-11-19，本机 macOS 无 GPU）
 
 - `edit_code/tests/test_quant.py`：13 个 CPU 测试（transformers 5.9.0 临时环境全部通过）。覆盖：打包往返、RTN/GPTQ/AWQ 误差随比特单调下降、GPTQ/AWQ 的输出误差 ≤ RTN、配置大小公式与单调性、schema 解析与报错、小型 Qwen3.5（含 GDN、视觉塔）的模块发现、Hessian 收集、缓存拼装 = 直接量化、fake-quant 导出后 transformers 重新加载 logits 有限、KL 随比特下降、真实 `profile_table` 路径、`QuantProblem.prepare()` 真实路径（CPU）+ 工具 + 两代递归量化。eval/.venv 里的 transformers 5.23 会把 qwen3_5 强制映射到 Qwen3_5Tokenizer，测试用的词表 tokenizer 不能用，这一项会跳过。
-- `edit_code/tests/test_mock_flow.py`：固定体积循环（2 代：第 1 代 mock 改造者的比特交换超过统一 3 bit 被接受；续跑全部跳过）；`loop.editor=current` + patience 1 时第一次没有新 incumbent 就停；体积小于参照配置时拒绝运行。
+- `edit_code/tests/test_mock_flow.py`：固定体积循环（2 代：第 1 代 mock 改造者的比特交换超过统一 4 bit 被接受；续跑全部跳过）；`loop.editor=current` + patience 1 时第一次没有新 incumbent 就停；体积小于参照配置时拒绝运行。
 - **只能在 GPU 上跑、本机没有验证**：vLLM 加载 27B fake-quant 检查点、vLLM `prompt_logprobs` 的 KL、27B 的校准/诊断/缓存耗时与显存（H20 上尤其要实测）、候选服务（`problem.serve` 真实分支）、`kl.self_generated`。
 
 ## 尚未做 / 后续

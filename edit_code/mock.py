@@ -206,6 +206,12 @@ def main(api):
                 dmg[(best[0], choice[best[0]])] = 0.0   # cannot afford: skip this group
                 improved = True
     {maybe_eval}
+    if "group_error" in tools:              # analysis tools (free): where the error concentrates
+        ge = api.group_error(config=cfg_of(choice), top=3)
+        print("group_error top", ge["top"])
+    if "compare" in tools:                  # item flips vs the incumbent (ids only)
+        cmp = api.compare(cid="incumbent")
+        print("compare vs incumbent", {{k: v["net"] for k, v in cmp["datasets"].items()}})
     return cfg_of(choice)
 '''
 
@@ -283,6 +289,11 @@ def main(api):
     cfg = cfg_of()
     if not api.bytes(config=cfg)["fits_budget"]:
         return inc
+    if "group_error" in info["tools"]:      # analysis tools (free): where the error concentrates
+        print("group_error top", api.group_error(config=cfg, top=3)["top"])
+    if "compare" in info["tools"]:          # item flips vs the incumbent (ids only)
+        cmp = api.compare(cid="incumbent")
+        print("compare vs incumbent", {k: v["net"] for k, v in cmp["datasets"].items()})
     return cfg
 """
 

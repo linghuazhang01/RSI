@@ -1,5 +1,5 @@
 """Gradient-free LoRA constructors (RSI_LOOP_DESIGN §3.1): rank-1 edits, activation-direction edits,
-singular-direction scaling (Transformer²-style), and a low-rank step along a gradient.
+singular-direction scaling (Transformer²-style).
 
 All functions append a low-rank term to `lora` in place and return the number of rank units added.
 """
@@ -58,13 +58,3 @@ def scale_singular(lora, short: str, U, S, V, idx, factors) -> int:
     Ui, Vi, sig = U[:, idx][:, keep], V[:, idx][:, keep], sig[keep]
     lora.add(short, Vi.T.contiguous(), (Ui * sig).contiguous())
     return int(keep.sum())
-
-
-def from_lowrank_grad(lora, short: str, U, S, V, lr: float, k: int | None = None) -> int:
-    """One projected gradient step: ΔW += −lr · U_k S_k V_kᵀ (top-k SVD of ∂L/∂W from grad())."""
-    if k is not None:
-        U, S, V = U[:, :k], S[:k], V[:, :k]
-    if S.numel() == 0:
-        return 0
-    lora.add(short, V.T.contiguous(), (U * (-float(lr) * S)).contiguous())
-    return int(S.numel())

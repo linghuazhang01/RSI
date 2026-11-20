@@ -136,5 +136,248 @@ class ScopeConfigTest(unittest.TestCase):
             self.load("A", "all", "scope=single")
 
 
+class DataSizeAndNoiseTest(unittest.TestCase):
+    """data: sizes override the draw config per run; fixed noise band and the noise subset."""
+
+    def rc(self, paper, *sets, tmp=None, seed=None):
+        from rsicore.config import build_arg_parser, load_run_config
+        if tmp is None:
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        argv = ["--domain", "math", "--mock", "--runs-dir", tmp, "--run-id", "t"]
+        if seed is not None:
+            argv += ["--seed", str(seed)]
+        for x in sets:
+            argv += ["--set", x]
+        return load_run_config(paper, build_arg_parser(paper).parse_args(argv)), tmp
+
+    def test_one_seed_for_draws_and_heldout(self):
+        """--seed drives the per-generation draws (effective draw config) and the held-out decoding seed;
+        the gate split keeps its own fixed gate.seed."""
+        import yaml
+        for paper in ("A", "B"):
+            rc, _ = self.rc(paper)                                # default 42 = the draw configs' seed
+            self.assertEqual(rc.paper_cfg["heldout"]["decoding"]["seed"], 42)
+            rc, _ = self.rc(paper, seed=7)
+            self.assertEqual(rc.paper_cfg["heldout"]["decoding"]["seed"], 7)
+            eff = yaml.safe_load(rc.draw_config.read_text())
+            self.assertEqual((eff["seed"], eff["gate"]["seed"]), (7, 20261118))
+
+    def test_no_data_sizes_keeps_the_draw_config(self):
+        from rsicore.config import DRAW_CONFIGS
+        rc, _ = self.rc("B")
+        self.assertEqual(rc.draw_config, DRAW_CONFIGS["B"])
+        rc, _ = self.rc("A", "scope=all")                        # KL texts from all five domains
+        self.assertEqual(rc.draw_config, DRAW_CONFIGS["A"])
+
+    def test_single_domain_paper_a_puts_every_kl_text_in_its_domain(self):
+        import yaml
+        rc, _ = self.rc("A")                                     # scope single: kl.domains = run
+        eff = yaml.safe_load(rc.draw_config.read_text())
+        self.assertEqual((eff["kl_domains"], eff["kl_contexts"]), (["math"], 400))       # 2026-11-20: was 256
+        self.assertEqual(eff["screen_n"], 400)
+        rc, _ = self.rc("A", "data.kl_contexts=64")
+        self.assertEqual(yaml.safe_load(rc.draw_config.read_text())["kl_domains"], ["math"])
+
+    def test_data_sizes_write_an_effective_draw_config(self):
+        import yaml
+        rc, tmp = self.rc("B", "data.n=300", "data.gate_n={math: 120}", "data.screen_n=40",
+                          "data.target_train_frac=0.5")
+        self.assertEqual(rc.draw_config.name, "draw_config.effective.yaml")
+        eff = yaml.safe_load(rc.draw_config.read_text())
+        self.assertEqual(eff["domains"]["math"]["n"], 300)
+        self.assertEqual(eff["domains"]["code"]["n"], 300)              # a number applies to every domain
+        self.assertEqual(eff["domains"]["math"]["gate_n"], 120)
+        self.assertEqual(eff["domains"]["code"]["gate_n"], 1000)        # unlisted domains keep the draw value
+        self.assertEqual((eff["screen_n"], eff["target_train_frac"]), (40, 0.5))
+        txt = rc.draw_config.read_text()
+        self.rc("B", "data.n=300", "data.gate_n={math: 120}", "data.screen_n=40", "data.target_train_frac=0.5",
+                tmp=tmp)                                                # resume: identical file, lock passes
+        self.assertEqual(rc.draw_config.read_text(), txt)
+        with self.assertRaises(SystemExit):                             # other sizes on the same run-id
+            self.rc("B", "data.n=500", tmp=tmp)
+        self.assertEqual(rc.draw_config.read_text(), txt)               # refused before rewriting the file
+        a, _ = self.rc("A", "data.kl_contexts=32", "data.n=100")
+        eff = yaml.safe_load(a.draw_config.read_text())
+        self.assertEqual((eff["kl_contexts"], eff["domains"]["math"]["n"]), (32, 100))
+
+    def test_data_sizes_are_validated(self):
+        for p, bad in (("B", "data.kl_contexts=32"), ("A", "data.retention_n=10"), ("B", "data.n=0"),
+                       ("B", "data.n=1.5"), ("B", "data.target_train_frac=1.2"), ("B", "data.gate_n={maths: 1}")):
+            with self.assertRaises(SystemExit, msg=bad):
+                self.rc(p, bad)
+
+    def test_greedy_noise_band_runs_nothing(self):
+        from rsicore.gate import measure_noise_band
+        with patch("rsicore.evaluate.score", side_effect=AssertionError("greedy must not re-run")):
+            nb = measure_noise_band("http://x", "m", "dapo_math", ["a", "b"], Path(tempfile.mkdtemp()), temperature=0.0)
+        self.assertEqual((nb["band"], nb["n"]), (0.0, 0))
+        self.assertTrue(nb["source"].startswith("greedy"))
+
+    def test_search_and_gate_greedy_heldout_sampled(self):
+        """2026-11-20: search / gate / noise greedy (tasks.yaml); held-out sampled at 0.7 / 0.8 / top_k 20 avg@n."""
+        import yaml
+        from rsicore.heldout import decoding_args
+        tasks = yaml.safe_load((ROOT / "eval" / "configs" / "tasks.yaml").read_text())
+        self.assertEqual(tasks["defaults"]["temperature"], 0.0)
+        for name, t in tasks["tasks"].items():
+            self.assertEqual(t.get("temperature", 0.0), 0.0, name)
+            self.assertEqual(t.get("n", 1), 1, name)
+        a = yaml.safe_load((ROOT / "edit_code" / "configs" / "base.yaml").read_text())
+        b = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())
+        self.assertEqual((a["noise"]["temperature"], b["baseline"]["noise_temperature"]), (0.0, 0.0))
+        for cfg in (a, b):
+            dec = cfg["heldout"]["decoding"]
+            self.assertEqual((dec["temperature"], dec["top_p"], dec["top_k"], dec["seed"]), (0.7, 0.8, 20, None))
+            dec = dict(dec, seed=42)                              # resolved to the run's --seed at load time
+            d = decoding_args(dec, "aime24")
+            self.assertEqual(d["extra"], ["--n", "8"])
+            self.assertEqual(d["kw"], {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "seed": 42})
+            self.assertEqual(decoding_args(dec, "gsm8k")["extra"], ["--n", "1"])
+        self.assertEqual(decoding_args(None, "gsm8k"), {"kw": {}, "extra": [], "key": None})
+
+    def test_run_eval_sends_top_k_only_when_sampling(self):
+        sys.path.insert(0, str(ROOT / "eval"))
+        import run_eval
+        a = run_eval.parse_args(["--task", "gsm8k", "--pool", "test", "--endpoint", "x", "--model", "m",
+                                 "--temperature", "0.7", "--top-p", "0.8", "--top-k", "20"])
+        dflt = {"temperature": 0.0, "top_p": 1.0, "top_k": None, "n": 1, "max_tokens": 10, "max_tokens_thinking": 10,
+                "thinking": False, "seed": 42, "send_chat_template_kwargs": True}
+        p = run_eval.build_payload({"messages": []}, run_eval.decoding_for({}, dflt, a), "m")
+        self.assertEqual((p["temperature"], p["top_p"], p["top_k"], p["seed"]), (0.7, 0.8, 20, 42))
+        g = run_eval.parse_args(["--task", "gsm8k", "--pool", "test", "--endpoint", "x", "--model", "m"])
+        p = run_eval.build_payload({"messages": []}, run_eval.decoding_for({}, dflt, g), "m")
+        self.assertEqual(p["temperature"], 0.0)
+        self.assertNotIn("top_k", p)
+        self.assertNotIn("seed", p)
+
+    def test_fixed_noise_band_and_subset(self):
+        from rsicore.gate import fixed_noise_band, noise_ids
+        self.assertIsNone(fixed_noise_band(None, "dapo_math"))
+        self.assertEqual(fixed_noise_band(0.03, "dapo_math"), 0.03)
+        spec = {"math": 0.04, "taco_verified": 0.05, "default": 0.02}
+        self.assertEqual(fixed_noise_band(spec, "dapo_math"), 0.04)       # by domain
+        self.assertEqual(fixed_noise_band(spec, "taco_verified"), 0.05)   # by dataset
+        self.assertEqual(fixed_noise_band(spec, "ifeval_train"), 0.02)    # default
+        self.assertIsNone(fixed_noise_band({"math": 0.04}, "ifeval_train"))
+        with self.assertRaises(ValueError):
+            fixed_noise_band(True, "dapo_math")
+        ids = [f"x/{i}" for i in range(100)]
+        sub = noise_ids(ids, 20, 42)
+        self.assertEqual(len(sub), 20)
+        self.assertEqual(sub, noise_ids(list(reversed(ids)), 20, 42))
+        self.assertEqual(noise_ids(ids, None, 42), ids)
+        self.assertEqual(noise_ids(ids, 500, 42), ids)
+
+    def test_raw_train_size(self):
+        from lora_code import baselines as BL
+        r, n, gb = BL.raw_recipe({})
+        self.assertIsNone(n)                                             # raw.n_train null -> all train items
+        self.assertNotIn("n_train", r)
+        r, n, gb = BL.raw_recipe({"raw": {"n_train": 40}})
+        self.assertEqual(n, 40)
+        self.assertFalse(hasattr(BL, "sft_n_train") or hasattr(BL, "train_sft"))   # no SFT baseline
+
+
+class SamplingParamsTest(unittest.TestCase):
+    """Training answers use train_data (2026-11-20: 4 samples at 0.7 / 0.8 / top_k 20, the run seed); noise is greedy."""
+
+    def test_train_data_sampling_uses_configured_temperature_and_top_p(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rc = SimpleNamespace(domain="math", run_dir=Path(tmp.name), mock=False, seed=42)
+        seen = {}
+
+        def fake_score(endpoint, served, task, **kw):
+            seen.update(kw)
+            return SimpleNamespace(records=[])
+
+        import yaml
+        base = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())
+        td = base["train_data"]
+        self.assertEqual((td["temperature"], td["top_p"], td["top_k"], td["samples"]), (0.7, 0.8, 20, 4))
+        self.assertEqual((base["baseline"]["noise_temperature"], base["baseline"]["noise_top_p"]), (0.0, 1.0))
+        run = Run(rc, {"train_data": base["train_data"]})
+        with patch("rsicore.evaluate.score", side_effect=fake_score), \
+                patch("lora_code.run.load_records", return_value={}):
+            run.build_train_data("dapo_math", ["a"], Path(tmp.name) / "td.json", endpoint="http://x", served="m",
+                                 mode="self_correct_then_gold")
+        self.assertEqual((seen["temperature"], seen["top_p"], seen["top_k"], seen["seed"]), (0.7, 0.8, 20, 42))
+        self.assertEqual(seen["extra"], ["--n", "4"])
+
+
+    def test_items_without_a_correct_sample_are_skipped(self):
+        """train_data.mode self_correct (default): first correct sample kept; no correct sample -> no target
+        (skipped by training), not the gold answer; self_correct_then_gold falls back to gold."""
+        import yaml
+        base = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())
+        self.assertEqual(base["train_data"]["mode"], "self_correct")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rc = SimpleNamespace(domain="math", run_dir=Path(tmp.name), mock=False, seed=42)
+
+        def fake_score(endpoint, served, task, **kw):
+            return SimpleNamespace(records=[{"id": "a", "raw_output": ["w1", "w2"], "sample_scores": [0, 0]},
+                                            {"id": "b", "raw_output": ["w", "right"], "sample_scores": [0, 1]}])
+        run = Run(rc, {"train_data": base["train_data"]})
+        for mode, want_a in (("self_correct", (None, None)), ("self_correct_then_gold", ("GOLD", "gold"))):
+            with patch("rsicore.evaluate.score", side_effect=fake_score), \
+                    patch("lora_code.run.load_records", return_value={"a": {}, "b": {}}), \
+                    patch("lora_code.run.render_messages", return_value=[{"role": "user", "content": "q"}]), \
+                    patch("lora_code.run.gold_target", return_value="GOLD"):
+                ex = run.build_train_data("dapo_math", ["a", "b"], Path(tmp.name) / f"{mode}.json",
+                                          endpoint="http://x", served="m", mode=mode)
+            self.assertEqual((ex["b"]["target"], ex["b"]["source"]), ("right", "self"))
+            self.assertEqual((ex["a"]["target"], ex["a"]["source"]), want_a)
+
+    def test_answers_are_sampled_only_when_the_raw_lora_is_trained(self):
+        """(mock runs force train_data.mode=gold, so this is checked here, not in the mock flow)"""
+        rc = SimpleNamespace(domain="math", run_dir=Path(tempfile.mkdtemp()), mock=False)
+        td = {"train_data": {"mode": "self_correct"}}
+        edit = Run(rc, dict(td, method={"mode": "edit"}))
+        self.assertEqual(edit.train_data_mode(0), "self_correct")             # the only training of a run
+        self.assertEqual([edit.train_data_mode(g) for g in (1, 2, 5)], ["gold"] * 3)
+        scratch = Run(rc, dict(td, method={"mode": "scratch"}))
+        self.assertEqual([scratch.train_data_mode(g) for g in (0, 1, 2)], ["gold"] * 3)
+
+
+class MaxTokensTest(unittest.TestCase):
+    """max_tokens in the paper config reaches every run_eval call as --max-tokens."""
+
+    def tearDown(self):
+        from rsicore.evaluate import set_max_tokens
+        set_max_tokens(None)
+
+    def test_score_passes_the_configured_length(self):
+        import yaml
+        from rsicore import evaluate as E
+        for paper in ("lora_code", "edit_code"):
+            mt = yaml.safe_load((ROOT / paper / "configs" / "base.yaml").read_text())["max_tokens"]
+            self.assertEqual(mt, {"dapo_math": 4096, "taco_verified": 4096, "ifeval_train": 2048,
+                                  "sealtool_train": 1024, "triviaqa_train": 1024})
+        E.set_max_tokens({"dapo_math": 1234})
+        cmds = []
+
+        def fake_run(cmd, **kw):
+            cmds.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch("rsicore.evaluate.subprocess.run", side_effect=fake_run):
+            E.score("http://x", "m", "dapo_math", pool="pool", ids=None, out_dir=Path(tmp.name) / "a")
+            E.score("http://x", "m", "gsm8k", pool="test", ids=None, out_dir=Path(tmp.name) / "b")
+            E.score("http://x", "m", "dapo_math", pool="pool", ids=None, out_dir=Path(tmp.name) / "c",
+                    extra=["--max-tokens", "77"])
+        a, b, c = cmds
+        self.assertEqual(a[a.index("--max-tokens") + 1], "1234")
+        self.assertNotIn("--max-tokens", b)                         # unlisted task: tasks.yaml value
+        self.assertEqual(c.count("--max-tokens"), 1)                 # an explicit extra wins
+        with self.assertRaises(SystemExit):
+            E.set_max_tokens({"dapo_mth": 10})
+        with self.assertRaises(SystemExit):
+            E.set_max_tokens({"dapo_math": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,8 +47,11 @@ class Evaluator:
         self.mock = mock
         self.registry = registry
         self.parent_quality = parent_quality
-        self.sft_name: str | None = None
         self.raw_name: str | None = None    # mode=edit: the raw LoRA (feedback adds vs_raw)
+        # mode=edit, generation >= 1: the parent model is M_0 + the current LoRA (served as this adapter on the
+        # M_0 server); candidates are full replacement LoRAs on M_0. None = the served model itself.
+        self.parent_lora: str | None = None
+        self.pinned: set = set()            # adapters never unloaded (the parent / editor LoRA)
         self.shown: dict[str, set] = {}
         self._loaded: OrderedDict = OrderedDict()
         self._paths: dict[str, Path] = {}
@@ -87,13 +90,24 @@ class Evaluator:
     def known(self, name: str) -> bool:
         return name in self._paths
 
+    def set_parent(self, lora, name: str) -> None:
+        """mode=edit: the parent / editor model is M_0 + `lora` (registered and pinned as `name`)."""
+        if not self.known(name):
+            self.register(lora, name)
+        self.parent_lora = name
+        self.pinned.add(name)
+        self.ensure_loaded(name)
+
     def ensure_loaded(self, name: str) -> None:
         with self._lock:
             if name in self._loaded:
                 self._loaded.move_to_end(name)
                 return
             while len(self._loaded) >= self._max_loaded:
-                old, _ = self._loaded.popitem(last=False)
+                old = next((k for k in self._loaded if k not in self.pinned), None)
+                if old is None:
+                    break
+                self._loaded.pop(old)
                 try:
                     self.server.unload_lora(old)
                 except Exception:  # noqa: BLE001
@@ -107,16 +121,17 @@ class Evaluator:
         from rsicore.evaluate import score as rs_score
 
         key = name or "__parent__"
+        lora = name if name is not None else self.parent_lora
         res = {}
         for ds, ids in sorted(self.ids[level].items()):
             cache = self.out_dir / "evals" / key / level / f"{ds}.json"
             got = read_json(cache)
             if got is None:
-                if name is not None:
-                    self.ensure_loaded(name)
+                if lora is not None:
+                    self.ensure_loaded(lora)
                 er = rs_score(self.endpoint, self.served, ds, pool="pool", ids=list(ids),
                               out_dir=self.out_dir / "evals" / key / level / f"{ds}_raw",
-                              lora=name, mock=self.mock)
+                              lora=lora, mock=self.mock)
                 recs = []
                 for r in er.records:
                     recs.append({"id": r.get("id"), "score": r.get("score"),
@@ -133,6 +148,17 @@ class Evaluator:
             res[ds] = got
         return res
 
+    def cached(self, name: str | None, level: str) -> dict | None:
+        """run()'s result if every dataset of `level` is already on disk; None otherwise (never evaluates)."""
+        key = name or "__parent__"
+        res = {}
+        for ds in sorted(self.ids.get(level, {})):
+            got = read_json(self.out_dir / "evals" / key / level / f"{ds}.json")
+            if got is None:
+                return None
+            res[ds] = got
+        return res
+
     def kl(self, name: str | None) -> float | None:
         if name is None or not self.kl_texts:
             return 0.0 if name is None else None
@@ -144,7 +170,9 @@ class Evaluator:
             return got["mean"]
         with self._lock:
             if self._ref_cache is None:
-                self._ref_cache = reference_logprobs(self.endpoint, self.served, self.kl_texts,
+                if self.parent_lora:   # reference = M_0 + current LoRA (adapter name as the model)
+                    self.ensure_loaded(self.parent_lora)
+                self._ref_cache = reference_logprobs(self.endpoint, self.parent_lora or self.served, self.kl_texts,
                                                      self.out_dir / "evals" / "__parent__" / "ref_logprobs.jsonl")
             self.ensure_loaded(name)
         out = token_kl(self._ref_cache, self.endpoint, self.served, self.kl_texts, lora=name)
@@ -172,18 +200,13 @@ class Evaluator:
                  parent_gen0: dict | None = None) -> tuple[float | None, dict]:
         cand = self.run(name, level)
         par = self.run(None, level)
-        sft = self.run(self.sft_name, level) if (self.sft_name and level != "gate") else None
         kl = self.kl(name)
         vs_par = self.compare(cand, par)
         fb = {"level": level, "lora": name}
         t = cand.get(self.target, {})
         tgt = {"dataset": self.target, "score": t.get("score"), "ci": t.get("ci"), "n": t.get("n_scored"),
                "parent": par.get(self.target, {}).get("score"), "vs_parent": vs_par.get(self.target)}
-        if sft is not None and self.target in sft:
-            tgt["sft"] = sft[self.target]["score"]
-            tgt["vs_sft"] = self._paired(t.get("records", []), sft[self.target]["records"])
-        raw = (self.run(self.raw_name, level) if (self.raw_name and level != "gate" and self.raw_name != self.sft_name)
-               else (sft if self.raw_name and self.raw_name == self.sft_name else None))
+        raw = self.run(self.raw_name, level) if (self.raw_name and level != "gate") else None
         if raw is not None and self.target in raw:
             tgt["raw"] = raw[self.target]["score"]
             tgt["vs_raw"] = self._paired(t.get("records", []), raw[self.target]["records"])

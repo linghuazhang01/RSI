@@ -114,9 +114,11 @@ class EvalResult:
     out_dir: Path
 def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
           lora: str | None = None, extra: list[str] = (), mock: bool = False,
-          seed: int | None = None, temperature: float | None = None) -> EvalResult
+          seed: int | None = None, temperature: float | None = None, top_p: float | None = None) -> EvalResult
     # 子进程调用 eval/run_eval.py（--ids-file 临时文件、--no-cache、--quiet），代码任务在 Docker 不可用时状态为 pending
-    # seed / temperature（2026-11-19 增补）→ run_eval --seed / --temperature，覆盖任务的解码设置；seed 只在 temperature > 0 时发给服务
+    # seed / temperature（2026-11-19 增补）→ run_eval --seed / --temperature，覆盖任务的解码设置；seed 只在 temperature > 0 时发给服务；top_p（2026-11-20）→ --top-p
+def set_max_tokens(spec: dict | None) -> dict[str, int]   # 2026-11-20：本次运行每个任务的最大生成长度
+    # 论文配置的 max_tokens: {任务名: token}；之后每次 score() 对列出的任务加 --max-tokens（extra 里已有则不加）；未知任务名报错
 def paired_delta(a: list[dict], b: list[dict], seed: int = 42, n_boot: int = 1000) -> dict
     # 按 id 配对，返回 {"delta", "ci": [lo, hi], "n"}
 def reference_logprobs(endpoint, served_name, texts: list[str], cache: Path, top_k: int = 20) -> Path
@@ -181,11 +183,14 @@ def load_candidates(rc, gen: int, out_dir: Path | None = None) -> dict[str, Cand
 # gate.py
 def noise_band(results_runs: list[list[dict]]) -> float     # 同一模型重复评测的分数波动（max - min）
 def measure_noise_band(endpoint, served_name, task: str, ids: list[str] | None, out_dir: Path, *, repeats: int = 3,
-                       temperature: float = 0.6, base_seed: int = 42, mock: bool = False, lora: str | None = None,
-                       pool: str = "pool") -> dict   # 2026-11-19 增补
-    # 用 score(seed=base_seed+k, temperature=temperature) 重复评测 repeats 次（输出 out_dir/seed<seed>/）；
+                       temperature: float = 0.6, top_p: float = 1.0, base_seed: int = 42, mock: bool = False,
+                       lora: str | None = None, pool: str = "pool") -> dict   # 2026-11-19 增补；top_p 2026-11-20
+    # 用 score(seed=base_seed+k, temperature=temperature, top_p=top_p) 重复评测 repeats 次（输出 out_dir/seed<seed>/）；
     # 返回 {"band": max-min, "se": sqrt(p(1-p)/n)（p=各次均值的平均，n=有分数的题数）, "scores", "seeds", "mean", "n", "temperature", "task"}
     # 贪心（temperature=0）重复评测在 vLLM 和 mock 里都完全相同，band=0
+def fixed_noise_band(spec, dataset: str) -> float | None   # 2026-11-20：config 里的固定噪声带
+    # spec: None | 数字（所有数据集）| {数据集名 / 领域名 / "default": 数字}；没有值返回 None（照常测）
+def noise_ids(ids, n: int | None, seed: int) -> list | None   # 2026-11-20：噪声重评用的固定子集（n=None 或 >= len 时全部）
 def relative_pass(score: float, baseline: float, ratio: float) -> bool
 
 # heldout.py
@@ -199,7 +204,7 @@ def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=Non
 
 ### 3.1 core 实现说明（2026-11-19，均为增补，原签名不变）
 
-- `config`：`hardware_profiles[hardware]`（`--set hardware=h20`）和 `scope_profiles[scope]`（`--set scope=single`：只用这次运行的领域；`--domain all` 时拒绝）依次在 base/domain 之后、`--set` 之前合并（`--set` 优先），之后 `heldout.domains: run` 解析成运行的领域，结果锁进 run_config.yaml。CLI 另有 `--runs-dir`（默认 `experiment_records/`）、`--paper-dir`（覆盖读取 configs/ 的目录）、`--set KEY=VALUE`（可重复，点号键，YAML 值，并入 paper_cfg）。`run_config.yaml` 锁定 paper/domain/model/model_path/seed/mock/draw_config/paper_cfg；`gens`、`gpus` 可改（延长运行、换机器）。`RunConfig.cli_extra` 记录论文自加的 CLI 参数（不锁定）。`config.eval_python()`：run_eval.py / draw.py 用的解释器（`RSI_EVAL_PYTHON` > `eval/.venv/bin/python` > 当前解释器）。真实模式下 model_path 不存在直接报错。
+- `config`：`hardware_profiles[hardware]`（`--set hardware=h20`）和 `scope_profiles[scope]`（`--set scope=single`：只用这次运行的领域；`--domain all` 时拒绝）依次在 base/domain 之后、`--set` 之前合并（`--set` 优先），之后 `heldout.domains: run` 解析成运行的领域，结果锁进 run_config.yaml。CLI 另有 `--runs-dir`（默认 `experiment_records/`）、`--paper-dir`（覆盖读取 configs/ 的目录）、`--set KEY=VALUE`（可重复，点号键，YAML 值，并入 paper_cfg）。`run_config.yaml` 锁定 paper/domain/model/model_path/seed/mock/draw_config/paper_cfg；`gens`、`gpus` 可改（延长运行、换机器）。`RunConfig.cli_extra` 记录论文自加的 CLI 参数（不锁定）。paper_cfg 的 `data:`（2026-11-20）覆盖抽题配置里的数量（Paper A：`n`、`gate_n`、`screen_n`、`kl_contexts`；Paper B：`n`、`gate_n`、`screen_n`、`target_train_frac`、`retention_n`、`retention_kl`；`n` / `gate_n` 可以是一个数或 {领域: 数}），有值时 `config.apply_data_sizes` 生成 `<run>/draw_config.effective.yaml`，`rc.draw_config` 指向它（锁检查通过后才写）。Paper A 单领域（`kl.domains` 不是 `all`、`--domain` 不是 all）时 `config.kl_domains_for` 还会在里面写 `kl_domains: [<domain>]`，draw.py 把 `kl_contexts` 只分给这些领域。`config.eval_python()`：run_eval.py / draw.py 用的解释器（`RSI_EVAL_PYTHON` > `eval/.venv/bin/python` > 当前解释器）。真实模式下 model_path 不存在直接报错。
 - `state.RunState`：另有 `unmark(key)`、`keys()`；`step()` 块内自己调用 `mark(key, info)` 不会被覆盖。
 - `records`：另有 `read_json(path, default)`、`read_jsonl(path)`；`summary.json = {"run_id","paper","domain","gens": {"<g>": {...}}}`。
 - `draws`：已抽过的代 / 已切过的 gate 直接读文件，不再起子进程；`ids()` 文件不存在返回 `[]`。
@@ -222,9 +227,9 @@ def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=Non
 - mock：不加载真实权重；候选 artifact 只记录配置与一个由配置算出的 `quality`（越接近原精度越高），写入 mock registry。
 
 ### Paper B：`lora_code/`（B agent）
-- `lora_code/run.py`：逐代：draw（`--target <domain>`）→ 诊断表 → `inner_search`（工具：`svd`、`acts`、`grad`、`sgd`、LoRA 栈操作、`evaluate(lora)`）→ `submit_to_gate` → 把 LoRA 合并进权重得 M_{t+1} → 对照分支（SFT 基线、非 LLM 搜索）→ E_t（固定任务：为原始基座在 Seal-Tools 上写 LoRA；工具调用领域单独跑时换成代码领域）→ 留出评测。
+- `lora_code/run.py`：逐代：draw（`--target <domain>`）→ 诊断表 → `inner_search`（工具：`svd`、`acts`、构造工具、LoRA 栈操作、`evaluate(lora)`；没有训练 / 梯度工具）→ `submit_to_gate` → 把 LoRA 合并进权重得 M_{t+1} → 对照分支（非 LLM 搜索；没有 SFT 基线）→ E_t（固定任务：为原始基座在 Seal-Tools 上写 LoRA；工具调用领域单独跑时换成代码领域）→ 留出评测。
 - 配置：`lora_code/configs/base.yaml`、`lora_code/configs/domains/<domain>.yaml`。
-- LoRA 存成 PEFT 格式（`adapter_config.json` + `adapter_model.safetensors`），目标模块名要能被 vLLM 0.24.0 的 Qwen3.5 LoRA 加载；梯度工具用 transformers + peft（只能用本代 `train` 角色的题）。
+- LoRA 存成 PEFT 格式（`adapter_config.json` + `adapter_model.safetensors`），目标模块名要能被 vLLM 0.24.0 的 Qwen3.5 LoRA 加载；唯一的训练（edit 模式第 0 代的 raw LoRA）和激活统计用 transformers + peft（只能用本代 `train` 角色的题）。
 - mock：不加载真实权重；LoRA artifact 是一个小 JSON（含由程序参数算出的 gain / damage），登记到 mock registry 的是按领域的 dict：目标领域 = 父模型该领域 + gain，其余领域 = 父模型 − damage（2026-11-19），合并后的 M_{g+1} 继承这个 dict。
 
 ## 5. mock 模式（core agent 提供 `eval/rsicore/mock_server.py`）

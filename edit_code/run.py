@@ -10,10 +10,10 @@ generation g tries to beat the incumbent Q_{g-1} (best accepted quantization so 
 
 Generation 0 (baseline/): fixed gate split; M_0 scored on the gate; noise band (sampled screen runs);
 held-out evaluation of M_0; layer cache + diagnostics of M_0 (run_dir/prep/, built once, reused by every
-generation); budget = budget.gib or the packed size of budget.reference (uniform W3 GPTQ by default);
+generation); budget = budget.gib or the packed size of budget.reference (uniform W4 GPTQ by default);
 Q_0 = the reference config, scored on the gate (it is the first incumbent) and on the held-out sets.
-Generation g = 1..gens (gen_XX/): draw -> M_0 references on this generation's items -> incumbent scored
-on the same items (shown to the editor) -> inner search (threads x steps, <= max_evaluate evaluations;
+Generation g = 1..gens (gen_XX/): draw -> M_0's KL reference logprobs (M_0 is not scored on the items) ->
+incumbent scored on the same items (the reference of every candidate; shown to the editor) -> inner search (threads x steps, <= max_evaluate evaluations;
 candidates from the shared cache; one candidate server per candidate-GPU group, so the threads of a step
 are built and evaluated at the same time) -> optional baselines -> gate (<= 3 submissions of
 candidates whose score beats the incumbent's: fits the budget AND paired gain over the incumbent on the
@@ -41,7 +41,7 @@ from rsicore import records as R  # noqa: E402
 from rsicore import search as S  # noqa: E402
 from rsicore.editor import Editor  # noqa: E402
 from rsicore.evaluate import score  # noqa: E402
-from rsicore.gate import measure_noise_band  # noqa: E402
+from rsicore.gate import fixed_noise_band, measure_noise_band, noise_ids  # noqa: E402
 from rsicore.heldout import HELDOUT, run_heldout  # noqa: E402
 from rsicore.sandbox import run_program  # noqa: E402
 from rsicore.servers import VLLMServer  # noqa: E402
@@ -170,6 +170,16 @@ class Runner:
         """An exported quantized model (fake-quant checkpoint, or mock_model.json in mock mode)."""
         q = M.load_state(Path(model_dir) / "mock_model.json")["quality"] if self.rc.mock else None
         return self._server(name, Path(model_dir), q, gpus, args_key)
+
+    def kl_texts(self, gen: int, m0: LazyServer) -> list[tuple[str, str]]:
+        """(domain, text) KL / calibration texts of generation `gen`. kl.self_generated: prompt + M_0's own greedy
+        response (cached in run_dir/kl_selfgen/gen_XX.jsonl; M_0 is started only for responses not cached yet),
+        else the prompt alone."""
+        texts = kl_texts_for(self.rc, gen, self.kl_datasets, self.cfg)
+        if not self.cfg["kl"].get("self_generated"):
+            return texts
+        return add_self_generated(texts, lambda: m0.get().endpoint, m0.name, self.cfg,
+                                  self.run_dir / "kl_selfgen" / f"gen_{gen:02d}.jsonl")
 
     def data_for(self, gen: int) -> dict:
         return {ds: {"screen": D.ids(self.rc, gen, ds, "screen"), "signal": D.ids(self.rc, gen, ds, "signal")}
@@ -300,13 +310,14 @@ class Runner:
                     srv = m0.get()
                     h = run_heldout(srv.endpoint, m0.name, bdir / "heldout",
                                     domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
-                                    limit=cfg["heldout"].get("limit"))
+                                    limit=cfg["heldout"].get("limit"), decoding=cfg["heldout"].get("decoding"))
                     write_json(bdir / "heldout.json", h)
+            kl0 = self.kl_texts(0, m0)       # calibration / KL texts (prompt + M_0 response with kl.self_generated)
         finally:
             m0.close()
         # layer cache + diagnostics of M_0 (once), budget, Q_0
         prob = self.problem(tag="q0", gen=0, out_dir=bdir / "q0", budget=float("inf"), data=self.data_for(0),
-                            kl_texts=kl_texts_for(rc, 0, self.kl_datasets, cfg), refs_dir=bdir / "q0" / "refs",
+                            kl_texts=kl0, refs_dir=bdir / "q0" / "refs",
                             eval_budget=0, show_examples=0)
         with st.step("baseline/prep") as todo:
             prob.prepare()
@@ -331,7 +342,7 @@ class Runner:
                     s = srv.get()
                     h = run_heldout(s.endpoint, srv.name, bdir / "q0" / "heldout",
                                     domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
-                                    limit=cfg["heldout"].get("limit"))
+                                    limit=cfg["heldout"].get("limit"), decoding=cfg["heldout"].get("decoding"))
                 write_json(bdir / "q0" / "heldout.json", h)
         if cfg["e_task"].get("enabled", False):
             self.run_e_task(0)
@@ -352,22 +363,30 @@ class Runner:
             out["gib"], out["source"] = float(rb["gib"]), "budget.reference"   # exact: Q_0 fits it
         else:
             raise ValueError("budget: set budget.gib or budget.reference")
-        if ref and out["reference_gib"] > out["gib"] + 1e-9:
+        if ref and rb["gib"] > out["gib"] + 1e-9:   # unrounded: reference_gib is rounded (W4 rounds up)
             raise ValueError(f"budget {out['gib']:.3f} GiB is smaller than budget.reference ({out['reference_gib']:.3f} "
                              "GiB), which is the starting incumbent Q_0: lower budget.reference as well")
         out["fraction_of_bf16"] = round(out["gib"] / bf16, 4)
         return out
 
     def noise_band(self, ed: LazyServer, bdir: Path) -> dict:
-        """{dataset: band} (max - min of repeated sampled screen runs of M_0); details in noise_detail.json."""
+        """{dataset: band} (max - min of repeated sampled screen runs of M_0); details in noise_detail.json.
+        noise.fixed gives the band directly (no re-runs for those datasets); noise.n scores a subset of the
+        generation-0 screen items (null = all of them)."""
         rc, ncfg = self.rc, self.cfg["noise"]
-        srv = ed.get()
         detail = {}
         for ds in self.datasets:
-            detail[ds] = measure_noise_band(srv.endpoint, ed.name, ds, D.ids(rc, 0, ds, "screen"), bdir / "noise" / ds,
+            fixed = fixed_noise_band(ncfg.get("fixed"), ds)
+            if fixed is not None:
+                detail[ds] = {"band": fixed, "source": "fixed (noise.fixed)", "task": ds}
+                continue
+            srv = ed.get()
+            ids = noise_ids(D.ids(rc, 0, ds, "screen"), ncfg.get("n"), rc.seed)
+            detail[ds] = measure_noise_band(srv.endpoint, ed.name, ds, ids, bdir / "noise" / ds,
                                             repeats=int(ncfg.get("repeats", 3)),
-                                            temperature=float(ncfg.get("temperature", 0.6)), base_seed=rc.seed,
-                                            mock=rc.mock)
+                                            temperature=float(ncfg.get("temperature", 0.0)),
+                                            top_p=float(ncfg.get("top_p", 1.0)), base_seed=rc.seed,
+                                            mock=rc.mock)   # source: measured | greedy (temperature 0: band 0)
         write_json(bdir / "noise_detail.json", detail)
         out = {ds: round(v["band"], 4) for ds, v in detail.items()}
         self.log("[baseline] noise band", out)
@@ -392,17 +411,18 @@ class Runner:
             return
         ec = cfg["e_task"]
         out = self.gen_dir(g) / "e_t"
-        texts = kl_texts_for(rc, 0, self.kl_datasets, cfg)
+        m0 = self.m0_server()
+        texts = self.kl_texts(0, m0)                # the generation-0 texts (same cache as the baseline)
         prob = self.problem(tag=f"e{g:02d}", gen=g, out_dir=out, budget=float(ec.get("budget_gib") or self.budget_gib()),
                             data=self.data_for(0), kl_texts=texts[0::2], kl_heldout=texts[1::2],
                             refs_dir=self.run_dir / "e_task" / "refs", eval_budget=ec["evaluate"], show_examples=0,
                             incumbent=self.incumbent(0))
         prob.prepare()
-        m0 = self.m0_server()
         ed = self.editor_server(g + 1, m0)          # frozen: M_0; current: the incumbent after generation g
         try:
             srv = m0.get()
-            prob.compute_parent_refs(srv.endpoint, m0.name)
+            prob.compute_refs(srv.endpoint, m0.name)
+            prob.evaluate_incumbent()               # Q_0 on the generation-0 items: the candidates' reference
             if ed is not m0:
                 m0.close()
             scfg = dict(cfg["search"], threads=ec["threads"], steps=ec["steps"], max_evaluate=ec["evaluate"],
@@ -419,7 +439,7 @@ class Runner:
             with prob.serve(best.artifact, f"{rc.run_id}-e{g:02d}-best") as srv:
                 h = run_heldout(srv.endpoint, srv.served_name, out / "heldout",
                                 domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
-                                limit=ec.get("heldout_limit"))
+                                limit=ec.get("heldout_limit"), decoding=cfg["heldout"].get("decoding"))
             res["best"] = {"cid": best.cid, "score": best.score, "bytes_gib": best.artifact["bytes_gib"],
                            "config": best.artifact["config"], "heldout_kl": hk, "heldout": h,
                            "heldout_by_domain": _by_domain(h)}
@@ -455,26 +475,20 @@ class Runner:
         with st.step(f"{p}/draw") as todo:
             if todo:
                 D.draw_gen(rc, g)
-        prob = self.problem(tag=f"g{g:02d}", gen=g, out_dir=gd, budget=budget, data=self.data_for(g),
-                            kl_texts=kl_texts_for(rc, g, self.kl_datasets, cfg), refs_dir=gd / "refs",
-                            eval_budget=cfg["search"]["max_evaluate"], show_examples=cfg["feedback"].get("examples", 2),
-                            incumbent=inc)
-        prob.prepare()
         m0 = self.m0_server(tasks=self.datasets)
         ed = None
         try:
-            if cfg["kl"].get("self_generated") and not rc.mock:  # pragma: no cover - GPU path
-                srv = m0.get()
-                prob.kl_texts = add_self_generated(prob.kl_texts, srv.endpoint, m0.name, cfg, gd / "refs" / "selfgen.jsonl")
+            prob = self.problem(tag=f"g{g:02d}", gen=g, out_dir=gd, budget=budget, data=self.data_for(g),
+                                kl_texts=self.kl_texts(g, m0), refs_dir=gd / "refs",
+                                eval_budget=cfg["search"]["max_evaluate"],
+                                show_examples=cfg["feedback"].get("examples", 2), incumbent=inc)
+            prob.prepare()
             with st.step(f"{p}/refs") as todo:
-                if todo:
+                if todo:                            # M_0 = the KL reference only (not scored on the items)
                     srv = m0.get()
-                    prob.compute_parent_refs(srv.endpoint, m0.name,
-                                             stages=("screen", "full") if cfg["feedback"].get("parent_full", True) else ("screen",))
-            # the incumbent on this generation's items (uncharged; cached in evals.jsonl)
-            inc_art = prob.build(inc["config"], "incumbent")
-            prob.incumbent_scores = {stage: prob.evaluate(inc_art, stage, "incumbent", charge=False, origin="incumbent")["score"]
-                                     for stage in ("screen", "full")}
+                    prob.compute_refs(srv.endpoint, m0.name)
+            # the incumbent on this generation's items = the reference of every candidate (uncharged; cached)
+            prob.evaluate_incumbent()
             write_json(gd / "incumbent_scores.json", prob.incumbent_scores)
             ed = self.editor_server(g, m0)
             if ed is not m0:
@@ -545,7 +559,7 @@ class Runner:
                         s = srv.get()
                         h = run_heldout(s.endpoint, srv.name, gd / "heldout",
                                         domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
-                                        limit=cfg["heldout"].get("limit"))
+                                        limit=cfg["heldout"].get("limit"), decoding=cfg["heldout"].get("decoding"))
                     write_json(gd / "heldout.json", h)
             self.log(f"[gen {g}] new incumbent {new['cid']}: gate {new['gate_scores']}")
         else:
@@ -682,6 +696,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     rc = C.load_run_config("A", args)
     cfg = effective_config(rc, args)
+    from rsicore.evaluate import set_max_tokens
+    set_max_tokens(cfg.get("max_tokens"))                # per-task max generation length for every run_eval call
     try:
         Runner(rc, cfg).run()
     except Exception:

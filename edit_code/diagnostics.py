@@ -1,8 +1,12 @@
 """Fixed diagnostics given to the editor (identical program in every generation; METHOD_DESIGN §2.2).
 
-profile_table     one row per (group key, bits): whole-model DeltaKL(current || current with ONLY that
-                  module group RTN-quantized to `bits`), on a subsample of this generation's KL
-                  contexts; plus p99 token KL, top-1 agreement drop, params.
+profile_table     one row per (group key, bits): whole-model DeltaKL(M_0 || M_0 with ONLY that module group
+                  RTN-quantized to `bits`), full-vocabulary token KL by teacher forcing on the first
+                  diagnostics.profile_contexts generation-0 KL texts (prompt + M_0's answer, cut at
+                  profile_max_len tokens); plus p99 token KL, top-1 agreement drop, params.
+hessian_table     one row per (group key, quantizer, bits): Hessian-weighted output error tr(dW H dW^T) of
+                  that group alone, from the cached quantized weights and the calibration Hessians (every
+                  calibration token; no forward pass). Built by QuantProblem.hessian_table.
 activation_table  one row per linear module: input RMS / max-over-median / outlier fraction / red flag
                   (from the calibration pass, quant/hessian.py).
 bytes_table       one row per group key: params and packed MiB for each (bits, group size).
@@ -103,7 +107,8 @@ def load_tables(diag_dir: Path) -> dict | None:
     if not (d / "profile_table.json").exists():
         return None
     return {"profile": read_json(d / "profile_table.json"), "activation": read_json(d / "activation_table.json"),
-            "bytes": read_json(d / "bytes_table.json"), "meta": read_json(d / "meta.json", {})}
+            "bytes": read_json(d / "bytes_table.json"), "meta": read_json(d / "meta.json", {}),
+            "hessian": read_json(d / "hessian_table.json")}   # None until QuantProblem.prepare builds it
 
 
 def save_tables(diag_dir: Path, profile, activation, bytes_rows, meta: dict) -> dict:

@@ -14,7 +14,8 @@
 ./download_models.sh qwen3.8-27b   # 两篇都用 Qwen3.8-27B
 
 # 正式启动（launch.sh：先检查环境 / 模型 / 数据 / Docker，再按卡数分配 GPU，各领域后台并行）
-./launch.sh --hw h20 --paper both --smoke          # 先每个领域跑 1 代检查（默认单领域：每个运行至少 2 张，共至少 20 张）
+./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1,2,3                          # Paper A：4 张卡
+./launch.sh --hw h20 --paper B --domains math --gens 5 --gpus 4,5,6,7 --set method.mode=scratch # Paper B：4 张卡
 ./launch.sh --hw h20 --paper both --gens 5         # 正式：两篇 × 五个领域
 ./launch.sh --hw b300 --paper both --gens 5 --with-all   # B300：再加 Paper A 五领域主实验
 ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1    # 只跑一个
@@ -46,31 +47,39 @@
 ## 3. 一代的流程
 
 ```
+解码（2026-11-20）：搜索、验收、噪声都是贪心（噪声重评因此不再执行，噪声带 = 0）；留出评测用采样（Qwen 非思考模式推荐：
+temperature 0.7、top_p 0.8、top_k 20，种子 42，avg@n：AIME / AMC 8 个、MATH-500 / GPQA 4 个、其余 1 个，`heldout.decoding`）；
+Paper B 的训练答案用同一组采样参数（每题 4 个，取第一个判对的，4 个都错就跳过这道题）；改造者写程序时 temperature 0.6。
+
 Paper A（2026-11-19 修订：改造者冻结、体积固定、迭代被量化的模型）
   第 0 代：原模型 M_0 的验收分、噪声带、留出评测；对 M_0 建一次逐层量化缓存（之后每代复用）；
-          体积 = 统一 3 bit GPTQ 配置的大小；Q_0 = 这份配置，是第一个 incumbent
+          体积 = 统一 4 bit GPTQ 配置的大小（2026-11-20 起；原为 3 bit）；Q_0 = 这份配置，是第一个 incumbent
   第 g 代：
     卡 0：vLLM 加载 M_0（冻结的改造者 + 参照），只占 1 张卡
     其余卡：候选服务池，每张卡（candidate_group_size）一个候选服务；同一步里各线程的候选同时导出、加载、评测
     1. draw.py 抽本代的题
-    2. incumbent 在本代题上打分，展示给改造者
+    2. M_0 只算 KL 参照（不在本代题上打分）；incumbent 在本代题上打分，作为所有候选的参照（保持率、配对差、例题都相对它）
     3. 改造者写程序 → 候选 → 快速筛 →（前 3 名）完整一批，≤24 次评测
     4. 只把分数高于 incumbent 的候选交验收（≤3 次）：在验收集上逐题配对，显著超过 incumbent 才替换
     5. 替换了就导出新 incumbent、做五个领域留出评测；连续 2 代没替换就停
 
-Paper B（每代 M_t 写 LoRA，合并进自己；2026-11-19 起分两种方式，method.mode）
-  edit（默认）：每代先按固定配方训练 raw LoRA（--set raw.n_train=... raw.steps=... raw.rank=...），
-               改造者不能训练、不能算梯度，只编辑 raw LoRA；验收和 raw 比
-  scratch    ：从零写，没有训练和梯度；验收和当前模型比（目标至少涨 gate.min_gain）
-  free（消融）：旧设计，改造者可以自己 sgd / grad
+Paper B（每代 M_t 写 LoRA，合并进自己；2026-11-19 起分两种方式，method.mode；2026-11-20 起没有 SFT 基线和 free 模式，
+        唯一的训练是 edit 模式第 0 代的 raw LoRA，其余永远不训练）
+  edit（默认）：只在第 0 代按固定配方训练一次 raw LoRA（--set raw.n_train=... raw.steps=... raw.rank=...；
+               抽题量 data.n / data.gate_n / data.screen_n，噪声带可固定：baseline.noise_fixed，见 lora_code/README.md），
+               之后不再训练；每一代 M_g = M_0 + 当前 LoRA（adapter，不合并）编辑这个 LoRA，结果替换它；
+               验收：第 0 代和 raw 比，之后和当前模型逐题配对（提升 ≥ gate.min_gain 且置信区间下界 > 0），不过就保留当前 LoRA
+  scratch    ：从零写，没有训练和梯度；验收和当前模型逐题配对（提升 ≥ gate.min_gain 且置信区间下界 > 0）
+  两种方式都只送信号题上赢了当前模型的候选；连续 3 代都没接受就停（loop.patience）；数据切分 train / signal = 50% / 50%，
+  快速筛 400 道；改造者另有免费的 compare（只给题号）和 train_loss（train 题上的答案损失，只做前向）
   main 卡：vLLM 加载 M_t（改造者）+ 候选 LoRA 热切换评测
   theta0 卡：vLLM 加载原模型（E_t 和参照）
-  train 卡：SFT 基线和 raw LoRA 训练、程序里的奇异分解 / 激活统计（只能用本代 train 题）、合并 LoRA
+  train 卡：raw LoRA 训练（edit 第 0 代）、程序里的奇异分解 / 激活统计（只能用本代 train 题）、合并 LoRA
     1. draw.py 抽本代的题（目标领域 train / signal，其余领域保留探针）
-    2. SFT 基线；edit 模式再训练 raw LoRA（配方和 SFT 相同时直接复用）
+    2. edit 模式第 0 代：采样训练答案，训练 raw LoRA（之后各代和 scratch 都不训练、不采样）
     3. 改造者写程序 → 得到 LoRA → 评测（快速筛 + 前 3 名完整），≤32 个候选
     4. 交固定验收集 → 通过后把 LoRA 合并进权重，得 M_{t+1}
-    5. 四个分支（原模型 / SFT 基线 / 自写 LoRA / 非 LLM 搜索）各测 E_t；M_{t+1} 跑留出评测
+    5. 各分支（原模型 / edit 的 raw LoRA / 自写 LoRA / 非 LLM 搜索）各测 E_t；M_{t+1} 跑留出评测
 ```
 
 ## 4. 需要几张卡（Qwen3.8-27B，BF16 约 52 GB）
@@ -85,11 +94,11 @@ H20 档（`--set hardware=h20`，launch.sh 用 `--hw h20`；2026-11-20 起按每
 - 仍然每张卡只放一个 27B（约 52 GB）：两个 27B 就是 104 GB，不剩 KV 缓存。
 - vLLM 的显存按 GiB 给：参数 `--rsi-gpu-memory-gib 110` 在启动时换算成 `--gpu-memory-utilization = 110 / 卡的总显存`（`rsicore.servers`，读 nvidia-smi；读不到时用配置里的 0.78）。52 GB 权重和约 6 GB 运行时之外，约 50 GB 给 KV 缓存和线性注意力状态【估计】，所以 `--max-num-seqs 128`；上下文 20480（够 AIME 的 16k 回答），Paper A 改造者 32768。
 - Paper A：校准用默认的每次 16 层 Hessian（52 GB 模型 + 16 × 1.6 GB）。
-- Paper B：8 个 LoRA 槽；训练每次前向 2 条序列【试点值】（每条 4k token 的 fp32 logits、梯度和 log-softmax 约 12 GB），smoke 运行看到显存峰值后再调。
+- Paper B：8 个 LoRA 槽；训练每次前向 2 条序列【试点值】（每条 4k token 的 fp32 logits、梯度和 log-softmax 约 12 GB），第一次正式运行看到显存峰值后再调。
 - 原来按 80 GB 规划的档改名为 `h20_80`（`--hw h20_80`）：0.92、32 条序列、4 个 LoRA 槽、训练每次 1 条、校准每次 4 层。之前用旧 `h20` 档启动的运行要接着跑，需要改用 `--hw h20_80`（运行配置是锁定的）。
 - 卡的分工是自动的：给多少张卡就用多少张（见上面）。
 
-**速度（假设，未实测）**：H20 的 BF16 算力约为 B300 的 1/15，显存带宽约一半。生成（解码）主要受带宽限制，约慢 2 倍；校准、LoRA 训练、长提示的预填充受算力限制，会慢很多。B300 上估计 Paper A 每代 11–13 h、Paper B 每代 20–22 h，H20 上可能是 2–5 倍，第一周用 `--smoke` 实测后再定代数和评测预算（`--set search.max_evaluate=...`）。
+**速度（假设，未实测）**：H20 的 BF16 算力约为 B300 的 1/15，显存带宽约一半。生成（解码）主要受带宽限制，约慢 2 倍；校准、LoRA 训练、长提示的预填充受算力限制，会慢很多。B300 上估计 Paper A 每代 11–13 h、Paper B 每代 20–22 h，H20 上可能是 2–5 倍，以第一次正式运行第 0 / 1 代的实测耗时为准，再定代数和评测预算（`--set search.max_evaluate=...`）。
 
 **种子：只跑单种子 42**。种子 42 用于每代抽题、改造者采样和评测时的采样解码；数据切分用固定种子 20261118。置信区间用按题目的配对 bootstrap。
 

@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20]
-#               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all] [--smoke]
+#               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all]
 #               [--all-domains] [--set KEY=VALUE ...] [--dry-run] [--mock] [--skip-checks]
 #
 #   --paper     A, B or both (default both)
@@ -22,7 +22,6 @@
 #   --set       passed to every run.py (repeatable), e.g. --set search.max_evaluate=12, or a manual GPU
 #               split --set 'gpu_roles.train=[2,3]' (indices into the run's GPUs; overrides the automatic one)
 #   --with-all  also start Paper A's five-domain main experiment (--domain all)
-#   --smoke     1 generation, run ids end in _smoke (first real-hardware check; separate from formal runs)
 #   (default)   each run uses ONLY its own domain (scope single): training, gate, feedback, KL and held-out
 #               on that domain; Paper B has no retention probes and no E_t. Run ids end in _single.
 #   --all-domains  the original design (scope all): the other four domains are retention probes / KL texts,
@@ -31,12 +30,13 @@
 #   --mock      laptop test: mock model server, no GPU (fake GPU ids), uses eval/.venv
 #   --skip-checks  skip the preflight checks
 #
-# Run ids: <A|B>_<domain>_s<seed>[_single][_smoke] (A_all_s<seed> for --with-all), in experiment_records/.
+# Run ids: <A|B>_<domain>_s<seed>[_single] (A_all_s<seed> for --with-all), in experiment_records/.
+# --seed is the one experiment seed: per-generation draws, vLLM servers, editor sampling, training answers,
+# held-out sampling and bootstrap CIs all use it (the data / gate split keeps its fixed seed 20261118).
 # Logs and pids: experiment_records/_launch/<timestamp>/. Rerunning the same command resumes every run
 # (finished steps are skipped); a run whose process is still alive is not started twice.
 #
 # Examples:
-#   ./launch.sh --paper both --smoke                 # all 10 single-domain runs, 1 generation (20 B300)
 #   ./launch.sh --paper both --gens 5 --with-all     # formal: 10 single-domain runs + Paper A all (22 B300)
 #   ./launch.sh --hw h20 --paper both --gens 5       # on H20: 5 x 2 + 5 x 3 = 25 GPUs
 #   ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1
@@ -51,7 +51,7 @@ cd "$ROOT"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$ROOT/launch.sh"; }
 
 PAPER=both; DOMAINS=all; GENS=5; GPUS=""; PER_RUN=""; MODEL=qwen3.8-27b; SEED=42; HW=b300
-WITH_ALL=0; SMOKE=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; SETS=()
+WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; SETS=()
 need() { [ $# -ge 2 ] || { echo "ERROR: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -66,7 +66,6 @@ while [ $# -gt 0 ]; do
     --model) need "$@"; MODEL="$2"; shift ;;
     --seed) need "$@"; SEED="$2"; shift ;;
     --with-all) WITH_ALL=1 ;;
-    --smoke) SMOKE=1 ;;
     --single-domain) SINGLE=1 ;;
     --all-domains) SINGLE=0 ;;
     --dry-run) DRY=1 ;;
@@ -89,18 +88,16 @@ if [ "$DOMAINS" = all ]; then DOMS="$ALL_DOMAINS"; else DOMS="$(echo "$DOMAINS" 
 for d in $DOMS; do
   case " $ALL_DOMAINS " in *" $d "*) ;; *) echo "ERROR: unknown domain $d" >&2; exit 2 ;; esac
 done
-[ "$SMOKE" -eq 1 ] && GENS=1
 SUFFIX=""; [ "$SINGLE" -eq 1 ] && SUFFIX="_single"
 [ "$SINGLE" -eq 0 ] && SETS=(--set scope=all ${SETS[@]+"${SETS[@]}"})   # explicit --set values come later and win
-SMOKE_SUFFIX=""; [ "$SMOKE" -eq 1 ] && SMOKE_SUFFIX="_smoke"
 
 # ---------------------------------------------------------------- run list
 RUNS=()   # "paper domain run_id"
 for p in $PAPERS; do
-  for d in $DOMS; do RUNS+=("$p $d ${p}_${d}_s${SEED}${SUFFIX}${SMOKE_SUFFIX}"); done
+  for d in $DOMS; do RUNS+=("$p $d ${p}_${d}_s${SEED}${SUFFIX}"); done
 done
 if [ "$WITH_ALL" -eq 1 ]; then   # Paper A's five-domain run always uses scope all
-  case " $PAPERS " in *" A "*) RUNS+=("A all A_all_s${SEED}${SMOKE_SUFFIX}") ;;
+  case " $PAPERS " in *" A "*) RUNS+=("A all A_all_s${SEED}") ;;
     *) echo "WARNING: --with-all only applies to Paper A; ignored" >&2 ;; esac
 fi
 N_RUNS=${#RUNS[@]}

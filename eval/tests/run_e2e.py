@@ -20,7 +20,7 @@ FX = EVAL / "tests" / "fixtures"
 CASES = [
     # ---- held-out benchmarks (pool=test)
     ("gsm8k", "test", ["--limit", "300"], "accuracy", 1.0, 0.0),                    # math
-    ("aime24", "test", [], "accuracy", 1.0, 0.0),                                  # math, n=8 sampling path
+    ("aime24", "test", [], "accuracy", 1.0, 0.0),                                  # math (greedy since 2026-11-20; was n=8 sampling)
     ("mmlu_pro", "test", ["--limit", "500"], "accuracy", 1.0, 0.0),                # knowledge (MCQ)
     ("gpqa_diamond", "test", [], "accuracy", 1.0, 0.0),                            # knowledge (MCQ, GPQA)
     ("triviaqa", "test", ["--limit", "500"], "accuracy", 1.0, 0.0),                # knowledge (EM)

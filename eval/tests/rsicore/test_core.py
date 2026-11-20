@@ -6,7 +6,7 @@ Covers: RunState resume, ToolAPI budgets (fixed, measured cost_fn, dedupe), sand
 error propagation, environment isolation, file/subprocess/network denial), Editor with mock_policy
 (transcript + replay), inner_search / submit_to_gate with toy functions (resume, out_dir), draws wrappers in a
 temp run dir, evaluate.score / paired_delta / token_kl / run_heldout against the mock server, per-domain
-mock quality (target up, retention down), measure_noise_band (0 greedy, > 0 sampled), gate helpers, and the end-to-end toy paper (twice: the second run must skip everything).
+mock quality (target up, retention down), measure_noise_band (greedy: nothing re-run, band 0; > 0 sampled), gate helpers, and the end-to-end toy paper (twice: the second run must skip everything).
 """
 import argparse
 import json
@@ -258,7 +258,8 @@ def test_draws():
     m = draws.draw_gen(rc, 0, target="math")
     check(m["target"] == "math", "manifest target")
     tr, sig, scr = (draws.ids(rc, 0, "dapo_math", r) for r in ("train", "signal", "screen"))
-    check(len(tr) == 1600 and len(sig) == 400 and len(scr) == 200 and set(scr) <= set(sig), "role sizes")
+    # data/draw/paper_b.yaml (2026-11-20): n 2000, target_train_frac 0.5, screen_n 400
+    check(len(tr) == 1000 and len(sig) == 1000 and len(scr) == 400 and set(scr) <= set(sig), "role sizes")
     check(not set(tr) & set(draws.gate_ids(rc, "dapo_math")), "train overlaps gate")
     check(len(draws.ids(rc, 0, "triviaqa_train", "kl")) == 64, "retention kl")
     m2 = draws.draw_gen(rc, 0, target="math")
@@ -282,14 +283,14 @@ def test_evaluate_mock():
         ids = draws.ids(rc, 0, "dapo_math", "screen")
         a = evaluate.score(srv.endpoint, "base", "dapo_math", pool="pool", ids=ids, out_dir=rc.run_dir / "ev" / "base",
                            mock=True)
-        check(a.summary["n"] == 200 and 0.7 <= a.accuracy <= 0.9, f"base accuracy {a.accuracy}")
+        check(a.summary["n"] == 400 and 0.7 <= a.accuracy <= 0.9, f"base accuracy {a.accuracy}")
         (rc.run_dir / "weak_lora").mkdir(exist_ok=True)
         srv.load_lora("weak", rc.run_dir / "weak_lora")
         b = evaluate.score(srv.endpoint, "base", "dapo_math", pool="pool", ids=ids, out_dir=rc.run_dir / "ev" / "weak",
                            lora="weak", mock=True)
         check(0.2 <= b.accuracy <= 0.4, f"weak accuracy {b.accuracy}")
         d = evaluate.paired_delta(a.records, b.records)
-        check(d["n"] == 200 and d["ci"][0] <= d["delta"] <= d["ci"][1] < 0, f"paired delta {d}")
+        check(d["n"] == 400 and d["ci"][0] <= d["delta"] <= d["ci"][1] < 0, f"paired delta {d}")
         texts = ["Compute 2+2 and explain.", "The capital of France is Paris, isn't it?", "def f(x): return x * 2"]
         cache = evaluate.reference_logprobs(srv.endpoint, "base", texts, rc.run_dir / "kl" / "ref.jsonl")
         k_self = evaluate.token_kl(cache, srv.endpoint, "base", texts)
@@ -422,7 +423,7 @@ def test_mock_domain_quality_and_noise():
                                      temperature=0.6, base_seed=rc.seed, mock=True)
         g1b = gate.measure_noise_band(srv.endpoint, "base", "dapo_math", ids, rc.run_dir / "nb_t06b", repeats=3,
                                       temperature=0.6, base_seed=rc.seed, mock=True)
-    check(g0["band"] == 0.0 and len(set(g0["scores"])) == 1, f"greedy band {g0}")
+    check(g0["band"] == 0.0 and g0["scores"] == [] and g0["source"].startswith("greedy"), f"greedy band {g0}")   # nothing re-run
     check(g1["band"] > 0 and g1["se"] > 0 and g1["seeds"] == [rc.seed, rc.seed + 1, rc.seed + 2], f"sampled band {g1}")
     check(g1b["scores"] == g1["scores"], "sampled repeats not deterministic per seed")
     s = json.loads((rc.run_dir / "nb_t06" / f"seed{rc.seed + 1}" / "summary.json").read_text())["dapo_math"]

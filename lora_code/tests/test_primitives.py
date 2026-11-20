@@ -76,9 +76,9 @@ def test_constructors_shapes(store):
     construct.from_direction(lo, m, torch.randn(out_f), key, 0.3, shape=(out_f, in_f))
     U, S, V = store.svd(m, 4)
     construct.scale_singular(lo, m, U, S, V, [0, 1], [1.1, 0.9])
-    construct.from_lowrank_grad(lo, m, U, S, V, 1e-3, k=2)
+    assert not hasattr(construct, "from_lowrank_grad")              # no gradient constructor (2026-11-20)
     A, B = lo.factors[m]
-    assert A.shape == (1 + 1 + 2 + 2, in_f) and B.shape == (out_f, 6)
+    assert A.shape == (1 + 1 + 2, in_f) and B.shape == (out_f, 4)
     ok, rep = check_lora(lo, store, rank_cap=64, tau=10.0)
     assert ok, rep
     # from_direction maps the key onto alpha * d_hat
@@ -188,7 +188,7 @@ def test_operators(store):
     assert torch.allclose(ti.delta(mods[0]), lo.delta(mods[0]), atol=1e-5)
 
 
-def test_train_restriction_grad_sgd_acts(store):
+def test_train_restriction_sgd_acts(store):
     import torch
     from lora_code.primitives.train import HFModel, TrainData
     td = TrainData(_examples(8))
@@ -204,8 +204,7 @@ def test_train_restriction_grad_sgd_acts(store):
     assert info["steps_done"] == 30 and len(info["checkpoints"]) == 2 and set(lo.modules()) == set(mods)
     # the model is restored (no peft wrappers left) and hooks give the same loss as a merged copy
     assert "lora" not in "".join(n for n, _ in hf.model.named_modules())
-    g = hf.grad(ex[:4], mods[:1], k=2)
-    assert g[mods[0]]["U"].shape == (64, 2) and g[mods[0]]["fro"] > 0
+    assert not hasattr(hf, "grad")                                   # sgd is only for the raw LoRA
     a = hf.acts(td.texts(td.ids()[:4]), [mods[0]], k=2)[mods[0]]
     assert a["in_mean"].shape == (128,) and a["pcs"].shape == (2, 128)
     r = hf.act_ratio(td.texts(td.ids()[:2]), lo)
@@ -216,25 +215,25 @@ def test_train_restriction_grad_sgd_acts(store):
 
 
 def test_workspace_refuses_non_train_ids(store, tmp_path):
-    """The sandbox API (Workspace tools) refuses ids outside this generation's train set."""
+    """The sandbox API (Workspace tools) refuses ids outside this generation's train set and has no training /
+    gradient tools (2026-11-20)."""
     from lora_code.primitives.train import HFModel, TrainData
     from lora_code.tools import Workspace
     hf = HFModel(store.model_dir, store, device="cpu", dtype="float32", max_len=64)
     ws = Workspace(mock=False, store=store, train=TrainData(_examples(4)), cfg={"lora": {"rank_cap": 16, "norm_cap_tau": 5}},
                    out_dir=tmp_path, hf=hf, budget={"evaluate": 2, "gpu_seconds": 600})
     ws.build_api()                                   # gpu seconds are charged by the rsicore ToolAPI
-    with pytest.raises(PermissionError):
-        ws.api.call("sgd", dict(ids=["gate/0"], steps=1, lr=1e-3, modules=["layers.0.mlp.down_proj"]))
+    assert not set(ws.api.names()) & {"sgd", "grad", "from_grad"}
     with pytest.raises(PermissionError):
         ws.api.call("acts", dict(module="layers.0.mlp.down_proj", ids=["heldout/3"]))
-    out = ws.api.call("sgd", dict(ids=ws.t_train_ids(), steps=3, lr=1e-3, rank=4, modules=["layers.0.mlp.down_proj"]))
-    lo = ws._get(out["lora"], "lora")
-    assert lo.modules() == ["layers.0.mlp.down_proj"] and ws.spent["gpu_seconds"] > 0
+    ws.api.call("acts", dict(module="layers.0.mlp.down_proj", ids=ws.t_train_ids()[:2], k=2))
+    assert ws.spent["gpu_seconds"] > 0
     s = ws.t_svd(module="layers.0.mlp.down_proj", k=2)
-    r = ws.t_rank1(lora=out["lora"], module="layers.0.mlp.down_proj", u=f"{s['handle']}.u0", v=f"{s['handle']}.v1", s=0.1)
-    assert ws._get(r["lora"]).rank("layers.0.mlp.down_proj") == 5
+    new = ws.t_new_lora()["lora"]
+    r = ws.t_rank1(lora=new, module="layers.0.mlp.down_proj", u=f"{s['handle']}.u0", v=f"{s['handle']}.v1", s=0.1)
+    assert ws._get(r["lora"]).rank("layers.0.mlp.down_proj") == 1
     rep = ws.t_inspect(lora=r["lora"])
-    assert rep["check_ok"] and rep["max_rank"] == 5
+    assert rep["check_ok"] and rep["max_rank"] == 1
 
 
 def test_diagnostics_real(store):

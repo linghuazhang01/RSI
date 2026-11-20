@@ -1,17 +1,12 @@
-"""Non-LLM branches and strong baselines (RSI_LOOP_DESIGN §3.5, METHOD_DESIGN §3.6).
+"""Raw LoRA training (mode=edit, generation 0 only) and the non-LLM branch (RSI_LOOP_DESIGN §3.5).
 
-- SFT baseline: fixed recipe (rank 16 by default, all attention/MLP projections except in_proj_a/b), trained on
-  this generation's `train` items with the SAME gradient budget (GPU-seconds) as the editor; checkpoints at
-  25/50/75/100% are kept for the checkpoint frontier.
-- Global-scale frontier: SFT LoRA × s for a grid of s.
-- Checkpoint frontier: the SFT checkpoints.
-- Raw LoRA (method.mode=edit): the `raw` recipe (null fields = SFT recipe; raw.n_train = how many train items),
-  trained once per generation; the editor edits it. Identical to the SFT recipe -> the SFT LoRA is reused.
-- Non-LLM search (the 4th branch), same evaluate budget as the editor, by method.mode:
-  free: random search over SFT hyper-parameters (lr, rank, module set, steps fraction) × checkpoint × global
-  scale (same total gradient budget split over the sampled configurations); edit: random rule-based edits of
-  the raw LoRA (random_edit_search); scratch: random gradient-free constructions (random_construct_search).
-  Best by screen, top-3 re-scored on the full signal.
+2026-11-20: there is no SFT baseline and nothing else is ever trained. The only training of a run is the
+raw LoRA of mode=edit: the fixed `raw` recipe (rank 16 by default, all attention / MLP projections except
+in_proj_a/b), trained once in generation 0 on raw.n_train of that generation's train items; the editor edits
+it in every generation. (The E task of scope=all, mode=edit, trains the same recipe once for θ0.)
+Non-LLM search (the 4th branch), same evaluate budget as the editor, by method.mode: edit = random rule-based
+edits of the raw LoRA (random_edit_search); scratch = random gradient-free constructions
+(random_construct_search). Best by screen, top-3 re-scored on the full signal.
 All points report target gain, worst retention delta and token-KL vs the current model.
 """
 from __future__ import annotations
@@ -21,34 +16,24 @@ import random
 
 from . import mock as M
 
-DEFAULT_SFT = {"rank": 16, "lr": 1e-4, "epochs": 1.0, "steps": None, "batch_size": 4,
+DEFAULT_RAW = {"rank": 16, "lr": 1e-4, "epochs": 1.0, "steps": None, "batch_size": 4,
                "leaves": ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj",
-                          "gate_proj", "up_proj", "down_proj"], "ckpt_fracs": [0.25, 0.5, 0.75, 1.0]}
-
-
-def recipe(cfg: dict) -> dict:
-    r = dict(DEFAULT_SFT)
-    r.update(cfg.get("sft", {}) or {})
-    return r
-
-
+                          "gate_proj", "up_proj", "down_proj"]}
 RAW_KEYS = ("rank", "lr", "epochs", "steps", "batch_size", "leaves")
 
 
-def raw_recipe(cfg: dict) -> tuple[dict, int | None, float, bool]:
-    """mode=edit: (recipe, n_train, gpu_seconds, same_as_sft) of the raw LoRA the editor starts from.
-    Null raw.* values take the SFT recipe's; same_as_sft=True means the SFT LoRA can be reused as is."""
-    sft = recipe(cfg)
+def raw_recipe(cfg: dict) -> tuple[dict, int | None, float]:
+    """mode=edit: (recipe, n_train, gpu_seconds) of the raw LoRA. Null raw.* values take DEFAULT_RAW;
+    raw.n_train null = all of generation 0's train items; raw.gpu_seconds null = budget.gpu_seconds."""
     rc = cfg.get("raw", {}) or {}
-    r = dict(sft)
+    r = dict(DEFAULT_RAW)
     for k in RAW_KEYS:
         if rc.get(k) is not None:
             r[k] = rc[k]
-    gb_default = float(cfg.get("budget", {}).get("gpu_seconds", 7200))
-    gb = float(rc["gpu_seconds"]) if rc.get("gpu_seconds") is not None else gb_default
+    gb = rc.get("gpu_seconds")
+    gb = float(gb) if gb is not None else float(cfg.get("budget", {}).get("gpu_seconds", 7200))
     n = int(rc["n_train"]) if rc.get("n_train") is not None else None
-    same = r == sft and n is None and gb == gb_default
-    return r, n, gb, same
+    return r, n, gb
 
 
 def subset_ids(ids, n: int | None, seed: int) -> list:
@@ -71,39 +56,30 @@ def modules_for(store, leaves=None, layers=None) -> list[str]:
     return out
 
 
-def train_sft(ws, rec: dict, gpu_budget_s: float, *, seed: int = 42, modules=None, ids=None):
-    """Returns (final LoRA, [(frac, LoRA)], info). Uses ws.train / ws.hf (or the mock model).
-    ids: train items to use (default: all of ws.train)."""
+def train_lora(ws, rec: dict, gpu_budget_s: float, *, seed: int = 42, modules=None, ids=None):
+    """Train one LoRA with the recipe (the raw LoRA of mode=edit). Returns (LoRA, info). Uses ws.train /
+    ws.hf (or the mock model). ids: train items to use (default: all of ws.train)."""
     mods = modules or modules_for(ws.store, rec["leaves"], rec.get("layers"))
     ids = ws.train.check(list(ids)) if ids is not None else ws.train.ids()
     bs = int(rec["batch_size"])
     n_ex = max(1, len([e for e in ws.train.get(ids) if e.get("target")]) if not ws.mock else len(ids))
     steps = int(rec["steps"] or max(1, math.ceil(n_ex * float(rec["epochs"]) / bs)))
-    fracs = list(rec.get("ckpt_fracs") or [1.0])
     if ws.mock:
         spe = float(ws.cfg.get("mock", {}).get("sec_per_example", 0.6))
         steps = min(steps, max(1, int(gpu_budget_s / (bs * spe))))
         final = M.m_sgd(None, mods, ids, steps, float(rec["lr"]), int(rec["rank"]))
-        ck = [(f, M.m_sgd(None, mods, ids, max(1, int(steps * f)), float(rec["lr"]), int(rec["rank"]))) for f in fracs]
-        return final, ck, {"steps": steps, "modules": len(mods), "gpu_seconds": round(steps * bs * spe, 1),
+        return final, {"steps": steps, "modules": len(mods), "gpu_seconds": round(steps * bs * spe, 1),
                            "rank": int(rec["rank"]), "lr": float(rec["lr"])}
     ex = ws._examples(ids)
     t0 = ws.hf.gpu_seconds
     final, info = ws.hf.sgd(ex, None, modules=mods, rank=int(rec["rank"]), steps=steps, lr=float(rec["lr"]),
                             batch_size=bs, warmup=int(rec.get("warmup", 0)), time_budget_s=gpu_budget_s,
-                            checkpoints=fracs, init_seed=seed)
-    ck = info.pop("checkpoints", [])
+                            init_seed=seed)
+    info.pop("checkpoints", None)
     info.update({"steps_planned": steps, "gpu_seconds": round(ws.hf.gpu_seconds - t0, 1), "lr": float(rec["lr"])})
     info["loss_first"], info["loss_last"] = (info["losses"][0], info["losses"][-1]) if info["losses"] else (None, None)
     info.pop("losses", None)
-    return final, ck, info
-
-
-def scaled(ws, lo, s: float):
-    if ws.mock:
-        return M.m_scale(lo, s)
-    from .primitives.ops import scale
-    return scale(lo, s)
+    return final, info
 
 
 def point(ws, lo, label: str, level: str = "screen") -> dict:
@@ -116,45 +92,6 @@ def point(ws, lo, label: str, level: str = "screen") -> dict:
     return {"label": label, "score": sc, "target_gain": (tgt.get("vs_parent") or {}).get("delta"),
             "worst_retention_delta": min(ds) if ds else None, "kl": fb.get("kl_vs_parent"),
             "check_error": fb.get("error"), "name": ws.lora_name(lo) if lo.modules() else None}
-
-
-def frontiers(ws, sft_final, sft_ckpts, scales) -> dict:
-    return {"global_scale": [point(ws, scaled(ws, sft_final, s), f"scale={s}") for s in scales],
-            "checkpoint": [point(ws, lo, f"ckpt={f:.2f}") for f, lo in sft_ckpts]}
-
-
-def random_search(ws, rec: dict, *, evals: int, gpu_budget_s: float, n_configs: int, scales, seed: int,
-                  top_full: int = 3) -> tuple[object, dict]:
-    """Same evaluate budget and total gradient budget as the editor. Returns (best LoRA, log)."""
-    rng = random.Random(f"{seed}:nonllm")
-    leaves_opts = {"mlp": ["gate_proj", "up_proj", "down_proj"],
-                   "attn": ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj"],
-                   "all": rec["leaves"]}
-    configs, pool = [], []
-    per = gpu_budget_s / max(n_configs, 1)
-    for i in range(n_configs):
-        c = dict(rec)
-        c["lr"] = float(10 ** rng.uniform(math.log10(3e-5), math.log10(1e-3)))
-        c["rank"] = rng.choice([8, 16, 32, 64])
-        key = rng.choice(list(leaves_opts))
-        c["leaves"] = leaves_opts[key]
-        c["epochs"] = float(rec["epochs"]) * rng.choice([0.5, 1.0])
-        final, ck, info = train_sft(ws, c, per, seed=seed + 1 + i)
-        configs.append({"i": i, "lr": c["lr"], "rank": c["rank"], "modules": key, "epochs": c["epochs"], "train": info})
-        for f, lo in ck:
-            pool.append((i, f, lo))
-    combos = [(i, f, s) for (i, f, _) in pool for s in scales]
-    rng.shuffle(combos)
-    lookup = {(i, f): lo for (i, f, lo) in pool}
-    tried = []
-    for i, f, s in combos[:evals]:
-        lo = scaled(ws, lookup[(i, f)], s)
-        p = point(ws, lo, f"cfg={i},ckpt={f:.2f},scale={s}")
-        p.update({"cfg": i, "ckpt": f, "scale": s})
-        tried.append((p, lo))
-    best, log = _pick_best(ws, tried, top_full)
-    log["configs"] = configs
-    return best, log
 
 
 def _apply(ws, tool: str, lo, **kw):

@@ -1,5 +1,6 @@
-# Target: RLVR-IFeval (ifeval_train; no gold text -> SFT targets are the model's own constraint-satisfying samples). Held-out: IFEval, IFBench.
+# Target: RLVR-IFeval (ifeval_train; no gold text -> the raw LoRA's training targets (mode=edit, generation 0) are the model's own
+# constraint-satisfying samples). Held-out: IFEval, IFBench.
 # Sizes (n, gate_n, retention_n, ...) come from data/draw/paper_b.yaml; override here only what differs.
 train_data:
-  mode: self_correct_then_gold
-  samples: 8
+  mode: self_correct
+  samples: 8                     # no gold text: more samples to find a constraint-satisfying answer

@@ -4,6 +4,28 @@
 
 draw_config: data/draw/paper_a.yaml
 
+# Data size of every step (null = keep the draw config's value). The draw sizes below override
+# data/draw/paper_a.yaml for this run (written to <run>/draw_config.effective.yaml and locked with the run).
+# n / gate_n: a number (every domain) or {math: 1000, code: 500}. Other step sizes live next to their step:
+#   noise.n (noise re-runs), calibration.max_texts, diagnostics.profile_contexts, heldout.limit,
+#   e_task.heldout_limit.
+data:
+  n: null                             # signal items drawn per generation per domain (full-stage evaluation)
+  screen_n: null                      # first-stage (screen) subset of the signal items (draw config: 400)
+  kl_contexts: null                   # KL / calibration contexts per generation (draw config: 400; scope single: all
+                                      # from the run's domain; scope all: split evenly over the five domains)
+  gate_n: null                        # fixed gate items per domain
+
+# Max generation length (tokens) per eval task, for EVERY model call of this run: candidates, gate, noise
+# re-runs. Overrides eval/configs/tasks.yaml (passed to run_eval as --max-tokens); tasks not
+# listed keep their tasks.yaml value. e.g. --set max_tokens.dapo_math=2048
+max_tokens:
+  dapo_math: 4096
+  taco_verified: 4096
+  ifeval_train: 2048
+  sealtool_train: 1024
+  triviaqa_train: 1024
+
 # Domain scope (default single since 2026-11-19; --set scope=all or ./launch.sh --all-domains for the original
 # design). single = ONLY the run's --domain: signal, gate, KL / calibration texts and held-out all on that domain.
 # all = signal and gate on the run's domain(s), KL / calibration texts and held-out on all five domains.
@@ -20,7 +42,8 @@ scope_profiles:
 budget:
   gib: null                           # explicit packed GiB (overrides `reference`); CLI --budget-gib
   reference:                          # null gib -> budget = packed size of this config; it is also the
-    default: {bits: 3, group_size: 128, quantizer: gptq}   # starting incumbent Q_0 (uniform W3 GPTQ)
+    default: {bits: 4, group_size: 128, quantizer: gptq}   # starting incumbent Q_0 (uniform W4 GPTQ;
+                                                           # was W3 until 2026-11-20: W4 leaves room for 2/3-bit trades)
     embed: 8
     lm_head: 8
 
@@ -42,7 +65,7 @@ search:                               # inner search (RSI_LOOP_DESIGN §1.2)
   program_evaluate_calls: 2           # max api.evaluate calls inside one program
   top_full: 3                         # best screened candidates re-evaluated on the full signal set
   rerun_seeds: 0
-  kl_weight: 0.5                      # score = mean retention vs current model - kl_weight * KL  [pilot]
+  kl_weight: 0.5                      # score = retention (candidate acc / incumbent acc) - kl_weight * KL vs BF16 [pilot]
 
 gate:                                 # L2: beat the incumbent on the fixed gate set (paired per item)
   min_delta: 0.005                    # mean paired gain over gate datasets
@@ -50,31 +73,47 @@ gate:                                 # L2: beat the incumbent on the fixed gate
   max_submissions: 3
   allow_unscored: false               # true lets a gate with no scored items pass (code w/o Docker)
 
-feedback:
-  examples: 2                         # regression examples per dataset in screen feedback (marked shown)
-  parent_full: true                   # score the current model on the full signal set (paired deltas)
+feedback:                             # every candidate is compared with the INCUMBENT on the same items (2026-11-20;
+                                      # M_0 is not scored on the items, it is only the KL reference)
+  examples: 2                         # regression examples per dataset in screen feedback: incumbent right,
+                                      # candidate wrong (marked shown)
 
 noise:
-  repeats: 3                          # M_0 screen re-runs for the noise band
-  temperature: 0.6                    # sampled re-runs (seeds seed, seed+1, ...); greedy repeats are identical
+  repeats: 3                          # M_0 screen re-runs for the noise band (only when temperature > 0)
+  temperature: 0.0                    # 2026-11-20: greedy, like every evaluation -> re-runs would be identical,
+                                      # so none is run and the band is 0 (the gate uses paired CIs anyway);
+                                      # > 0 = sampled re-runs (seeds seed, seed+1, ...)
+  top_p: 1.0
+  n: null                             # screen items the re-runs score (deterministic subset; null = all screen items)
+  fixed: null                         # a fixed band instead of the re-runs: 0.03, or {math: 0.03, default: 0.02}
+                                      # (keys: dataset, domain or default); datasets without a value are still measured
 
 kl:
   domains: all                        # KL/calibration texts from all five domains' `kl` draw (or: run)
   top_k: 20                           # vLLM prompt_logprobs top-k (<= --max-logprobs)
-  max_chars: 8000
-  self_generated: false               # append the reference model's greedy response to each KL prompt
-  self_generated_max_tokens: 512
+  max_chars: 8000                     # the prompt part (question in chat format) is cut at this many characters
+  self_generated: true                # prompt + M_0's own greedy response (cached per generation in kl_selfgen/):
+                                      # KL and the GPTQ / AWQ calibration also cover the answer tokens; false =
+                                      # the question alone
+  self_generated_max_tokens: 2048     # response length cap (a cut response gets no <|im_end|>)
+  self_generated_batch: 64            # prompts per /completions request
+  eval_texts: 400                     # KL texts scored for every candidate (evenly spaced subset; null = all);
+                                      # = the screen size (2026-11-20; was 64). Per-text KL is kept on disk
+                                      # (evals/<cid>/<stage>/kl_per_text.json). Calibration: calibration.max_texts
 
 calibration:                          # Hessians for GPTQ / AWQ (original model, generation-0 kl texts, once)
   max_texts: 256
-  max_len: 2048
+  max_len: 2560                       # tokens per text (prompt + a response of up to 2048 tokens)
   layers_per_pass: 16                 # window of layers per calibration pass (fp32 Hessians ~1.6 GB/layer)
 
-diagnostics:
-  profile_bits: [2, 3, 4, 8]
+diagnostics:                          # computed once from M_0 (prep/diagnostics/), see edit_code/diagnostics.py
+  profile_bits: [2, 3, 4]             # 2026-11-20: 8 bit dropped (near lossless), more contexts instead
   profile_group_size: 128
-  profile_contexts: 32                # subsample of KL contexts for the profile table
+  profile_contexts: 64                # generation-0 KL texts used by the profile table (forward pass per group x
+                                      # bits; ~350 groups x 3 bits; 2026-11-20: 64, was 32)
   profile_max_len: 512
+  hessian_quantizers: [rtn, gptq, awq]   # hessian_table: Hessian-weighted error per (group, quantizer, bits),
+  hessian_bits: null                  # from the cache + calibration Hessians, no forward pass (null = profile_bits)
 
 cache:
   device: cuda                        # cuda -> cuda:<gpus[1]>; or cpu
@@ -90,6 +129,9 @@ cache:
     - {quantizer: gptq, bits: 3, group_size: 128}
     - {quantizer: gptq, bits: 4, group_size: 128}
     - {quantizer: gptq, bits: 8, group_size: 128}
+    - {quantizer: awq, bits: 2, group_size: 128}    # used by the hessian table anyway
+    - {quantizer: awq, bits: 3, group_size: 128}
+    - {quantizer: awq, bits: 4, group_size: 128}
 
 candidates:
   keep_checkpoints: 1                 # fake-quant checkpoints kept per candidate server (~54 GB each; disk = servers x 54 GB)
@@ -101,6 +143,9 @@ tools:                                # ablations: remove tools from the editor'
   profile_table: true
   activation_table: true
   solve_allocation: true
+  hessian_table: true                 # 2026-11-20: analysis tools
+  group_error: true
+  compare: true
 
 solver:
   group_sizes: [128]                  # group sizes solve_allocation chooses from by default (KL-greedy baseline)
@@ -123,6 +168,15 @@ archive:
 heldout:
   domains: all                        # all | run (= the run's --domain; scope=single) | a domain list
   limit: null                         # per-task item limit (null = full held-out sets)
+  # Held-out decoding (2026-11-20): sampled, Qwen's non-thinking recommendation, same seed as the run; avg@n.
+  # (Search, gate and noise stay greedy.) null = each task's tasks.yaml decoding (greedy).
+  decoding:
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    seed: null                        # null = the run's --seed (one experiment seed for everything)
+    n: 1                              # samples per item (accuracy = avg@n)
+    n_by_task: {aime24: 8, aime25: 8, amc23: 8, math500: 4, gpqa_diamond: 4}   # small sets: more samples
 
 e_task:                               # editor-capability task E_t: a fresh session (no archive) of this
   enabled: false                      # generation's editor on the fixed-size task; only informative with

@@ -1,22 +1,21 @@
 """The editor's tool surface for one generation (or one E_t session): a Workspace holding tensors behind
 string handles, registered on an rsicore.sandbox.ToolAPI so programs call `api.<tool>(**kwargs)`.
 
-Handles: L* = LoRA, S* = SVD of a weight, A* = activation statistics, G* = low-rank gradient,
+Handles: L* = LoRA, S* = SVD of a weight, A* = activation statistics,
 H<g> = adapter accepted in generation g (the stack), C:<cid> = an earlier candidate of this generation.
-Vector references (for rank1 / from_direction): "S3.u0", "S3.v1", "A2.in_mean", "A2.out_mean",
-"A2.pc0", "G4.<module>.u0" / ".v0".
+Vector references (for rank1 / from_direction): "S3.u0", "S3.v1", "A2.in_mean", "A2.out_mean", "A2.pc0".
 
 Budgets (RSI_LOOP_DESIGN §3.3): `evaluate` calls (an identical LoRA is evaluated once and only charged
-once) and `gpu_seconds` for grad / sgd / acts / regmean_preserve (measured on gpu1; estimated in mock).
+once) and `gpu_seconds` for acts / regmean_preserve (measured on gpu1; estimated in mock).
 All accounting is done by the workspace's rsicore.sandbox.ToolAPI (`ws.api`, created with the workspace):
 evaluate = cost_fn (1 per non-empty LoRA) + dedupe_key_fn (LoRA name = digest; identical LoRAs are free,
 also between program calls and the search's screen evaluation, which goes through the same tool);
 GPU tools = cost {"gpu_seconds": 0} (refused once exhausted) + cost_fn (measured seconds, capped at what
 was left before the call so a successful call keeps its result; the uncapped total is ws.gpu_measured).
-Data access: acts / grad / sgd / train_example only accept this generation's `train` ids (TrainData).
-Tool set by method.mode (tools_for_mode): free = all; edit = no sgd / grad / from_grad, plus raw_lora (the
-raw LoRA under handle "RAW"); scratch = no sgd / grad / from_grad and no raw LoRA. Unregistered tools are
-refused by the ToolAPI.
+Data access: acts / train_example only accept this generation's `train` ids (TrainData).
+The editor never trains and never computes gradients (2026-11-20: no sgd / grad / from_grad tools in any
+mode). Tool set by method.mode (tools_for_mode): edit = every tool plus raw_lora (the raw LoRA under handle
+"RAW"); scratch = every tool without raw_lora. Unregistered tools are refused by the ToolAPI.
 """
 from __future__ import annotations
 
@@ -32,17 +31,14 @@ from .common import stable_hash, write_json
 TOOL_DOCS = {
     "modules": "modules(layer=None, leaf=None, group=None) -> list of {module, layer, layer_type, leaf, group, out, in}",
     "diagnostics": "diagnostics(module=None, layer=None, top=20, sort='w_norm') -> rows of the fixed diagnostics table",
-    "train_ids": "train_ids(n=None) -> ids of this generation's train items (the only items gradient/activation tools accept)",
+    "train_ids": "train_ids(n=None) -> ids of this generation's train items (the only items activation tools accept)",
     "train_example": "train_example(id) -> {prompt, target} of one train item (truncated)",
     "svd": "svd(module, k=8) -> {handle, S, shape}: top-k singular triplets of the CURRENT weight W",
     "acts": "acts(module, ids=None, k=4) -> {handle, in_norm, out_norm, pc_var}: activation stats on train items",
-    "grad": "grad(modules, ids=None, k=4, lora=None) -> {handle, modules:{m:{fro,S}}}: top-k SVD of dLoss/dW (costs gpu_seconds)",
     "new_lora": "new_lora() -> {lora}: an empty LoRA",
     "rank1": "rank1(lora, module, u, v, s) -> {lora}: add s * u v^T (u,v vector refs, normalised)",
     "from_direction": "from_direction(lora, module, direction, key, alpha) -> {lora}: dW = alpha d k^T/|k|^2 so dW k = alpha d",
     "scale_singular": "scale_singular(lora, module, svd, idx, factors) -> {lora}: dW = sum_i (f_i-1) s_i u_i v_i^T",
-    "from_grad": "from_grad(lora, grad, lr, k=None, modules=None) -> {lora}: dW = -lr * (low-rank gradient)",
-    "sgd": "sgd(lora=None, ids=None, steps=50, lr=1e-4, rank=16, modules=None, batch_size=4) -> {lora, loss_first, loss_last, steps_done, gpu_seconds}",
     "scale": "scale(lora, s, modules=None) -> {lora}",
     "interpolate": "interpolate(a, b, lam) -> {lora}: (1-lam) a + lam b",
     "combine": "combine(loras, weights=None) -> {lora}: weighted sum",
@@ -55,25 +51,29 @@ TOOL_DOCS = {
     "ties": "ties(loras, weights=None, density=0.2) -> {lora}",
     "inspect": "inspect(lora) -> {modules, max_rank, check, top, intruder_mean}",
     "stack": "stack() -> list of {handle, gen, modules, max_rank} (adapters merged in earlier generations)",
-    "raw_lora": "raw_lora() -> {lora: 'RAW', modules, max_rank, train}: the LoRA trained for you this generation "
-                "with the fixed recipe (the starting point you edit)",
+    "raw_lora": "raw_lora() -> {lora: 'RAW', modules, max_rank, train}: the LoRA you start from (trained once, "
+                "in generation 0, with the fixed raw recipe; edited since)",
     "candidate": "candidate(cid) -> {lora} of an earlier candidate of this generation",
     "evaluate": "evaluate(lora) -> structured screen feedback (costs 1 evaluate; identical LoRAs are free)",
+    "compare": "compare(cid, other='parent', level='screen') -> per dataset: acc and acc_other, broken (other right, "
+               "cid wrong) / fixed counts and ids, flips by output length, truncation; ids and statistics only, both "
+               "must already be evaluated (free). cid / other: a candidate id or 'parent' (the current model)",
+    "train_loss": "train_loss(lora, ids=None, n=64) -> {loss, parent_loss, delta, n}: mean answer NLL of train items "
+                  "under the current model + lora vs without it (forward pass only, no training; costs gpu_seconds)",
     "budget": "budget() -> {spent, left}",
 }
 
 
-def tools_for_mode(mode: str, retention: bool = True) -> dict:
-    """TOOL_DOCS available to the editor in method.mode: free = everything except raw_lora; edit = no
-    training / gradient tools, plus raw_lora; scratch = no training / gradient tools, no raw_lora.
-    retention=False (no retention texts: scope=single, or the E task): no regmean_preserve."""
-    from .common import GRADIENT_TOOLS
+def tools_for_mode(mode: str, retention: bool = True, cfg: dict | None = None) -> dict:
+    """TOOL_DOCS available to the editor in method.mode: edit = everything incl. raw_lora; scratch = no
+    raw_lora. retention=False (no retention texts: scope=single, or the E task): no regmean_preserve.
+    cfg["tools"][name] = false removes a switchable tool (compare, train_loss)."""
     out = dict(TOOL_DOCS)
+    for name, on in ((cfg or {}).get("tools") or {}).items():
+        if on is False:
+            out.pop(name, None)
     if not retention:
         out.pop("regmean_preserve", None)
-    if mode in ("edit", "scratch"):
-        for t in GRADIENT_TOOLS:
-            out.pop(t, None)
     if mode != "edit":
         out.pop("raw_lora", None)
     return out
@@ -94,7 +94,7 @@ def _budget_exc():
 class Workspace:
     def __init__(self, *, mock: bool, store, train, cfg: dict, out_dir: Path, evaluator=None, hf=None,
                  stack=None, retention_texts=None, budget: dict | None = None, name_prefix: str = "c",
-                 diagnostics: dict | None = None, seed: int = 42, mode: str = "free", raw=None,
+                 diagnostics: dict | None = None, seed: int = 42, mode: str = "scratch", raw=None,
                  raw_info: dict | None = None):
         self.mock = mock
         self.mode = mode                        # method.mode: which tools are registered (tools_for_mode)
@@ -250,12 +250,12 @@ class Workspace:
         return {} if self._eval_key(kwargs) == "__keep__" else {"evaluate": 1}
 
     # ------------------------------------------------------------------ registration
-    GPU_TOOLS = ("acts", "grad", "sgd", "regmean_preserve")
+    GPU_TOOLS = ("acts", "regmean_preserve", "train_loss")
 
     def build_api(self):
         if self._registered:
             return self.api
-        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts))
+        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts), cfg=self.cfg)
         if self.mode == "edit" and self.raw is None:
             docs.pop("raw_lora", None)
         for name, doc in docs.items():
@@ -363,24 +363,6 @@ class Workspace:
         return {"handle": self._new("A", st), "in_norm": st["in_norm"], "out_norm": st["out_norm"],
                 "pc_var": st["pc_var"], "tokens": st["tokens"]}
 
-    def t_grad(self, modules, ids=None, k=4, lora=None):
-        ids = self._ids(ids, default_n=64)
-        mods = self._mods(modules)
-        if not mods:
-            raise ValueError("grad needs modules")
-        lo = self._get(lora, "lora") if lora else None
-        k = int(min(max(1, k), 32))
-        if self.mock:
-            def run():
-                return {m: {"S": [1.0 / (i + 1) for i in range(k)], "fro": 1.5} for m in mods}
-            g = self._gpu(run, est_seconds=5 + 0.2 * len(ids))
-        else:
-            ex = self._examples(ids)
-            g = self._gpu(lambda: self.hf.grad(ex, mods, lora=lo, k=k), est_seconds=0)
-        h = self._new("G", g)
-        return {"handle": h, "modules": {m: {"fro": float(v["fro"]), "S": [float(x) for x in v["S"]][:k]}
-                                         for m, v in g.items()}}
-
     def _examples(self, ids):
         ex = [e for e in self.train.get(ids) if e.get("target")]
         if not ex:
@@ -410,10 +392,6 @@ class Workspace:
                 v = obj["pcs"][int(rest[2:])]
             else:
                 raise ValueError(f"bad activation field {rest!r}")
-        elif h.startswith("G"):
-            mod, tail = rest.rsplit(".", 1)
-            side, i = tail[0], int(tail[1:])
-            v = obj[mod]["U"][:, i] if side == "u" else obj[mod]["V"][:, i]
         else:
             raise ValueError(f"handle {h!r} has no vectors")
         if v.numel() != dim:
@@ -459,50 +437,6 @@ class Workspace:
         lo = base.copy()
         scale_singular(lo, module, s["U"], s["S"], s["V"], idx, factors)
         return {"lora": self._new("L", lo)}
-
-    def t_from_grad(self, lora, grad, lr, k=None, modules=None):
-        base = self._get(lora, "lora")
-        g = self._get(grad)
-        mods = self._mods(modules) if modules else list(g)
-        if self.mock:
-            return {"lora": self._new("L", M.m_from_grad(base, mods, float(lr), int(k or 4)))}
-        from .primitives.construct import from_lowrank_grad
-        lo = base.copy()
-        for m in mods:
-            from_lowrank_grad(lo, m, g[m]["U"], g[m]["S"], g[m]["V"], float(lr), k=k)
-        return {"lora": self._new("L", lo)}
-
-    def t_sgd(self, lora=None, ids=None, steps=50, lr=1e-4, rank=16, modules=None, batch_size=4):
-        ids = self._ids(ids)
-        base = self._get(lora, "lora") if lora else None
-        if modules:
-            mods = self._mods(modules)
-        elif base is not None and base.modules():
-            mods = list(base.modules())
-        else:  # default: the SFT recipe's module set
-            from .baselines import modules_for, recipe
-            mods = modules_for(self.store, recipe(self.cfg)["leaves"])
-        steps, rank, batch_size = int(steps), int(min(rank, self.rank_cap)), int(max(1, min(batch_size, 16)))
-        lr = float(lr)
-        if steps <= 0 or not (0 < lr < 1):
-            raise ValueError("need steps > 0 and 0 < lr < 1")
-        if self.mock:
-            est = steps * batch_size * float(self.cfg.get("mock", {}).get("sec_per_example", 0.6))
-            if est > self.left("gpu_seconds"):
-                frac = max(self.left("gpu_seconds"), 0) / est
-                steps = max(1, int(steps * frac))
-                est = self.left("gpu_seconds")
-            lo = self._gpu(lambda: M.m_sgd(base, mods, ids, steps, lr, rank), est_seconds=est)
-            return {"lora": self._new("L", lo), "loss_first": 1.2, "loss_last": round(1.2 * math.exp(-steps * lr * 40), 4),
-                    "steps_done": steps, "gpu_seconds": round(est, 1)}
-        ex = self._examples(ids)
-        t0 = self.hf.gpu_seconds
-        lo, info = self._gpu(lambda: self.hf.sgd(ex, base, modules=mods, rank=rank, steps=steps, lr=lr,
-                                                  batch_size=batch_size, time_budget_s=self.left("gpu_seconds")),
-                             est_seconds=0)
-        return {"lora": self._new("L", lo), "loss_first": info["losses"][0] if info["losses"] else None,
-                "loss_last": info["losses"][-1] if info["losses"] else None, "steps_done": info["steps_done"],
-                "gpu_seconds": round(self.hf.gpu_seconds - t0, 1)}
 
     # ------------------------------------------------------------------ operators
     def _op(self, mock_fn, real_fn, *los):
@@ -680,6 +614,79 @@ class Workspace:
         self._evaluated[key] = (score, fb)
         return score, fb
 
+    def t_compare(self, cid, other="parent", level="screen"):
+        """Item-level comparison of two already-evaluated models on the same items; ids and statistics only."""
+        if level not in ("screen", "full"):
+            raise ValueError("level must be 'screen' or 'full'")
+
+        def name_of(c):
+            if c in (None, "parent"):
+                return None
+            lo = self.load_candidate(str(c))
+            if lo is None:
+                raise KeyError(f"unknown candidate {c!r}")
+            return self.lora_name(lo) if lo.modules() else None
+        A, B = self.evaluator.cached(name_of(cid), level), self.evaluator.cached(name_of(other), level)
+        if A is None or B is None:
+            raise ValueError(f"{[c for c, r in ((cid, A), (other, B)) if r is None]} not evaluated at level {level!r} "
+                             "yet (compare only reads existing results; it never evaluates)")
+        out = {"cid": cid, "other": other, "level": level, "datasets": {}}
+        for ds in sorted(set(A) & set(B)):
+            a = {r["id"]: r for r in A[ds]["records"] if r.get("score") is not None}
+            b = {r["id"]: r for r in B[ds]["records"] if r.get("score") is not None}
+            ids = sorted(set(a) & set(b))
+            broken = [i for i in ids if b[i]["score"] > 0.5 >= a[i]["score"]]
+            fixed = [i for i in ids if a[i]["score"] > 0.5 >= b[i]["score"]]
+            lens = sorted(b[i].get("len", 0) for i in ids)
+            c1, c2 = (lens[len(lens) // 3], lens[2 * len(lens) // 3]) if lens else (0, 0)
+
+            def bucket(i):
+                n = b[i].get("len", 0)
+                return "short" if n <= c1 else ("medium" if n <= c2 else "long")
+            by = {k: {"n": 0, "broken": 0, "fixed": 0} for k in ("short", "medium", "long")}
+            for i in ids:
+                by[bucket(i)]["n"] += 1
+            for i in broken:
+                by[bucket(i)]["broken"] += 1
+            for i in fixed:
+                by[bucket(i)]["fixed"] += 1
+            n = max(len(ids), 1)
+            out["datasets"][ds] = {
+                "n": len(ids), "acc": round(sum(a[i]["score"] for i in ids) / n, 4),
+                "acc_other": round(sum(b[i]["score"] for i in ids) / n, 4),
+                "broken": len(broken), "fixed": len(fixed), "net": len(fixed) - len(broken),
+                "broken_ids": broken[:50], "fixed_ids": fixed[:50], "by_other_length": by,
+                "truncated": round(sum(a[i].get("finish") == "length" for i in ids) / n, 4),
+                "truncated_other": round(sum(b[i].get("finish") == "length" for i in ids) / n, 4)}
+        return out
+
+    def _parent_lora_for_loss(self):
+        """The LoRA that makes the current model in the HF model: mode=edit after generation 0 the current LoRA
+        (RAW, source 'current') on M_0; otherwise none (the HF model is the current model itself)."""
+        return self.raw if (self.raw is not None and self.raw_info.get("source") == "current") else None
+
+    def t_train_loss(self, lora, ids=None, n=64):
+        """Mean answer NLL on train items with and without the LoRA (forward only)."""
+        lo = self._get(lora, "lora")
+        ids = self._ids(ids, default_n=int(n))
+        ex = self._examples(ids)
+        ref = self._parent_lora_for_loss()
+        key = tuple(sorted(ids))
+        cache = self.__dict__.setdefault("_parent_loss", {})
+        if self.mock:
+            def mloss(x):
+                return 1.2 if x is None else round(1.2 - 2.0 * x.gain + 1.0 * x.damage, 6)
+            loss = self._gpu(lambda: mloss(lo if lo.modules() else ref), est_seconds=1 + 0.05 * len(ex))
+            if key not in cache:
+                cache[key] = mloss(ref)
+        else:
+            loss = self._gpu(lambda: self.hf.loss(ex, lora=lo if lo.modules() else ref), est_seconds=0)
+            if key not in cache:
+                cache[key] = self._gpu(lambda: self.hf.loss(ex, lora=ref), est_seconds=0)
+        p = cache[key]
+        return {"loss": round(float(loss), 6), "parent_loss": round(float(p), 6),
+                "delta": round(float(loss) - float(p), 6), "n": len(ex)}
+
     def t_evaluate(self, lora):
         lo = self._get(lora, "lora")
         self._local.eval_pending = 1 if lo.modules() else 0
@@ -784,8 +791,7 @@ def _count(xs):
 def classify(tools) -> str:
     """Primitive-usage category for behaviour analysis (RSI_LOOP_DESIGN §3.6)."""
     s = set(tools)
-    construct = s & {"rank1", "from_direction", "scale_singular", "from_grad"}
-    train = "sgd" in s
+    construct = s & {"rank1", "from_direction", "scale_singular"}
     stack_ops = s & {"interpolate", "combine", "truncate_rank", "intruder_scale", "relchange_prune",
                      "regmean_preserve", "orthogonalize", "ties", "scale", "drop"}
     if "raw_lora" in s:   # mode=edit: what was done to the raw LoRA
@@ -794,12 +800,8 @@ def classify(tools) -> str:
         if construct:
             return "raw+construct"
         return "raw+ops" if stack_ops else "raw_as_is"
-    if not (construct or train or stack_ops):
+    if not (construct or stack_ops):
         return "keep"
-    if train and not construct and not stack_ops:
-        return "pure_sft"
-    if construct and not train:
+    if construct:
         return "pure_construct" if not stack_ops else "construct+ops"
-    if construct and train:
-        return "construct+sft"
-    return "sft+ops" if train else "ops_only"
+    return "ops_only"

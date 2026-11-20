@@ -6,6 +6,8 @@ run_eval merges into <out_dir>/summary.json, so two concurrent score() calls mus
 Code tasks stay status=pending_sandbox (score None) when Docker is unavailable; mock mode always
 passes --no-sandbox (never starts Docker). seed / temperature override the task's decoding (run_eval
 --seed / --temperature); the seed only reaches the server for sampled decoding (temperature > 0).
+set_max_tokens() installs a run-wide {task: max generation tokens} table (the paper config's `max_tokens`);
+every score() call of a listed task then passes run_eval --max-tokens (unless `extra` already does).
 
 Token KL uses vLLM's /v1/completions with `prompt_logprobs=k` (an extra sampling param that vLLM's
 OpenAI server accepts in the request body); the response's choices[0].prompt_logprobs is a list
@@ -27,6 +29,27 @@ from .config import EVAL_DIR, eval_python
 from .draws import DOMAIN_TRAIN
 
 RUN_EVAL = EVAL_DIR / "run_eval.py"
+TASKS_YAML = EVAL_DIR / "configs" / "tasks.yaml"
+_MAX_TOKENS: dict[str, int] = {}
+
+
+def set_max_tokens(spec: dict | None) -> dict[str, int]:
+    """Run-wide max generation length per run_eval task (paper config `max_tokens: {task: tokens}`), overriding
+    eval/configs/tasks.yaml for this process; null / {} = keep tasks.yaml. Returns the installed table."""
+    import yaml
+    spec = {k: v for k, v in (spec or {}).items() if v is not None}
+    known = set((yaml.safe_load(TASKS_YAML.read_text()) or {}).get("tasks") or {})
+    bad = sorted(set(spec) - known)
+    if bad:
+        raise SystemExit(f"max_tokens: unknown task(s) {bad} (see eval/configs/tasks.yaml)")
+    out = {}
+    for k, v in spec.items():
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise SystemExit(f"max_tokens.{k} must be a positive integer, got {v!r}")
+        out[k] = int(v)
+    _MAX_TOKENS.clear()
+    _MAX_TOKENS.update(out)
+    return dict(_MAX_TOKENS)
 
 
 @dataclass
@@ -48,7 +71,8 @@ def domain_eval_tasks(domain: str) -> list[str]:
 
 def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
           lora: str | None = None, extra: list[str] = (), mock: bool = False,
-          seed: int | None = None, temperature: float | None = None) -> EvalResult:
+          seed: int | None = None, temperature: float | None = None, top_p: float | None = None,
+          top_k: int | None = None) -> EvalResult:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [eval_python(), "-I", str(RUN_EVAL), "--task", task, "--pool", pool, "--endpoint", endpoint,
@@ -68,6 +92,12 @@ def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None,
         cmd += ["--seed", str(int(seed))]
     if temperature is not None:
         cmd += ["--temperature", str(float(temperature))]
+    if top_p is not None:
+        cmd += ["--top-p", str(float(top_p))]
+    if top_k is not None:
+        cmd += ["--top-k", str(int(top_k))]
+    if task in _MAX_TOKENS and "--max-tokens" not in [str(x) for x in extra]:
+        cmd += ["--max-tokens", str(_MAX_TOKENS[task])]
     if mock and "--no-sandbox" not in extra:
         cmd += ["--no-sandbox"]
     cmd += [str(x) for x in extra]

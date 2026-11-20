@@ -2,8 +2,14 @@
 
     model_info()          architecture summary, budget, action space, current model's config, tools
     profile_table()       rows {key, layer, group, bits, group_size, quantizer, dkl_mean, dkl_p99, top1_drop, params}
+                          (whole-model KL when ONLY that group is RTN-quantized; forward pass on 64 texts)
+    hessian_table()       rows {key, layer, group, quantizer, bits, group_size, herr_per_token, herr_rel, params}
+                          (Hessian-weighted error of that group alone, rtn / gptq / awq; every calibration token)
     activation_table()    rows {layer, group, module, input, rms_mean, rms_max_over_median, absmax_over_median,
                                 outlier_frac, red_flag}
+    group_error(config)   per-group Hessian-weighted error of a config + the groups with the largest share
+    compare(cid, other)   item-level comparison of two evaluated candidates (default other = the incumbent):
+                          flips with ids, by output length, truncation; no item content
     bytes_table()         rows {key, layer, group, params, modules, mib: {"b4_g128": ..., "bf16": ...}}
     bytes(config)         packed size of a config {gib, total_bytes, linear_avg_bits, by_group_gib, fits_budget}
     evaluate(config)      build the candidate and run the screen evaluation -> L1 feedback   [cost: evaluate=1]
@@ -57,6 +63,34 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
     def activation_table():
         """Input activation statistics per linear module (red_flag = heavy outliers)."""
         return problem.tables["activation"]
+
+    def hessian_table():
+        """Hessian-weighted output error tr(dW H dW^T) per token (herr_per_token) and relative to tr(W H W^T)
+        (herr_rel) when ONLY this group is quantized with (quantizer, bits) at group size 128; rtn / gptq / awq.
+        Uses every calibration token (no forward pass): a local, low-noise complement of profile_table."""
+        return problem.tables.get("hessian") or []
+
+    def group_error(config, top: int = 10):
+        """Per-group Hessian-weighted error of a config (no evaluation, no forward pass; free): {total_per_token,
+        top: [(key, share)], groups: {key: {setting, herr_per_token, herr_rel, share}}}. Shows where a config's
+        quantization error concentrates."""
+        try:
+            return problem.group_error(config, top=int(top))
+        except schema.ConfigError as e:
+            raise ToolError(str(e)) from None
+
+    def compare(cid: str, other: str = "incumbent", stage: str = "screen"):
+        """Compare two evaluated candidates item by item on the same items (default other = the incumbent;
+        stage screen | full): per dataset accuracy of both, broken (other right, cid wrong) / fixed counts and
+        ids, flips by the other's output length (short / medium / long), truncation rate, mean output length.
+        Ids and statistics only (no item content). cid = a candidate id from the table, or '<cid>_e<k>' for
+        api.evaluate calls."""
+        if stage not in ("screen", "full"):
+            raise ToolError("stage must be 'screen' or 'full'")
+        try:
+            return problem.compare(str(cid), str(other), stage)
+        except ValueError as e:
+            raise ToolError(str(e)) from None
 
     def bytes_table():
         """Packed MiB of every group key for each (bits, group size)."""
@@ -116,6 +150,12 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         api.register("profile_summary", profile_summary)
     if tcfg.get("activation_table", True):
         api.register("activation_table", activation_table)
+    if tcfg.get("hessian_table", True):
+        api.register("hessian_table", hessian_table)
+    if tcfg.get("group_error", True):
+        api.register("group_error", group_error)
+    if tcfg.get("compare", True):
+        api.register("compare", compare)
     api.register("bytes_table", bytes_table)
     api.register("bytes", bytes)
     api.register("evaluate", evaluate, cost={"evaluate": 1})

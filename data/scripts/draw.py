@@ -236,7 +236,13 @@ def draw_generation(cfg, run_name, gen, ledger, store, target=None):
             sys.exit(f"Paper B needs --target, one of {names}")
     elif target:
         sys.exit("--target is only used for Paper B")
-    kl_alloc = alloc({d: 1 for d in names}, int(cfg.get("kl_contexts", 0))) if paper == "A" else {}
+    # Paper A: kl_contexts split evenly over `kl_domains` (default: every domain; a single-domain run lists only
+    # its own domain, so all kl_contexts texts come from it)
+    kl_doms = cfg.get("kl_domains") or names
+    bad = [d for d in kl_doms if d not in cfg["domains"]]
+    if bad:
+        sys.exit(f"kl_domains: unknown domain(s) {bad}; known: {names}")
+    kl_alloc = alloc({d: 1 for d in kl_doms}, int(cfg.get("kl_contexts", 0))) if paper == "A" else {}
 
     # target domain first so its train/signal get first pick of fresh items
     order = ([target] + [d for d in names if d != target]) if target else names

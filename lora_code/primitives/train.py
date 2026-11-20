@@ -1,13 +1,12 @@
-"""Gradient tools and activation statistics with transformers + peft (gpu1 in the real run, CPU in tests).
+"""Raw-LoRA training and activation statistics with transformers + peft (gpu1 in the real run, CPU in tests).
 
-TrainData holds the ONLY items gradient / activation tools may touch: this generation's `train` role of
+TrainData holds the ONLY items training / activation statistics may touch: this generation's `train` role of
 the target domain. Every call that takes ids goes through TrainData.check(), which refuses any other id
 (signal, screen, gate, kl or held-out items) with PermissionError.
 
 HFModel lazily loads the current model (BF16, gradient checkpointing) and provides:
   loss(examples, lora)            mean token NLL of the target spans
-  grad(examples, modules, lora)   ∂L/∂W for the given modules at W + ΔW, returned as top-k SVD
-  sgd(examples, lora, ...)        short LoRA training with peft (AdamW), warm-started from `lora`
+  sgd(examples, lora, ...)        LoRA training with peft (AdamW): only the raw LoRA of mode=edit (generation 0)
   acts(texts, modules, k)         input/output activation statistics (mean, norms, top principal directions)
   grams(texts, modules)           input Gram matrices Σ x xᵀ (RegMean)
   act_ratio(texts, lora)          ||ΔW h|| / ||W h|| per module
@@ -222,44 +221,6 @@ class HFModel:
                     tot += float(self._loss(ids, lab, att)) * ids.shape[0]
                     n += ids.shape[0]
             return tot / max(n, 1)
-        return self._timed(run)
-
-    def grad(self, examples, modules, lora=None, k: int = 8, batch_size: int = 4) -> dict:
-        """Top-k SVD of the mean-loss gradient ∂L/∂W for each module, evaluated at W + ΔW(lora)."""
-        import torch
-
-        def run():
-            mods = {m: self.module(m) for m in modules}
-            for mod in mods.values():
-                mod.weight.requires_grad_(True)
-            acc = {m: None for m in modules}
-            nb = 0
-            try:
-                with self.applied(lora):
-                    for ids, lab, att in self.batches(examples, batch_size):
-                        loss = self._loss(ids, lab, att)
-                        loss.backward()
-                        nb += 1
-                        for m, mod in mods.items():
-                            g = mod.weight.grad.float()
-                            acc[m] = g.clone() if acc[m] is None else acc[m] + g
-                            mod.weight.grad = None
-            finally:
-                for mod in mods.values():
-                    mod.weight.requires_grad_(False)
-                    mod.weight.grad = None
-            out = {}
-            for m, G in acc.items():
-                G = G / max(nb, 1)
-                if min(G.shape) <= 2048:
-                    U, S, Vh = torch.linalg.svd(G, full_matrices=False)
-                    U, S, V = U[:, :k], S[:k], Vh[:k].T
-                else:
-                    torch.manual_seed(self.seed)
-                    U, S, V = torch.svd_lowrank(G, q=k + 8, niter=4)
-                    U, S, V = U[:, :k], S[:k], V[:, :k]
-                out[m] = {"U": U.cpu(), "S": S.cpu(), "V": V.cpu(), "fro": float(G.norm())}
-            return out
         return self._timed(run)
 
     def sgd(self, examples, lora=None, *, modules=None, rank: int = 16, steps: int = 50, lr: float = 1e-4,
