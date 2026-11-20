@@ -52,6 +52,7 @@ objective_profiles:
     search: {kl_weight: 0.0, top_full: 0}   # score = eval accuracy / incumbent's; screen = full = the whole set
     gate: {min_delta: 1.0e-6, require_significant: false}        # accept any strictly higher eval-set score
     feedback: {examples: 5}
+    heldout: {domains: eval_target, decoding: null}   # evaluated on the same 1819 items, greedy (2026-11-21)
 
 # One fixed size for every generation. Every candidate quantizes the ORIGINAL BF16 model M_0 (the layer
 # cache is built once); generation g must beat the incumbent (best accepted quantization so far).

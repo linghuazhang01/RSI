@@ -66,6 +66,27 @@ class ReplicaScoringTest(unittest.TestCase):
         again = heldout.run_heldout(eps, "m", self.tmp / "hpar", domains="math", mock=True, limit=5)   # resume
         self.assertEqual(again, par)
 
+    def test_single_task_split_over_replicas(self):
+        """eval_target (one task, 2026-11-21): the items are split over every replica, same scores, resumable."""
+        if heldout._task_ids("math500", "test") is None:
+            self.skipTest("math500 split not built")
+        eps = [s.endpoint for s in self.srvs]
+        orig = heldout.HELDOUT_EXTRA
+        heldout.HELDOUT_EXTRA = {"one": [("math500", "test")]}
+        try:
+            sp = heldout.run_heldout(eps, "m", self.tmp / "hsplit", domains="one", mock=True, limit=9)
+            seq = heldout.run_heldout(eps[0], "m", self.tmp / "hseq1", domains="one", mock=True, limit=9)
+            summ = json.loads((self.tmp / "hsplit" / "summary.json").read_text())["math500"]
+            self.assertEqual((summ["split_over_replicas"], summ["n"], summ["limit"]), (3, 9, 9))
+            self.assertEqual(sp["math500"]["accuracy"], seq["math500"]["accuracy"])
+            again = heldout.run_heldout(eps, "m", self.tmp / "hsplit", domains="one", mock=True, limit=9)
+            self.assertEqual(again, sp)
+            self.assertEqual(len(list((self.tmp / "hsplit").glob("_part*"))), 3)
+        finally:
+            heldout.HELDOUT_EXTRA = orig
+        self.assertEqual(heldout.heldout_tasks("eval_target"), [("math_eval", "pool")])
+        self.assertNotIn(("math_eval", "pool"), heldout.heldout_tasks("all"))
+
 
 class SleepModeTest(unittest.TestCase):
     def test_command_env_and_mock_state(self):

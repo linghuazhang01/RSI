@@ -6,6 +6,7 @@
 # Candidate score = eval accuracy / incumbent's (kl_weight 0: no KL); accepted when the eval-set score is
 # strictly higher (gate.min_delta 1e-6, no significance test). KL / calibration texts = 400 eval prompts + M_0's
 # answers. The editor's regression examples also show the reference answer.
+# Held-out = the same 1819 items, greedy (2026-11-21): no AIME, no sampled avg@n.
 #
 # Launch:
 #   ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1,2,3 --eval-overfit
@@ -174,20 +175,9 @@ archive:
   enabled: true
   top_candidates: 3
 heldout:
-  domains: math
+  domains: eval_target        # the same 1819 math_eval items, greedy (2026-11-21)
   limit: null
-  decoding:
-    temperature: 0.7
-    top_p: 0.8
-    top_k: 20
-    seed: 42
-    n: 1
-    n_by_task:
-      aime24: 8
-      aime25: 8
-      amc23: 8
-      math500: 4
-      gpqa_diamond: 4
+  decoding: null
 e_task:
   enabled: false
   budget_gib: null

@@ -224,6 +224,9 @@ class TestMockFlow(unittest.TestCase):
         self.assertIn("datasets=['math_eval']", r.stdout)
         self.assertFalse((rd / "draws").exists())
         self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"math_eval"})
+        # held-out = the same 1819 items (greedy), for M_0 and Q_0
+        self.assertEqual(set(json.loads((rd / "baseline" / "heldout.json").read_text())), {"math_eval"})
+        self.assertEqual(set(json.loads((rd / "baseline" / "q0" / "heldout.json").read_text())), {"math_eval"})
         ev = jl(rd / "gen_01" / "evals.jsonl")
         scr = [e for e in ev if e["stage"] == "screen" and e["origin"] == "candidate"]
         self.assertTrue(scr)

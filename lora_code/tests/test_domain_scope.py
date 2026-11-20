@@ -203,6 +203,7 @@ class DataSizeAndNoiseTest(unittest.TestCase):
             self.assertEqual((cfg["objective"], cfg["eval_target"]["dataset"]), ("eval_overfit", "math_eval"))
             gate = cfg["gate"]
             self.assertFalse(gate["require_significant"])
+            self.assertEqual((cfg["heldout"]["domains"], cfg["heldout"]["decoding"]), ("eval_target", None))
             self.assertLess(gate.get("min_delta", gate.get("min_gain")), 1e-3)
             self.assertEqual(draws.eval_dataset(rc), "math_eval")
             allids = draws.gate_ids(rc, "math_eval")

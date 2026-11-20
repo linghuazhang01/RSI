@@ -9,13 +9,20 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .evaluate import score
+import yaml
+
+from .config import EVAL_DIR, ROOT
+from .evaluate import score, score_split
 
 HELDOUT = {"math": [("math500", "test"), ("gsm8k", "test"), ("aime24", "test"), ("aime25", "test")],
            "code": [("humanevalplus", "test"), ("mbppplus", "test"), ("livecodebench", "test")],
            "knowledge": [("gpqa_diamond", "test"), ("mmlu_pro", "test"), ("triviaqa", "test")],
            "instruction_following": [("ifeval", "test"), ("ifbench", "test")],
            "tool_calling": [("sealtool", "test"), ("apibank", "test"), ("bfcl", "test")]}
+
+# Not part of "all": selected by name only. eval_target = the merged eval set an eval_overfit run optimises on
+# (2026-11-21: the run is evaluated on exactly those 1819 items, MATH-500 + GSM8K test).
+HELDOUT_EXTRA = {"eval_target": [("math_eval", "pool")]}
 
 _KEYS = ("accuracy", "n", "n_pending", "prompt_strict", "avg_at_n", "pass_at_n", "maj_at_n", "em", "f1")
 
@@ -27,7 +34,7 @@ def heldout_tasks(domains="all") -> list[tuple[str, str]]:
         doms = [d.strip() for d in domains.split(",") if d.strip()]
     else:
         doms = list(domains)
-    return [tp for d in doms for tp in HELDOUT[d]]
+    return [tp for d in doms for tp in (HELDOUT[d] if d in HELDOUT else HELDOUT_EXTRA[d])]
 
 
 def decoding_args(decoding: dict | None, task: str) -> dict:
@@ -50,14 +57,52 @@ def _same_decoding(prev_dec: dict | None, key: dict | None) -> bool:
 def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=None, mock=False, limit=None,
                 decoding: dict | None = None) -> dict:
     """endpoint: one URL, or a list of URLs of replicas of the same model (2026-11-20): the tasks are then run
-    in parallel, one replica per task (each task in out_dir/_par/<task>/, merged into out_dir afterwards)."""
+    in parallel, one replica per task (each task in out_dir/_par/<task>/, merged into out_dir afterwards).
+    A single task (eval_target: the 1819 math_eval items, 2026-11-21) is instead split item-wise over all
+    replicas (score_split), so every GPU works on it."""
     if isinstance(endpoint, (list, tuple)) and len(endpoint) > 1:
+        tasks = heldout_tasks(domains)
+        if len(tasks) == 1 and _task_ids(*tasks[0], limit) is not None:
+            return _run_heldout_split(list(endpoint), served_name, Path(out_dir), tasks[0], lora=lora, mock=mock,
+                                      limit=limit, decoding=decoding)
         return _run_heldout_parallel(list(endpoint), served_name, Path(out_dir), domains=domains, lora=lora,
                                      mock=mock, limit=limit, decoding=decoding)
     if isinstance(endpoint, (list, tuple)):
         endpoint = endpoint[0]
     return _run_heldout_one(endpoint, served_name, out_dir, domains=domains, lora=lora, mock=mock, limit=limit,
                             decoding=decoding)
+
+
+def _task_ids(task: str, pool: str, limit=None) -> list[str] | None:
+    """The sorted item ids run_eval would score for (task, pool[, --limit]); None when the split file is missing."""
+    tcfg = (yaml.safe_load((EVAL_DIR / "configs" / "tasks.yaml").read_text()).get("tasks") or {}).get(task) or {}
+    f = ROOT / "data" / "splits" / tcfg.get("dataset", task) / f"{pool}.json"
+    if not f.exists():
+        return None
+    ids = sorted(set(json.loads(f.read_text())))
+    return ids[:limit] if limit else ids
+
+
+def _run_heldout_split(endpoints, served_name, out_dir: Path, task_pool, *, lora, mock, limit, decoding) -> dict:
+    """One held-out task, its items split over the replicas (resumable like _run_heldout_one)."""
+    task, pool = task_pool
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sp = out_dir / "summary.json"
+    served = lora or served_name
+    dec = decoding_args(decoding, task)
+    prev = json.loads(sp.read_text()).get(task) if sp.exists() else None
+    if prev and prev.get("served_model_name") == served and prev.get("limit") == limit \
+            and _same_decoding(prev.get("decoding"), dec["key"]) and (out_dir / f"{task}.jsonl").exists():
+        summ = prev
+    else:
+        summ = score_split(endpoints, served_name, task, pool=pool, ids=_task_ids(task, pool, limit), out_dir=out_dir,
+                           lora=lora, extra=dec["extra"], mock=mock, **dec["kw"]).summary
+        summ = dict(summ, limit=limit)              # ids replace --limit; keep the resume key of _run_heldout_one
+        summ.pop("ids_file", None)
+        allsum = json.loads(sp.read_text()) if sp.exists() else {}
+        allsum[task] = summ
+        sp.write_text(json.dumps(allsum, indent=1, ensure_ascii=False))
+    return {task: {k: summ[k] for k in _KEYS if k in summ}}
 
 
 def _run_heldout_parallel(endpoints, served_name, out_dir: Path, *, domains, lora, mock, limit, decoding) -> dict:

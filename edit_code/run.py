@@ -42,7 +42,7 @@ from rsicore import search as S  # noqa: E402
 from rsicore.editor import Editor  # noqa: E402
 from rsicore.evaluate import score, score_split  # noqa: E402
 from rsicore.gate import fixed_noise_band, measure_noise_band, noise_ids  # noqa: E402
-from rsicore.heldout import HELDOUT, run_heldout  # noqa: E402
+from rsicore.heldout import HELDOUT, HELDOUT_EXTRA, run_heldout  # noqa: E402
 from rsicore.sandbox import run_program  # noqa: E402
 from rsicore.servers import VLLMServer  # noqa: E402
 from rsicore.state import RunState  # noqa: E402
@@ -777,9 +777,10 @@ def _acc(records: list[dict]):
 
 def _by_domain(h: dict) -> dict:
     out = {}
-    for dom, tasks in HELDOUT.items():
+    for dom, tasks in {**HELDOUT, **HELDOUT_EXTRA}.items():
         vals = [h[t]["accuracy"] for t, _ in tasks if t in h and h[t].get("accuracy") is not None]
-        out[dom] = round(sum(vals) / len(vals), 4) if vals else None
+        if vals or dom in HELDOUT:                  # eval_target only when it was evaluated
+            out[dom] = round(sum(vals) / len(vals), 4) if vals else None
     return out
 
 

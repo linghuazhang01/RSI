@@ -319,6 +319,8 @@ def test_mock_eval_overfit_scratch(tmp_path):
     assert list(json.loads((run / "baseline" / "gate_scores.json").read_text())) == ["math_eval"]
     summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
     assert summ["accepted"]["source"] in ("llm", "keep")
+    assert set(json.loads((run / "baseline" / "heldout.json").read_text())) == {"math_eval"}   # same 1819 items
+    assert set(summ["heldout"]) == {"math_eval"}
 
 
 def test_mock_weights_mode(tmp_path):

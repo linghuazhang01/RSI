@@ -5,6 +5,7 @@
 # the editor's train_example / acts / train_loss see every eval item and its gold answer; scored greedily.
 # Accepted when the eval-set score is strictly higher than the current model's (gate.min_gain 1e-6, no
 # significance test); only candidates with a positive eval-set gain are submitted. Nothing is trained (scratch).
+# Held-out = the same 1819 items, greedy (2026-11-21): no AIME, no sampled avg@n.
 #
 # Launch:
 #   ./launch.sh --hw h20 --paper B --domains math --gens 5 --gpus 4,5,6,7 --set method.mode=scratch --eval-overfit
@@ -134,20 +135,9 @@ e_t:
   test_limit: null
 heldout:
   enabled: true
-  domains: math
+  domains: eval_target        # the same 1819 math_eval items, greedy (2026-11-21)
   limit: null
-  decoding:
-    temperature: 0.7
-    top_p: 0.8
-    top_k: 20
-    seed: 42
-    n: 1
-    n_by_task:
-      aime24: 8
-      aime25: 8
-      amc23: 8
-      math500: 4
-      gpqa_diamond: 4
+  decoding: null
 baseline:
   noise_repeats: 3
   noise_temperature: 0.0

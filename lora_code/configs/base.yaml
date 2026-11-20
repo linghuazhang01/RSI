@@ -76,6 +76,7 @@ objective_profiles:
     search: {top_full: 0}                   # screen = full = the whole set
     gate: {min_gain: 1.0e-6, require_significant: false}         # accept any strictly higher eval-set score
     feedback: {n_examples: 5, lambda_kl: 0.0}
+    heldout: {domains: eval_target, decoding: null}   # evaluated on the same 1819 items, greedy (2026-11-21)
     e_t: {enabled: false}
 
 raw:                        # mode=edit only: recipe of the raw LoRA (trained once, generation 0; the only training)
