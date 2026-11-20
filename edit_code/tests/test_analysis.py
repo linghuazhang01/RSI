@@ -42,6 +42,7 @@ def _problem(tmp: Path, mock: bool):
     p.datasets = ["dapo_math"]
     p._herr, p._herr_lock, p._export_lock = None, threading.Lock(), threading.Lock()
     p._evals = {}
+    p.prep_gpus = None                       # one worker (the hessian table on several GPUs is the GPU path)
     p.log = lambda *a, **k: None
     p.tag = "t"
     return p

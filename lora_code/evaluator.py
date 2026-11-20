@@ -36,10 +36,18 @@ def _short(s, n=400):
 class Evaluator:
     def __init__(self, rc, cfg: dict, *, out_dir: Path, endpoint: str, served: str, server, ids: dict,
                  target_dataset: str, kl_texts: list[str], store, mock: bool, registry: Path | None,
-                 parent_quality: float | dict | None = None, max_loaded: int = 6, tag: str = ""):
+                 parent_quality: float | dict | None = None, max_loaded: int = 6, tag: str = "",
+                 replicas: list | None = None):
         self.rc, self.cfg = rc, cfg
         self.out_dir = Path(out_dir)
         self.endpoint, self.served, self.server = endpoint, served, server
+        # replicas of the served model (2026-11-20, data parallelism): every LoRA is loaded on all of them and the
+        # items of a scoring job are split over them (rsicore.evaluate.score_split); KL uses the first
+        self.replicas = list(replicas) if replicas else [server]
+        if self.replicas[0] is not server and server in self.replicas:
+            self.replicas.remove(server)
+            self.replicas.insert(0, server)
+        self.endpoints = [s.endpoint for s in self.replicas]
         self.ids = ids                      # level -> {dataset: [ids]}
         self.target = target_dataset
         self.kl_texts = kl_texts
@@ -108,17 +116,19 @@ class Evaluator:
                 if old is None:
                     break
                 self._loaded.pop(old)
-                try:
-                    self.server.unload_lora(old)
-                except Exception:  # noqa: BLE001
-                    pass
-            self.server.load_lora(name, self._paths[name])
+                for s in self.replicas:
+                    try:
+                        s.unload_lora(old)
+                    except Exception:  # noqa: BLE001
+                        pass
+            for s in self.replicas:
+                s.load_lora(name, self._paths[name])
             self._loaded[name] = True
 
     # ------------------------------------------------------------------ scoring
     def run(self, name: str | None, level: str) -> dict:
         """{dataset: {"score","ci","n","n_scored","records":[{id,score,out,finish,parsed}]}} (cached)."""
-        from rsicore.evaluate import score as rs_score
+        from rsicore.evaluate import score_split
 
         key = name or "__parent__"
         lora = name if name is not None else self.parent_lora
@@ -129,9 +139,9 @@ class Evaluator:
             if got is None:
                 if lora is not None:
                     self.ensure_loaded(lora)
-                er = rs_score(self.endpoint, self.served, ds, pool="pool", ids=list(ids),
-                              out_dir=self.out_dir / "evals" / key / level / f"{ds}_raw",
-                              lora=lora, mock=self.mock)
+                er = score_split(self.endpoints, self.served, ds, pool="pool", ids=list(ids),
+                                 out_dir=self.out_dir / "evals" / key / level / f"{ds}_raw",
+                                 lora=lora, mock=self.mock)
                 recs = []
                 for r in er.records:
                     recs.append({"id": r.get("id"), "score": r.get("score"),

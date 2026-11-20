@@ -88,24 +88,35 @@ def ranked(cands) -> list[Candidate]:
 
 def inner_search(rc, gen: int, *, editor_factory, render_context, build_fn, screen_fn, full_fn,
                  threads: int, steps: int, max_candidates: int, top_full: int = 3, rerun_seeds: int = 0,
-                 out_dir: Path | None = None, parallel: int = 1) -> list[Candidate]:
+                 out_dir: Path | None = None, parallel: int = 1, phases=None) -> list[Candidate]:
     """parallel=1: one thread after another (a thread sees the candidates of the threads before it in the
     same step). parallel=N>1: within a step, up to N threads propose, build and screen at the same time
     (they all see the history up to the end of the previous step; the paper's build/screen functions must
     be thread-safe, e.g. a pool of N candidate servers), and the top_full stage runs N at a time. Results
-    are recorded in thread order, so the record does not depend on which job finished first."""
+    are recorded in thread order, so the record does not depend on which job finished first.
+    phases (2026-11-20, parallel > 1): an object with editor_phase() and eval_phase() -> int. Each step then
+    runs in two phases: every thread proposes at once (editor_phase() first: e.g. wake the editor), then
+    eval_phase() (e.g. put the editor to sleep and lend its GPU as one more candidate slot; returns how many
+    builds / screens run at once) and all builds + screens. The top_full stage runs in the eval phase; the
+    search ends in the eval phase (the caller wakes or stops the editor)."""
     gd = _out(rc, gen, out_dir)
     (gd / "programs").mkdir(exist_ok=True)
     (gd / "feedback").mkdir(exist_ok=True)
     cands = load_candidates(rc, gen, gd)
     editors = {}
 
-    def one(th: int, step: int, cid: str, history: list) -> Candidate:
+    def propose(th: int, cid: str, history: list) -> tuple[str, dict]:
         msg = render_context(history, th)
         t0 = time.time()
         program = editors[th].propose(msg)
-        cost = {"propose_s": round(time.time() - t0, 2)}
         (gd / "programs" / f"{cid}.py").write_text(program)
+        return program, {"propose_s": round(time.time() - t0, 2)}
+
+    def one(th: int, step: int, cid: str, history: list) -> Candidate:
+        return evaluate(th, step, cid, *propose(th, cid, history))
+
+    def evaluate(th: int, step: int, cid: str, program: str, cost: dict) -> Candidate:
+        cost = dict(cost)
         t0 = time.time()
         try:
             artifact, error = build_fn(program, cid) if program.strip() else (None, "no ```python block in the reply")
@@ -140,7 +151,17 @@ def inner_search(rc, gen: int, *, editor_factory, render_context, build_fn, scre
         for th, _ in batch:
             if th not in editors:
                 editors[th] = editor_factory(th)
-        if parallel <= 1 or len(batch) <= 1:
+        if phases is not None and parallel > 1 and batch:
+            history = list(cands.values())
+            phases.editor_phase()
+            with ThreadPoolExecutor(max_workers=len(batch)) as ex:      # all proposals at once (one editor server)
+                props = list(ex.map(lambda tc: propose(tc[0], tc[1], history), batch))
+            n_eval = max(1, int(phases.eval_phase() or parallel))
+            with ThreadPoolExecutor(max_workers=min(n_eval, len(batch))) as ex:
+                futs = [ex.submit(evaluate, th, step, cid, *pr) for (th, cid), pr in zip(batch, props)]
+                for f in futs:          # thread order
+                    record(f.result())
+        elif parallel <= 1 or len(batch) <= 1:
             for th, cid in batch:
                 record(one(th, step, cid, list(cands.values())))
         else:
@@ -151,6 +172,8 @@ def inner_search(rc, gen: int, *, editor_factory, render_context, build_fn, scre
                     record(f.result())
 
     # second stage: full evaluation of the best screened candidates
+    if phases is not None and parallel > 1:
+        parallel = max(1, int(phases.eval_phase() or parallel))
     screened = [c for c in cands.values() if c.screen and c.screen.get("score") is not None]
     top = sorted(screened, key=lambda c: c.screen["score"], reverse=True)[:top_full]
     todo = [c for c in top if not (c.full is not None and len(c.full.get("reruns", [])) >= rerun_seeds)]
@@ -188,10 +211,12 @@ def inner_search(rc, gen: int, *, editor_factory, render_context, build_fn, scre
 
 
 def submit_to_gate(rc, gen: int, ranked: list[Candidate], gate_fn, max_submissions: int = 3,
-                   out_dir: Path | None = None) -> Candidate | None:
+                   out_dir: Path | None = None, parallel: int = 1) -> Candidate | None:
     """Submit candidates in order (skipping failed ones) until one passes or max_submissions is reached.
     gate_fn(candidate) -> (passed, info). Appends to <out_dir or gen_XX>/gate.json; resumable (already
-    submitted candidates are not resubmitted)."""
+    submitted candidates are not resubmitted). parallel > 1 (2026-11-20): the next up-to-`parallel` eligible
+    candidates are gate-evaluated at the same time (idle GPUs), then recorded in rank order up to the first
+    pass, so the decision is identical to the sequential one (results after a pass are discarded)."""
     p = _out(rc, gen, out_dir) / "gate.json"
     log = read_json(p, None) or {"submissions": []}
     by_cid = {c.cid: c for c in ranked}
@@ -199,12 +224,15 @@ def submit_to_gate(rc, gen: int, ranked: list[Candidate], gate_fn, max_submissio
         if s["passed"]:
             return by_cid.get(s["cid"])
     done = {s["cid"] for s in log["submissions"]}
-    for c in ranked:
-        if len(log["submissions"]) >= max_submissions:
-            break
-        if c.cid in done or c.artifact is None or c.error is not None or c.score is None:
-            continue
-        passed, info = gate_fn(c)
+    todo = [c for c in ranked if c.cid not in done and c.artifact is not None and c.error is None
+            and c.score is not None][:max(0, max_submissions - len(log["submissions"]))]
+    if parallel > 1 and len(todo) > 1:
+        with ThreadPoolExecutor(max_workers=min(int(parallel), len(todo))) as ex:
+            results = list(ex.map(gate_fn, todo))
+    else:
+        results = None
+    for i, c in enumerate(todo):
+        passed, info = results[i] if results is not None else gate_fn(c)
         log["submissions"].append({"cid": c.cid, "passed": bool(passed), "info": info,
                                    "t": time.strftime("%Y-%m-%dT%H:%M:%S")})
         write_json(p, log)

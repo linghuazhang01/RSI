@@ -102,7 +102,14 @@
 
 ## 硬件（`hardware`，27B）
 
-角色：editor（vLLM：M_0 / 改造者、参照）、candidate（候选服务；校准、缓存、诊断在它的第一张卡上）。
+角色：editor（vLLM：M_0 / 改造者、参照）、candidate（候选服务，每个候选槽一张卡）。
+
+**用满所有卡（2026-11-20，`gpu_layout.*`，改造者有自己的卡时才生效）**：
+- `prep_all_gpus`：第 0 代准备分到所有卡上，每张卡一个 HF 模型：Hessian 按文本分给各卡后相加（结果和单卡一样）、敏感度表按组分、缓存预热和 Hessian 误差表按模块分。
+- `m0_replicas`：M_0 的批量任务（第 0 代验收打分、留出评测、每代 KL 文本的回答）在所有卡上各起一份 M_0，按题目或任务分开跑（`rsicore.evaluate.score_split`、`run_heldout` 传多个地址）。
+- `editor_sleep`：搜索时改造者写完这一轮的程序就进入 vLLM 睡眠模式（`--enable-sleep-mode`，权重移到 CPU 内存约 52 GB，释放 KV cache），它的卡临时当一个候选槽（4 张卡：同时评测 4 个候选）；下一轮开始前收回并唤醒。搜索结束后改造者关闭，验收和导出用所有槽。
+- `parallel_heldout`：新 incumbent / Q_0 的留出评测在每组空闲卡上各起一份，任务分开跑。
+- 验收：最多 3 个提交同时评测，再按排名顺序取第一个通过的（结果和逐个评测一样）。
 
 **改造者 1 张卡，其余卡全部用来同时评测候选**（`common.gpu_layout` / `candidate_groups`，不设 `gpu_roles` 时）：
 - 改造者在候选评测时是空闲的，所以默认只给 1 张卡；

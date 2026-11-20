@@ -25,14 +25,16 @@ from .quant.spec import ModelSpec
 
 # ----------------------------------------------------------------------------- real (torch)
 def profile_table_real(model, spec: ModelSpec, batches, refs, *, bits_list=(2, 3, 4, 8), group_size: int = 128,
-                       log=print) -> list[dict]:
+                       log=print, groups: list[str] | None = None) -> list[dict]:
+    """groups: only these group keys (one worker's share when the table is split over several GPUs)."""
     import torch
     from .quant import quantizers as Q
     from .quant.kl import kl_to_reference
     rows = []
     gp = spec.group_params()
     t0 = time.time()
-    groups = spec.groups()
+    keep = set(groups) if groups is not None else None
+    groups = {k: v for k, v in spec.groups().items() if keep is None or k in keep}
     for gi, (key, mods) in enumerate(groups.items()):
         params = {m.name: model.get_parameter(m.name) for m in mods}
         orig = {n: p.data.clone() for n, p in params.items()}

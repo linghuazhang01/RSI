@@ -126,13 +126,16 @@ class QuantCache:
         q = self.get(module, setting["quantizer"], setting["bits"], setting["group_size"])
         return Q.dequant(q, dtype=dtype, device=self.device).cpu()
 
-    def warm(self, variants: list[dict], *, groups: list[str] | None = None) -> dict:
+    def warm(self, variants: list[dict], *, groups: list[str] | None = None, modules: list[str] | None = None) -> dict:
         """Precompute variants [{"quantizer", "bits", "group_size"}] for every module (or those of
-        the listed group names)."""
+        the listed group names, or only the listed module names: one worker's share)."""
         t0 = time.time()
         n = 0
+        keep = set(modules) if modules is not None else None
         for m in self.spec.modules:
             if groups and m.group not in groups:
+                continue
+            if keep is not None and m.name not in keep:
                 continue
             for v in variants:
                 if v["bits"] >= 16:

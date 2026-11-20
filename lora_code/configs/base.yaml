@@ -196,14 +196,19 @@ server:
   theta0_args: ["--gpu-memory-utilization", "0.45", "--max-logprobs", "20"]
   mock_tasks: null
 
-# GPU roles (lora_code/common.py gpu_layout). gpu_roles unset = EVERY GPU of --gpus is used: one GPU each for
-# main and train (+ theta0 when E_t is on and theta0_own_gpu), extra GPUs to main (TP 2), train (2), main (TP 4),
-# theta0 (TP 2), main (TP 8). e.g. single-domain: 2 -> main | train, 3 -> main x2 | train, 4 -> main x2 | train x2.
-# Set gpu_roles (indices into --gpus) only to override, e.g. --set 'gpu_roles.train=[2,3]'.
+# GPU roles (lora_code/common.py gpu_layout). gpu_roles unset = EVERY GPU of --gpus is used: train = the last
+# gpu_layout.train_gpus GPUs, theta0 its own GPU when E_t is on and theta0_own_gpu (else it shares train), main =
+# all other GPUs as replicas (gpu_layout.main_replicas). Set gpu_roles (indices into --gpus) only to override,
+# e.g. --set 'gpu_roles.train=[2,3]' (then main is a single tensor-parallel server).
 gpu_roles: null
 gpu_layout:
   theta0_own_gpu: false     # B300: the theta0 server shares the first train GPU (0.45 utilisation)
   share_single_gpu: false
+  main_replicas: true       # 2026-11-20: main = independent vLLM replicas (data parallelism), every LoRA loaded on
+                            # all of them; scoring split over them, editor thread k on replica k mod n
+  main_tp: 1                # GPUs per main replica (tensor parallelism inside a replica)
+  train_gpus: 1             # GPUs of the train role (HF model: SVD / acts / train_loss / merge / edit's raw LoRA)
+                            # 4 GPUs, single domain: main [0, 1, 2] (3 replicas) | train [3]
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
 # cards. rsicore.config merges the profile over base/domain config and BEFORE --set (--set wins).

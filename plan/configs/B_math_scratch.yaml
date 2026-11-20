@@ -12,8 +12,8 @@
 # activation statistics / train_loss; 50% signal = 1000), screen_n=400, gate_n=1000; no retention probes,
 # no E_t (scope single).
 #
-# Launch on 4 GPUs (main = editor + candidate LoRAs on 2 GPUs, tensor parallel 2; train = SVD / activation
-# stats / train_loss / merge on 2 GPUs); one seed (--seed 42) for everything:
+# Launch on 4 GPUs (main = 3 data-parallel replicas of M_t, one per GPU, every candidate LoRA on all of them;
+# train = SVD / activation stats / train_loss / merge on 1 GPU); one seed (--seed 42) for everything:
 #   ./launch.sh --hw h20 --paper B --domains math --gens 5 --gpus 4,5,6,7 --set method.mode=scratch
 # Run id: B_math_s42_single -> experiment_records/B_math_s42_single/run_config.yaml is the locked copy.
 draw_config: data/draw/paper_b.yaml
@@ -187,4 +187,7 @@ gpu_roles: null
 gpu_layout:
   theta0_own_gpu: true
   share_single_gpu: false
+  main_replicas: true
+  main_tp: 1
+  train_gpus: 1
 hardware: h20

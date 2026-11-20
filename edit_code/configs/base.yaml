@@ -207,6 +207,14 @@ gpu_roles: null
 gpu_layout:
   share_single_gpu: true              # 1 GPU: editor and candidate share it (B300 / mock only)
   candidate_group_size: 1             # GPUs per candidate server (1 / 2 / 4 / 8)
+  # use every GPU (2026-11-20; each only when the editor has its own GPUs):
+  editor_sleep: true                  # the editor (vLLM sleep mode: weights -> CPU RAM, ~52 GB) sleeps while the
+                                      # candidates of a search step are evaluated; its GPUs serve as one more
+                                      # candidate slot (4 GPUs: 4 candidates at once instead of 3)
+  m0_replicas: true                   # M_0 batch jobs (generation 0 gate / held-out, KL self-generated answers) on
+                                      # every GPU group, items / tasks split over the replicas
+  parallel_heldout: true              # held-out evaluation of an exported model on every free GPU group (tasks split)
+  prep_all_gpus: true                 # generation-0 calibration / profile table / cache / hessian table on every GPU
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
 # cards. rsicore.config merges the profile over base/domain config and BEFORE --set (--set wins).

@@ -5,7 +5,9 @@
 # kl_contexts=400 (all dapo_math since scope single; KL on all 400, calibration on the first 256).
 # Candidates are compared with the incumbent on the same items (M_0 is only the KL reference).
 #
-# Launch on 4 GPUs (editor on 1 GPU, the other 3 = 3 candidate servers); one seed (--seed 42) for everything:
+# Launch on 4 GPUs (editor on 1 GPU, the other 3 = 3 candidate servers; while candidates are evaluated the editor
+# sleeps (weights -> CPU RAM) and its GPU is a 4th candidate slot; generation-0 prep, M_0 batch jobs and held-out
+# evaluation use all 4 GPUs); one seed (--seed 42) for everything:
 #   ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1,2,3
 # Run id: A_math_s42_single -> experiment_records/A_math_s42_single/run_config.yaml is the locked copy.
 draw_config: data/draw/paper_a.yaml
@@ -223,5 +225,9 @@ gpu_roles: null
 gpu_layout:
   share_single_gpu: false
   candidate_group_size: 1
+  editor_sleep: true
+  m0_replicas: true
+  parallel_heldout: true
+  prep_all_gpus: true
 hardware: h20
 domain: math

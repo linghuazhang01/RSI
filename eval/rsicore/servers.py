@@ -13,6 +13,11 @@ VLLM_ALLOW_RUNTIME_LORA_UPDATING=True when enable_lora (needed by /v1/load_lora_
 GET /v1/models answers. Logs: <log_dir>/<served_name>.<port>.log.
 Mock path: eval/rsicore/mock_server.py with the same served name (extra_args are passed to it, e.g.
 ["--tasks", "dapo_math"] to index fewer tasks).
+
+Sleep mode (2026-11-20; sleep_mode=True): `--enable-sleep-mode` and VLLM_SERVER_DEV_MODE=1, so the server
+exposes POST /sleep?level=1 (weights offloaded to CPU RAM, KV cache freed) and POST /wake_up. sleep() /
+wake_up() let another vLLM server use the GPU meanwhile (e.g. Paper A's editor while candidates are
+evaluated). Mock: state only. start_all() starts several servers at once (replicas, one per GPU group).
 """
 import os
 import shutil
@@ -88,7 +93,7 @@ class VLLMServer:
                  enable_lora: bool = False, max_loras: int = 8, max_lora_rank: int = 64,
                  extra_args: list[str] = (), mock: bool = False, mock_registry: Path | None = None,
                  seed: int = 42, log_dir: Path | None = None, ready_timeout_s: float = 3600,
-                 host: str = "127.0.0.1"):
+                 host: str = "127.0.0.1", sleep_mode: bool = False):
         self.model_path, self.served_name = Path(model_path), served_name
         self.gpu_ids = list(gpu_ids or [])
         self.port = port or _net.free_port()
@@ -107,6 +112,8 @@ class VLLMServer:
         self.endpoint = f"http://127.0.0.1:{self.port}/v1"
         self.base = f"http://127.0.0.1:{self.port}"
         self.proc = None
+        self.sleep_mode = bool(sleep_mode)
+        self.sleeping = False
         self.loras: dict[str, str] = {}
         self.log_path = self.log_dir / f"{served_name.replace('/', '_')}.{self.port}.log"
 
@@ -130,6 +137,8 @@ class VLLMServer:
             cmd += ["--tensor-parallel-size", str(max(1, len(self.gpu_ids)))]
         if self.enable_lora:
             cmd += ["--enable-lora", "--max-loras", str(self.max_loras), "--max-lora-rank", str(self.max_lora_rank)]
+        if self.sleep_mode and "--enable-sleep-mode" not in self.extra_args:
+            cmd += ["--enable-sleep-mode"]
         return cmd + self.extra_args
 
     def start(self):
@@ -140,6 +149,8 @@ class VLLMServer:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self.gpu_ids)
             if self.enable_lora:
                 env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+            if self.sleep_mode:
+                env["VLLM_SERVER_DEV_MODE"] = "1"          # exposes /sleep and /wake_up
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "ab")
         log.write(f"\n==== {time.strftime('%F %T')} {' '.join(self.command())}\n".encode())
@@ -194,6 +205,26 @@ class VLLMServer:
         self.stop()
         return False
 
+    # ----------------------------------------------------------------- sleep mode
+    def sleep(self, level: int = 1) -> None:
+        """Level 1: offload the weights to CPU RAM and free the KV cache (needs sleep_mode=True). No-op when
+        already sleeping or not running."""
+        if self.sleeping or not self.alive():
+            return
+        if not self.sleep_mode:
+            raise RuntimeError(f"{self.served_name}: started without sleep_mode")
+        if not self.mock:
+            _net.post_json(self.base + f"/sleep?level={int(level)}", {}, timeout=1800)
+        self.sleeping = True
+
+    def wake_up(self) -> None:
+        """Reload the weights onto the GPU (and re-create the KV cache)."""
+        if not self.sleeping:
+            return
+        if not self.mock and self.alive():
+            _net.post_json(self.base + "/wake_up", {}, timeout=1800)
+        self.sleeping = False
+
     # ----------------------------------------------------------------- LoRA hot swap
     def load_lora(self, name: str, path: Path) -> None:
         """POST /v1/load_lora_adapter {"lora_name", "lora_path"} (server needs --enable-lora and
@@ -218,3 +249,26 @@ class VLLMServer:
             if e.status != 404 and not any(x in low for x in ("not found", "does not exist", "cannot be found")):
                 raise RuntimeError(f"unload_lora({name}) failed: {e}") from None
         self.loras.pop(name, None)
+
+
+def start_all(servers: list) -> list:
+    """Start several servers at the same time (threads; each start() blocks until ready). If one fails, the
+    others are stopped and the error is raised."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [s for s in servers if not s.alive()]
+    if len(todo) <= 1:
+        for s in todo:
+            s.start()
+        return servers
+    errs = []
+    with ThreadPoolExecutor(max_workers=len(todo)) as ex:
+        for f in [ex.submit(s.start) for s in todo]:
+            try:
+                f.result()
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+    if errs:
+        for s in servers:
+            s.stop()
+        raise errs[0]
+    return servers

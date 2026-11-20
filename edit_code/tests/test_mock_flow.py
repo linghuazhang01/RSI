@@ -200,6 +200,20 @@ class TestMockFlow(unittest.TestCase):
         self.assertEqual(json.loads((rd / "baseline" / "noise.json").read_text()), {"dapo_math": 0.04})
         self.assertFalse((rd / "baseline" / "noise").exists())              # no sampled re-runs
 
+    def test_four_gpus_all_used(self):
+        """4 GPUs (2026-11-20): M_0's generation-0 gate scoring split over 4 replicas, held-out tasks spread over
+        the GPU groups, the editor's GPU lent as a 4th candidate slot while it sleeps, gate submissions at once."""
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_4gpu", "--gpus", "0,1,2,3",
+                    "--set", "hardware=h20", "--set", "heldout.limit=2"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        rd = self.runs / "A_mock_4gpu"
+        self.assertEqual(len(list((rd / "baseline" / "gate").glob("_part*"))), 4)
+        self.assertEqual({p.name for p in (rd / "baseline" / "heldout" / "_par").iterdir()},
+                         {"math500", "gsm8k", "aime24", "aime25"})
+        self.assertTrue((rd / "baseline" / "q0" / "heldout" / "_par").exists())
+        self.assertIn("serve as candidate slot 3 (4 slots)", r.stdout)
+        self.assertEqual(len(jl(rd / "kl_selfgen" / "gen_00.jsonl")), 400)
+
     def test_budget_below_reference_is_refused(self):
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_small", "--budget-gib", "5",
                     "--set", "heldout.limit=2"], self.runs)

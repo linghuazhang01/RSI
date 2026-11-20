@@ -28,44 +28,68 @@ from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / "eval")]
 
 from lora_code.common import (DOMAIN_DATASET, DOMAINS, deep_merge, gate_policy, gold_target,  # noqa: E402
-                              gpu_layout, load_records, method_mode, prompt_text, read_json, render_messages,
-                              retention_domains, role_gpus, write_json)
+                              gpu_layout, load_records, main_groups, method_mode, prompt_text, read_json,
+                              render_messages, retention_domains, role_gpus, write_json)
 
 
 # ============================================================================ servers
 class Servers:
-    """One live server per slot ('main' / 'theta0' on their gpu_roles GPUs); reused while the model is the same."""
+    """Live servers per slot ('main' / 'theta0'); reused while the model is the same. 'main' = one replica per
+    main GPU group (main_groups, 2026-11-20: data parallelism; every replica holds the same LoRAs): get() returns
+    the first, replicas() all of them."""
 
     def __init__(self, rc, cfg):
         self.rc, self.cfg = rc, cfg
         self.live = {}
 
     def get(self, slot: str, model_path, served: str):
-        from rsicore.servers import VLLMServer
+        return self.replicas(slot, model_path, served)[0]
+
+    def replicas(self, slot: str = "main", model_path=None, served: str | None = None) -> list:
+        """All replicas of `slot` (started for model_path / served if given and different or not running)."""
+        from rsicore.servers import VLLMServer, start_all
         cur = self.live.get(slot)
-        if cur is not None and cur[0] == (str(model_path), served) and cur[1].alive():
+        if model_path is None:
+            if cur is None:
+                raise RuntimeError(f"no {slot} server running")
+            return cur[1]
+        if cur is not None and cur[0] == (str(model_path), served) and all(s.alive() for s in cur[1]):
             return cur[1]
         if cur is not None:
-            cur[1].stop()
+            for s in cur[1]:
+                s.stop()
         sc = self.cfg.get("server", {})
-        gpu = role_gpus(self.rc, self.cfg, "main" if slot == "main" else "theta0")
+        groups = main_groups(self.rc, self.cfg) if slot == "main" else [role_gpus(self.rc, self.cfg, "theta0")]
         if self.rc.mock:   # mock_server.py takes none of vLLM's flags
             extra = ["--tasks", ",".join(sc["mock_tasks"])] if sc.get("mock_tasks") else []
         else:
             extra = list(sc.get("main_args" if slot == "main" else "theta0_args", []) or [])
-        srv = VLLMServer(model_path, served, gpu, enable_lora=True, max_loras=int(sc.get("max_loras", 8)),
-                         max_lora_rank=int(self.cfg.get("lora", {}).get("rank_cap", 64)), extra_args=extra,
-                         mock=self.rc.mock, mock_registry=self.rc.run_dir / "mock_registry.json", seed=self.rc.seed,
-                         log_dir=self.rc.run_dir / "logs")
-        srv.start()
-        self.live[slot] = ((str(model_path), served), srv)
-        return srv
+        srvs = [VLLMServer(model_path, served, g, enable_lora=True, max_loras=int(sc.get("max_loras", 8)),
+                           max_lora_rank=int(self.cfg.get("lora", {}).get("rank_cap", 64)), extra_args=extra,
+                           mock=self.rc.mock, mock_registry=self.rc.run_dir / "mock_registry.json", seed=self.rc.seed,
+                           log_dir=self.rc.run_dir / "logs") for g in groups]
+        start_all(srvs)
+        self.live[slot] = ((str(model_path), served), srvs)
+        return srvs
 
     def stop(self, slot=None):
         for k in ([slot] if slot else list(self.live)):
             v = self.live.pop(k, None)
             if v is not None:
-                v[1].stop()
+                for s in v[1]:
+                    s.stop()
+
+
+class _ReplicaPhases:
+    """inner_search phases with several main replicas (2026-11-20): every thread proposes at once (thread k on
+    replica k mod n), then the candidates are built and evaluated one at a time, each scoring job split over all
+    replicas (the editor workspace serialises its tool calls)."""
+
+    def editor_phase(self):
+        pass
+
+    def eval_phase(self) -> int:
+        return 1
 
 
 # ============================================================================ helpers
@@ -286,9 +310,10 @@ class Run:
         selfs = {}
         tc = self.cfg.get("train_data", {})
         if mode in ("self_correct", "self_correct_then_gold") and endpoint:
-            from rsicore.evaluate import score
+            from rsicore.evaluate import score_split
             n = int(tc.get("samples", 4))
-            er = score(endpoint, served, dataset, pool="pool", ids=list(ids), out_dir=out_path.parent / "train_samples",
+            eps = endpoint if isinstance(endpoint, (list, tuple)) else [endpoint]
+            er = score_split(eps, served, dataset, pool="pool", ids=list(ids), out_dir=out_path.parent / "train_samples",
                        extra=["--n", str(n)], temperature=float(tc.get("temperature", 0.7)),
                        top_p=float(tc.get("top_p", 0.8)), top_k=tc.get("top_k", 20), seed=self.rc.seed,
                        mock=self.rc.mock)
@@ -321,6 +346,7 @@ class Run:
     def evaluator(self, g, out_dir, srv, served, ids, kl_texts, store):
         from lora_code.evaluator import Evaluator
         return Evaluator(self.rc, self.cfg, out_dir=out_dir, endpoint=srv.endpoint, served=served, server=srv,
+                         replicas=self.servers.replicas("main"),
                          ids=ids, target_dataset=self.tds, kl_texts=kl_texts, store=store, mock=self.rc.mock,
                          registry=self.registry, parent_quality=self.quality_value(served),
                          max_loaded=int(self.cfg.get("server", {}).get("max_loras", 8)) - 2)
@@ -346,15 +372,16 @@ class Run:
         key = "baseline/gate"
         if not self.st.done(key):
             srv = self.servers.get("main", self.model_path(0), self.served(0))
-            from rsicore.evaluate import score
+            eps = [s.endpoint for s in self.servers.replicas("main")]
+            from rsicore.evaluate import score_split
             bc = self.cfg.get("baseline", {})
             reps = int(bc.get("noise_repeats", 3))
             gate = self.gate_level()
             res = {}
             for ds, ids in gate.items():
                 # gate score: greedy, like every candidate's gate evaluation
-                er = score(srv.endpoint, self.served(0), ds, pool="pool", ids=ids, out_dir=bdir / "gate" / ds,
-                           mock=self.rc.mock)
+                er = score_split(eps, self.served(0), ds, pool="pool", ids=ids, out_dir=bdir / "gate" / ds,
+                                 mock=self.rc.mock)
                 recs = [{"id": x.get("id"), "score": x.get("score")} for x in er.records]
                 sc = [x["score"] for x in recs if x["score"] is not None]
                 m = mean_or_none(sc)
@@ -383,8 +410,8 @@ class Run:
             self.st.mark(key, {ds: {k: v[k] for k in ("score", "noise_band")} for ds, v in res.items()})
         if self.cfg.get("heldout", {}).get("enabled", True) and not self.st.done("baseline/heldout"):
             from rsicore.heldout import run_heldout
-            srv = self.servers.get("main", self.model_path(0), self.served(0))
-            h = run_heldout(srv.endpoint, self.served(0), bdir / "heldout",
+            self.servers.get("main", self.model_path(0), self.served(0))
+            h = run_heldout([s.endpoint for s in self.servers.replicas("main")], self.served(0), bdir / "heldout",
                             domains=self.cfg.get("heldout", {}).get("domains", "all"), mock=self.rc.mock,
                             limit=self.cfg.get("heldout", {}).get("limit"), decoding=self.cfg.get("heldout", {}).get("decoding"))
             write_json(bdir / "heldout.json", h)
@@ -479,7 +506,8 @@ class Run:
         if not st.done(f"{P}/train_data"):
             srv = main_srv() if tmode != "gold" else None
             ex = self.build_train_data(self.tds, train_ids, gd / "train_data.json", mode=tmode,
-                                       endpoint=srv.endpoint if srv else None, served=served)
+                                       endpoint=[s.endpoint for s in self.servers.replicas("main")] if srv else None,
+                                       served=served)
             st.mark(f"{P}/train_data", {"n": len(ex), "with_target": sum(1 for e in ex.values() if e["target"]),
                                         "self": sum(1 for e in ex.values() if e["source"] == "self")})
         tdata = read_json(gd / "train_data.json")
@@ -602,7 +630,8 @@ class Run:
             # target gain vs the current model - penalties > 0), like Paper A (2026-11-20). Reference = raw
             # (mode=edit, generation 0): every ranked candidate, the gate checks target >= raw - epsilon.
             subs = [c for c in ranked if c.score is not None and c.score > 0] if ref["kind"] == "parent" else ranked
-            acc = submit_to_gate(rc, g, subs, gate_fn, max_submissions=int(cfg.get("gate", {}).get("max_submissions", 3)))
+            acc = submit_to_gate(rc, g, subs, gate_fn, max_submissions=int(cfg.get("gate", {}).get("max_submissions", 3)),
+                                 parallel=len(ev.endpoints))      # submissions gate-evaluated at once
             if acc is not None:
                 lo = ws.load_candidate(acc.cid)
                 rec = {"source": "llm", "cid": acc.cid, "name": ws.lora_name(lo) if lo.modules() else None,
@@ -737,14 +766,14 @@ class Run:
                     if not ev.known(nxt[1]):
                         ev.register(nxt[0], nxt[1])
                     ev.ensure_loaded(nxt[1])
-                h = run_heldout(ev.endpoint, served, gd / "heldout", lora=nxt[1] if nxt else None,
+                h = run_heldout(ev.endpoints, served, gd / "heldout", lora=nxt[1] if nxt else None,
                                 domains=cfg.get("heldout", {}).get("domains", "all"), mock=rc.mock,
                                 limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
             else:
                 nxt = self.model_path(g + 1)
-                srv = self.servers.get("main", nxt, self.served(g + 1))
+                self.servers.get("main", nxt, self.served(g + 1))
                 state.clear()
-                h = run_heldout(srv.endpoint, self.served(g + 1), gd / "heldout",
+                h = run_heldout([s.endpoint for s in self.servers.replicas("main")], self.served(g + 1), gd / "heldout",
                                 domains=cfg.get("heldout", {}).get("domains", "all"), mock=rc.mock,
                                 limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
             write_json(gd / "heldout.json", h)
@@ -820,7 +849,7 @@ class Run:
                                      retention=has_ret) if rc.mock else None)
 
         def editor_factory(th):
-            return Editor(ev.endpoint, editor, system_prompt=sysmsg, seed=rc.seed + 1000 * g + th,
+            return Editor(ev.endpoints[th % len(ev.endpoints)], editor, system_prompt=sysmsg, seed=rc.seed + 1000 * g + th,
                           transcript=gd / "editor" / f"thread_{th}.jsonl", mock_policy=policy,
                           temperature=float(cfg.get("editor", {}).get("temperature", 0.6)),
                           max_tokens=int(cfg.get("editor", {}).get("max_tokens", 8192)))
@@ -837,10 +866,12 @@ class Run:
         def full(art, cid):
             return ws.evaluate_lora(ws.load_candidate(art["cid"]), "full", charge=False)
 
+        n_rep = len(ev.endpoints)
         return inner_search(rc, g, editor_factory=editor_factory, render_context=ctx, build_fn=build, screen_fn=screen,
                             full_fn=full, threads=int(sc.get("threads", 4)), steps=int(sc.get("steps", 8)),
                             max_candidates=int(sc.get("max_evaluate", 32)), top_full=int(sc.get("top_full", 3)),
-                            rerun_seeds=int(sc.get("rerun_seeds", 0)))
+                            rerun_seeds=int(sc.get("rerun_seeds", 0)),
+                            parallel=2 if n_rep > 1 else 1, phases=_ReplicaPhases() if n_rep > 1 else None)
 
     def archive(self, g: int) -> str:
         """Experience channel: best programs and outcomes of earlier generations (RSI_LOOP_DESIGN §1.1)."""

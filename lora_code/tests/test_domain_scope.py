@@ -42,9 +42,33 @@ class DomainScopeTest(unittest.TestCase):
 class GpuLayoutTest(unittest.TestCase):
     """Every given GPU is used (rsicore.gpu_layout); gpu_roles pins roles, the rest are laid out around them."""
 
-    def test_paper_b(self):
-        from lora_code.common import gpu_layout
+    def test_paper_b_replicas(self):
+        """Default since 2026-11-20: train = 1 GPU, theta0 its own GPU only with E_t, main = the rest as replicas."""
+        from lora_code.common import gpu_layout, main_groups
         h20 = {"gpu_layout": {"theta0_own_gpu": True}}
+
+        def cfg(e_t, **lay):
+            return {"gpu_layout": dict(h20["gpu_layout"], **lay), "e_t": {"enabled": e_t}}
+
+        def rc(n):
+            return SimpleNamespace(gpus=list(range(n)))
+        self.assertEqual(gpu_layout(rc(4), cfg(False))[0], {"main": [0, 1, 2], "train": [3], "theta0": [3]})
+        self.assertEqual(main_groups(rc(4), cfg(False)), [[0], [1], [2]])          # 3 replicas
+        self.assertEqual(gpu_layout(rc(4), cfg(True))[0], {"main": [0, 1], "train": [3], "theta0": [2]})
+        self.assertEqual(main_groups(rc(5), cfg(False, main_tp=2)), [[0, 1], [2, 3]])
+        self.assertEqual(gpu_layout(rc(5), cfg(False, train_gpus=2))[0]["train"], [3, 4])
+        self.assertEqual(gpu_layout(rc(2), cfg(False))[0], {"main": [0], "train": [1], "theta0": [1]})
+        with self.assertRaises(ValueError):
+            gpu_layout(rc(2), cfg(True))                                            # E_t on h20 needs 3
+        for n in range(2, 9):
+            self.assertEqual(gpu_layout(rc(n), cfg(False))[1], [], n)                # nothing idle
+        roles, _ = gpu_layout(rc(4), dict(cfg(True), gpu_roles={"train": [2, 3]}))  # pinned: one main server
+        self.assertEqual(main_groups(rc(4), dict(cfg(True), gpu_roles={"train": [2, 3]})), [roles["main"]])
+
+    def test_paper_b(self):
+        """The earlier layout (gpu_layout.main_replicas: false): main grows by tensor parallelism."""
+        from lora_code.common import gpu_layout
+        h20 = {"gpu_layout": {"theta0_own_gpu": True, "main_replicas": False}}
 
         def lay(n, e_t, **extra):
             return gpu_layout(SimpleNamespace(gpus=list(range(n))), dict(h20, e_t={"enabled": e_t}, **extra))

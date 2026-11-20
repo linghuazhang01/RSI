@@ -284,6 +284,24 @@ def test_mock_run_single_domain(tmp_path):
     assert "Single-domain run" in prompt and "- regmean_preserve(" not in prompt
 
 
+def test_mock_scratch_four_gpus(tmp_path):
+    """4 GPUs (2026-11-20): main = 3 replicas + train 1; every scoring job split over the replicas, held-out tasks
+    in parallel, gate submissions at once."""
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
+           "--gpus", "0,1,2,3", "--runs-dir", str(tmp_path), "--run-id", "B_4gpu", "--set", "method.mode=scratch",
+           "--set", "hardware=h20"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    assert "roles {'main': [0, 1, 2], 'train': [3]}" in r.stdout
+    run = tmp_path / "B_4gpu"
+    assert len(list((run / "baseline" / "gate" / "dapo_math").glob("_part*"))) == 3
+    assert len(list((run / "gen_00" / "evals" / "__parent__" / "screen" / "dapo_math_raw").glob("_part*"))) == 3
+    assert {p.name for p in (run / "gen_00" / "heldout" / "_par").iterdir()} == {"math500", "gsm8k", "aime24", "aime25"}
+    assert json.loads((run / "summary.json").read_text())["gens"]["0"]["search"]["candidates"] >= 1
+
+
 def test_mock_edit_chain_trains_once(tmp_path):
     """mode=edit: only generation 0 trains (the raw LoRA); later generations edit the current LoRA on M_0
     (no training, no merge), the gate compares with the current model, a rejected generation keeps it."""

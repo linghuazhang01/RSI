@@ -40,7 +40,7 @@ from rsicore import draws as D  # noqa: E402
 from rsicore import records as R  # noqa: E402
 from rsicore import search as S  # noqa: E402
 from rsicore.editor import Editor  # noqa: E402
-from rsicore.evaluate import score  # noqa: E402
+from rsicore.evaluate import score, score_split  # noqa: E402
 from rsicore.gate import fixed_noise_band, measure_noise_band, noise_ids  # noqa: E402
 from rsicore.heldout import HELDOUT, run_heldout  # noqa: E402
 from rsicore.sandbox import run_program  # noqa: E402
@@ -60,7 +60,8 @@ ALL_DOMAINS = ["math", "code", "knowledge", "instruction_following", "tool_calli
 
 
 class LazyServer:
-    """Starts a VLLMServer on first use; close() stops it."""
+    """Starts a VLLMServer on first use; close() stops it. With sleep_mode, sleep() offloads its weights to CPU
+    RAM (the GPU can serve something else) and get() wakes it again."""
 
     def __init__(self, **kw):
         self.kw = kw
@@ -69,7 +70,17 @@ class LazyServer:
     def get(self) -> VLLMServer:
         if self.srv is None:
             self.srv = VLLMServer(**self.kw).start()
+        elif self.srv.sleeping:
+            self.srv.wake_up()
         return self.srv
+
+    def sleep(self):
+        if self.srv is not None and self.kw.get("sleep_mode"):
+            self.srv.sleep()
+
+    @property
+    def sleeping(self) -> bool:
+        return bool(self.srv is not None and self.srv.sleeping)
 
     @property
     def name(self) -> str:
@@ -86,6 +97,42 @@ class LazyServer:
     def __exit__(self, *a):
         self.close()
         return False
+
+
+def start_lazy(servers: list) -> list:
+    """Start several LazyServers at the same time (replicas on different GPUs); returns their VLLMServers."""
+    from rsicore.servers import start_all
+    for s in servers:
+        if s.srv is None:
+            s.srv = VLLMServer(**s.kw)
+    start_all([s.srv for s in servers])
+    return [s.srv for s in servers]
+
+
+class EditorPhases:
+    """rsicore.search.inner_search `phases` (2026-11-20, gpu_layout.editor_sleep): the editor proposes, then sleeps
+    (weights -> CPU RAM) while every candidate of the step is built and evaluated, its GPU lent to the problem as
+    one more candidate slot; editor_phase() takes the slot back and wakes the editor."""
+
+    def __init__(self, ed: "LazyServer", prob, gpus: list[int], enabled: bool, log=print):
+        self.ed, self.prob, self.gpus, self.enabled, self.log = ed, prob, list(gpus), bool(enabled), log
+        self.slot = None
+
+    def editor_phase(self):
+        if self.slot is not None:
+            self.prob.remove_slot(self.slot)
+            self.slot = None
+        self.ed.get()                             # wakes it if it sleeps
+
+    def eval_phase(self) -> int:
+        if self.enabled and self.slot is None and self.ed.srv is not None:
+            self.ed.sleep()
+            self.slot = self.prob.add_slot(self.gpus)
+            if not getattr(self, "_logged", False):
+                self.log(f"[search] editor asleep while candidates are evaluated; its GPUs {self.gpus} serve as "
+                         f"candidate slot {self.slot} ({self.prob.n_slots} slots)")
+                self._logged = True
+        return self.prob.n_slots
 
 
 def effective_config(rc, args) -> dict:
@@ -115,6 +162,15 @@ class Runner:
         roles, unused = gpu_layout(rc, cfg)
         self.gpu_editor, self.gpu_cand = roles["editor"], roles["candidate"]
         self.cand_slots = candidate_groups(rc, cfg)   # one candidate server per slot, evaluated concurrently
+        lay = cfg.get("gpu_layout") or {}
+        # the editor's GPUs can be used for other work only when they are not shared with the candidates
+        own = not (set(self.gpu_editor) & set(self.gpu_cand))
+        self.editor_sleep = bool(lay.get("editor_sleep", True)) and own
+        self.m0_replicas = bool(lay.get("m0_replicas", True)) and own
+        self.parallel_heldout = bool(lay.get("parallel_heldout", True))
+        self.prep_all_gpus = bool(lay.get("prep_all_gpus", True)) and own
+        # every GPU group of the run: the editor's + one per candidate slot
+        self.all_groups = ([list(self.gpu_editor)] if own else []) + [list(s) for s in self.cand_slots]
         print(f"[edit_code] hardware={cfg.get('hardware', 'b300')} scope={cfg.get('scope', 'all')} gpus={rc.gpus} "
               f"editor={self.gpu_editor} candidate servers={self.cand_slots} "
               f"({len(self.cand_slots)} candidate(s) evaluated at a time)"
@@ -150,7 +206,7 @@ class Runner:
         return M.fresh_state(self.cfg["mock"]["base_quality"]) if self.rc.mock else None
 
     def _server(self, name: str, model_dir, quality: float | None, gpus: list[int], args_key: str,
-                tasks: list[str] | None = None) -> LazyServer:
+                tasks: list[str] | None = None, sleep_mode: bool = False) -> LazyServer:
         if self.rc.mock:
             M.register(self.registry, name, quality)
             extra = ["--tasks", ",".join(tasks)] if tasks else []
@@ -159,12 +215,43 @@ class Runner:
             extra = list(self.cfg["vllm"].get(args_key, []))
             path = model_dir
         return LazyServer(model_path=path, served_name=name, gpu_ids=list(gpus), mock=self.rc.mock,
-                          mock_registry=self.registry, seed=self.rc.seed, log_dir=self.run_dir / "logs", extra_args=extra)
+                          mock_registry=self.registry, seed=self.rc.seed, log_dir=self.run_dir / "logs", extra_args=extra,
+                          sleep_mode=sleep_mode)
 
-    def m0_server(self, tasks: list[str] | None = None) -> LazyServer:
-        """The original BF16 model M_0 on the editor GPU (editor in frozen mode, and the reference)."""
+    def m0_server(self, tasks: list[str] | None = None, gpus: list[int] | None = None) -> LazyServer:
+        """The original BF16 model M_0 on the editor GPU (editor in frozen mode, and the reference); gpus = a
+        replica elsewhere (candidate GPUs, args candidate_args)."""
+        on_editor = gpus is None or list(gpus) == list(self.gpu_editor)
         return self._server(f"{self.rc.run_id}-m0", Path(self.rc.model_path),
-                            self.cfg["mock"]["base_quality"] if self.rc.mock else None, self.gpu_editor, "editor_args", tasks)
+                            self.cfg["mock"]["base_quality"] if self.rc.mock else None,
+                            self.gpu_editor if gpus is None else gpus, "editor_args" if on_editor else "candidate_args",
+                            tasks, sleep_mode=self.editor_sleep and on_editor)
+
+    def m0_replicas_for(self, m0: LazyServer, tasks: list[str] | None = None) -> list[LazyServer]:
+        """M_0 on every GPU group of the run (data parallelism for M_0's batch jobs, gpu_layout.m0_replicas):
+        [m0 (editor GPU)] + one replica per candidate slot. Close the extra ones when done."""
+        if not self.m0_replicas:
+            return [m0]
+        return [m0] + [self.m0_server(tasks, gpus=g) for g in self.cand_slots]
+
+    def heldout_on(self, servers: list, out_dir: Path, *, lora=None) -> dict:
+        """Held-out evaluation with the tasks spread over the given replicas (started together)."""
+        cfg = self.cfg
+        srvs = start_lazy(servers)
+        return run_heldout([s.endpoint for s in srvs], servers[0].name, out_dir, domains=cfg["heldout"].get("domains", "all"),
+                           mock=self.rc.mock, lora=lora, limit=cfg["heldout"].get("limit"),
+                           decoding=cfg["heldout"].get("decoding"))
+
+    def model_heldout(self, model_dir: Path, name: str, out_dir: Path) -> dict:
+        """Held-out evaluation of an exported model: one server per free GPU group (gpu_layout.parallel_heldout;
+        call it when the editor GPU is free) or just the first candidate slot."""
+        groups = self.all_groups if self.parallel_heldout else [self.cand_slots[0]]
+        servers = [self.model_server(model_dir, name, g, "candidate_args") for g in groups]
+        try:
+            return self.heldout_on(servers, out_dir)
+        finally:
+            for s in servers:
+                s.close()
 
     def model_server(self, model_dir: Path, name: str, gpus: list[int], args_key: str) -> LazyServer:
         """An exported quantized model (fake-quant checkpoint, or mock_model.json in mock mode)."""
@@ -178,8 +265,18 @@ class Runner:
         texts = kl_texts_for(self.rc, gen, self.kl_datasets, self.cfg)
         if not self.cfg["kl"].get("self_generated"):
             return texts
-        return add_self_generated(texts, lambda: m0.get().endpoint, m0.name, self.cfg,
-                                  self.run_dir / "kl_selfgen" / f"gen_{gen:02d}.jsonl")
+        extra = []
+
+        def endpoints():                    # only called when some response is not cached yet
+            reps = self.m0_replicas_for(m0)
+            extra.extend(reps[1:])
+            return [s.endpoint for s in start_lazy(reps)]
+        try:
+            return add_self_generated(texts, endpoints, m0.name, self.cfg,
+                                      self.run_dir / "kl_selfgen" / f"gen_{gen:02d}.jsonl")
+        finally:
+            for s in extra:                  # the candidate GPUs are needed for candidates next
+                s.close()
 
     def data_for(self, gen: int) -> dict:
         return {ds: {"screen": D.ids(self.rc, gen, ds, "screen"), "signal": D.ids(self.rc, gen, ds, "signal")}
@@ -194,7 +291,8 @@ class Runner:
                             kl_texts=kl_texts, kl_heldout=kl_heldout, refs_dir=refs_dir,
                             noise=read_json(self.run_dir / "baseline" / "noise.json", {}),
                             gate_baseline=read_json(self.run_dir / "baseline" / "gate.json", {}),
-                            eval_budget=eval_budget, show_examples=show_examples, incumbent=incumbent, log=self.log)
+                            eval_budget=eval_budget, show_examples=show_examples, incumbent=incumbent, log=self.log,
+                            prep_gpus=[g[0] for g in self.all_groups] if self.prep_all_gpus else None)
 
     def export(self, prob: QuantProblem, art: dict, dst: Path):
         """Write the quantized model (fake-quant BF16 checkpoint; mock: its mock state)."""
@@ -266,11 +364,14 @@ class Runner:
                     full_fn=full_fn)
 
     def run_search(self, prob, gen, gdir, ed, *, task, archive, scfg) -> list:
+        """The search ends with the editor asleep and its GPU lent to `prob` as a candidate slot (editor_sleep):
+        the caller closes the editor; the gate / exports then use every slot."""
         fns = self.search_fns(prob, gdir, ed, task=task, archive=archive, scfg=scfg)
+        phases = EditorPhases(ed, prob, self.gpu_editor, self.editor_sleep, log=self.log)
         return S.inner_search(self.rc, gen, threads=scfg["threads"], steps=scfg["steps"],
                               max_candidates=scfg.get("max_candidates", scfg["max_evaluate"]),
                               top_full=scfg.get("top_full", 3), rerun_seeds=scfg.get("rerun_seeds", 0),
-                              out_dir=gdir, parallel=len(prob.slots), **fns)
+                              out_dir=gdir, parallel=max(2, prob.n_slots), phases=phases, **fns)
 
     def shown_items(self, prob: QuantProblem) -> dict:
         shown = {}
@@ -291,14 +392,15 @@ class Runner:
         if rc.mock:
             M.save_state(bdir / "mock_model.json", self.source_state())
         m0 = self.m0_server()
+        reps = self.m0_replicas_for(m0)          # M_0 on every GPU: nothing else runs in generation 0 yet
         try:
             with st.step("baseline/gate") as todo:
                 if todo:
-                    srv = m0.get()
+                    eps = [s.endpoint for s in start_lazy(reps)]
                     res = {}
                     for ds in self.datasets:
-                        r = score(srv.endpoint, m0.name, ds, pool="pool", ids=D.gate_ids(rc, ds),
-                                  out_dir=bdir / "gate", mock=rc.mock)
+                        r = score_split(eps, m0.name, ds, pool="pool", ids=D.gate_ids(rc, ds),
+                                        out_dir=bdir / "gate", mock=rc.mock)
                         res[ds] = _acc(r.records)
                     write_json(bdir / "gate.json", res)
                     self.log("[baseline] M_0 gate scores", res)
@@ -307,14 +409,12 @@ class Runner:
                     write_json(bdir / "noise.json", self.noise_band(m0, bdir))
             with st.step("baseline/heldout") as todo:
                 if todo:
-                    srv = m0.get()
-                    h = run_heldout(srv.endpoint, m0.name, bdir / "heldout",
-                                    domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
-                                    limit=cfg["heldout"].get("limit"), decoding=cfg["heldout"].get("decoding"))
+                    h = self.heldout_on(reps, bdir / "heldout")
                     write_json(bdir / "heldout.json", h)
             kl0 = self.kl_texts(0, m0)       # calibration / KL texts (prompt + M_0 response with kl.self_generated)
         finally:
-            m0.close()
+            for s in reps:
+                s.close()
         # layer cache + diagnostics of M_0 (once), budget, Q_0
         prob = self.problem(tag="q0", gen=0, out_dir=bdir / "q0", budget=float("inf"), data=self.data_for(0),
                             kl_texts=kl0, refs_dir=bdir / "q0" / "refs",
@@ -337,12 +437,7 @@ class Runner:
                 self.log(f"[baseline] budget {budget:.3f} GiB; Q_0 (reference) gate scores {inc['gate_scores']}")
         with st.step("baseline/q0_heldout") as todo:
             if todo:
-                srv = self.model_server(bdir / "q0" / "model", f"{rc.run_id}-q0", self.cand_slots[0], "candidate_args")
-                with srv:
-                    s = srv.get()
-                    h = run_heldout(s.endpoint, srv.name, bdir / "q0" / "heldout",
-                                    domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
-                                    limit=cfg["heldout"].get("limit"), decoding=cfg["heldout"].get("decoding"))
+                h = self.model_heldout(bdir / "q0" / "model", f"{rc.run_id}-q0", bdir / "q0" / "heldout")
                 write_json(bdir / "q0" / "heldout.json", h)
         if cfg["e_task"].get("enabled", False):
             self.run_e_task(0)
@@ -523,7 +618,8 @@ class Runner:
                     gi = r["feedback"]["gate"]
                     return gi["passed"], {"reason": gi["reason"], "bytes_gib": c.artifact["bytes_gib"],
                                           "probes": r["feedback"]["probes"]}
-                acc = S.submit_to_gate(rc, g, subs, gate_fn, max_submissions=cfg["gate"]["max_submissions"])
+                acc = S.submit_to_gate(rc, g, subs, gate_fn, max_submissions=cfg["gate"]["max_submissions"],
+                                       parallel=prob.n_slots)   # the submissions are gate-evaluated at once
                 gl = read_json(gd / "gate.json", {"submissions": []}) or {"submissions": []}
                 if acc is None:
                     reasons = [s["info"].get("reason") for s in gl["submissions"]] or \
@@ -553,13 +649,8 @@ class Runner:
                     self.export(prob, art, gd / "model")
                     shutil.rmtree(gd / "ckpt", ignore_errors=True)
             with st.step(f"{p}/heldout") as todo:
-                if todo:
-                    srv = self.model_server(gd / "model", f"{rc.run_id}-q{g:02d}", self.cand_slots[0], "candidate_args")
-                    with srv:
-                        s = srv.get()
-                        h = run_heldout(s.endpoint, srv.name, gd / "heldout",
-                                        domains=cfg["heldout"].get("domains", "all"), mock=rc.mock,
-                                        limit=cfg["heldout"].get("limit"), decoding=cfg["heldout"].get("decoding"))
+                if todo:                        # the editor is closed: every GPU group is free
+                    h = self.model_heldout(gd / "model", f"{rc.run_id}-q{g:02d}", gd / "heldout")
                     write_json(gd / "heldout.json", h)
             self.log(f"[gen {g}] new incumbent {new['cid']}: gate {new['gate_scores']}")
         else:

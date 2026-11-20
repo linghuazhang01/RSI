@@ -176,7 +176,12 @@ PAPER_B_GROWTH = [("main", 2), ("train", 2), ("main", 4), ("theta0", 2), ("main"
 
 
 def gpu_layout(rc, cfg: dict) -> tuple[dict, list[int]]:
-    """({role: [GPU ids]}, [unused GPU ids]) for Paper B. Roles: main (vLLM: M_t + candidate LoRAs, the
+    """({role: [GPU ids]}, [unused GPU ids]) for Paper B.
+    gpu_layout.main_replicas (default, 2026-11-20): train = the last gpu_layout.train_gpus GPUs (default 1), theta0
+    = its own GPU before them when E_t is on and theta0_own_gpu (else it shares the first train GPU), main = every
+    other GPU, served as independent replicas of gpu_layout.main_tp GPUs each (main_groups): 4 GPUs, single domain
+    -> main [0, 1, 2] (3 replicas) | train [3]. gpu_roles pins roles as before (then main is one server).
+    Without main_replicas (the earlier layout): Roles: main (vLLM: M_t + candidate LoRAs, the
     editor), theta0 (vLLM: original model, only for E_t / e_ref), train (HF model for training, weight store,
     diagnostics, merge; several GPUs = the HF model is split across them). Several GPUs for a vLLM role =
     tensor parallelism.
@@ -192,6 +197,20 @@ def gpu_layout(rc, cfg: dict) -> tuple[dict, list[int]]:
     gpus = list(rc.gpus or [0])
     lay = cfg.get("gpu_layout") or {}
     own_theta0 = bool(lay.get("theta0_own_gpu", False)) and bool((cfg.get("e_t") or {}).get("enabled", True))
+    if lay.get("main_replicas", True) and not cfg.get("gpu_roles"):
+        n = len(gpus)
+        if n == 1:
+            if not lay.get("share_single_gpu", False):
+                raise ValueError(f"Paper B on --gpus {gpus}: needs at least 2 GPUs (main | train)")
+            return {"main": gpus, "train": gpus, "theta0": gpus}, []
+        nt = max(1, int(lay.get("train_gpus", 1)))
+        nt = min(nt, n - 1 - int(own_theta0))
+        if nt < 1:
+            raise ValueError(f"Paper B on --gpus {gpus}: needs at least {2 + int(own_theta0)} GPUs "
+                             "(main | train" + (" | theta0" if own_theta0 else "") + ")")
+        train, rest = gpus[n - nt:], gpus[:n - nt]
+        theta0 = [rest.pop()] if own_theta0 else [train[0]]
+        return {"main": rest, "train": train, "theta0": theta0}, []
     try:
         idx, unused = layout(len(gpus), own=["main", "theta0", "train"] if own_theta0 else ["main", "train"],
                              growth=PAPER_B_GROWTH, shared={} if own_theta0 else {"theta0": "train"},
@@ -205,4 +224,17 @@ def gpu_layout(rc, cfg: dict) -> tuple[dict, list[int]]:
 def role_gpus(rc, cfg: dict, role: str) -> list[int]:
     """GPU ids of one role (see gpu_layout)."""
     return gpu_layout(rc, cfg)[0][role]
+
+
+def main_groups(rc, cfg: dict) -> list[list[int]]:
+    """GPU groups of the main replicas (gpu_layout.main_replicas): main GPUs in chunks of gpu_layout.main_tp
+    (tensor parallelism inside a replica; leftover GPUs that do not fill a chunk are not used). Without
+    main_replicas, or with gpu_roles pinned: one server on all main GPUs."""
+    lay = cfg.get("gpu_layout") or {}
+    main = role_gpus(rc, cfg, "main")
+    if not lay.get("main_replicas", True) or cfg.get("gpu_roles"):
+        return [main]
+    tp = max(1, int(lay.get("main_tp", 1)))
+    groups = [main[i:i + tp] for i in range(0, len(main) - len(main) % tp, tp)]
+    return groups or [main]
 

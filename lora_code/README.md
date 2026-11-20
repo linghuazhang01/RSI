@@ -151,18 +151,20 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 
 ## 硬件（`hardware`，27B）
 
-角色：main（vLLM：M_t + 候选 LoRA，改造者）、theta0（vLLM：原模型，只给 E_t / e_ref 用）、train（HF 模型：训练、权重缓存、诊断、合并）。vLLM 角色多张卡 = 张量并行；train 多张卡 = 按层拆开（`device_map`）。
+角色：main（vLLM：M_t + 候选 LoRA，改造者）、theta0（vLLM：原模型，只给 E_t / e_ref 用）、train（HF 模型：训练、权重缓存、诊断、`train_loss`、合并）。
 
-**给多少张卡就用多少张**（`common.gpu_layout`，不设 `gpu_roles` 时）：main 和 train 各一张，E_t 开着且 `gpu_layout.theta0_own_gpu`（H20）时 theta0 也单独一张，否则 theta0 和 train 共用第一张；多的卡依次给 main（TP 2）→ train（2）→ main（TP 4）→ theta0（TP 2）→ main（TP 8），剩下的全给 train，不留空卡。
+**给多少张卡就用多少张，main 是数据并行副本**（2026-11-20，`gpu_layout.main_replicas`，不设 `gpu_roles` 时）：train 取最后 `gpu_layout.train_gpus` = 1 张；E_t 开着且 `theta0_own_gpu`（H20）时 theta0 单独一张，否则和 train 共用；**其余的卡全给 main，每张卡一份独立的 vLLM 副本**（`gpu_layout.main_tp` = 每份几张卡）。
+- 每个候选 LoRA 加载到所有副本上；一次评测的题目分给各副本（`rsicore.evaluate.score_split`）；改造者线程 k 用副本 k mod n，所以一轮里所有线程同时写程序，然后候选逐个评测、每次都用满所有副本；
+- 留出评测的任务分给各副本同时跑；验收的最多 3 个提交同时评测，再按排名取第一个通过的。
 
 | 卡数 | 单领域（默认） | 五领域（`scope=all`，H20） |
 |---|---|---|
-| 2 | main 1 · train 1 | 不够（要 3 张） |
-| 3 | main 2 · train 1 | main 1 · theta0 1 · train 1 |
-| 4 | main 2 · train 2 | main 2 · theta0 1 · train 1 |
-| 5 | main 2 · train 3 | main 2 · theta0 1 · train 2 |
-| 6 | main 4 · train 2 | main 2 · theta0 2 · train 2 |
-| 8 | main 4 · train 4 | main 4 · theta0 2 · train 2 |
+| 2 | main 1 份 · train 1 | 不够（要 3 张） |
+| 3 | main 2 份 · train 1 | main 1 份 · theta0 1 · train 1 |
+| 4 | main 3 份 · train 1 | main 2 份 · theta0 1 · train 1 |
+| 8 | main 7 份 · train 1 | main 6 份 · theta0 1 · train 1 |
+
+旧的布局（main 一个张量并行服务，多的卡依次给 main / train / theta0）：`--set gpu_layout.main_replicas=false`。
 
 手动指定：`--set 'gpu_roles.train=[2,3]'`（--gpus 里的下标）把这个角色固定下来，其余角色在剩下的卡上自动分。B300 上 theta0 和 train 共用一张卡（显存比例 0.45）。
 

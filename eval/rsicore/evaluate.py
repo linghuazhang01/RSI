@@ -8,6 +8,7 @@ passes --no-sandbox (never starts Docker). seed / temperature override the task'
 --seed / --temperature); the seed only reaches the server for sampled decoding (temperature > 0).
 set_max_tokens() installs a run-wide {task: max generation tokens} table (the paper config's `max_tokens`);
 every score() call of a listed task then passes run_eval --max-tokens (unless `extra` already does).
+score_split() splits one scoring job over several replicas of the same model (data parallelism).
 
 Token KL uses vLLM's /v1/completions with `prompt_logprobs=k` (an extra sampling param that vLLM's
 OpenAI server accepts in the request body); the response's choices[0].prompt_logprobs is a list
@@ -109,6 +110,47 @@ def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None,
         return EvalResult({"accuracy": None, "n": 0, "n_pending": 0, "note": r.stdout[-500:]}, [], out_dir)
     recs = [json.loads(l) for l in (out_dir / f"{task}.jsonl").read_text().splitlines() if l.strip()]
     return EvalResult(summ_all[task], recs, out_dir)
+
+
+def score_split(endpoints: list[str], served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
+                lora: str | None = None, extra: list[str] = (), mock: bool = False, seed: int | None = None,
+                temperature: float | None = None, top_p: float | None = None,
+                top_k: int | None = None) -> EvalResult:
+    """score() with the items split over several replicas of the same model (2026-11-20: data parallelism on
+    every GPU). endpoints: one URL per replica. Each replica scores a contiguous chunk of the sorted ids into
+    out_dir/_part<k>/; the records are merged (sorted by id) into out_dir/<task>.jsonl and a summary entry
+    (accuracy = item-level mean, n, n_pending) is merged into out_dir/summary.json. One endpoint or ids None
+    (the whole pool) -> plain score() on the first endpoint."""
+    eps = [e for e in endpoints if e]
+    if len(eps) <= 1 or ids is None or len(set(ids)) < 2:
+        return score(eps[0], served_name, task, pool=pool, ids=ids, out_dir=out_dir, lora=lora, extra=extra,
+                     mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ids = sorted(set(ids))
+    k = min(len(eps), len(ids))
+    size = math.ceil(len(ids) / k)
+    chunks = [ids[i * size:(i + 1) * size] for i in range(k)]
+
+    def run(i):
+        return score(eps[i], served_name, task, pool=pool, ids=chunks[i], out_dir=out_dir / f"_part{i}", lora=lora,
+                     extra=extra, mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k)
+    with ThreadPoolExecutor(max_workers=k) as ex:
+        parts = list(ex.map(run, range(k)))
+    recs = sorted((r for p in parts for r in p.records), key=lambda r: (str(r.get("id")), str(r.get("unit_id", ""))))
+    per = _per_id(recs)
+    pend = sum(1 for r in recs if r.get("score") is None)
+    summ = dict(parts[0].summary)
+    for key in ("avg_at_n", "pass_at_n", "maj_at_n", "em", "f1", "prompt_strict", "note"):
+        summ.pop(key, None)
+    summ.update({"accuracy": (sum(per.values()) / len(per)) if per else None, "n": len({r.get("id") for r in recs}),
+                 "n_pending": pend, "split_over_replicas": k})
+    (out_dir / f"{task}.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs))
+    sp = out_dir / "summary.json"
+    allsum = json.loads(sp.read_text()) if sp.exists() else {}
+    allsum[task] = summ
+    sp.write_text(json.dumps(allsum, indent=1, ensure_ascii=False))
+    return EvalResult(summ, recs, out_dir)
 
 
 # ----------------------------------------------------------------------------- paired bootstrap

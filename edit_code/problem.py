@@ -61,7 +61,8 @@ class QuantProblem:
                  source_dir: Path | None, source_state: dict | None, budget_gib: float,
                  datasets: list[str], data: dict, kl_texts: list[tuple[str, str]], kl_heldout: list[tuple[str, str]] = (),
                  refs_dir: Path, noise: dict | None = None, gate_baseline: dict | None = None,
-                 eval_budget: int = 24, show_examples: int = 2, incumbent: dict | None = None, log=print):
+                 eval_budget: int = 24, show_examples: int = 2, incumbent: dict | None = None, log=print,
+                 prep_gpus: list[int] | None = None):
         from rsicore import evaluate as _ev  # noqa: F401  (fail early if rsicore is missing)
         self.rc, self.cfg, self.tag, self.gen = rc, cfg, tag, gen
         self.mock = bool(rc.mock)
@@ -93,6 +94,8 @@ class QuantProblem:
         self._inflight: dict = {}                  # (hash, stage) -> threading.Event
         self._reserved = 0                         # charged screen evaluations running now
         self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
+        self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
+        self.prep_gpus = list(prep_gpus) if prep_gpus else None   # generation-0 prep on these GPUs (one worker each)
         self._pool: queue.Queue = queue.Queue()
         for i in range(len(self.slots)):
             self._pool.put(i)
@@ -103,6 +106,37 @@ class QuantProblem:
         self._herr: dict | None = None             # {"module|q|b|gs": [h_err, tr(W H W^T), tokens]} (persisted)
 
     # ------------------------------------------------------------------ bookkeeping
+    @property
+    def n_slots(self) -> int:
+        """Candidate slots in use (a lent editor GPU counts while it is lent)."""
+        return len(self.slots) - len(self._removed)
+
+    def add_slot(self, gpus) -> int:
+        """Lend GPUs to the candidate-server pool (e.g. the sleeping editor's); returns the slot index."""
+        gpus = list(gpus)
+        with self._lock:
+            if gpus in self.slots and self.slots.index(gpus) in self._removed:
+                i = self.slots.index(gpus)
+                self._removed.discard(i)
+            else:
+                self.slots.append(gpus)
+                i = len(self.slots) - 1
+        self._pool.put(i)
+        return i
+
+    def remove_slot(self, i: int) -> None:
+        """Take a lent slot back once it is free (waits for a running evaluation on it to finish)."""
+        held = []
+        while True:
+            j = self._pool.get()
+            if j == i:
+                break
+            held.append(j)
+        for j in held:
+            self._pool.put(j)
+        with self._lock:
+            self._removed.add(i)
+
     @property
     def evals_used(self) -> int:
         return sum(1 for (h, st), r in self._evals.items() if st == "screen" and r.get("charged", True))
@@ -151,10 +185,11 @@ class QuantProblem:
             self._herr = read_json(self.prep_dir / "diagnostics" / "herr_cache.json", {}) or {}
         return self._herr
 
-    def herr_module(self, module: str, setting: dict) -> tuple[float, float, int]:
+    def herr_module(self, module: str, setting: dict, cache=None, lock=None) -> tuple[float, float, int]:
         """(tr((W - Wq) H (W - Wq)^T), tr(W H W^T), calibration tokens) of one module under a resolved
         setting; H = the module's input Hessian from the calibration pass (sum over tokens). Memoised and
-        persisted (prep/diagnostics/herr_cache.json). bits 16 -> 0 error."""
+        persisted (prep/diagnostics/herr_cache.json). bits 16 -> 0 error. cache / lock: a worker's own layer
+        cache on its GPU (hessian_table over several GPUs); default self.cache under the export lock."""
         b, q, gs = int(setting["bits"]), setting.get("quantizer", "rtn"), int(setting.get("group_size") or 128)
         key = f"{module}|{q}|{b}|{gs}"
         with self._herr_lock:
@@ -172,11 +207,12 @@ class QuantProblem:
             from .quant import quantizers as Q
             from .quant.hessian import load_hessian
             m = self.spec.module(module)
-            with self._export_lock:                # the shared cache / GPU
-                H, n, _ = load_hessian(self.prep_dir / "hessians", m.layer, m.input_key, device=self.cache.device)
-                W = self.cache.weight(module).to(self.cache.device).float()
-                Wq = self.cache.dequant(module, {"bits": b, "quantizer": q, "group_size": gs},
-                                        dtype=torch.float32).to(self.cache.device)
+            c = cache or self.cache
+            with (lock or self._export_lock):      # one GPU user at a time per cache
+                H, n, _ = load_hessian(self.prep_dir / "hessians", m.layer, m.input_key, device=c.device)
+                W = c.weight(module).to(c.device).float()
+                Wq = c.dequant(module, {"bits": b, "quantizer": q, "group_size": gs},
+                               dtype=torch.float32).to(c.device)
                 err = Q.h_error(W, Wq, H)
                 ref = float(((W @ H.float()) * W).sum())
                 del H, W, Wq
@@ -228,20 +264,36 @@ class QuantProblem:
         gs = int(d.get("profile_group_size", 128))
         qs = [q for q in d.get("hessian_quantizers", ["rtn", "gptq", "awq"]) if q in self.space["quantizers"]]
         bits = [b for b in d.get("hessian_bits") or d.get("profile_bits", [2, 3, 4]) if b < 16]
-        rows, gp, t0 = [], self.spec.group_params(), time.time()
-        for key, mods in self.spec.groups().items():
-            layer, g = key.split(".", 1)
-            for q in qs:
-                for b in bits:
-                    s = {"bits": b, "group_size": gs, "quantizer": q}
-                    err = ref = 0.0
-                    tok = 1
-                    for m in mods:
-                        e, r, n = self.herr_module(m.name, s)
-                        err, ref, tok = err + e, ref + r, max(1, n)
-                    rows.append({"key": key, "layer": int(layer), "group": g, "quantizer": q, "bits": b,
-                                 "group_size": gs, "herr_per_token": round(err / tok, 8),
-                                 "herr_rel": round(err / ref, 8) if ref > 0 else 0.0, "params": gp[key]})
+        gp, t0 = self.spec.group_params(), time.time()
+        groups = list(self.spec.groups().items())
+
+        def rows_for(items, cache=None, lock=None):
+            out = []
+            for key, mods in items:
+                layer, g = key.split(".", 1)
+                for q in qs:
+                    for b in bits:
+                        s = {"bits": b, "group_size": gs, "quantizer": q}
+                        err = ref = 0.0
+                        tok = 1
+                        for m in mods:
+                            e, r, n = self.herr_module(m.name, s, cache=cache, lock=lock)
+                            err, ref, tok = err + e, ref + r, max(1, n)
+                        out.append({"key": key, "layer": int(layer), "group": g, "quantizer": q, "bits": b,
+                                    "group_size": gs, "herr_per_token": round(err / tok, 8),
+                                    "herr_rel": round(err / ref, 8) if ref > 0 else 0.0, "params": gp[key]})
+            return out
+        devs = [f"cuda:{g}" for g in self.prep_gpus] if (self.prep_gpus and not self.mock) else []
+        if len(devs) > 1:                          # one worker (own layer cache) per GPU, groups round-robin
+            from concurrent.futures import ThreadPoolExecutor
+            shares = [groups[i::len(devs)] for i in range(len(devs))]
+            caches = [self._open_cache(device=d) for d in devs]
+            with ThreadPoolExecutor(max_workers=len(devs)) as ex:
+                parts = list(ex.map(lambda i: rows_for(shares[i], caches[i], threading.Lock()), range(len(devs))))
+            order = {k: i for i, (k, _) in enumerate(groups)}
+            rows = sorted((r for p in parts for r in p), key=lambda r: order[r["key"]])
+        else:
+            rows = rows_for(groups)
         self._herr_flush()
         self.log(f"[prep:{self.tag}] hessian table: {len(rows)} rows in {time.time() - t0:.0f}s")
         return rows
@@ -251,10 +303,10 @@ class QuantProblem:
         dev = self.cfg["cache"].get("device", "cuda")
         return f"cuda:{g}" if dev == "cuda" else dev
 
-    def _open_cache(self):
+    def _open_cache(self, device: str | None = None):
         from .quant.cache import QuantCache
         return QuantCache(self.prep_dir / "cache", self.spec, self.source_dir, hessian_dir=self.prep_dir / "hessians",
-                          device=self._device(), damp=self.cfg["cache"].get("gptq_damp", 0.01),
+                          device=device or self._device(), damp=self.cfg["cache"].get("gptq_damp", 0.01),
                           lazy=self.cfg["cache"].get("lazy", True), log=self.log)
 
     def _prepare_real(self):  # GPU path on the cluster; exercised on CPU by tests/test_quant.py
@@ -266,6 +318,8 @@ class QuantProblem:
         dev = self._device()
         t0 = time.time()
         texts = [t for _, t in self.kl_texts][: ccfg.get("max_texts", 256)]
+        if self.prep_gpus and len(self.prep_gpus) > 1:
+            return self._prepare_real_parallel(texts, [f"cuda:{g}" for g in self.prep_gpus])
         self.log(f"[prep:{self.tag}] loading {self.source_dir} on {dev}")
         model = load_hf_model(self.source_dir, dev)
         batches = tokenize_texts(self.source_dir, texts, ccfg.get("max_len", 2048))
@@ -284,6 +338,79 @@ class QuantProblem:
         free_cuda()
         return prof, act, {"seconds": time.time() - t0, "contexts": len(batches), "profile_contexts": len(pb),
                            "cache_disk_gib": self.cache.disk_bytes() / 2 ** 30}
+
+    def _prepare_real_parallel(self, texts: list[str], devs: list[str]):  # pragma: no cover - GPU path
+        """Generation-0 prep on several GPUs (gpu_layout.prep_all_gpus, 2026-11-20), one worker + one HF model per
+        GPU: (1) calibration Hessians, texts round-robin per worker, summed afterwards (H and the token count
+        are sums over tokens, absmax a max: identical to one pass over all texts); (2) the profile table, group
+        keys round-robin; (3) the cache warm-up, modules round-robin (the hessian table follows in prepare)."""
+        import torch
+        from concurrent.futures import ThreadPoolExecutor
+        from safetensors.torch import save_file
+        from .diagnostics import activation_table_real, profile_table_real
+        from .quant.hessian import (activation_summary, collect_stats, hessian_path, load_hessian, load_hf_model,
+                                    tokenize_texts)
+        from .quant.kl import reference
+        dcfg, ccfg = self.cfg["diagnostics"], self.cfg["calibration"]
+        t0, k = time.time(), len(devs)
+        self.log(f"[prep:{self.tag}] {k} workers on {devs}: loading {self.source_dir}")
+        with ThreadPoolExecutor(max_workers=k) as ex:
+            models = list(ex.map(lambda d: load_hf_model(self.source_dir, d), devs))
+        parts = [texts[i::k] for i in range(k)]
+
+        def calib(i):
+            b = tokenize_texts(self.source_dir, parts[i], ccfg.get("max_len", 2048))
+            collect_stats(models[i], self.spec, b, self.prep_dir / "hessians_parts" / f"w{i}",
+                          layers_per_pass=ccfg.get("layers_per_pass", 16), device=devs[i], log=self.log)
+        with ThreadPoolExecutor(max_workers=k) as ex:
+            list(ex.map(calib, range(k)))
+        stats, hdir = {}, self.prep_dir / "hessians"
+        keys = sorted({(m.layer, m.input_key) for m in self.spec.modules})
+        for (layer, key) in keys:                  # sum the workers' Hessians
+            dst = hessian_path(hdir, layer, key)
+            if not dst.exists():
+                H = absmax = None
+                n = 0
+                for i in range(k):
+                    h, ni, a = load_hessian(self.prep_dir / "hessians_parts" / f"w{i}", layer, key)
+                    H = h if H is None else H + h
+                    absmax = a if absmax is None else torch.maximum(absmax, a)
+                    n += ni
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                save_file({"H": H.contiguous(), "absmax": absmax.contiguous(), "n": torch.tensor([n], dtype=torch.int64)},
+                          str(dst))
+            H, n, absmax = load_hessian(hdir, layer, key)
+            stats[f"{layer}.{key}"] = activation_summary(H, n, absmax)
+        shutil.rmtree(self.prep_dir / "hessians_parts", ignore_errors=True)
+        self.log(f"[prep:{self.tag}] calibration done ({len(keys)} Hessians, {time.time() - t0:.0f}s)")
+        group_keys = self.spec.group_keys()
+        share = [group_keys[i::k] for i in range(k)]
+
+        def prof(i):
+            pb = tokenize_texts(self.source_dir, texts[: dcfg["profile_contexts"]], dcfg["profile_max_len"])
+            refs = reference(models[i], pb)
+            rows = profile_table_real(models[i], self.spec, pb, refs, bits_list=dcfg["profile_bits"],
+                                      group_size=dcfg["profile_group_size"], log=self.log, groups=share[i])
+            del refs
+            return rows
+        with ThreadPoolExecutor(max_workers=k) as ex:
+            prow = [r for rows in ex.map(prof, range(k)) for r in rows]
+        order = {g: i for i, g in enumerate(group_keys)}
+        prof_rows = sorted(prow, key=lambda r: (order[r["key"]], r["bits"]))
+        act = activation_table_real(self.spec, stats)
+        del models
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        mods = [m.name for m in self.spec.modules]
+        caches = [self._open_cache(device=d) for d in devs]
+        warm = self.cfg["cache"].get("warm", [])
+        with ThreadPoolExecutor(max_workers=k) as ex:
+            list(ex.map(lambda i: caches[i].warm(warm, modules=mods[i::k]), range(k)))
+        self.cache = self._open_cache()
+        free_cuda()
+        return prof_rows, act, {"seconds": time.time() - t0, "contexts": len(texts), "workers": devs,
+                                "profile_contexts": dcfg["profile_contexts"],
+                                "cache_disk_gib": self.cache.disk_bytes() / 2 ** 30}
 
     # ------------------------------------------------------------------ configs
     def normalize(self, config) -> dict:
@@ -693,8 +820,9 @@ def add_self_generated(texts: list[tuple[str, str]], endpoint, served_name: str,
                        cache: Path) -> list[tuple[str, str]]:
     """prompt + response: append the reference model's own greedy response to each KL / calibration prompt
     (2504.04823: reasoning-style calibration text), so KL and the calibration statistics also cover the answer
-    tokens. endpoint: a URL, or a callable returning one (called only when some response is not cached yet, so
-    a resume needs no server). Requests go in batches of kl.self_generated_batch prompts. Cached as jsonl
+    tokens. endpoint: a URL or a list of URLs (replicas: the batches are spread over them, 2026-11-20), or a
+    callable returning one (called only when some response is not cached yet, so a resume needs no server).
+    Requests go in batches of kl.self_generated_batch prompts. Cached as jsonl
     {sha, response, finish_reason}; <|im_end|> is appended only to responses that finished (not cut by
     kl.self_generated_max_tokens)."""
     import hashlib
@@ -706,19 +834,34 @@ def add_self_generated(texts: list[tuple[str, str]], endpoint, served_name: str,
     todo = [(sha, t) for sha, (_, t) in zip(shas, texts) if sha not in have]
     todo = list(dict(todo).items())                        # one request per distinct prompt
     if todo:
-        url = (endpoint() if callable(endpoint) else endpoint).rstrip("/") + "/completions"
+        eps = endpoint() if callable(endpoint) else endpoint
+        urls = [e.rstrip("/") + "/completions" for e in (eps if isinstance(eps, (list, tuple)) else [eps])]
         bs = max(1, int(kc.get("self_generated_batch", 64)))
-        for b in range(0, len(todo), bs):
-            chunk = todo[b:b + bs]
-            body = {"model": served_name, "prompt": [t for _, t in chunk], "temperature": 0.0,
-                    "max_tokens": int(kc.get("self_generated_max_tokens", 2048))}
-            req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=7200) as r:
-                resp = json.loads(r.read())
-            for ch in sorted(resp["choices"], key=lambda c: c.get("index", 0)):
-                sha = chunk[int(ch.get("index", 0))][0]
-                have[sha] = {"sha": sha, "response": ch.get("text") or "", "finish_reason": ch.get("finish_reason")}
-                append_jsonl(cache, have[sha])
+        chunks = [todo[b:b + bs] for b in range(0, len(todo), bs)]
+        lock = threading.Lock()
+
+        def worker(url):
+            while True:
+                with lock:
+                    if not chunks:
+                        return
+                    chunk = chunks.pop(0)
+                body = {"model": served_name, "prompt": [t for _, t in chunk], "temperature": 0.0,
+                        "max_tokens": int(kc.get("self_generated_max_tokens", 2048))}
+                req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=7200) as r:
+                    resp = json.loads(r.read())
+                with lock:
+                    for ch in sorted(resp["choices"], key=lambda c: c.get("index", 0)):
+                        sha = chunk[int(ch.get("index", 0))][0]
+                        have[sha] = {"sha": sha, "response": ch.get("text") or "", "finish_reason": ch.get("finish_reason")}
+                        append_jsonl(cache, have[sha])
+        if len(urls) == 1:
+            worker(urls[0])
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(urls)) as ex:
+                list(ex.map(worker, urls))
     out = []
     for sha, (d, t) in zip(shas, texts):
         r = have[sha]

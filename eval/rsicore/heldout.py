@@ -4,6 +4,9 @@ Decoding (2026-11-20): search, gate and noise are greedy; the held-out evaluatio
 `heldout.decoding` (Qwen's non-thinking recommendation: temperature 0.7, top_p 0.8, top_k 20, seed 42) with
 n samples per item (avg@n; per-task n in `n_by_task`). decoding=None keeps the task's tasks.yaml decoding."""
 import json
+import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .evaluate import score
@@ -46,6 +49,54 @@ def _same_decoding(prev_dec: dict | None, key: dict | None) -> bool:
 
 def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=None, mock=False, limit=None,
                 decoding: dict | None = None) -> dict:
+    """endpoint: one URL, or a list of URLs of replicas of the same model (2026-11-20): the tasks are then run
+    in parallel, one replica per task (each task in out_dir/_par/<task>/, merged into out_dir afterwards)."""
+    if isinstance(endpoint, (list, tuple)) and len(endpoint) > 1:
+        return _run_heldout_parallel(list(endpoint), served_name, Path(out_dir), domains=domains, lora=lora,
+                                     mock=mock, limit=limit, decoding=decoding)
+    if isinstance(endpoint, (list, tuple)):
+        endpoint = endpoint[0]
+    return _run_heldout_one(endpoint, served_name, out_dir, domains=domains, lora=lora, mock=mock, limit=limit,
+                            decoding=decoding)
+
+
+def _run_heldout_parallel(endpoints, served_name, out_dir: Path, *, domains, lora, mock, limit, decoding) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tasks = heldout_tasks(domains)
+    lock = threading.Lock()
+    queue = list(tasks)
+
+    def worker(ep):
+        res = {}
+        while True:
+            with lock:
+                if not queue:
+                    return res
+                task, pool = queue.pop(0)
+            sub = out_dir / "_par" / task
+            r = _run_heldout_one(ep, served_name, sub, tasks=[(task, pool)], lora=lora, mock=mock, limit=limit,
+                                 decoding=decoding)
+            with lock:                              # merge this task into out_dir (summary.json + records)
+                sp, ssp = out_dir / "summary.json", sub / "summary.json"
+                allsum = json.loads(sp.read_text()) if sp.exists() else {}
+                if ssp.exists():
+                    allsum[task] = json.loads(ssp.read_text()).get(task, {})
+                    sp.write_text(json.dumps(allsum, indent=1, ensure_ascii=False))
+                if (sub / f"{task}.jsonl").exists():
+                    shutil.copyfile(sub / f"{task}.jsonl", out_dir / f"{task}.jsonl")
+            res.update(r)
+    with ThreadPoolExecutor(max_workers=len(endpoints)) as ex:
+        parts = list(ex.map(worker, endpoints))
+    out = {}
+    for task, _ in tasks:                           # task order as in HELDOUT
+        for p in parts:
+            if task in p:
+                out[task] = p[task]
+    return out
+
+
+def _run_heldout_one(endpoint, served_name, out_dir: Path, *, domains="all", lora=None, mock=False, limit=None,
+                     decoding: dict | None = None, tasks: list | None = None) -> dict:
     """Evaluate every held-out task of `domains` into out_dir (run_eval layout). Tasks already present in
     out_dir/summary.json for the same served model / LoRA / limit / decoding are skipped (resumable).
     decoding: the paper config's heldout.decoding (see the module doc); None = tasks.yaml decoding.
@@ -54,7 +105,7 @@ def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=Non
     out_dir.mkdir(parents=True, exist_ok=True)
     sp = out_dir / "summary.json"
     res = {}
-    for task, pool in heldout_tasks(domains):
+    for task, pool in (tasks if tasks is not None else heldout_tasks(domains)):
         prev = json.loads(sp.read_text()).get(task) if sp.exists() else None
         served = lora or served_name
         dec = decoding_args(decoding, task)
