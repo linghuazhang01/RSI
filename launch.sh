@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20]
-#               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all]
+#               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all] [--eval-overfit]
 #               [--all-domains] [--set KEY=VALUE ...] [--dry-run] [--mock] [--skip-checks]
 #
 #   --paper     A, B or both (default both)
@@ -24,6 +24,8 @@
 #   --with-all  also start Paper A's five-domain main experiment (--domain all)
 #   (default)   each run uses ONLY its own domain (scope single): training, gate, feedback, KL and held-out
 #               on that domain; Paper B has no retention probes and no E_t. Run ids end in _single.
+#   --eval-overfit optimise directly on the eval sets (objective eval_overfit: math_eval = MATH-500 + GSM8K test;
+#               every stage is the whole set, accepted when the score is higher). Run ids end in _evalfit.
 #   --all-domains  the original design (scope all): the other four domains are retention probes / KL texts,
 #               held-out on all five domains, Paper B E_t on. Run ids without _single.
 #   --dry-run   print the preflight result and the commands, start nothing
@@ -51,7 +53,7 @@ cd "$ROOT"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$ROOT/launch.sh"; }
 
 PAPER=both; DOMAINS=all; GENS=5; GPUS=""; PER_RUN=""; MODEL=qwen3.8-27b; SEED=42; HW=b300
-WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; SETS=()
+WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; EVALFIT=0; SETS=()
 need() { [ $# -ge 2 ] || { echo "ERROR: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -68,6 +70,7 @@ while [ $# -gt 0 ]; do
     --with-all) WITH_ALL=1 ;;
     --single-domain) SINGLE=1 ;;
     --all-domains) SINGLE=0 ;;
+    --eval-overfit) EVALFIT=1 ;;
     --dry-run) DRY=1 ;;
     --mock) MOCK=1 ;;
     --skip-checks) SKIP=1 ;;
@@ -90,6 +93,7 @@ for d in $DOMS; do
 done
 SUFFIX=""; [ "$SINGLE" -eq 1 ] && SUFFIX="_single"
 [ "$SINGLE" -eq 0 ] && SETS=(--set scope=all ${SETS[@]+"${SETS[@]}"})   # explicit --set values come later and win
+[ "$EVALFIT" -eq 1 ] && { SETS=(--set objective=eval_overfit ${SETS[@]+"${SETS[@]}"}); SUFFIX="${SUFFIX}_evalfit"; }
 
 # ---------------------------------------------------------------- run list
 RUNS=()   # "paper domain run_id"

@@ -29,6 +29,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import mock as M
 from .common import (append_jsonl, candidate_groups, config_hash, free_cuda, load_processed, read_json, read_jsonl,
@@ -96,6 +97,8 @@ class QuantProblem:
         self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
         self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
         self.prep_gpus = list(prep_gpus) if prep_gpus else None   # generation-0 prep on these GPUs (one worker each)
+        from rsicore.draws import eval_target
+        self._eval_mode = bool(eval_target(rc))   # objective eval_overfit: examples also show the reference answer
         self._pool: queue.Queue = queue.Queue()
         for i in range(len(self.slots)):
             self._pool.put(i)
@@ -574,10 +577,25 @@ class QuantProblem:
         name = f"{self.rc.run_id}-{self.tag}-{art['config_hash']}"
         edir = self.out_dir / "evals" / f"{cid}" / stage
         probes, regressions, scored = {}, [], {}
-        with self.serve(art, name) as srv:
+        # the same items as an existing screen evaluation of this config (objective eval_overfit: every stage is
+        # the whole eval set): reuse its records instead of scoring them again
+        scr = self._evals.get((art["config_hash"], "screen")) if stage != "screen" else None
+        reuse = None
+        if scr is not None and all(sorted(self._ids(ds, stage)) == sorted(self._ids(ds, "screen")) for ds in self.datasets):
+            src = {ds: self.records_path(scr["cid"], "screen", ds) for ds in self.datasets}
+            if all(p.exists() for p in src.values()):
+                reuse = {ds: read_jsonl(p) for ds, p in src.items()}
+        from contextlib import nullcontext
+        with (nullcontext() if reuse else self.serve(art, name)) as srv:
             for ds in self.datasets:
                 ids = self._ids(ds, stage)
-                res = score(srv.endpoint, name, ds, pool="pool", ids=ids, out_dir=edir, mock=self.mock)
+                if reuse:
+                    edir.mkdir(parents=True, exist_ok=True)
+                    (edir / f"{ds}.jsonl").write_text("".join(__import__("json").dumps(r, ensure_ascii=False) + "\n"
+                                                              for r in reuse[ds]))
+                    res = SimpleNamespace(records=reuse[ds])
+                else:
+                    res = score(srv.endpoint, name, ds, pool="pool", ids=ids, out_dir=edir, mock=self.mock)
                 acc, per, pending = _mean_per_id(res.records)
                 dom = DATASET_DOMAIN.get(ds, ds)
                 p = {"dataset": ds, "score": None if acc is None else round(acc, 4), "n": len(per), "pending": pending}
@@ -616,7 +634,11 @@ class QuantProblem:
                             p["retention"] = None if acc is None else round(acc / pacc, 4)
                 probes[dom] = p
                 scored[ds] = acc
-            kl = self._kl(srv, art, stage) if stage in ("screen", "full") else None
+            klw = float(self.cfg["search"].get("kl_weight", 0.0))
+            if reuse:
+                kl = (scr.get("feedback") or {}).get("kl") if stage in ("screen", "full") else None
+            else:   # kl_weight 0 (objective eval_overfit): the score does not use KL, so it is not computed
+                kl = self._kl(srv, art, stage) if (stage in ("screen", "full") and klw > 0) else None
         if kl and "per_text" in kl:                # kept on disk, not in the editor's feedback
             kl = dict(kl)
             per_text = kl.pop("per_text")
@@ -697,6 +719,7 @@ class QuantProblem:
             q = item.get("prompt") or (item.get("messages") or [{}])[-1].get("content", "")
             out.append({"dataset": ds, "id": r["id"], "prompt": tail(str(q)[:400], 400),
                         "incumbent_answer": str(p.get("parsed_answer"))[:200],
+                        **({"reference": str(item.get("reference"))[:200]} if self._eval_mode else {}),
                         "candidate_answer": str(r.get("parsed_answer"))[:200],
                         "candidate_output_tail": tail(r.get("raw_output") or "", 300)})
             if len(out) >= self.show_examples:
@@ -725,7 +748,7 @@ class QuantProblem:
     def compute_refs(self, endpoint: str, served_name: str) -> None:
         """M_0 (served as the editor) is only the KL reference: cache its prompt logprobs on the KL texts
         (real mode). It is not scored on the signal items (candidates are compared with the incumbent)."""
-        if self.mock:
+        if self.mock or float(self.cfg["search"].get("kl_weight", 0.0)) <= 0:   # no KL in the score: no reference
             return
         from rsicore.evaluate import reference_logprobs  # pragma: no cover - GPU path
         k = self.cfg["kl"]["top_k"]

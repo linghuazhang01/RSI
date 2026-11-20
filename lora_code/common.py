@@ -145,26 +145,28 @@ def prompt_text(dataset: str, item: dict) -> str:
         return "\n\n".join(m.get("content", "") for m in (item.get("messages") or []))
 
 
-MODES = ("edit", "scratch")   # 2026-11-20: no SFT baseline, no free mode; only edit trains (one raw LoRA, gen 0)
+MODES = ("scratch", "weights", "edit")   # 2026-11-21: scratch (write a LoRA) is the default; weights = edit the weights
+#                                        directly (any rank); edit = the one mode that trains (raw LoRA, generation 0)
 
 
 def method_mode(cfg: dict) -> str:
-    m = str((cfg.get("method") or {}).get("mode") or "edit")
+    m = str((cfg.get("method") or {}).get("mode") or "scratch")
     if m not in MODES:
         raise SystemExit(f"method.mode must be one of {MODES}, got {m!r}")
     return m
 
 
 def gate_policy(cfg: dict) -> tuple[str, str]:
-    """(reference, fallback) of the gate: 'auto' resolves by method.mode (edit: raw / raw, scratch: parent / keep)."""
+    """(reference, fallback) of the gate: 'auto' resolves by method.mode (edit: raw / raw, scratch and weights:
+    parent / keep)."""
     mode = method_mode(cfg)
     g = cfg.get("gate") or {}
     ref = g.get("reference") or "auto"
     fb = g.get("fallback") or "auto"
     if ref == "auto":
-        ref = {"edit": "raw", "scratch": "parent"}[mode]
+        ref = {"edit": "raw", "scratch": "parent", "weights": "parent"}[mode]
     if fb == "auto":
-        fb = {"edit": "raw", "scratch": "keep"}[mode]
+        fb = {"edit": "raw", "scratch": "keep", "weights": "keep"}[mode]
     if ref not in ("raw", "parent") or fb not in ("raw", "keep"):
         raise SystemExit(f"gate.reference must be raw|parent and gate.fallback raw|keep, got {ref!r} / {fb!r}")
     if mode != "edit" and "raw" in (ref, fb):

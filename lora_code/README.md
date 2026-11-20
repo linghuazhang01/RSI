@@ -2,14 +2,23 @@
 
 计划见 `plan/PLAN.md` §4、`plan/research/RSI_LOOP_DESIGN.md` §3、`plan/research/METHOD_DESIGN.md` §3。模型 Qwen3.8-27B（`Qwen3_5ForConditionalGeneration`）。共用运行时在 `eval/rsicore/`（契约 `eval/rsicore/INTERFACES.md`），本目录只写 Paper B 特有的部分。
 
-## 两种写 LoRA 的方式（`method.mode`，2026-11-19）
+## 三种改模型的方式（`method.mode`，2026-11-21）
 
-**2026-11-20 起没有 SFT 基线，也没有 free 模式。** 整个运行里唯一的训练是 `edit` 模式在第 0 代训练一次 raw LoRA；除此之外永远不训练。改造者在任何模式下都没有 `sgd` / `grad` / `from_grad`。
+**默认不训练**：改造者在任何模式下都没有 `sgd` / `grad` / `from_grad`。只有保留下来的 `edit` 模式会在第 0 代训练一次 raw LoRA。
 
-| 模式 | LoRA 从哪来 | 改造者能用的工具 | 验收的目标参照 | 都不过时 |
-|---|---|---|---|---|
-| `edit`（默认） | **只在第 0 代**按固定 `raw` 配方训练一次 raw LoRA，之后不再训练；每一代由 M_g = M_0 + 当前 LoRA 编辑它出发的那个 LoRA（句柄 `RAW`：第 0 代是 raw，之后是当前 LoRA），结果替换当前 LoRA；权重不合并，当前 LoRA 作为 adapter 挂在 M_0 服务上 | 编辑算子、SVD、激活统计、构造工具、`raw_lora` | 第 0 代：目标 ≥ raw − ε；之后：和当前模型逐题配对：平均提升 ≥ `gate.min_gain` 且 95% 置信区间下界 > 0 | 第 0 代合并 raw；之后保留当前 LoRA |
-| `scratch` | 从零写，没有任何训练 | 同上，但没有 raw LoRA | 和当前模型逐题配对：平均提升 ≥ `gate.min_gain` 且 95% 置信区间下界 > 0 | 保持原样 |
+| 模式 | 改什么 | 改造者能用的工具 | 候选怎么评测 | 验收参照 | 都不过时 |
+|---|---|---|---|---|---|
+| `scratch`（**默认**） | 从零写一个 LoRA（低秩 ΔW） | SVD、激活统计、秩 1 / 方向 / 奇异方向构造、编辑算子、`compare`、`train_loss` | 热加载到 main 副本上 | 和当前模型逐题配对：平均提升 ≥ `gate.min_gain` 且 95% 置信区间下界 > 0 | 保持原样 |
+| `weights` | **直接编辑权重**（任意秩的结构化修改） | 同上（用来构造低秩部分）+ `new_edit`、`w_scale`（整个模块缩放）、`w_scale_rows` / `w_scale_cols`（输出 / 输入通道缩放）、`w_add_lora`（把构造出的低秩 ΔW 稠密地加进权重）、`w_toward_original`（往原模型的权重拉回）、`inspect_edit`；每个模块 ‖W'−W‖/‖W‖ ≤ `weights.norm_cap_tau`（0.05） | 写出改动后的权重（只重写被改的分片，其余硬链接），在一个空闲候选槽上起一个 vLLM 服务评测，评完删除；同一轮的候选同时在各槽上评测 | 同上 | 保持原样 |
+| `edit`（保留，非默认） | 第 0 代训练一次 raw LoRA，之后每代编辑它（M_g = M_0 + 当前 LoRA，不合并） | 同 scratch，另有 `raw_lora` | 热加载 | 第 0 代：目标 ≥ raw − ε；之后同上 | 第 0 代合并 raw；之后保留当前 LoRA |
+
+**weights 模式的卡**（4 张卡）：卡 0 是改造者（当前模型，vLLM 睡眠模式）；卡 1、2 是候选槽；卡 3 是 train（导出改动后的权重、SVD、激活统计、`train_loss`）。改造者写完这一轮的程序就睡眠，卡 0 临时当第 3 个候选槽，所以一轮里 3 个候选同时导出、加载、评测。每个候选要写出改动的分片并启动一个 vLLM 服务，比热加载 LoRA 多几分钟。接受后改动直接写进权重，得到 M_{t+1}。非 LLM 分支是随机的权重编辑（通道 / 模块缩放）。weights 模式不支持 E_t（单领域本来就关闭）。
+
+```bash
+--set method.mode=scratch      # 默认：从零写 LoRA
+--set method.mode=weights      # 直接编辑权重
+--set method.mode=edit         # 训练一次 raw LoRA 再编辑（保留的旧方式）
+```
 
 raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 个 epoch、batch 4，除 `in_proj_a/b` 外的全部投影层；`raw.n_train` 空 = 第 0 代全部 train 题）：
 
@@ -21,6 +30,15 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 训练答案（`train_data`：拒绝采样 M_g 自己答对的回答；4 个都错的题**跳过**，不用金标，`train_data.mode: self_correct`，2026-11-20）只在训练 raw LoRA 时（edit 第 0 代）采样。训练样本的题目部分就是评测时发给模型的那条请求：评测任务自己生成的聊天消息 + Qwen 对话模板、关闭思考，和 vLLM 评测时完全一致，只在回答部分算损失；其余情况 train 题直接用金标答案、不采样，只给激活统计和 `train_example` 用。
 
 `gate.reference` / `gate.fallback` 可以覆盖上表的默认值（`raw` | `parent`，`raw` | `keep`）。非 LLM 分支随模式变化：edit = 对 raw LoRA 随机组合编辑规则（截断 / 剪枝 / intruder / RegMean / 正交化 / 缩放），scratch = 随机的无梯度构造（奇异方向缩放）。ΔE_write 的参照分支：edit = M_t ⊕ raw（自动加 `raw` 分支），scratch = parent。E_t 会话用同一个模式（edit 时为 θ0 在 E 任务上按同一 raw 配方训练一个 raw LoRA，在 `e_ref` 里只算一次）；E-ref 是 θ0 本身在 E-test 上的分数。
+
+## 直接在评测集上优化（`objective: eval_overfit`，2026-11-20）
+
+不做训练 / 信号 / 验收切分，直接在评测集上过拟合：`--set objective=eval_overfit`（或 `./launch.sh --eval-overfit`），运行名带 `_evalfit`。
+- 数据：`math_eval` = MATH-500 + GSM8K test，共 1819 道（`data/scripts/build_eval_target.py`，首次用到时自动生成）。
+- train / signal / gate 都是这全部 1819 道：改造者的 `train_example`、`acts`、`train_loss` 直接看到评测题和标准答案；快速筛、完整评测、验收共用同一份逐题结果，贪心打分。不抽题，不标记展示过的题。
+- **评测集分数严格高于当前模型就接受**（`gate.min_gain: 1e-6`，不做显著性检验）；只送评测集上提升 > 0 的候选。
+- edit 模式第 0 代的 raw LoRA 也直接在评测题上训练（自己答对的回答，4 个都错就跳过）；scratch 不训练。
+- 留出评测照常（采样 avg@n），其中 MATH-500 / GSM8K 就是优化过的题，结果不能当作泛化结果。
 
 ## 单领域实验（`scope`）
 

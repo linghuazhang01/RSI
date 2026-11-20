@@ -158,6 +158,9 @@ class Runner:
         self.datasets = [ds for d in doms for ds in D.DOMAIN_TRAIN[d]]
         kd = cfg["kl"].get("domains", "all")
         self.kl_datasets = [ds for d in (ALL_DOMAINS if kd == "all" else doms) for ds in D.DOMAIN_TRAIN[d]]
+        if D.eval_target(rc):                       # objective eval_overfit: the eval sets are the data (signal,
+            self.datasets = [D.eval_dataset(rc)]    # gate and KL / calibration texts), see rsicore.draws
+            self.kl_datasets = list(self.datasets)
         self.registry = self.run_dir / "mock_registry.json"
         roles, unused = gpu_layout(rc, cfg)
         self.gpu_editor, self.gpu_cand = roles["editor"], roles["candidate"]

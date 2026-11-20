@@ -20,7 +20,10 @@ Every step is recorded in state.json (rsicore.state.RunState); rerunning the sam
 """
 from __future__ import annotations
 
+import queue
+import shutil
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -38,9 +41,21 @@ class Servers:
     main GPU group (main_groups, 2026-11-20: data parallelism; every replica holds the same LoRAs): get() returns
     the first, replicas() all of them."""
 
-    def __init__(self, rc, cfg):
+    def __init__(self, rc, cfg, weights: bool = False):
         self.rc, self.cfg = rc, cfg
         self.live = {}
+        # method.mode weights (2026-11-21): the first main group serves the current model (the editor, with vLLM
+        # sleep mode); the other main groups are candidate slots (WeightSlots), one exported candidate each
+        self.weights = bool(weights)
+
+    @property
+    def main_gpu_groups(self) -> list:
+        groups = main_groups(self.rc, self.cfg)
+        return groups[:1] if self.weights else groups
+
+    @property
+    def slot_groups(self) -> list:
+        return main_groups(self.rc, self.cfg)[1:] if self.weights else []
 
     def get(self, slot: str, model_path, served: str):
         return self.replicas(slot, model_path, served)[0]
@@ -59,7 +74,7 @@ class Servers:
             for s in cur[1]:
                 s.stop()
         sc = self.cfg.get("server", {})
-        groups = main_groups(self.rc, self.cfg) if slot == "main" else [role_gpus(self.rc, self.cfg, "theta0")]
+        groups = self.main_gpu_groups if slot == "main" else [role_gpus(self.rc, self.cfg, "theta0")]
         if self.rc.mock:   # mock_server.py takes none of vLLM's flags
             extra = ["--tasks", ",".join(sc["mock_tasks"])] if sc.get("mock_tasks") else []
         else:
@@ -67,9 +82,24 @@ class Servers:
         srvs = [VLLMServer(model_path, served, g, enable_lora=True, max_loras=int(sc.get("max_loras", 8)),
                            max_lora_rank=int(self.cfg.get("lora", {}).get("rank_cap", 64)), extra_args=extra,
                            mock=self.rc.mock, mock_registry=self.rc.run_dir / "mock_registry.json", seed=self.rc.seed,
-                           log_dir=self.rc.run_dir / "logs") for g in groups]
+                           log_dir=self.rc.run_dir / "logs", sleep_mode=self.weights and slot == "main")
+                for g in groups]
         start_all(srvs)
         self.live[slot] = ((str(model_path), served), srvs)
+        return srvs
+
+    def extra_main(self, model_path, served: str) -> list:
+        """Temporary servers of model_path on the candidate slots (weights mode; e.g. held-out, generation-0 gate
+        scoring on every GPU); the caller stops them. Empty outside weights mode."""
+        from rsicore.servers import VLLMServer, start_all
+        if not self.slot_groups:
+            return []
+        sc = self.cfg.get("server", {})
+        extra = [] if self.rc.mock else list(sc.get("main_args", []) or [])
+        srvs = [VLLMServer(model_path, served, g, extra_args=extra, mock=self.rc.mock,
+                           mock_registry=self.rc.run_dir / "mock_registry.json", seed=self.rc.seed,
+                           log_dir=self.rc.run_dir / "logs") for g in self.slot_groups]
+        start_all(srvs)
         return srvs
 
     def stop(self, slot=None):
@@ -78,6 +108,103 @@ class Servers:
             if v is not None:
                 for s in v[1]:
                     s.stop()
+
+
+class WeightSlots:
+    """method.mode weights (2026-11-21): a candidate weight edit cannot be hot-loaded like an adapter, so each one is
+    exported (parent model + edit: only the shards with an edited tensor are rewritten, the rest hard-linked) and
+    served on a free candidate slot (one GPU group), scored, then the server and the export are removed. Slots =
+    the main groups after the first; while the editor sleeps its group is lent as one more (lend / reclaim)."""
+
+    def __init__(self, run):
+        self.run = run
+        self.q: queue.Queue = queue.Queue()
+        self.groups = None                          # the slot GPU groups, filled on first use (lazy)
+        self._init_lock = threading.Lock()
+        self.lent = None
+        self.export_lock = threading.Lock()
+        self.parent, self.store = None, None
+
+    def _init(self):
+        with self._init_lock:
+            if self.groups is None:
+                self.groups = [list(g) for g in self.run.servers.slot_groups]
+                for g in self.groups:
+                    self.q.put(g)
+
+    @property
+    def n(self) -> int:
+        self._init()
+        return len(self.groups) + (1 if self.lent is not None else 0)
+
+    def set_parent(self, parent_dir, store) -> None:
+        self.parent, self.store = Path(parent_dir), store
+
+    def lend(self, gpus) -> None:
+        self._init()
+        if self.lent is None:
+            self.lent = list(gpus)
+            self.q.put(self.lent)
+
+    def reclaim(self) -> None:
+        """Take the lent group back once it is free (waits for a candidate running on it)."""
+        if self.lent is None:
+            return
+        held = []
+        while True:
+            g = self.q.get()
+            if g is self.lent:
+                break
+            held.append(g)
+        for g in held:
+            self.q.put(g)
+        self.lent = None
+
+    def score(self, name: str, path, ids_by_ds: dict, dirs_by_ds: dict) -> dict:  # pragma: no cover - GPU path
+        from rsicore.evaluate import score_split
+        from rsicore.servers import VLLMServer
+
+        from lora_code.primitives.wedit import WeightEdit, edit_into_model
+        if self.n == 0:
+            raise RuntimeError("no candidate slot for a weight edit (needs a free main GPU group)")
+        run = self.run
+        g = self.q.get()
+        mdir = run.rc.run_dir / "cand_models" / name
+        try:
+            with self.export_lock:              # one export at a time (train GPU + disk)
+                edit_into_model(WeightEdit.load_raw(path), self.parent, mdir, store=self.store,
+                                base_store=run.store(Path(run.rc.model_path)), device=run.train_device())
+            srv = VLLMServer(mdir, name, g, extra_args=list(run.cfg.get("server", {}).get("main_args", []) or []),
+                             seed=run.rc.seed, log_dir=run.rc.run_dir / "logs")
+            srv.start()
+            try:
+                return {ds: score_split([srv.endpoint], name, ds, pool="pool", ids=ids, out_dir=dirs_by_ds[ds])
+                        for ds, ids in ids_by_ds.items()}
+            finally:
+                srv.stop()
+        finally:
+            shutil.rmtree(mdir, ignore_errors=True)
+            self.q.put(g)
+
+
+class _WeightPhases:
+    """inner_search phases in weights mode: the editor (current model) proposes, then sleeps (weights -> CPU RAM)
+    while the step's candidates are exported and evaluated at the same time on every slot, its GPU group lent as one
+    more; editor_phase() takes the group back and wakes it."""
+
+    def __init__(self, run):
+        self.run = run
+
+    def editor_phase(self):
+        self.run.wslots.reclaim()
+        for s in self.run.servers.replicas("main"):
+            s.wake_up()
+
+    def eval_phase(self) -> int:
+        ed = self.run.servers.replicas("main")[0]
+        ed.sleep()
+        self.run.wslots.lend(ed.gpu_ids)
+        return max(1, self.run.wslots.n)
 
 
 class _ReplicaPhases:
@@ -108,15 +235,19 @@ class Run:
         from rsicore.state import RunState
         self.rc, self.cfg = rc, cfg
         self.st = RunState(rc.run_dir)
-        self.servers = Servers(rc, cfg)
+        self.servers = Servers(rc, cfg, weights=method_mode(cfg) == "weights")
+        self.wslots = WeightSlots(self) if method_mode(cfg) == "weights" else None
         self.registry = rc.run_dir / "mock_registry.json"
         self.target = rc.domain
         self.tds = DOMAIN_DATASET[rc.domain]
+        from rsicore import draws as _dr
+        if _dr.eval_target(rc):                     # objective eval_overfit: the eval sets are the target dataset
+            self.tds = _dr.eval_dataset(rc)         # (train / signal / gate = all of it, see rsicore.draws)
         retention = cfg.get("retention", {}).get("domains")
         self.retention_domains = retention_domains(self.target) if retention is None else list(retention)
         if any(d not in DOMAINS or d == self.target for d in self.retention_domains):
             raise ValueError("retention.domains must contain only non-target domains")
-        self.datasets = [DOMAIN_DATASET[d] for d in DOMAINS
+        self.datasets = [self.tds if d == self.target else DOMAIN_DATASET[d] for d in DOMAINS
                          if d == self.target or d in self.retention_domains]
         self.mcfg = cfg.get("mock", {})
         self.mode = method_mode(cfg)
@@ -207,6 +338,7 @@ class Run:
                                     micro_batch=tc.get("micro_batch"),
                                     dtype=tc.get("dtype", "bfloat16"), max_len=int(tc.get("max_len", 4096)),
                                     seed=self.rc.seed)
+            self._hf[key].base_store = self.store(Path(self.rc.model_path))   # weight edits' toward_base ops
         return self._hf[key]
 
     def train_device(self) -> str:
@@ -223,6 +355,13 @@ class Run:
         return gen_dir(self.rc, g)
 
     def load_lora(self, path: Path):
+        """A saved LoRA, or in weights mode a saved weight edit (accepted / non-LLM candidates)."""
+        if self.mode == "weights":
+            if self.rc.mock:
+                from lora_code.mock import MockWeightEdit
+                return MockWeightEdit.from_json(read_json(path))
+            from lora_code.primitives.wedit import WeightEdit
+            return WeightEdit.load_raw(path)
         if self.rc.mock:
             from lora_code.mock import MockLoRA
             return MockLoRA.from_json(read_json(path))
@@ -252,7 +391,7 @@ class Run:
         return self.lora_file(gd / "baselines" / "raw_lora")
 
     def stack(self, g: int) -> list:
-        if self.chain:   # accepted LoRAs replace each other; nothing is merged
+        if self.chain or self.mode == "weights":   # edit: LoRAs replace each other; weights: dense edits, no adapters
             return []
         out = []
         for k in range(g):
@@ -349,7 +488,8 @@ class Run:
                          replicas=self.servers.replicas("main"),
                          ids=ids, target_dataset=self.tds, kl_texts=kl_texts, store=store, mock=self.rc.mock,
                          registry=self.registry, parent_quality=self.quality_value(served),
-                         max_loaded=int(self.cfg.get("server", {}).get("max_loras", 8)) - 2)
+                         max_loaded=int(self.cfg.get("server", {}).get("max_loras", 8)) - 2,
+                         weights_scorer=self.wslots.score if (self.wslots is not None and not self.rc.mock) else None)
 
     def workspace(self, out_dir, ev, store, hf, train, budget, prefix, stack=(), diag=None, ret_texts=(),
                   raw=None, raw_info=None):
@@ -358,7 +498,7 @@ class Run:
         return Workspace(mock=self.rc.mock, store=store, train=TrainData(train), cfg=self.cfg, out_dir=out_dir,
                          evaluator=ev, hf=hf, stack=stack, retention_texts=ret_texts, budget=budget,
                          name_prefix=prefix, diagnostics=diag, seed=self.rc.seed, mode=self.mode, raw=raw,
-                         raw_info=raw_info)
+                         raw_info=raw_info, base_store=self.store(Path(self.rc.model_path)))
 
     # ================================================================== baseline
     def baseline(self):
@@ -372,7 +512,8 @@ class Run:
         key = "baseline/gate"
         if not self.st.done(key):
             srv = self.servers.get("main", self.model_path(0), self.served(0))
-            eps = [s.endpoint for s in self.servers.replicas("main")]
+            tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
+            eps = [s.endpoint for s in self.servers.replicas("main") + tmp]
             from rsicore.evaluate import score_split
             bc = self.cfg.get("baseline", {})
             reps = int(bc.get("noise_repeats", 3))
@@ -407,13 +548,21 @@ class Run:
                            "noise_source": nb.get("source", "measured") + " (gate margin = max(band, 2 SE))",
                            "records": recs}
             write_json(bdir / "gate_scores.json", res)
+            for s in tmp:
+                s.stop()
             self.st.mark(key, {ds: {k: v[k] for k in ("score", "noise_band")} for ds, v in res.items()})
         if self.cfg.get("heldout", {}).get("enabled", True) and not self.st.done("baseline/heldout"):
             from rsicore.heldout import run_heldout
             self.servers.get("main", self.model_path(0), self.served(0))
-            h = run_heldout([s.endpoint for s in self.servers.replicas("main")], self.served(0), bdir / "heldout",
-                            domains=self.cfg.get("heldout", {}).get("domains", "all"), mock=self.rc.mock,
-                            limit=self.cfg.get("heldout", {}).get("limit"), decoding=self.cfg.get("heldout", {}).get("decoding"))
+            tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
+            try:
+                h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(0), bdir / "heldout",
+                                domains=self.cfg.get("heldout", {}).get("domains", "all"), mock=self.rc.mock,
+                                limit=self.cfg.get("heldout", {}).get("limit"),
+                                decoding=self.cfg.get("heldout", {}).get("decoding"))
+            finally:
+                for s in tmp:
+                    s.stop()
             write_json(bdir / "heldout.json", h)
             self.st.mark("baseline/heldout", {"tasks": len(h)})
         if self.cfg.get("e_t", {}).get("enabled", True) and not self.st.done("e_ref"):
@@ -690,13 +839,20 @@ class Run:
                                                "lora": acc["name"]})
                 info = {"merged": True, "quality": q}
             else:
-                from lora_code.primitives.lora import merge_into_model
                 lo = self.load_lora(lf)
-                rep = merge_into_model(lo, parent, gd / "model", store=store,
-                                       device=self.train_device() if cfg.get("merge", {}).get("gpu", True) else "cpu")
-                write_json(gd / "model.json", {"path": str(gd / "model"), "source": "merged", "lora": acc["name"],
-                                               "max_realised_rel_err": rep["max_realised_rel_err"]})
-                info = {"merged": True, "max_realised_rel_err": rep["max_realised_rel_err"]}
+                dev = self.train_device() if cfg.get("merge", {}).get("gpu", True) else "cpu"
+                if getattr(lo, "kind", "lora") == "weights":   # weights mode: write the edited weights
+                    from lora_code.primitives.wedit import edit_into_model
+                    rep = edit_into_model(lo, parent, gd / "model", store=store,
+                                          base_store=self.store(Path(rc.model_path)), device=dev)
+                    rels = [v.get("rel_change", 0.0) for v in (rep.get("modules") or {}).values()]
+                    stat = {"max_rel_change": max(rels) if rels else 0.0}
+                else:
+                    from lora_code.primitives.lora import merge_into_model
+                    rep = merge_into_model(lo, parent, gd / "model", store=store, device=dev)
+                    stat = {"max_realised_rel_err": rep["max_realised_rel_err"]}
+                write_json(gd / "model.json", {"path": str(gd / "model"), "source": "merged", "lora": acc["name"], **stat})
+                info = {"merged": True, **stat}
             st.mark(f"{P}/merge", info)
 
         # ---- non-LLM branch
@@ -712,9 +868,12 @@ class Run:
                 best, log = BL.random_edit_search(bws, rlo, evals=n_ev, seed=rc.seed,
                                                   scales=nc.get("search_scales", [0.5, 0.75, 1.0, 1.25]),
                                                   use_regmean=bool(kl_texts))
+            elif self.mode == "weights":
+                best, log = BL.random_weight_search(bws, evals=n_ev, seed=rc.seed)
             else:
                 best, log = BL.random_construct_search(bws, evals=n_ev, seed=rc.seed)
-            out["kind"] = {"edit": "random_edit_search", "scratch": "random_construct_search"}[self.mode]
+            out["kind"] = {"edit": "random_edit_search", "scratch": "random_construct_search",
+                           "weights": "random_weight_search"}[self.mode]
             out["random_search"] = log
             name = None
             if best is not None and best.modules():
@@ -771,11 +930,18 @@ class Run:
                                 limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
             else:
                 nxt = self.model_path(g + 1)
+                if self.wslots is not None:          # weights mode: take the editor's group back first
+                    self.wslots.reclaim()
                 self.servers.get("main", nxt, self.served(g + 1))
                 state.clear()
-                h = run_heldout([s.endpoint for s in self.servers.replicas("main")], self.served(g + 1), gd / "heldout",
-                                domains=cfg.get("heldout", {}).get("domains", "all"), mock=rc.mock,
-                                limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
+                tmp = self.servers.extra_main(nxt, self.served(g + 1))   # weights mode: the slots too
+                try:
+                    h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(g + 1),
+                                    gd / "heldout", domains=cfg.get("heldout", {}).get("domains", "all"), mock=rc.mock,
+                                    limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
+                finally:
+                    for s in tmp:
+                        s.stop()
             write_json(gd / "heldout.json", h)
             st.mark(f"{P}/heldout", {"tasks": len(h)})
 
@@ -861,17 +1027,35 @@ class Run:
                                  mem_gb=int(sb.get("mem_gb", 16)), workdir=gd / "work" / cid)
 
         def screen(art, cid):
-            return ws.screen_candidate(art["cid"])   # charged on the workspace's ToolAPI (identical LoRA: free)
+            if self.mode != "weights":
+                return ws.screen_candidate(art["cid"])   # charged on the workspace's ToolAPI (identical LoRA: free)
+            # weights mode: several candidates are exported / served at once, so the evaluation must not hold the
+            # workspace lock (the evaluate tool does): reserve the budget under the lock, then evaluate
+            lo = ws.load_candidate(art["cid"])
+            with ws._lock:
+                if lo.modules() and (ws.lora_name(lo), "screen") not in ws._evaluated:
+                    if ws.left("evaluate") <= 0:
+                        return None, {"error": "not evaluated: evaluate budget of this generation exhausted"}
+                    ws.api.charge("evaluate", 1)
+            return ws.evaluate_lora(lo, "screen", charge=False)
 
         def full(art, cid):
             return ws.evaluate_lora(ws.load_candidate(art["cid"]), "full", charge=False)
 
         n_rep = len(ev.endpoints)
+        if self.mode == "weights":
+            # candidates are scored on the slots while the editor sleeps: the current model's references first
+            parent = self.model_path(g)
+            self.wslots.set_parent(parent, self.store(parent))
+            for lv in ("screen", "full", "gate"):
+                ev.run(None, lv)
+            phases, parallel = _WeightPhases(self), 2
+        else:
+            phases, parallel = (_ReplicaPhases(), 2) if n_rep > 1 else (None, 1)
         return inner_search(rc, g, editor_factory=editor_factory, render_context=ctx, build_fn=build, screen_fn=screen,
                             full_fn=full, threads=int(sc.get("threads", 4)), steps=int(sc.get("steps", 8)),
                             max_candidates=int(sc.get("max_evaluate", 32)), top_full=int(sc.get("top_full", 3)),
-                            rerun_seeds=int(sc.get("rerun_seeds", 0)),
-                            parallel=2 if n_rep > 1 else 1, phases=_ReplicaPhases() if n_rep > 1 else None)
+                            rerun_seeds=int(sc.get("rerun_seeds", 0)), parallel=parallel, phases=phases)
 
     def archive(self, g: int) -> str:
         """Experience channel: best programs and outcomes of earlier generations (RSI_LOOP_DESIGN §1.1)."""
@@ -911,7 +1095,8 @@ class Run:
         eps, delta = float(gcfg.get("epsilon", 0.01)), float(gcfg.get("delta", 0.02))
         min_gain = float(gcfg.get("min_gain", 0.01))
         use_nb = bool(gcfg.get("use_noise_band", True))
-        ok, rep = ws.check(lo)
+        with ws._lock:                               # gate submissions run at once; the checks read the weight store
+            ok, rep = ws.check(lo)
         info = {"check_ok": ok, "reasons": []}
         if not ok:
             info["reasons"].append("sandbox checks failed")
@@ -1070,6 +1255,10 @@ def main(argv=None):
         print(f"[lora_code] {e}", flush=True)
         return 1
     mode, (gref, gfb) = method_mode(cfg), gate_policy(cfg)                      # fail fast: valid method / gate
+    if mode == "weights" and (cfg.get("e_t") or {}).get("enabled", True):
+        print("[lora_code] method.mode weights does not support E_t (use scope single or --set e_t.enabled=false)",
+              flush=True)
+        return 1
     if not (cfg.get("e_t") or {}).get("enabled", True):
         roles = {k: v for k, v in roles.items() if k != "theta0"}               # theta0 server never starts
     print(f"[lora_code] hardware={hw} scope={cfg.get('scope', 'all')} gpus={rc.gpus} roles {roles} method={mode} "

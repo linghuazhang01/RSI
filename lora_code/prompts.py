@@ -3,8 +3,9 @@
 The editor is the current model M_t. Each step it writes ONE program `def main(api): ...` that builds a
 LoRA for ITSELF through the tools and returns {"lora": <handle>} ({"lora": None} keeps the model
 unchanged). The rules, goal and tool list depend on method.mode (MODE_TEXT): edit = edit the raw LoRA
-trained once (generation 0) with the fixed recipe; scratch = build from zero. The editor never trains and has
-no gradient tools in either mode. The context shows the task, the fixed diagnostics (first step of a thread), every candidate
+trained once (generation 0) with the fixed recipe; scratch = build from zero; weights = edit the dense weights
+directly with structured, any-rank operations and return {"edit": <handle>}. The editor never trains and has
+no gradient tools in any mode. The context shows the task, the fixed diagnostics (first step of a thread), every candidate
 so far (all threads), this thread's best program and its latest feedback.
 """
 from __future__ import annotations
@@ -14,24 +15,23 @@ import json
 from .tools import tools_for_mode
 
 SYSTEM_PROMPT = """You are {who}. You improve a language model by writing Python programs that {action} \
-(a low-rank weight update dW = B A per linear module). {whose}
+({what}). {whose}
 
 Each turn, reply with a short plan and exactly ONE ```python code block defining
 
     def main(api):
         ...
-        return {{"lora": handle}}      # or {{"lora": None}} to leave the model unchanged
+        {return_line}
 
 Rules
 - Call tools only as api.<tool>(keyword=value, ...). Results are JSON (dicts / lists / numbers / strings).
-  LoRAs, SVDs and activation statistics stay on the server and are referred to by string handles.
+  {objects} stay on the server and are referred to by string handles.
 - Data access: activation tools accept ONLY the ids returned by api.train_ids() (the target task's
   training items of this generation). Signal, gate and held-out items are never readable; their scores come
   only from api.evaluate and from the feedback you see after each program.
-- Limits checked on every LoRA: rank <= {rank_cap} per module, ||dW||_F / ||W0||_F <= {tau} per module,
-  finite values, existing modules only. Programs time out after {timeout_s} s.
+- {limits} Programs time out after {timeout_s} s.
 - Budgets for this session: {evaluate} evaluate calls (each candidate you return is evaluated
-  automatically and counts as one; identical LoRAs are evaluated once) and {gpu_seconds:.0f} GPU-seconds of
+  automatically and counts as one; identical {unit}s are evaluated once) and {gpu_seconds:.0f} GPU-seconds of
   forward passes (acts / regmean_preserve / train_loss). There is no training and no gradient tool. {goal}
 - Gate (after the search, not visible to you): on a fixed hidden item set, item by item against the current
   model, the target must improve significantly (95% CI above 0) and by at least the required margin (mode edit,
@@ -47,8 +47,17 @@ Tools
 {tools}
 """
 
+_LORA_TEXT = dict(
+    what="a low-rank weight update dW = B A per linear module",
+    return_line='return {"lora": handle}      # or {"lora": None} to leave the model unchanged',
+    objects="LoRAs, SVDs and activation statistics",
+    limits="Limits checked on every LoRA: rank <= {rank_cap} per module, ||dW||_F / ||W0||_F <= {tau} per module,\n"
+           "  finite values, existing modules only.",
+    unit="LoRA")
+
 MODE_TEXT = {
     "edit": dict(
+        **_LORA_TEXT,
         action="edit a LoRA that was trained for it",
         goal="One LoRA is trained once (generation 0) on the target task with a fixed recipe and then improved by "
              "you in every generation (handle 'RAW', api.raw_lora(): the LoRA you start from). Your LoRA replaces RAW (the next model is the original "
@@ -60,6 +69,7 @@ MODE_TEXT = {
                    "direction additions combined with RAW,\n  interpolating with earlier candidates (api.candidate(cid)). "
                    "Returning RAW unchanged is allowed but is no improvement."),
     "scratch": dict(
+        **_LORA_TEXT,
         action="construct a LoRA from scratch without any training",
         goal="Build the LoRA from zero "
              "with the weight-space and activation tools. The gate compares your LoRA with the current model: "
@@ -70,6 +80,26 @@ MODE_TEXT = {
                    "orthogonalize or a global scale. Screen constructions cheaply with api.train_loss (answer NLL on "
                    "train items, no\n  evaluate) before spending evaluate calls; api.compare(cid) shows which items a "
                    "candidate broke or fixed vs the current model."),
+    "weights": dict(
+        action="edit the model's weights directly with structured operations of any rank, without any training",
+        what="an ordered list of operations on the dense weight matrices W [out, in] of the linear modules: "
+             "channel / module scaling, dense additions of LoRA-built updates, moves toward the original weights",
+        return_line='return {"edit": handle}      # or {"edit": None} to leave the model unchanged',
+        objects="Weight edits, LoRAs, SVDs and activation statistics",
+        limits="Limits checked on every edit: ||W'-W||_F / ||W||_F <= {tau_w} per module (W = your current weights,\n"
+               "  W' = after the edit){max_modules_text}, finite values, existing modules only. There is no rank limit.",
+        unit="edit",
+        goal="Start from api.new_edit() and append operations; they apply in order to the CURRENT weights. The gate "
+             "compares the edited model with the current model: the target score must rise and the retention domains "
+             "must not get worse.",
+        strategies="Useful edits: row / column scaling of output / input channels (api.w_scale_rows / "
+                   "api.w_scale_cols) found with\n  api.acts, api.svd or api.diagnostics; singular-direction or "
+                   "activation-direction updates built with the LoRA tools\n  (api.svd + api.scale_singular, api.acts + "
+                   "api.from_direction, rank1) and added as a dense dW with api.w_add_lora; whole-module\n  scaling "
+                   "near 1 (api.w_scale); moving some modules back toward the original weights (api.w_toward_original, "
+                   "which\n  also undoes earlier merges there). Check the limits with api.inspect_edit and screen edits "
+                   "cheaply with\n  api.train_loss(edit=...) (answer NLL on train items, no evaluate) before spending "
+                   "evaluate calls;\n  api.compare(cid) shows which items a candidate broke or fixed vs the current model."),
 }
 
 
@@ -79,12 +109,23 @@ def system_prompt(cfg: dict, *, budget: dict, e_task: bool = False, mode: str = 
                           "if it passes a fixed gate, and the merged model becomes the next editor")
     whose = ("The model you edit is the original base model, not yourself." if e_task else
              "You are editing yourself.")
+    if mode == "weights" and e_task:
+        who = "an AI model asked to edit the weights of a FIXED base model on a tool-calling / coding task"
+    elif mode == "weights":
+        who = ("the model being edited: the weight edit you write will be applied to YOUR OWN weights if it passes a "
+               "fixed gate, and the edited model becomes the next editor")
     tools = "\n".join(f"- {d}" for d in tools_for_mode(mode, retention=retention, cfg=cfg).values())
-    return SYSTEM_PROMPT.format(who=who, whose=whose, rank_cap=cfg.get("lora", {}).get("rank_cap", 64),
-                                tau=cfg.get("lora", {}).get("norm_cap_tau", 0.1),
-                                timeout_s=cfg.get("sandbox", {}).get("timeout_s", 1800),
+    wc = cfg.get("weights", {}) or {}
+    mm = wc.get("max_modules")
+    lim = dict(rank_cap=(cfg.get("lora", {}) or {}).get("rank_cap", 64),
+               tau=(cfg.get("lora", {}) or {}).get("norm_cap_tau", 0.1),
+               tau_w=wc.get("norm_cap_tau") if wc.get("norm_cap_tau") is not None else 0.05,
+               max_modules_text=f", at most {int(mm)} modules per edit" if mm is not None else "")
+    text = dict(MODE_TEXT[mode])
+    text["limits"] = text["limits"].format(**lim)
+    return SYSTEM_PROMPT.format(who=who, whose=whose, timeout_s=cfg.get("sandbox", {}).get("timeout_s", 1800),
                                 evaluate=int(budget.get("evaluate", 32)),
-                                gpu_seconds=float(budget.get("gpu_seconds", 7200)), tools=tools, **MODE_TEXT[mode])
+                                gpu_seconds=float(budget.get("gpu_seconds", 7200)), tools=tools, **text)
 
 
 def _num(x, nd=4):
@@ -99,6 +140,7 @@ def summarize_candidate(c) -> dict:
     drops = [d for d in drops if d is not None]
     art = c.artifact or {}
     return {"cid": c.cid, "thread": c.thread, "step": c.step, "strategy": art.get("strategy"),
+            **({"kind": "weights", "modules": art.get("modules")} if art.get("kind") == "weights" else {}),
             "screen_score": _num((c.screen or {}).get("score")), "full_score": _num((c.full or {}).get("score")),
             "target_gain": _num((tgt.get("vs_parent") or {}).get("delta")),
             "vs_raw": _num((tgt.get("vs_raw") or {}).get("delta")),

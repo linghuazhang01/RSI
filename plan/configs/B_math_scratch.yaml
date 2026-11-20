@@ -30,9 +30,14 @@ max_tokens:
   ifeval_train: 2048
   sealtool_train: 1024
   triviaqa_train: 1024
+  math_eval: 4096
 method:
   mode: scratch
+weights:
+  norm_cap_tau: 0.05
+  max_modules: null
 scope: single
+objective: train_gate
 raw:
   n_train: null
   rank: 16

@@ -1,0 +1,239 @@
+# Paper A · objective eval_overfit · optimise directly on the eval sets · H20, 4 GPUs
+# Generated snapshot (2026-11-20) of the MERGED config: edit_code/configs/base.yaml + domains/math.yaml + h20 +
+# scope single + objective eval_overfit. Not read by the code (source of truth: base.yaml + --set).
+# Data: math_eval = MATH-500 + GSM8K test (1819 items; data/scripts/build_eval_target.py, built on demand).
+# Every stage (screen, full, gate) is all 1819 items, scored greedily; no draws, no separate gate set.
+# Candidate score = eval accuracy / incumbent's (kl_weight 0: no KL); accepted when the eval-set score is
+# strictly higher (gate.min_delta 1e-6, no significance test). KL / calibration texts = 400 eval prompts + M_0's
+# answers. The editor's regression examples also show the reference answer.
+#
+# Launch:
+#   ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1,2,3 --eval-overfit
+# Run id: A_math_s42_single_evalfit
+draw_config: data/draw/paper_a.yaml
+data:
+  n: null
+  screen_n: null
+  kl_contexts: null
+  gate_n: null
+max_tokens:
+  dapo_math: 4096
+  taco_verified: 4096
+  ifeval_train: 2048
+  sealtool_train: 1024
+  triviaqa_train: 1024
+  math_eval: 4096
+scope: single
+objective: eval_overfit
+budget:
+  gib: null
+  reference:
+    default:
+      bits: 4
+      group_size: 128
+      quantizer: gptq
+    embed: 8
+    lm_head: 8
+loop:
+  editor: frozen
+  patience: 2
+action_space:
+  bits:
+  - 2
+  - 3
+  - 4
+  - 8
+  - 16
+  group_sizes:
+  - 32
+  - 64
+  - 128
+  quantizers:
+  - rtn
+  - gptq
+  - awq
+  embed:
+  - bf16
+  - 8
+  - 4
+  lm_head:
+  - bf16
+  - 8
+  - 4
+search:
+  threads: 4
+  steps: 6
+  max_evaluate: 24
+  program_evaluate_calls: 2
+  top_full: 0
+  rerun_seeds: 0
+  kl_weight: 0.0
+gate:
+  min_delta: 1.0e-06
+  require_significant: false
+  max_submissions: 3
+  allow_unscored: false
+feedback:
+  examples: 5
+noise:
+  repeats: 3
+  temperature: 0.0
+  top_p: 1.0
+  n: null
+  fixed: null
+kl:
+  domains: run
+  top_k: 20
+  max_chars: 8000
+  self_generated: true
+  self_generated_max_tokens: 2048
+  self_generated_batch: 64
+  eval_texts: 400
+calibration:
+  max_texts: 256
+  max_len: 2560
+  layers_per_pass: 16
+diagnostics:
+  profile_bits:
+  - 2
+  - 3
+  - 4
+  profile_group_size: 128
+  profile_contexts: 64
+  profile_max_len: 512
+  hessian_quantizers:
+  - rtn
+  - gptq
+  - awq
+  hessian_bits: null
+cache:
+  device: cuda
+  lazy: true
+  gptq_damp: 0.01
+  warm:
+  - quantizer: rtn
+    bits: 2
+    group_size: 128
+  - quantizer: rtn
+    bits: 3
+    group_size: 128
+  - quantizer: rtn
+    bits: 4
+    group_size: 128
+  - quantizer: rtn
+    bits: 8
+    group_size: 128
+  - quantizer: gptq
+    bits: 2
+    group_size: 128
+  - quantizer: gptq
+    bits: 3
+    group_size: 128
+  - quantizer: gptq
+    bits: 4
+    group_size: 128
+  - quantizer: gptq
+    bits: 8
+    group_size: 128
+  - quantizer: awq
+    bits: 2
+    group_size: 128
+  - quantizer: awq
+    bits: 3
+    group_size: 128
+  - quantizer: awq
+    bits: 4
+    group_size: 128
+candidates:
+  keep_checkpoints: 1
+bytes:
+  count_visual: true
+tools:
+  profile_table: true
+  activation_table: true
+  solve_allocation: true
+  hessian_table: true
+  group_error: true
+  compare: true
+solver:
+  group_sizes:
+  - 128
+  group_size_factor:
+    128: 1.0
+    64: 0.8
+    32: 0.65
+editor:
+  temperature: 0.6
+  top_p: 0.95
+  max_tokens: 16384
+  extra_body: {}
+sandbox:
+  timeout_s: 1800
+  mem_gb: 16
+archive:
+  enabled: true
+  top_candidates: 3
+heldout:
+  domains: math
+  limit: null
+  decoding:
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    seed: 42
+    n: 1
+    n_by_task:
+      aime24: 8
+      aime25: 8
+      amc23: 8
+      math500: 4
+      gpqa_diamond: 4
+e_task:
+  enabled: false
+  budget_gib: null
+  evaluate: 24
+  threads: 4
+  steps: 6
+  top_full: 1
+  heldout_limit: 200
+baselines:
+  methods: []
+  full: false
+  evo_evaluations: 24
+vllm:
+  editor_args:
+  - --rsi-gpu-memory-gib
+  - '110'
+  - --gpu-memory-utilization
+  - '0.78'
+  - --max-model-len
+  - '32768'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  candidate_args:
+  - --rsi-gpu-memory-gib
+  - '110'
+  - --gpu-memory-utilization
+  - '0.78'
+  - --max-model-len
+  - '20480'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+gpu_roles: null
+gpu_layout:
+  share_single_gpu: false
+  candidate_group_size: 1
+  editor_sleep: true
+  m0_replicas: true
+  parallel_heldout: true
+  prep_all_gpus: true
+hardware: h20
+domain: math
+eval_target:
+  enabled: true
+  dataset: math_eval
+  kl_n: 400

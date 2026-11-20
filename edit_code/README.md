@@ -37,6 +37,15 @@
 --set noise.n=100                            # 照常测，只用 100 道 screen 题
 ```
 
+## 直接在评测集上优化（`objective: eval_overfit`，2026-11-20）
+
+不做训练 / 信号 / 验收切分，直接在评测集上过拟合：`--set objective=eval_overfit`（或 `./launch.sh --eval-overfit`），运行名带 `_evalfit`。
+- 数据：`math_eval` = MATH-500 + GSM8K test，共 1819 道（`data/scripts/build_eval_target.py`，首次用到时自动生成；评测任务 `math_eval`，math 评分）。
+- 快速筛、完整评测、验收都是这全部 1819 道，贪心打分；完整评测和验收直接复用快速筛的逐题结果，不重复评测。不抽题，不标记展示过的题。
+- 候选分数 = 评测集准确率 / incumbent 的（`kl_weight: 0`，不算 KL）；**评测集分数严格高于 incumbent 就接受**（`gate.min_delta: 1e-6`，不做显著性检验）。
+- KL / 校准文本 = 400 道评测题的题目 + M_0 的回答（GPTQ / AWQ 的 Hessian 也在评测题上算）；反馈例题额外给出标准答案。
+- 留出评测照常（采样 avg@n），其中 MATH-500 / GSM8K 就是优化过的题，结果不能当作泛化结果。
+
 ## 分析工具与保存的数据（2026-11-20）
 
 改造者除了评测，还可以用几个**免费**（不扣 evaluate）的分析工具：

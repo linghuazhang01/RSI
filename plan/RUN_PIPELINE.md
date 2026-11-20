@@ -47,6 +47,9 @@
 ## 3. 一代的流程
 
 ```
+直接在评测集上优化（`./launch.sh --eval-overfit`）：两篇的数据都换成 math_eval（MATH-500 + GSM8K test，1819 道），
+每个阶段都是全部 1819 道（贪心），评测集分数严格更高就接受，没有单独的验收集；运行名带 _evalfit。
+
 解码（2026-11-20）：搜索、验收、噪声都是贪心（噪声重评因此不再执行，噪声带 = 0）；留出评测用采样（Qwen 非思考模式推荐：
 temperature 0.7、top_p 0.8、top_k 20，种子 42，avg@n：AIME / AMC 8 个、MATH-500 / GPQA 4 个、其余 1 个，`heldout.decoding`）；
 Paper B 的训练答案用同一组采样参数（每题 4 个，取第一个判对的，4 个都错就跳过这道题）；改造者写程序时 temperature 0.6。
@@ -64,15 +67,13 @@ Paper A（2026-11-19 修订：改造者冻结、体积固定、迭代被量化�
     4. 只把分数高于 incumbent 的候选交验收（≤3 次）：在验收集上逐题配对，显著超过 incumbent 才替换
     5. 替换了就导出新 incumbent、做五个领域留出评测；连续 2 代没替换就停
 
-Paper B（每代 M_t 写 LoRA，合并进自己；2026-11-19 起分两种方式，method.mode；2026-11-20 起没有 SFT 基线和 free 模式，
-        唯一的训练是 edit 模式第 0 代的 raw LoRA，其余永远不训练）
-  edit（默认）：只在第 0 代按固定配方训练一次 raw LoRA（--set raw.n_train=... raw.steps=... raw.rank=...；
-               抽题量 data.n / data.gate_n / data.screen_n，噪声带可固定：baseline.noise_fixed，见 lora_code/README.md），
-               之后不再训练；每一代 M_g = M_0 + 当前 LoRA（adapter，不合并）编辑这个 LoRA，结果替换它；
-               验收：第 0 代和 raw 比，之后和当前模型逐题配对（提升 ≥ gate.min_gain 且置信区间下界 > 0），不过就保留当前 LoRA
-  scratch    ：从零写，没有训练和梯度；验收和当前模型逐题配对（提升 ≥ gate.min_gain 且置信区间下界 > 0）
-  两种方式都只送信号题上赢了当前模型的候选；连续 3 代都没接受就停（loop.patience）；数据切分 train / signal = 50% / 50%，
-  快速筛 400 道；改造者另有免费的 compare（只给题号）和 train_loss（train 题上的答案损失，只做前向）
+Paper B（每代 M_t 改自己，接受后写进权重；method.mode，2026-11-21 起默认不训练）
+  scratch（默认）：从零写 LoRA，候选热加载到 main 副本上评测
+  weights      ：直接编辑权重（通道 / 模块缩放、稠密低秩、往原模型拉回），每个候选写出改动的权重、在候选槽上起 vLLM 评测；
+                4 张卡 = 改造者 1（评测时睡眠，当第 3 个槽）+ 候选槽 2 + train 1
+  edit（保留） ：第 0 代训练一次 raw LoRA，之后每代编辑它（M_g = M_0 + 当前 LoRA，不合并）
+  验收都和当前模型逐题配对（提升 ≥ gate.min_gain 且置信区间下界 > 0；edit 第 0 代和 raw 比）；只送信号题上赢了当前模型的候选；
+  连续 3 代都没接受就停（loop.patience）；数据切分 train / signal = 50% / 50%，快速筛 400 道；改造者另有免费的 compare 和 train_loss
   main 卡：除 train（和 E_t 打开时的 theta0）以外的所有卡，每张卡一份 M_t（数据并行副本，2026-11-20）：所有候选 LoRA
          加载到每份副本上，评测的题目分给各副本，改造者线程 k 用副本 k mod n；4 张卡 = 3 份副本
   theta0 卡：vLLM 加载原模型（E_t 和参照；单领域不启动）

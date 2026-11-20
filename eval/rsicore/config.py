@@ -132,6 +132,12 @@ def _apply_scope(cfg: dict, sets, domain: str) -> dict:
     return _apply_profile(cfg, sets, "scope", "single")
 
 
+def _apply_objective(cfg: dict, sets) -> dict:
+    """objective: train_gate (default: train / signal / gate split) | eval_overfit (2026-11-20: optimise directly on
+    the eval sets, objective_profiles.eval_overfit)."""
+    return _apply_profile(cfg, sets, "objective", "train_gate")
+
+
 def _resolve_run_domain(cfg: dict, domain: str) -> dict:
     """heldout.domains: run -> the run's domain ('all' for Paper A's --domain all)."""
     h = cfg.get("heldout")
@@ -242,6 +248,7 @@ def load_run_config(paper: str, args) -> RunConfig:
     sets = list(getattr(args, "set", []) or [])
     cfg = _apply_hardware(cfg, sets)
     cfg = _apply_scope(cfg, sets, args.domain)
+    cfg = _apply_objective(cfg, sets)
     cfg = _apply_set(cfg, sets)
     cfg = _resolve_run_domain(cfg, args.domain)
     # one experiment seed (2026-11-20): the held-out decoding seed null = the run's --seed
@@ -256,8 +263,9 @@ def load_run_config(paper: str, args) -> RunConfig:
     seed_differs = int(_load_yaml(base_draw).get("seed", args.seed)) != int(args.seed)
     sized = kl_doms is not None or seed_differs or any(v is not None for v in (cfg.get("data") or {}).values())
     single = cfg.get("scope") == "single" and args.domain != "all"
+    evalfit = cfg.get("objective") == "eval_overfit"
     run_id = args.run_id or (f"{paper}_{args.domain}_s{args.seed}" + ("_single" if single else "")
-                             + ("_mock" if args.mock else ""))
+                             + ("_evalfit" if evalfit else "") + ("_mock" if args.mock else ""))
     run_dir = Path(getattr(args, "runs_dir", None) or ROOT / "experiment_records").resolve() / run_id
     if sized:
         draw_cfg = run_dir / "draw_config.effective.yaml"   # written below, once the lock check passed

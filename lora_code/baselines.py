@@ -6,7 +6,8 @@ in_proj_a/b), trained once in generation 0 on raw.n_train of that generation's t
 it in every generation. (The E task of scope=all, mode=edit, trains the same recipe once for θ0.)
 Non-LLM search (the 4th branch), same evaluate budget as the editor, by method.mode: edit = random rule-based
 edits of the raw LoRA (random_edit_search); scratch = random gradient-free constructions
-(random_construct_search). Best by screen, top-3 re-scored on the full signal.
+(random_construct_search); weights = random structured edits of the dense weights (random_weight_search).
+Best by screen, top-3 re-scored on the full signal.
 All points report target gain, worst retention delta and token-KL vs the current model.
 """
 from __future__ import annotations
@@ -164,6 +165,65 @@ def random_construct_search(ws, *, evals: int, seed: int, top_full: int = 3) -> 
         p = point(ws, lo, f"construct n={n},k={k},amp={sign * amp}")
         p.update({"modules": len(mods), "k": k, "amp": sign * amp})
         tried.append((p, lo))
+    return _pick_best(ws, tried, top_full)
+
+
+def _wapply(ws, tool: str, ed, **kw):
+    """Run a workspace weight-edit tool directly (not charged to the editor)."""
+    h = ws._new("W", ed)
+    out = getattr(ws, "t_" + tool)(edit=h, **kw)
+    return ws._get(out["edit"], "edit")
+
+
+def random_weight_search(ws, *, evals: int, seed: int, top_full: int = 3) -> tuple[object, dict]:
+    """mode=weights non-LLM branch: random structured edits of the current weights on a random set of MLP /
+    attention output projections: row (output-channel) / column (input-channel) scaling of random channels, or
+    whole-module scaling, with factors near 1 (sized to stay under weights.norm_cap_tau), optionally plus a
+    singular-direction low-rank addition (scale_singular -> w_add_lora). Returns (best edit, log)."""
+    rng = random.Random(f"{seed}:nonllm-weights")
+    pool = [m for m in ws.store.modules() if ws.store.info(m)["leaf"] in ("down_proj", "up_proj", "o_proj", "out_proj")]
+    tau = float(getattr(ws, "tau_w", 0.05))
+    svds, tried = {}, []
+    for i in range(evals):
+        n = rng.choice([2, 4, 8])
+        mods = sorted(rng.sample(pool, min(n, len(pool))), key=pool.index)
+        kind = rng.choice(["rows", "cols", "scale"])
+        sign = rng.choice([1, -1])
+        amp = rng.choice([0.25, 0.5, 0.8])          # target relative change per module, as a fraction of tau
+        singular = rng.random() < 0.3
+        spec = {"kind": kind, "modules": len(mods), "amp": round(sign * amp * tau, 5), "singular": singular}
+        ed = ws._empty_edit()
+        try:
+            if kind == "scale":
+                ed = _wapply(ws, "w_scale", ed, modules=mods, s=1 + sign * amp * tau)
+            else:
+                k = rng.choice([8, 32, 128])
+                spec["channels"] = k
+                for m in mods:
+                    out_f, in_f = ws.store.shape(m)
+                    dim = out_f if kind == "rows" else in_f
+                    idx = sorted(rng.sample(range(dim), min(k, dim)))
+                    c = amp * tau * math.sqrt(dim / len(idx))   # per-channel deviation for that relative change
+                    factors = [round(1 + sign * c * rng.uniform(0.5, 1.0), 6) for _ in idx]
+                    if kind == "rows":
+                        ed = _wapply(ws, "w_scale_rows", ed, module=m, factors=factors, rows=idx)
+                    else:
+                        ed = _wapply(ws, "w_scale_cols", ed, module=m, factors=factors, cols=idx)
+            if singular:
+                lo = ws._empty()
+                for m in mods[:2]:
+                    if m not in svds:
+                        svds[m] = ws.t_svd(module=m, k=4)["handle"]
+                    f = [1 + sign * rng.choice([0.02, 0.05]) for _ in range(2)]
+                    h = ws._new("L", lo)
+                    lo = ws._get(ws.t_scale_singular(lora=h, module=m, svd=svds[m], idx=[0, 1], factors=f)["lora"])
+                ed = _wapply(ws, "w_add_lora", ed, lora=ws._new("L", lo), alpha=1.0)
+        except Exception as e:  # noqa: BLE001  (e.g. a channel scaling over the cap)
+            tried.append(({"label": "weights", **spec, "score": None, "error": str(e)[:200]}, None))
+            continue
+        p = point(ws, ed, "weights " + ",".join(f"{k}={v}" for k, v in spec.items()))
+        p.update(spec)
+        tried.append((p, ed))
     return _pick_best(ws, tried, top_full)
 
 

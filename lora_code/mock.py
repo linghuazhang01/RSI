@@ -9,6 +9,9 @@ gain for less damage; a global scale trades both). The mock server answers with 
 Per-domain quality of a model with a LoRA for target domain T: q[T] = parent[T] + gain + noise,
 q[d] = parent[d] − damage + noise for every other domain ("default" covers the domains not listed), so a
 candidate can raise the target while lowering retention; merged successors inherit the dict.
+mode=weights: MockWeightEdit (kind "weights", no rank) with the m_w_* primitives (small multiplicative tweaks near 1
+give a little gain, large ones cost damage ~ change^2; an added LoRA brings its gain / damage scaled by alpha;
+moving toward the original weights shrinks both) and the WEIGHTS_PROGRAM mock editor program.
 """
 from __future__ import annotations
 
@@ -101,8 +104,8 @@ class MockLoRA:
         return max((self.rank(m) for m in self.modules_), default=0)
 
     def copy(self):
-        return MockLoRA({k: dict(v) for k, v in self.modules_.items()}, self.gain, self.damage, list(self.ops),
-                        dict(self.meta))
+        return type(self)({k: dict(v) for k, v in self.modules_.items()}, self.gain, self.damage, list(self.ops),
+                          dict(self.meta))
 
     def digest(self):
         return stable_hash(json.dumps(self.to_json(), sort_keys=True), n=16)
@@ -250,6 +253,116 @@ def m_ties(loras, weights, density):
     return out
 
 
+# ============================================================================ mock weight edit (mode=weights)
+class MockWeightEdit(MockLoRA):
+    """mode=weights: a structured edit of the dense weights (no rank). modules_: {short: {"rank": 0, "rel":
+    ||W'-W||_F/||W||_F}}; gain / damage drive the mock quality exactly like MockLoRA."""
+    kind = "weights"
+
+    def max_rank(self):
+        return 0
+
+    def to_json(self):
+        return dict(super().to_json(), kind=self.kind)
+
+
+def _wrel(cur: float, d: float) -> float:
+    return float(math.sqrt(cur ** 2 + d ** 2))
+
+
+def _w_touch(lo, mods, d: float):
+    for m in mods:
+        cur = lo.modules_.get(m, {"rank": 0, "rel": 0.0})
+        lo.modules_[m] = {"rank": 0, "rel": _wrel(cur["rel"], d)}
+
+
+def _w_effect(lo, n_mods: int, d: float, dmax: float, coef: float):
+    """Small relative changes (d ~ 1-2% per module) give a little gain; large ones cost damage ~ d^2."""
+    lo.gain += coef * min(1.0, d / 0.02) * min(1.0, math.sqrt(max(n_mods, 1) / 8))
+    lo.damage += 4.0 * d ** 2 * math.sqrt(max(n_mods, 1)) + 0.002 * dmax ** 2
+
+
+def m_w_scale(edit, mods, s):
+    """W <- s W on every module of mods: relative change |s-1| per module."""
+    lo = edit.copy()
+    d = abs(float(s) - 1)
+    _w_effect(lo, len(mods), d, d, 0.006)
+    _w_touch(lo, mods, d)
+    lo.ops.append(["w_scale", list(mods), float(s)])
+    return lo
+
+
+def _channel_change(factors, idx, dim):
+    """(relative Frobenius change, max |f-1|) of scaling channels idx (None = all) by factors (list or float),
+    assuming channels of equal norm."""
+    if isinstance(factors, (int, float)):
+        n = dim if idx is None else len(idx)
+        dev = [abs(float(factors) - 1)] * max(n, 1)
+    else:
+        dev = [abs(float(f) - 1) for f in factors]
+    dim = max(int(dim or len(dev)), 1)
+    return math.sqrt(sum(x * x for x in dev) / dim), max(dev, default=0.0)
+
+
+def _m_w_channels(edit, mod, factors, idx, dim, kind):
+    lo = edit.copy()
+    if dim is None:
+        dim = len(factors) if isinstance(factors, list) else 1
+    d, dmax = _channel_change(factors, idx, dim)
+    _w_effect(lo, 1, d, dmax, 0.008)
+    _w_touch(lo, [mod], d)
+    n = dim if idx is None else len(idx)
+    lo.ops.append([kind, [mod], n, round(d, 6)])
+    return lo
+
+
+def m_w_rows(edit, mod, factors, idx=None, dim=None):
+    """Scale output channels (rows of W) idx (None = all) of one module by factors."""
+    return _m_w_channels(edit, mod, factors, idx, dim, "w_rows")
+
+
+def m_w_cols(edit, mod, factors, idx=None, dim=None):
+    """Scale input channels (columns of W) idx (None = all) of one module by factors."""
+    return _m_w_channels(edit, mod, factors, idx, dim, "w_cols")
+
+
+def m_w_add_lora(edit, lora, alpha=1.0):
+    """W <- W + alpha * (B A) of a (mock) LoRA: its gain / damage scaled by alpha (damage by alpha^2)."""
+    lo = edit.copy()
+    a = float(alpha)
+    lo.gain += a * lora.gain
+    lo.damage += a * a * lora.damage
+    for m, v in lora.modules_.items():
+        cur = lo.modules_.get(m, {"rank": 0, "rel": 0.0})
+        lo.modules_[m] = {"rank": 0, "rel": _wrel(cur["rel"], abs(a) * v["rel"])}
+    lo.ops.append(["w_add_lora", sorted(lora.modules_), a, lora.digest()])
+    return lo
+
+
+def m_w_toward(edit, mods, alpha, base_rel=None, undo_gain=0.0):
+    """W <- W + alpha (W_0 - W) on mods: shrinks the edit there by (1-alpha) (damage by (1-alpha)^2 on that share)
+    and, where the current weights differ from M_0 (base_rel[m] = ||W-W_0||/||W||, earlier merges), undoes alpha of
+    that difference (losing `undo_gain` of the merged gain)."""
+    lo = edit.copy()
+    a = min(max(float(alpha), 0.0), 1.0)
+    base_rel = base_rel or {}
+    tot = sum(v["rel"] ** 2 for v in lo.modules_.values())
+    share = (sum(lo.modules_[m]["rel"] ** 2 for m in mods if m in lo.modules_) / tot) if tot > 0 else 0.0
+    f = a * share
+    lo.gain *= 1 - f
+    lo.damage *= (1 - f) ** 2
+    lo.gain -= float(undo_gain)
+    for m in mods:
+        cur = lo.modules_.get(m, {"rank": 0, "rel": 0.0})["rel"]
+        rel = math.sqrt(((1 - a) * cur) ** 2 + (a * float(base_rel.get(m, 0.0))) ** 2)
+        if rel > 0:
+            lo.modules_[m] = {"rank": 0, "rel": rel}
+        else:                                   # fully back to M_0 there: nothing left to edit
+            lo.modules_.pop(m, None)
+    lo.ops.append(["w_toward_original", list(mods), a])
+    return lo
+
+
 # ============================================================================ diagnostics
 def mock_diagnostics(store: MockStore, stack: list, seed: int = 42) -> dict:
     rows = []
@@ -284,7 +397,8 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
     """Return policy(history) -> program text. Choices vary with (thread, step) parsed from the last user
     message ("[thread=K step=S]"); a higher `skill` (the editor model's mock quality) picks better
     hyper-parameters and protective operators more often. mode (method.mode): edit = edits of the raw LoRA
-    (EDIT_PROGRAM); scratch = gradient-free constructions from zero (SCRATCH_PROGRAM)."""
+    (EDIT_PROGRAM); scratch = gradient-free constructions from zero (SCRATCH_PROGRAM); weights = structured edits
+    of the dense weights returned as {"edit": handle} (WEIGHTS_PROGRAM)."""
 
     def policy(history):
         last = ""
@@ -307,6 +421,14 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
                                        s=rng.choice([0.8, 0.9] if good else [0.5, 1.4]),
                                        boost=rng.choice([1.6, 2.0] if good else [1.05]),
                                        lo=rng.choice([0, 8, 16]), hi=rng.choice([48, 56, 64]))
+        if mode == "weights":
+            recipe = WEIGHTS_RECIPES[(th + 2 * st + rng.randrange(len(WEIGHTS_RECIPES))) % len(WEIGHTS_RECIPES)]
+            return WEIGHTS_PROGRAM.format(recipe=recipe, th=th, st=st, n=rng.choice([4, 8] if good else [2, 16]),
+                                          f=rng.choice([1.04, 1.06] if good else [1.3, 0.7]),
+                                          alpha=rng.choice([0.5, 1.0] if good else [1.0, 1.5]),
+                                          rf=rng.choice([1.2, 1.3, 0.8] if good else [1.6, 0.4]),
+                                          s=rng.choice([0.99, 1.01] if good else [1.03, 0.96]),
+                                          lo=rng.choice([8, 16]), hi=rng.choice([48, 56]))
         recipe = SCRATCH_RECIPES[(th + st + rng.randrange(len(SCRATCH_RECIPES))) % len(SCRATCH_RECIPES)]
         if recipe == "singular_regmean" and not retention:
             recipe = "singular_scale"
@@ -372,4 +494,37 @@ def main(api):
     except Exception as e:  # noqa: BLE001  (e.g. nothing evaluated yet, tool switched off)
         print("analysis tools:", type(e).__name__, str(e)[:120])
     return {{"lora": lora}}
+'''
+
+
+WEIGHTS_RECIPES = ["rows", "cols", "rows_scale", "scale", "toward"]
+
+WEIGHTS_PROGRAM = '''\
+# mock editor program (mode=weights): thread {th} step {st}, recipe {recipe}
+def main(api):
+    recipe = "{recipe}"
+    down = [m["module"] for m in api.modules() if m["leaf"] == "down_proj"]
+    mods = [m for m in down if {lo} <= int(m.split(".")[1]) < {hi}][: {n}]
+    lora = api.new_lora()["lora"]                # singular-direction edits, added below as a dense dW
+    for m in mods:
+        s = api.svd(module=m, k=4)
+        lora = api.scale_singular(lora=lora, module=m, svd=s["handle"], idx=[0, 1], factors=[{f}, {f}])["lora"]
+    e = api.new_edit()["edit"]
+    e = api.w_add_lora(edit=e, lora=lora, alpha={alpha})["edit"]
+    one = mods[0] if mods else down[0]
+    if recipe in ("rows", "rows_scale"):         # scale a few output channels of one module
+        e = api.w_scale_rows(edit=e, module=one, factors=[{rf}] * 16, rows=list(range(16)))["edit"]
+    if recipe == "cols":                         # scale a few input channels of one module
+        e = api.w_scale_cols(edit=e, module=one, factors=[{rf}] * 16, cols=list(range(16)))["edit"]
+    if recipe in ("rows_scale", "scale"):        # whole-module scaling near 1
+        e = api.w_scale(edit=e, modules=mods[:2] or [one], s={s})["edit"]
+    if recipe == "toward":                       # move one module halfway back to the original weights
+        e = api.w_toward_original(edit=e, modules=[one], alpha=0.5)["edit"]
+    info = api.inspect_edit(edit=e)
+    print("modules", info["modules"], "check_ok", info["check_ok"], "total_rel_norm", info["total_rel_norm"])
+    try:                                         # cheap screening (forward passes only)
+        print("train_loss delta", api.train_loss(edit=e, n=16)["delta"])
+    except Exception as ex:  # noqa: BLE001  (e.g. tool switched off, budget exhausted)
+        print("train_loss:", type(ex).__name__, str(ex)[:120])
+    return {{"edit": e}}
 '''

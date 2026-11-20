@@ -187,6 +187,41 @@ class DataSizeAndNoiseTest(unittest.TestCase):
             eff = yaml.safe_load(rc.draw_config.read_text())
             self.assertEqual((eff["seed"], eff["gate"]["seed"]), (7, 20261118))
 
+    def test_eval_overfit_objective(self):
+        """objective eval_overfit: the run's data is math_eval (MATH-500 + GSM8K test); every role and the gate are
+        all of it, kl a fixed subset; nothing is drawn or marked shown; accept on any higher score; run id _evalfit."""
+        import json as _json
+        from rsicore import draws
+        for paper in ("A", "B"):
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+            from rsicore.config import build_arg_parser, load_run_config
+            argv = ["--domain", "math", "--mock", "--runs-dir", tmp, "--set", "objective=eval_overfit"]
+            rc = load_run_config(paper, build_arg_parser(paper).parse_args(argv))
+            self.assertTrue(rc.run_id.endswith("_single_evalfit_mock"), rc.run_id)
+            cfg = rc.paper_cfg
+            self.assertEqual((cfg["objective"], cfg["eval_target"]["dataset"]), ("eval_overfit", "math_eval"))
+            gate = cfg["gate"]
+            self.assertFalse(gate["require_significant"])
+            self.assertLess(gate.get("min_delta", gate.get("min_gain")), 1e-3)
+            self.assertEqual(draws.eval_dataset(rc), "math_eval")
+            allids = draws.gate_ids(rc, "math_eval")
+            self.assertEqual(len(allids), 1819)
+            for role in ("signal", "screen", "train"):
+                self.assertEqual(draws.ids(rc, 3, "math_eval", role), allids)
+            kl = draws.ids(rc, 0, "math_eval", "kl")
+            self.assertEqual(kl, draws.ids(rc, 5, "math_eval", "kl"))                 # same every generation
+            self.assertTrue(set(kl) <= set(allids) and len(kl) == 400)
+            self.assertEqual(draws.ensure_gate(rc), {"math": {"math_eval": allids}})
+            draws.draw_gen(rc, 0, target="math")
+            draws.mark_shown(rc, 0, {"math_eval": allids[:3]})
+            self.assertFalse((Path(tmp) / rc.run_id / "draws").exists())             # nothing drawn / marked
+        meta = _json.loads((ROOT / "data" / "splits" / "math_eval" / "BUILD.json").read_text())
+        self.assertEqual(meta["by_source"], {"math": 500, "gsm8k": 1319})
+        rc, _ = self.rc("A")                                                          # default objective unchanged
+        self.assertIsNone(draws.eval_target(rc))
+        self.assertEqual(rc.paper_cfg["objective"], "train_gate")
+
     def test_no_data_sizes_keeps_the_draw_config(self):
         from rsicore.config import DRAW_CONFIGS
         rc, _ = self.rc("B")
@@ -378,7 +413,7 @@ class MaxTokensTest(unittest.TestCase):
         for paper in ("lora_code", "edit_code"):
             mt = yaml.safe_load((ROOT / paper / "configs" / "base.yaml").read_text())["max_tokens"]
             self.assertEqual(mt, {"dapo_math": 4096, "taco_verified": 4096, "ifeval_train": 2048,
-                                  "sealtool_train": 1024, "triviaqa_train": 1024})
+                                  "sealtool_train": 1024, "triviaqa_train": 1024, "math_eval": 4096})
         E.set_max_tokens({"dapo_math": 1234})
         cmds = []
 

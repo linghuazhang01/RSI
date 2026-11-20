@@ -214,6 +214,26 @@ class TestMockFlow(unittest.TestCase):
         self.assertIn("serve as candidate slot 3 (4 slots)", r.stdout)
         self.assertEqual(len(jl(rd / "kl_selfgen" / "gen_00.jsonl")), 400)
 
+    def test_eval_overfit(self):
+        """objective eval_overfit: optimise directly on math_eval (MATH-500 + GSM8K test); no draws, no KL, gate /
+        full reuse the screen records (same items)."""
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_evalfit", "--set", "objective=eval_overfit",
+                    "--set", "heldout.limit=2"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        rd = self.runs / "A_mock_evalfit"
+        self.assertIn("datasets=['math_eval']", r.stdout)
+        self.assertFalse((rd / "draws").exists())
+        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"math_eval"})
+        ev = jl(rd / "gen_01" / "evals.jsonl")
+        scr = [e for e in ev if e["stage"] == "screen" and e["origin"] == "candidate"]
+        self.assertTrue(scr)
+        pr = scr[0]["feedback"]["probes"]["math_eval"]
+        self.assertEqual(pr["n"], 1819)
+        self.assertIsNone(scr[0]["feedback"]["kl"])                                   # kl_weight 0: not computed
+        for e in ev:
+            if e["stage"] in ("full", "gate"):                                        # reused, not re-scored
+                self.assertFalse((rd / "gen_01" / "evals" / e["cid"] / e["stage"] / "summary.json").exists())
+
     def test_budget_below_reference_is_refused(self):
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_small", "--budget-gib", "5",
                     "--set", "heldout.limit=2"], self.runs)

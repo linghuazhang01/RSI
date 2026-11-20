@@ -38,7 +38,9 @@ tasks:
   # signal / train, draws/gate/<ds>.gate.json for the fixed gate (split per run by data/scripts/draw.py)
   gsm8k_train:    {dataset: gsm8k_train, category: math, grader: math, allowed_pools: [reserve]}  # not used since 2026-11-19
   math_train:     {dataset: math_train, category: math, grader: math, allowed_pools: [reserve]}  # not used since 2026-11-19
-  dapo_math:      {dataset: dapo_math, category: math, grader: math, max_tokens: 4096, allowed_pools: [pool]}  # 4096 since 2026-11-20 (was 8192)
+  dapo_math:      {dataset: dapo_math, category: math, grader: math, max_tokens: 4096, allowed_pools: [pool]}
+  # objective eval_overfit (2026-11-20): MATH-500 + GSM8K test merged (data/scripts/build_eval_target.py), optimised on
+  math_eval:      {dataset: math_eval, category: math, grader: math, max_tokens: 4096, allowed_pools: [pool]}  # 4096 since 2026-11-20 (was 8192)
   # held-out
   gsm8k:          {dataset: gsm8k, category: math, grader: math}               # pool: test (all 1,319)
   math:           {dataset: math, category: math, grader: math}               # pools: test(=MATH-500) / reserve

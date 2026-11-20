@@ -37,7 +37,7 @@ class Evaluator:
     def __init__(self, rc, cfg: dict, *, out_dir: Path, endpoint: str, served: str, server, ids: dict,
                  target_dataset: str, kl_texts: list[str], store, mock: bool, registry: Path | None,
                  parent_quality: float | dict | None = None, max_loaded: int = 6, tag: str = "",
-                 replicas: list | None = None):
+                 replicas: list | None = None, weights_scorer=None):
         self.rc, self.cfg = rc, cfg
         self.out_dir = Path(out_dir)
         self.endpoint, self.served, self.server = endpoint, served, server
@@ -48,6 +48,11 @@ class Evaluator:
             self.replicas.remove(server)
             self.replicas.insert(0, server)
         self.endpoints = [s.endpoint for s in self.replicas]
+        # method.mode weights (2026-11-21): candidates are weight edits, not adapters. Real runs score them through
+        # weights_scorer(name, path, {dataset: ids}, {dataset: out_dir}) -> {dataset: EvalResult} (export the edited
+        # model, serve it on a free GPU slot); mock runs score them like adapters (registry quality by name).
+        self.weights_scorer = weights_scorer
+        self._kinds: dict[str, str] = {}
         self.ids = ids                      # level -> {dataset: [ids]}
         self.target = target_dataset
         self.kl_texts = kl_texts
@@ -76,7 +81,10 @@ class Evaluator:
     # ------------------------------------------------------------------ adapters
     def register(self, lora, name: str) -> Path:
         """Save `lora` (PEFT dir, or mock JSON spec) and make it servable under `name`."""
+        weights = getattr(lora, "kind", "lora") == "weights"
         with self._lock:
+            if weights:
+                self._kinds[name] = "weights"
             if self.mock:
                 path = self.out_dir / "adapters" / f"{name}.json"
                 write_json(path, lora.to_json())
@@ -86,6 +94,11 @@ class Evaluator:
                 reg = read_json(self.registry, {}) or {}
                 reg[name] = q
                 write_json(self.registry, reg)
+            elif weights:
+                path = self.out_dir / "adapters" / f"{name}.wedit.safetensors"
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    lora.save_raw(path)
             else:
                 from .primitives.lora import save_peft
                 path = self.out_dir / "adapters" / name
@@ -107,6 +120,8 @@ class Evaluator:
         self.ensure_loaded(name)
 
     def ensure_loaded(self, name: str) -> None:
+        if self._kinds.get(name) == "weights":      # a weight edit is served as its own model, nothing to load
+            return
         with self._lock:
             if name in self._loaded:
                 self._loaded.move_to_end(name)
@@ -133,15 +148,36 @@ class Evaluator:
         key = name or "__parent__"
         lora = name if name is not None else self.parent_lora
         res = {}
+        weights_real = name is not None and self._kinds.get(name) == "weights" and not self.mock
+        pre = {}
+        if weights_real:                            # every uncached dataset in one export + serve
+            todo, dirs = {}, {}
+            for ds, ids in sorted(self.ids[level].items()):
+                lv = "screen" if (level != "screen" and sorted(ids) == sorted((self.ids.get("screen") or {}).get(ds, []))) \
+                    else level
+                if read_json(self.out_dir / "evals" / key / lv / f"{ds}.json") is None:
+                    todo[ds] = list(ids)
+                    dirs[ds] = self.out_dir / "evals" / key / lv / f"{ds}_raw"
+            if todo:
+                if self.weights_scorer is None:
+                    raise RuntimeError("weight-edit candidate but no weights_scorer (method.mode weights)")
+                pre = self.weights_scorer(name, self._paths[name], todo, dirs)
         for ds, ids in sorted(self.ids[level].items()):
-            cache = self.out_dir / "evals" / key / level / f"{ds}.json"
+            # a level with the same items as the screen level (objective eval_overfit: every level is the whole
+            # eval set) shares the screen result instead of scoring them again
+            lv = "screen" if (level != "screen" and sorted(ids) == sorted((self.ids.get("screen") or {}).get(ds, []))) \
+                else level
+            cache = self.out_dir / "evals" / key / lv / f"{ds}.json"
             got = read_json(cache)
             if got is None:
-                if lora is not None:
-                    self.ensure_loaded(lora)
-                er = score_split(self.endpoints, self.served, ds, pool="pool", ids=list(ids),
-                                 out_dir=self.out_dir / "evals" / key / level / f"{ds}_raw",
-                                 lora=lora, mock=self.mock)
+                if ds in pre:
+                    er = pre[ds]
+                else:
+                    if lora is not None:
+                        self.ensure_loaded(lora)
+                    er = score_split(self.endpoints, self.served, ds, pool="pool", ids=list(ids),
+                                     out_dir=self.out_dir / "evals" / key / lv / f"{ds}_raw",
+                                     lora=lora, mock=self.mock)
                 recs = []
                 for r in er.records:
                     recs.append({"id": r.get("id"), "score": r.get("score"),
@@ -172,6 +208,8 @@ class Evaluator:
     def kl(self, name: str | None) -> float | None:
         if name is None or not self.kl_texts:
             return 0.0 if name is None else None
+        if self._kinds.get(name) == "weights" and not self.mock:
+            return None                             # weight edits: no token KL (would need the model served here)
         from rsicore.evaluate import reference_logprobs, token_kl
 
         cache = self.out_dir / "evals" / name / "kl.json"

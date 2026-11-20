@@ -1,0 +1,194 @@
+# Paper B · math only · method.mode = weights · H20, 4 GPUs
+# Generated snapshot (2026-11-21) of the MERGED config: lora_code/configs/base.yaml + domains/math.yaml + h20 +
+# scope single + --set method.mode=weights. Not read by the code (source of truth: base.yaml + --set).
+# weights: the editor M_t edits its weights directly with structured, any-rank operations (w_scale, w_scale_rows /
+# w_scale_cols, w_add_lora = a low-rank piece built with the LoRA tools added as a dense dW, w_toward_original);
+# per-module ||W'-W||/||W|| <= weights.norm_cap_tau (0.05). Nothing is trained. A candidate is exported (only the
+# edited shards rewritten) and served on a free candidate slot: 4 GPUs = editor [0] (sleeps while candidates are
+# evaluated and lends its GPU as a 3rd slot), slots [1], [2], train [3]. Gate: paired with M_t, gain >= gate.min_gain
+# and 95% CI lower bound > 0; else keep M_t. An accepted edit is written into the weights -> M_{t+1}.
+#
+# Launch:
+#   ./launch.sh --hw h20 --paper B --domains math --gens 5 --gpus 4,5,6,7 --set method.mode=weights
+#   (add --eval-overfit to optimise directly on MATH-500 + GSM8K test)
+# Run id: B_math_s42_single
+draw_config: data/draw/paper_b.yaml
+data:
+  n: null
+  target_train_frac: null
+  screen_n: null
+  gate_n: null
+  retention_n: null
+  retention_kl: null
+max_tokens:
+  dapo_math: 4096
+  taco_verified: 4096
+  ifeval_train: 2048
+  sealtool_train: 1024
+  triviaqa_train: 1024
+  math_eval: 4096
+method:
+  mode: weights
+weights:
+  norm_cap_tau: 0.05
+  max_modules: null
+scope: single
+objective: train_gate
+raw:
+  n_train: null
+  rank: 16
+  lr: 0.0001
+  epochs: 1.0
+  steps: null
+  batch_size: 4
+  leaves:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - in_proj_qkv
+  - in_proj_z
+  - out_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  gpu_seconds: null
+lora:
+  rank_cap: 64
+  norm_cap_tau: 0.1
+  allowed_leaves: null
+  save_dtype: bfloat16
+budget:
+  gpu_seconds: 7200
+search:
+  threads: 4
+  steps: 8
+  max_evaluate: 32
+  top_full: 3
+  rerun_seeds: 0
+  archive: true
+editor:
+  temperature: 0.6
+  max_tokens: 8192
+sandbox:
+  timeout_s: 1800
+  mem_gb: 16
+feedback:
+  lambda_retention: 1.0
+  lambda_kl: 0.5
+  n_examples: 3
+  mark_shown: true
+retention:
+  domains: []
+loop:
+  patience: 3
+tools:
+  compare: true
+  train_loss: true
+gate:
+  reference: auto
+  fallback: auto
+  min_gain: 0.01
+  require_significant: true
+  epsilon: 0.01
+  delta: 0.02
+  use_noise_band: true
+  max_submissions: 3
+eval:
+  screen_limit: null
+  full_limit: null
+  gate_limit: null
+  kl_limit: null
+train_data:
+  mode: self_correct
+  samples: 4
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+train:
+  dtype: bfloat16
+  max_len: 4608
+  micro_batch: 2
+nonllm:
+  evaluate: 32
+  search_scales:
+  - 0.5
+  - 0.75
+  - 1.0
+  - 1.25
+diagnostics:
+  svd_k: 8
+e_t:
+  enabled: false
+  task: tool_calling
+  task_when_target_is_tool_calling: code
+  branches:
+  - parent
+  - llm
+  - nonllm
+  evaluate: 16
+  gpu_seconds: 3600
+  threads: 4
+  steps: 4
+  top_full: 1
+  n_train: 1600
+  n_signal: 200
+  items_seed: 20261118
+  test_limit: null
+heldout:
+  enabled: true
+  domains: math
+  limit: null
+  decoding:
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    seed: 42
+    n: 1
+    n_by_task:
+      aime24: 8
+      aime25: 8
+      amc23: 8
+      math500: 4
+      gpqa_diamond: 4
+baseline:
+  noise_repeats: 3
+  noise_temperature: 0.0
+  noise_top_p: 1.0
+  noise_n: null
+  noise_fixed: null
+merge:
+  gpu: true
+server:
+  max_loras: 8
+  main_args:
+  - --rsi-gpu-memory-gib
+  - '110'
+  - --gpu-memory-utilization
+  - '0.78'
+  - --max-model-len
+  - '20480'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  theta0_args:
+  - --rsi-gpu-memory-gib
+  - '110'
+  - --gpu-memory-utilization
+  - '0.78'
+  - --max-model-len
+  - '20480'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  mock_tasks: null
+gpu_roles: null
+gpu_layout:
+  theta0_own_gpu: true
+  share_single_gpu: false
+  main_replicas: true
+  main_tp: 1
+  train_gpus: 1
+hardware: h20

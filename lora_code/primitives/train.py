@@ -180,8 +180,31 @@ class HFModel:
     # ------------------------------------------------------------------ LoRA application via hooks
     @contextmanager
     def applied(self, lora, trainable: bool = False):
-        """Temporarily add x Aᵀ Bᵀ to the outputs of the LoRA's modules (forward hooks)."""
+        """Temporarily add x Aᵀ Bᵀ to the outputs of the LoRA's modules (forward hooks). A weight edit
+        (method.mode weights, kind "weights") instead swaps in the edited weights W' = edit.apply(W) for the
+        duration and restores the originals afterwards (toward_base ops read self.base_store, the original model)."""
+        import torch
         handles = []
+        saved = {}
+        if lora is not None and getattr(lora, "kind", "lora") == "weights":
+            with torch.no_grad():
+                for m in lora.modules():
+                    mod = self.module(m)
+                    w = mod.weight
+                    base = None
+                    if lora.needs_base(m):
+                        if getattr(self, "base_store", None) is None:
+                            raise ValueError(f"{m}: toward_base needs HFModel.base_store (the original model)")
+                        base = self.base_store.weight(m, device=w.device)
+                    saved[m] = w.data.clone()
+                    w.data.copy_(lora.apply(m, w.data.float(), base).to(w.dtype))
+            try:
+                yield
+            finally:
+                with torch.no_grad():
+                    for m, orig in saved.items():
+                        self.module(m).weight.data.copy_(orig)
+            return
         if lora is not None:
             for m in lora.modules():
                 A, B = lora.factors[m]

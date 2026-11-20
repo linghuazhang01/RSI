@@ -25,6 +25,7 @@ max_tokens:
   ifeval_train: 2048
   sealtool_train: 1024
   triviaqa_train: 1024
+  math_eval: 4096                     # objective eval_overfit (MATH-500 + GSM8K test)
 
 # Domain scope (default single since 2026-11-19; --set scope=all or ./launch.sh --all-domains for the original
 # design). single = ONLY the run's --domain: signal, gate, KL / calibration texts and held-out all on that domain.
@@ -36,6 +37,21 @@ scope_profiles:
   single:
     kl: {domains: run}
     heldout: {domains: run}
+
+# Objective (2026-11-20; --set objective=eval_overfit, or ./launch.sh --eval-overfit). train_gate = the train /
+# signal / gate split above. eval_overfit = optimise directly on the eval sets: the run's dataset is math_eval
+# (MATH-500 + GSM8K test, 1819 items, data/scripts/build_eval_target.py), every stage (screen, full, gate) is all
+# of it, scored greedily; a candidate is accepted when its eval-set score is strictly higher than the incumbent's
+# (no significance test, no separate gate set); the editor may see every item. Run ids end in _evalfit. Merged
+# before --set (explicit --set values still win).
+objective: train_gate
+objective_profiles:
+  train_gate: {}
+  eval_overfit:
+    eval_target: {enabled: true, dataset: math_eval, kl_n: 400}   # kl_n: KL / calibration texts (eval prompts)
+    search: {kl_weight: 0.0, top_full: 0}   # score = eval accuracy / incumbent's; screen = full = the whole set
+    gate: {min_delta: 1.0e-6, require_significant: false}        # accept any strictly higher eval-set score
+    feedback: {examples: 5}
 
 # One fixed size for every generation. Every candidate quantizes the ORIGINAL BF16 model M_0 (the layer
 # cache is built once); generation g must beat the incumbent (best accepted quantization so far).

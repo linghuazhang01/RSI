@@ -25,21 +25,28 @@ max_tokens:
   ifeval_train: 2048
   sealtool_train: 1024
   triviaqa_train: 1024
+  math_eval: 4096                     # objective eval_overfit (MATH-500 + GSM8K test)
 
-# How the editor gets its LoRA each generation (2026-11-19; SFT baseline and free mode removed 2026-11-20).
-# Nothing is ever trained except the raw LoRA of mode=edit in generation 0; the editor has no training or
-# gradient tools (no sgd / grad / from_grad) in either mode.
-#   edit    : ONE LoRA, trained ONCE: generation 0 trains a raw LoRA with the fixed `raw` recipe below (size
-#             set by raw.n_train / steps / epochs / rank); after that nothing is trained.
-#             Every generation the model M_g = M_0 + L_g (the current LoRA, an adapter on the M_0 server, never
-#             merged) writes a program that edits the LoRA it starts from (handle "RAW": the raw LoRA in
-#             generation 0, L_g later); the result replaces it.
-#             Gate: generation 0 vs the raw LoRA (fallback raw); later vs the current model + gate.min_gain
-#             (fallback keep L_g).
-#   scratch : no raw LoRA, no training at all; the editor builds the LoRA from zero with SVD / activation
-#             statistics / constructions. Gate reference = the parent model (+ gate.min_gain); fallback = keep.
+# How the editor changes the model each generation (2026-11-21). The default never trains: the editor has no
+# training or gradient tools (no sgd / grad / from_grad) in any mode.
+#   scratch (default) : write a LoRA from zero with SVD / activation statistics / constructions; candidates are
+#             hot-loaded on the main replicas. Gate reference = the current model (paired, + gate.min_gain);
+#             fallback = keep; an accepted LoRA is merged into the weights.
+#   weights : edit the weights directly with structured, any-rank operations (row / column / module scaling,
+#             dense low-rank additions built with the LoRA tools, moving modules toward the original weights;
+#             per-module ||W'-W||/||W|| <= weights.norm_cap_tau). A candidate is exported (only edited shards
+#             rewritten) and served on a free candidate slot: the main groups after the first (4 GPUs: editor
+#             [0], slots [1], [2] + the editor's GPU while it sleeps; train [3]). Same gate / fallback as scratch.
+#             No E_t (scope single).
+#   edit    : the one mode that trains: generation 0 trains ONE raw LoRA with the fixed `raw` recipe below,
+#             later generations edit it (M_g = M_0 + L_g, adapter, never merged). Gate: generation 0 vs the raw
+#             LoRA (fallback raw); later vs the current model + gate.min_gain (fallback keep L_g).
 method:
-  mode: edit                # edit | scratch
+  mode: scratch             # scratch | weights | edit
+
+weights:                    # method.mode weights
+  norm_cap_tau: 0.05        # [pilot] per-module ||W' - W||_F / ||W||_F cap of an edit (dense, any rank)
+  max_modules: null         # max modules one edit may touch (null = no limit)
 
 # Domain scope (default single since 2026-11-19; --set scope=all or ./launch.sh --all-domains for the original
 # design). single = ONLY the run's --domain: training, gate, feedback and token-KL use the target domain only
@@ -53,6 +60,23 @@ scope_profiles:
     retention: {domains: []}
     heldout: {domains: run}
     e_t: {enabled: false}   # (no E_t -> no theta0 server: the GPU layout needs only main + train)
+
+# Objective (2026-11-20; --set objective=eval_overfit, or ./launch.sh --eval-overfit). train_gate = the train /
+# signal / gate split above. eval_overfit = optimise directly on the eval sets: the run's target dataset is
+# math_eval (MATH-500 + GSM8K test, 1819 items, data/scripts/build_eval_target.py); train / signal / gate are all
+# of it (the editor sees every item: train_example, acts, train_loss), scored greedily; a candidate is accepted
+# when its eval-set score is strictly higher than the current model's (no significance test, no separate gate
+# set). Run ids end in _evalfit. Merged before --set (explicit --set values still win).
+objective: train_gate
+objective_profiles:
+  train_gate: {}
+  eval_overfit:
+    eval_target: {enabled: true, dataset: math_eval}
+    retention: {domains: []}
+    search: {top_full: 0}                   # screen = full = the whole set
+    gate: {min_gain: 1.0e-6, require_significant: false}         # accept any strictly higher eval-set score
+    feedback: {n_examples: 5, lambda_kl: 0.0}
+    e_t: {enabled: false}
 
 raw:                        # mode=edit only: recipe of the raw LoRA (trained once, generation 0; the only training)
   n_train: null             # train items used (deterministic subset; null = all of generation 0's train items =

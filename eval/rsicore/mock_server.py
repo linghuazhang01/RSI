@@ -75,6 +75,8 @@ class Mock:
                       "completions": 0, "lora_loads": 0}
         self.tasks = load_tasks(yaml.safe_load(open(EVAL_DIR / "configs" / "tasks.yaml")))
         names = [t for t in (a.tasks.split(",") if a.tasks else TRAIN_TASKS + HELDOUT_TASKS) if t]
+        if not a.tasks and (PROC_DIR / "math_eval.jsonl").exists():
+            names.append("math_eval")                  # eval-set target (objective eval_overfit), when built
         self.index = self._index(names)
         self.items: dict[str, dict] = {}
         self.if_ok: dict[str, bool] = {}

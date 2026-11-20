@@ -267,8 +267,6 @@ def merge_into_model(loras, src_dir: Path, out_dir: Path, *, store=None, device:
     preprocessor / generation configs, index) are copied. Returns a report with the realised relative
     error of each edited tensor after rounding to the stored dtype (bf16 rounding can swallow tiny ΔW)."""
     import torch
-    from safetensors import safe_open
-    from safetensors.torch import save_file
 
     from .weights import WeightStore
 
@@ -276,18 +274,55 @@ def merge_into_model(loras, src_dir: Path, out_dir: Path, *, store=None, device:
     if isinstance(loras, LoRA):
         loras = [loras]
     store = store or WeightStore(src_dir)
-    tmp = out_dir.with_name(out_dir.name + ".partial")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    tmp.mkdir(parents=True)
     edits = {}
     for lo in loras:
         for m in lo.modules():
             edits.setdefault(store.key(m), []).append((lo, m))
+    report = {"src": str(src_dir), "modules": {}}
+
+    def transform(k, t):
+        w = t.to(device=device, dtype=torch.float32)
+        dw = torch.zeros_like(w)
+        for lo, m in edits[k]:
+            A, B = lo.factors[m]
+            dw += B.to(device) @ A.to(device)
+        new = (w + dw).to(t.dtype)
+        realised = new.to(torch.float32) - w
+        rel_err = float((realised - dw).norm() / max(float(dw.norm()), 1e-30))
+        report["modules"][k] = {"dw_rel": float(dw.norm() / max(float(w.norm()), 1e-30)),
+                                "realised_rel_err": rel_err}
+        return new.cpu()
+
+    def finalize(rep):
+        errs = [v["realised_rel_err"] for v in rep["modules"].values()]
+        rep["max_realised_rel_err"] = max(errs) if errs else 0.0
+        rep["mean_realised_rel_err"] = sum(errs) / len(errs) if errs else 0.0
+
+    return _rewrite_checkpoint(src_dir, out_dir, store, edits, transform, report,
+                               report_name="merge_report.json", link_unchanged=link_unchanged, finalize=finalize)
+
+
+def _rewrite_checkpoint(src_dir: Path, out_dir: Path, store, keys, transform, report: dict, *, report_name: str,
+                        link_unchanged: bool = True, finalize=None) -> dict:
+    """Shared checkpoint writer (merge_into_model, wedit.edit_into_model).
+
+    keys: checkpoint keys to rewrite; transform(key, tensor) -> new CPU tensor (stored dtype) and may fill
+    report. Shards holding one of the keys are rewritten with every other tensor unchanged; other shards are
+    hard-linked (fallback copy); non-weight files are copied; report['shards_rewritten'] is set, finalize(report)
+    is called, the report is written to <out>/<report_name>; everything goes to <out>.partial first, then is
+    renamed over out_dir."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    src_dir, out_dir = Path(src_dir), Path(out_dir)
+    tmp = out_dir.with_name(out_dir.name + ".partial")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
     by_shard = {}
-    for key in edits:
+    for key in keys:
         by_shard.setdefault(store.weight_map[key], []).append(key)
-    report = {"src": str(src_dir), "modules": {}, "shards_rewritten": sorted(by_shard)}
+    report["shards_rewritten"] = sorted(by_shard)
     for shard in sorted(set(store.weight_map.values())):
         src = src_dir / shard
         dst = tmp / shard
@@ -299,27 +334,16 @@ def merge_into_model(loras, src_dir: Path, out_dir: Path, *, store=None, device:
             meta = f.metadata() or {"format": "pt"}
             for k in f.keys():
                 t = f.get_tensor(k)
-                if k in edits:
-                    w = t.to(device=device, dtype=torch.float32)
-                    dw = torch.zeros_like(w)
-                    for lo, m in edits[k]:
-                        A, B = lo.factors[m]
-                        dw += B.to(device) @ A.to(device)
-                    new = (w + dw).to(t.dtype)
-                    realised = new.to(torch.float32) - w
-                    rel_err = float((realised - dw).norm() / max(float(dw.norm()), 1e-30))
-                    report["modules"][k] = {"dw_rel": float(dw.norm() / max(float(w.norm()), 1e-30)),
-                                            "realised_rel_err": rel_err}
-                    t = new.cpu()
+                if k in keys:
+                    t = transform(k, t)
                 tensors[k] = t.contiguous()
         save_file(tensors, str(dst), metadata=meta)
     for p in src_dir.iterdir():
         if p.is_file() and not p.name.endswith(".safetensors") and not any(p.name.endswith(s) for s in NON_WEIGHT_SKIP):
             shutil.copy2(p, tmp / p.name)
-    errs = [v["realised_rel_err"] for v in report["modules"].values()]
-    report["max_realised_rel_err"] = max(errs) if errs else 0.0
-    report["mean_realised_rel_err"] = sum(errs) / len(errs) if errs else 0.0
-    with open(tmp / "merge_report.json", "w") as f:
+    if finalize is not None:
+        finalize(report)
+    with open(tmp / report_name, "w") as f:
         json.dump(report, f, indent=1, sort_keys=True)
     if out_dir.exists():
         shutil.rmtree(out_dir)

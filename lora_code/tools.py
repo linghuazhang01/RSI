@@ -1,7 +1,7 @@
 """The editor's tool surface for one generation (or one E_t session): a Workspace holding tensors behind
 string handles, registered on an rsicore.sandbox.ToolAPI so programs call `api.<tool>(**kwargs)`.
 
-Handles: L* = LoRA, S* = SVD of a weight, A* = activation statistics,
+Handles: L* = LoRA, W* = weight edit (mode=weights), S* = SVD of a weight, A* = activation statistics,
 H<g> = adapter accepted in generation g (the stack), C:<cid> = an earlier candidate of this generation.
 Vector references (for rank1 / from_direction): "S3.u0", "S3.v1", "A2.in_mean", "A2.out_mean", "A2.pc0".
 
@@ -14,8 +14,11 @@ GPU tools = cost {"gpu_seconds": 0} (refused once exhausted) + cost_fn (measured
 was left before the call so a successful call keeps its result; the uncapped total is ws.gpu_measured).
 Data access: acts / train_example only accept this generation's `train` ids (TrainData).
 The editor never trains and never computes gradients (2026-11-20: no sgd / grad / from_grad tools in any
-mode). Tool set by method.mode (tools_for_mode): edit = every tool plus raw_lora (the raw LoRA under handle
-"RAW"); scratch = every tool without raw_lora. Unregistered tools are refused by the ToolAPI.
+mode). Tool set by method.mode (tools_for_mode): edit = every LoRA tool plus raw_lora (the raw LoRA under handle
+"RAW"); scratch = every LoRA tool without raw_lora; weights = every LoRA tool without raw_lora plus the weight-edit
+tools (WEIGHT_TOOLS: structured, any-rank edits of the dense weights, a WeightEdit / MockWeightEdit with
+kind "weights"; programs return {"edit": handle}; per-module cap ||W'-W||_F/||W||_F <= weights.norm_cap_tau).
+Unregistered tools are refused by the ToolAPI.
 """
 from __future__ import annotations
 
@@ -61,14 +64,45 @@ TOOL_DOCS = {
     "train_loss": "train_loss(lora, ids=None, n=64) -> {loss, parent_loss, delta, n}: mean answer NLL of train items "
                   "under the current model + lora vs without it (forward pass only, no training; costs gpu_seconds)",
     "budget": "budget() -> {spent, left}",
+    # ---- mode=weights only (WEIGHT_TOOLS): edits of the dense weights, applied IN ORDER to the CURRENT weights
+    "new_edit": "new_edit() -> {edit}: an empty weight edit (handle 'W..'); every w_* op below returns a NEW edit "
+                "with the op appended; ops apply in order to the CURRENT weights W; per module "
+                "||W'-W||_F/||W||_F <= weights.norm_cap_tau",
+    "w_scale": "w_scale(edit, modules, s) -> {edit}: W <- s * W on every listed module (keep s near 1)",
+    "w_scale_rows": "w_scale_rows(edit, module, factors, rows=None) -> {edit}: scale OUTPUT channels (rows of W, "
+                    "shape [out, in]) of one module: factors = one float or a list (one per row in rows; rows=None "
+                    "= all rows)",
+    "w_scale_cols": "w_scale_cols(edit, module, factors, cols=None) -> {edit}: scale INPUT channels (columns of W) "
+                    "of one module: factors = one float or a list (one per column in cols; cols=None = all columns)",
+    "w_add_lora": "w_add_lora(edit, lora, alpha=1.0) -> {edit}: add alpha * dW of a LoRA built with the LoRA tools "
+                  "(new_lora, scale_singular, rank1, ...) as a dense update",
+    "w_toward_original": "w_toward_original(edit, modules, alpha) -> {edit}: W <- W + alpha (W_0 - W) on the listed "
+                         "modules (W_0 = the original model M_0's weights, 0 < alpha <= 1); undoes earlier merges "
+                         "and earlier ops of this edit there",
+    "inspect_edit": "inspect_edit(edit) -> {modules, check_ok, check_errors, top_rel_norm, total_rel_norm, ops}",
+}
+WEIGHT_TOOLS = ("new_edit", "w_scale", "w_scale_rows", "w_scale_cols", "w_add_lora", "w_toward_original",
+                "inspect_edit")
+WEIGHTS_DOC_OVERRIDES = {   # mode=weights: tools that also take an edit handle
+    "candidate": "candidate(cid) -> {edit} (or {lora}) of an earlier candidate of this generation",
+    "evaluate": "evaluate(edit=None, lora=None) -> structured screen feedback for an edit (a LoRA is evaluated as "
+                "the edit that adds it; costs 1 evaluate; identical edits are free)",
+    "train_loss": "train_loss(edit=None, lora=None, ids=None, n=64) -> {loss, parent_loss, delta, n}: mean answer NLL "
+                  "of train items under the current model + edit vs without it (forward pass only; costs gpu_seconds)",
 }
 
 
 def tools_for_mode(mode: str, retention: bool = True, cfg: dict | None = None) -> dict:
-    """TOOL_DOCS available to the editor in method.mode: edit = everything incl. raw_lora; scratch = no
-    raw_lora. retention=False (no retention texts: scope=single, or the E task): no regmean_preserve.
+    """TOOL_DOCS available to the editor in method.mode: edit = every LoRA tool incl. raw_lora; scratch = no
+    raw_lora; weights = no raw_lora, plus WEIGHT_TOOLS (and edit-aware docs of candidate / evaluate / train_loss).
+    retention=False (no retention texts: scope=single, or the E task): no regmean_preserve.
     cfg["tools"][name] = false removes a switchable tool (compare, train_loss)."""
     out = dict(TOOL_DOCS)
+    if mode == "weights":
+        out.update({k: v for k, v in WEIGHTS_DOC_OVERRIDES.items() if k in out})
+    else:
+        for name in WEIGHT_TOOLS:
+            out.pop(name, None)
     for name, on in ((cfg or {}).get("tools") or {}).items():
         if on is False:
             out.pop(name, None)
@@ -95,12 +129,13 @@ class Workspace:
     def __init__(self, *, mock: bool, store, train, cfg: dict, out_dir: Path, evaluator=None, hf=None,
                  stack=None, retention_texts=None, budget: dict | None = None, name_prefix: str = "c",
                  diagnostics: dict | None = None, seed: int = 42, mode: str = "scratch", raw=None,
-                 raw_info: dict | None = None):
+                 raw_info: dict | None = None, base_store=None):
         self.mock = mock
         self.mode = mode                        # method.mode: which tools are registered (tools_for_mode)
         self.raw = raw                          # mode=edit: the raw LoRA (handle "RAW")
         self.raw_info = dict(raw_info or {})
         self.store = store
+        self.base_store = base_store if base_store is not None else store   # M_0's weights (w_toward_original)
         self.train = train
         self.cfg = cfg
         self.lcfg = cfg.get("lora", {})
@@ -128,6 +163,9 @@ class Workspace:
         self.rank_cap = int(self.lcfg.get("rank_cap", 64))
         self.tau = float(self.lcfg.get("norm_cap_tau", 0.1))
         self.allowed = self.lcfg.get("allowed_leaves")
+        wcfg = cfg.get("weights", {}) or {}                # mode=weights: per-module relative change cap
+        self.tau_w = float(wcfg.get("norm_cap_tau") if wcfg.get("norm_cap_tau") is not None else 0.05)
+        self.max_modules_w = int(wcfg["max_modules"]) if wcfg.get("max_modules") is not None else None
         for g, lo in self.stack:
             self._h[f"H{g}"] = lo
         if raw is not None:
@@ -168,16 +206,37 @@ class Workspace:
             return None
         if isinstance(h, dict) and "lora" in h:
             h = h["lora"]
+        elif isinstance(h, dict) and "edit" in h:
+            h = h["edit"]
         if isinstance(h, str) and h.startswith("C:"):
-            return self.load_candidate(h[2:])
-        if h not in self._h:
+            obj = self.load_candidate(h[2:])
+            if obj is not None and kind == "edit" and not self._is_edit(obj):
+                raise TypeError(f"candidate {h!r} is not a weight edit")
+            if obj is not None and kind == "lora" and not self._is_lora(obj):
+                raise TypeError(f"candidate {h!r} is not a LoRA")
+            return obj
+        if not isinstance(h, str) or h not in self._h:
             raise KeyError(f"unknown handle {h!r}")
         obj = self._h[h]
         if kind == "lora" and not self._is_lora(obj):
-            raise TypeError(f"handle {h!r} is not a LoRA")
+            raise TypeError(f"handle {h!r} is not a LoRA" + (" (it is a weight edit)" if self._is_edit(obj) else ""))
+        if kind == "edit" and not self._is_edit(obj):
+            raise TypeError(f"handle {h!r} is not a weight edit (use new_edit / w_add_lora)")
         return obj
 
+    @staticmethod
+    def is_edit_obj(obj) -> bool:
+        """A weight edit (mode=weights): WeightEdit / MockWeightEdit, kind 'weights'."""
+        return getattr(obj, "kind", "lora") == "weights"
+
+    def _is_edit(self, obj):
+        if self.mock:
+            return isinstance(obj, M.MockWeightEdit)
+        return self.is_edit_obj(obj) and hasattr(obj, "apply")
+
     def _is_lora(self, obj):
+        if self.is_edit_obj(obj):
+            return False
         from_mock = isinstance(obj, M.MockLoRA)
         if self.mock:
             return from_mock
@@ -189,6 +248,25 @@ class Workspace:
             return M.MockLoRA()
         from .primitives.lora import LoRA
         return LoRA()
+
+    def _empty_edit(self):
+        if self.mock:
+            return M.MockWeightEdit()
+        from .primitives.wedit import WeightEdit
+        return WeightEdit()
+
+    def _as_edit(self, lo):
+        """mode=weights: a LoRA as the weight edit that adds it (an edit is returned unchanged)."""
+        if self.is_edit_obj(lo):
+            return lo
+        if self.mock:
+            return M.m_w_add_lora(M.MockWeightEdit(), lo, 1.0) if lo.modules() else M.MockWeightEdit()
+        from .primitives.wedit import lora_to_edit
+        return lora_to_edit(lo)
+
+    def _handle_of(self, lo) -> tuple[str, str]:
+        """(result key, handle prefix) for an object: ('edit', 'W') for weight edits, ('lora', 'L') otherwise."""
+        return ("edit", "W") if self.is_edit_obj(lo) else ("lora", "L")
 
     def _mods(self, modules) -> list[str]:
         if modules is None:
@@ -240,9 +318,21 @@ class Workspace:
         self.gpu_measured += used
         return {"gpu_seconds": min(used, max(self.left("gpu_seconds"), 0.0))}
 
+    def _eval_obj(self, kwargs):
+        """The object an evaluate / train_loss call refers to: kwargs edit (a weight edit) or lora (a LoRA; in
+        mode=weights converted to the edit that adds it, so it matches the returned candidate's name)."""
+        if kwargs.get("edit") is not None:
+            if kwargs.get("lora") is not None:
+                raise ValueError("pass either lora or edit, not both")
+            return self._get(kwargs["edit"], "edit")
+        if kwargs.get("lora") is None:
+            raise ValueError("pass lora=<handle>" + (" or edit=<handle>" if self.mode == "weights" else ""))
+        lo = self._get(kwargs["lora"], "lora")
+        return self._as_edit(lo) if self.mode == "weights" else lo
+
     def _eval_key(self, kwargs):
-        """dedupe_key_fn of evaluate: the LoRA's served name (digest), or "__keep__" for an empty LoRA."""
-        lo = self._get(kwargs.get("lora"), "lora")
+        """dedupe_key_fn of evaluate: the LoRA's / edit's served name (digest), or "__keep__" when empty."""
+        lo = self._eval_obj(kwargs)
         return self.lora_name(lo) if lo.modules() else "__keep__"
 
     def _eval_cost(self, kwargs, result) -> dict:
@@ -270,8 +360,14 @@ class Workspace:
         self._registered = True
         return self.api
 
+    UNLOCKED_TOOLS = ("evaluate",)   # mode=weights: lock only their own bookkeeping (concurrent evaluations)
+
     def _wrap(self, name, fn):
         def call(**kwargs):
+            if self.mode == "weights" and name in self.UNLOCKED_TOOLS:
+                with self._lock:
+                    self._log(name, kwargs)
+                return fn(**kwargs)
             with self._lock:
                 self._log(name, kwargs)
                 return fn(**kwargs)
@@ -333,8 +429,9 @@ class Workspace:
     def t_candidate(self, cid):
         lo = self.load_candidate(cid)
         if lo is None:
-            raise KeyError(f"candidate {cid!r} has no saved LoRA")
-        return {"lora": self._new("L", lo)}
+            raise KeyError(f"candidate {cid!r} has no saved LoRA / edit")
+        key, prefix = self._handle_of(lo)
+        return {key: self._new(prefix, lo)}
 
     # ------------------------------------------------------------------ weight-space tools
     def t_svd(self, module, k=8):
@@ -535,8 +632,151 @@ class Workspace:
         return {"lora": self._new("L", ops.ties(los, w, float(density), cap=self.rank_cap,
                                                 device=getattr(self.hf, "device", "cpu") if self.hf else "cpu"))}
 
+    # ------------------------------------------------------------------ weight edits (mode=weights)
+    def _wnew(self, ed):
+        return {"edit": self._new("W", ed)}
+
+    def _one_module(self, module) -> str:
+        if not isinstance(module, str) or not self.store.has(module):
+            raise KeyError(f"unknown module {module!r} (give one exact module name from api.modules())")
+        return module
+
+    @staticmethod
+    def _finite(x, what: str) -> float:
+        v = float(x)
+        if not math.isfinite(v):
+            raise ValueError(f"{what} must be finite, got {x!r}")
+        return v
+
+    def _channels(self, module, factors, idx, dim, what):
+        """Validate a channel scaling: idx (None = all `dim` channels) and factors (float or list)."""
+        if idx is not None:
+            if isinstance(idx, int):
+                idx = [idx]
+            idx = [int(i) for i in idx]
+            if not idx:
+                raise ValueError(f"{what}: empty index list")
+            bad = [i for i in idx if not 0 <= i < dim]
+            if bad:
+                raise ValueError(f"{what}: indices {bad[:5]} out of range for {module} ({dim} channels)")
+            if len(set(idx)) != len(idx):
+                raise ValueError(f"{what}: duplicate indices")
+        if isinstance(factors, (list, tuple)):
+            f = [self._finite(x, "factors") for x in factors]
+            n = dim if idx is None else len(idx)
+            if len(f) != n:
+                raise ValueError(f"{what}: {len(f)} factors for {n} channels")
+        else:
+            f = self._finite(factors, "factors")
+        return idx, f
+
+    def t_new_edit(self):
+        return self._wnew(self._empty_edit())
+
+    def t_w_scale(self, edit, modules, s):
+        ed = self._get(edit, "edit")
+        mods = self._mods(modules)
+        if not mods:
+            raise ValueError("w_scale needs at least one module")
+        s = self._finite(s, "s")
+        if self.mock:
+            return self._wnew(M.m_w_scale(ed, mods, s))
+        out = ed.copy()
+        for m in mods:
+            out.add(m, {"op": "scale", "s": s})
+        return self._wnew(out)
+
+    def _w_channels(self, kind, edit, module, factors, idx):
+        ed = self._get(edit, "edit")
+        module = self._one_module(module)
+        out_f, in_f = self.store.shape(module)
+        dim = out_f if kind == "rows" else in_f
+        idx, f = self._channels(module, factors, idx, dim, f"w_scale_{kind}")
+        if self.mock:
+            fn = M.m_w_rows if kind == "rows" else M.m_w_cols
+            return self._wnew(fn(ed, module, f, idx=idx, dim=dim))
+        out = ed.copy()
+        out.add(module, {"op": kind, "idx": idx, "f": f})
+        return self._wnew(out)
+
+    def t_w_scale_rows(self, edit, module, factors, rows=None):
+        return self._w_channels("rows", edit, module, factors, rows)
+
+    def t_w_scale_cols(self, edit, module, factors, cols=None):
+        return self._w_channels("cols", edit, module, factors, cols)
+
+    def t_w_add_lora(self, edit, lora, alpha=1.0):
+        ed = self._get(edit, "edit")
+        lo = self._get(lora, "lora")
+        alpha = self._finite(alpha, "alpha")
+        if self.mock:
+            return self._wnew(M.m_w_add_lora(ed, lo, alpha))
+        out = ed.copy()
+        for m in lo.modules():
+            A, B = lo.factors[m]
+            out.add(m, {"op": "lowrank", "A": A.detach().clone(), "B": (B * alpha).detach().clone()})
+        return self._wnew(out)
+
+    def _base_rel(self, mods) -> dict:
+        """mock: ||W - W_0|| / ||W|| per module from the merged stack (earlier generations)."""
+        out = {}
+        for m in mods:
+            r2 = sum(lo.modules_[m]["rel"] ** 2 for _, lo in self.stack if m in getattr(lo, "modules_", {}))
+            if r2 > 0:
+                out[m] = math.sqrt(r2)
+        return out
+
+    def t_w_toward_original(self, edit, modules, alpha):
+        ed = self._get(edit, "edit")
+        mods = self._mods(modules)
+        if not mods:
+            raise ValueError("w_toward_original needs at least one module")
+        alpha = self._finite(alpha, "alpha")
+        if not 0 < alpha <= 1:
+            raise ValueError(f"alpha must be in (0, 1], got {alpha}")
+        if self.mock:
+            undo = 0.0
+            for _, lo in self.stack:            # mock: the merged gain on these modules is (partly) undone
+                lm = getattr(lo, "modules_", {})
+                if lm:
+                    undo += alpha * lo.gain * len(set(mods) & set(lm)) / len(lm)
+            return self._wnew(M.m_w_toward(ed, mods, alpha, base_rel=self._base_rel(mods), undo_gain=undo))
+        out = ed.copy()
+        for m in mods:
+            out.add(m, {"op": "toward_base", "alpha": alpha})
+        return self._wnew(out)
+
+    def t_inspect_edit(self, edit):
+        return self.report(self._get(edit, "edit"))
+
     # ------------------------------------------------------------------ inspection / checks
+    def _store_device(self):
+        return getattr(self.store, "device", None) or (getattr(self.hf, "device", "cpu") if self.hf else "cpu")
+
+    def check_edit(self, ed) -> tuple[bool, dict]:
+        """Checks of a weight edit: existing modules, finite values, ||W'-W||_F/||W||_F <= weights.norm_cap_tau per
+        module, at most weights.max_modules modules."""
+        if self.mock:
+            errs, mods = [], {}
+            n_ops = _ops_per_module(ed.ops)
+            for m, v in ed.modules_.items():
+                if not self.store.has(m):
+                    errs.append(f"{m}: not in model")
+                if not math.isfinite(v["rel"]):
+                    errs.append(f"{m}: non-finite values")
+                elif v["rel"] > self.tau_w:
+                    errs.append(f"{m}: ||W'-W||/||W|| = {v['rel']:.4f} > tau {self.tau_w}")
+                mods[m] = {"rel_norm": v["rel"], "ops": n_ops.get(m, 0)}
+            if self.max_modules_w is not None and len(mods) > self.max_modules_w:
+                errs.append(f"{len(mods)} modules edited > max_modules {self.max_modules_w}")
+            return not errs, {"errors": errs[:50], "n_errors": len(errs), "modules": mods}
+        from .primitives.wedit import check_wedit
+        return check_wedit(ed, self.store, self.base_store, tau=self.tau_w, max_modules=self.max_modules_w,
+                           device=self._store_device())
+
     def check(self, lo) -> tuple[bool, dict]:
+        if self.is_edit_obj(lo):
+            return self.check_edit(lo)
         if self.mock:
             errs, mods = [], {}
             for m, v in lo.modules_.items():
@@ -551,7 +791,20 @@ class Workspace:
         from .primitives.lora import check_lora
         return check_lora(lo, self.store, rank_cap=self.rank_cap, tau=self.tau, allowed_leaves=self.allowed)
 
+    def report_edit(self, ed) -> dict:
+        ok, rep = self.check_edit(ed)
+        mods = rep.get("modules", {})
+        top = sorted(mods.items(), key=lambda kv: -kv[1].get("rel_norm", 0))[:8]
+        return {"kind": "weights", "modules": len(mods), "max_rank": 0, "check_ok": ok,
+                "check_errors": rep.get("errors", [])[:5],
+                "top_rel_norm": [{"module": m, **{k: round(v, 5) if isinstance(v, float) else v for k, v in d.items()}}
+                                 for m, d in top],
+                "total_rel_norm": round(math.sqrt(sum(d.get("rel_norm", 0) ** 2 for d in mods.values())), 5),
+                "ops": ed.ops[-6:] if self.mock else _trunc(ed.summary())}
+
     def report(self, lo, max_intruder_modules: int = 16) -> dict:
+        if self.is_edit_obj(lo):
+            return self.report_edit(lo)
         ok, rep = self.check(lo)
         mods = rep.get("modules", {})
         top = sorted(mods.items(), key=lambda kv: -kv[1].get("rel_norm", 0))[:8]
@@ -587,31 +840,38 @@ class Workspace:
         charge=True at level 'screen' goes through the `evaluate` tool of ws.api (budget + dedupe there)."""
         if charge and level == "screen":
             self.build_api()
-            h = self._new("L", lo)
+            key, prefix = self._handle_of(lo)
+            h = self._new(prefix, lo)
             try:
-                fb = self.api.call("evaluate", {"lora": h})
+                fb = self.api.call("evaluate", {key: h})
             finally:
                 with self._lock:
                     self._h.pop(h, None)
                     self._owner.pop(h, None)
             return fb.get("score"), fb
-        empty = not lo.modules()
-        name = None if empty else self.lora_name(lo)
-        key = (name, level)
-        if key in self._evaluated:
-            return self._evaluated[key]
-        rep = self.report(lo) if not empty else {"modules": 0, "keep": True}
-        if not empty and not rep["check_ok"]:
-            fb = {"error": "LoRA failed the sandbox checks", "lora_stats": rep}
-            self._evaluated[key] = (None, fb)
-            return None, fb
+        # Several threads may evaluate at once (run.py, mode=weights): the lock covers only the cache and the
+        # report / check (weight store, applying an edit); evaluator.register / feedback run concurrently.
+        with self._lock:
+            empty = not lo.modules()
+            name = None if empty else self.lora_name(lo)
+            key = (name, level)
+            if key in self._evaluated:
+                return self._evaluated[key]
+            rep = self.report(lo) if not empty else {"modules": 0, "keep": True}
+            if not empty and not rep["check_ok"]:
+                fb = {"error": ("edit" if self.is_edit_obj(lo) else "LoRA") + " failed the sandbox checks",
+                      "lora_stats": rep}
+                self._evaluated[key] = (None, fb)
+                return None, fb
+            pending = getattr(self._local, "eval_pending", 0)   # the evaluate tool charges after this returns
+            cost = {"evaluate_left": self.left("evaluate") - pending,
+                    "gpu_seconds_left": round(self.left("gpu_seconds"), 1),
+                    "gpu_seconds_spent": round(self.spent.get("gpu_seconds", 0), 1)}
         if name is not None and not self.evaluator.known(name):
             self.evaluator.register(lo, name)
-        pending = getattr(self._local, "eval_pending", 0)   # the evaluate tool charges after this returns
-        cost = {"evaluate_left": self.left("evaluate") - pending, "gpu_seconds_left": round(self.left("gpu_seconds"), 1),
-                "gpu_seconds_spent": round(self.spent.get("gpu_seconds", 0), 1)}
         score, fb = self.evaluator.feedback(name, level, lora_report=rep, cost=cost)
-        self._evaluated[key] = (score, fb)
+        with self._lock:
+            self._evaluated[key] = (score, fb)
         return score, fb
 
     def t_compare(self, cid, other="parent", level="screen"):
@@ -665,9 +925,10 @@ class Workspace:
         (RAW, source 'current') on M_0; otherwise none (the HF model is the current model itself)."""
         return self.raw if (self.raw is not None and self.raw_info.get("source") == "current") else None
 
-    def t_train_loss(self, lora, ids=None, n=64):
-        """Mean answer NLL on train items with and without the LoRA (forward only)."""
-        lo = self._get(lora, "lora")
+    def t_train_loss(self, lora=None, ids=None, n=64, edit=None):
+        """Mean answer NLL on train items with and without the LoRA / weight edit (forward only). Real mode with an
+        edit: HFModel.loss(ex, lora=<WeightEdit>) applies the edit."""
+        lo = self._eval_obj({"lora": lora, "edit": edit})
         ids = self._ids(ids, default_n=int(n))
         ex = self._examples(ids)
         ref = self._parent_lora_for_loss()
@@ -687,8 +948,9 @@ class Workspace:
         return {"loss": round(float(loss), 6), "parent_loss": round(float(p), 6),
                 "delta": round(float(loss) - float(p), 6), "n": len(ex)}
 
-    def t_evaluate(self, lora):
-        lo = self._get(lora, "lora")
+    def t_evaluate(self, lora=None, edit=None):
+        with self._lock:
+            lo = self._eval_obj({"lora": lora, "edit": edit})
         self._local.eval_pending = 1 if lo.modules() else 0
         try:
             _, fb = self.evaluate_lora(lo, "screen", charge=False)   # ws.api charges (cost_fn) and dedupes
@@ -704,28 +966,40 @@ class Workspace:
             return None, {"error": f"not evaluated: {e}"}
 
     # ------------------------------------------------------------------ candidates
-    def cand_path(self, cid: str) -> Path:
-        return self.out_dir / "loras" / (f"{cid}.json" if self.mock else f"{cid}.safetensors")
+    def cand_path(self, cid: str, kind: str = "lora") -> Path:
+        """loras/<cid>.json | .safetensors (LoRA), loras/<cid>.wedit.json | .wedit.safetensors (weight edit)."""
+        ext = ".json" if self.mock else ".safetensors"
+        return self.out_dir / "loras" / (f"{cid}.wedit{ext}" if kind == "weights" else f"{cid}{ext}")
 
     def save_candidate(self, cid: str, lo) -> Path:
-        p = self.cand_path(cid)
+        p = self.cand_path(cid, "weights" if self.is_edit_obj(lo) else "lora")
         if self.mock:
             write_json(p, lo.to_json())
         else:
+            p.parent.mkdir(parents=True, exist_ok=True)
             lo.save_raw(p)
         return p
 
     def load_candidate(self, cid: str):
-        p = self.cand_path(cid)
-        if not p.exists():
-            return None
-        if self.mock:
-            return M.MockLoRA.from_json(json.load(open(p)))
-        from .primitives.lora import LoRA
-        return LoRA.load_raw(p)
+        """The saved LoRA or weight edit of a candidate (None if neither exists)."""
+        p, pe = self.cand_path(cid), self.cand_path(cid, "weights")
+        if p.exists():
+            if self.mock:
+                return M.MockLoRA.from_json(json.load(open(p)))
+            from .primitives.lora import LoRA
+            return LoRA.load_raw(p)
+        if pe.exists():
+            if self.mock:
+                return M.MockWeightEdit.from_json(json.load(open(pe)))
+            from .primitives.wedit import WeightEdit
+            return WeightEdit.load_raw(pe)
+        return None
 
     def resolve_result(self, result):
-        """main(api) return value -> LoRA object (empty = keep), or raise ValueError."""
+        """main(api) return value -> LoRA object (empty = keep), or raise ValueError. mode=weights: -> weight edit
+        ({"edit": h}; {"lora": h} is converted to the edit that adds it; None = empty edit = keep)."""
+        if self.mode == "weights":
+            return self._resolve_edit(result)
         if result is None:
             raise ValueError("main(api) returned None; return {'lora': handle} (or {'lora': None} to keep the model)")
         h = result.get("lora", "__missing__") if isinstance(result, dict) else result
@@ -734,6 +1008,55 @@ class Workspace:
         if h is None:
             return self._empty()
         return self._get(h, "lora")
+
+    def _resolve_edit(self, result):
+        if result is None:
+            raise ValueError("main(api) returned None; return {'edit': handle} (or {'edit': None} to keep the model)")
+        if isinstance(result, dict):
+            if "edit" in result:
+                h = result["edit"]
+                return self._empty_edit() if h is None else self._get(h, "edit")
+            if "lora" in result:
+                h = result["lora"]
+                return self._empty_edit() if h is None else self._as_edit(self._get(h, "lora"))
+            raise ValueError("main(api) must return {'edit': <handle>}")
+        if isinstance(result, str):                 # a bare handle
+            obj = self._get(result)
+            if self._is_edit(obj):
+                return obj
+            if self._is_lora(obj):
+                return self._as_edit(obj)
+            raise TypeError(f"handle {result!r} is neither a weight edit nor a LoRA")
+        raise ValueError("main(api) must return {'edit': <handle>}")
+
+
+def _ops_per_module(ops) -> dict:
+    """mock: number of recorded ops per module (op[1] = module list)."""
+    out = {}
+    for op in ops or []:
+        if len(op) > 1 and isinstance(op[1], list):
+            for m in op[1]:
+                if isinstance(m, str):
+                    out[m] = out.get(m, 0) + 1
+    return out
+
+
+def _trunc(obj, n: int = 12, depth: int = 0):
+    """Shorten a JSON-like summary (dict items / list entries) for tool results."""
+    if depth > 3:
+        return "..."
+    if isinstance(obj, dict):
+        items = list(obj.items())
+        out = {str(k): _trunc(v, n, depth + 1) for k, v in items[:n]}
+        if len(items) > n:
+            out["..."] = f"{len(items) - n} more"
+        return out
+    if isinstance(obj, (list, tuple)):
+        out = [_trunc(v, n, depth + 1) for v in list(obj)[:6]]
+        return out + [f"... {len(obj) - 6} more"] if len(obj) > 6 else out
+    if isinstance(obj, float):
+        return round(obj, 6)
+    return obj if isinstance(obj, (int, str, bool, type(None))) else str(obj)[:200]
 
 
 def _overlap(lo, others) -> float | None:
@@ -774,7 +1097,8 @@ def program_build(ws: Workspace, program: str, cid: str, *, timeout_s: int, mem_
         path = ws.save_candidate(cid, lo)
         tools = ws.tool_log.get(cid, [])
         art = {"cid": cid, "path": str(path), "keep": not lo.modules(), "modules": len(lo.modules()),
-               "max_rank": lo.max_rank(), "digest": lo.digest(), "tools_used": _count(tools),
+               "max_rank": lo.max_rank(), "digest": lo.digest(), "kind": getattr(lo, "kind", "lora"),
+               "tools_used": _count(tools),
                "strategy": classify(tools), "stdout": (res.stdout or "")[-1000:], "seconds": round(time.time() - t0, 1)}
         return art, None
     finally:
@@ -789,11 +1113,15 @@ def _count(xs):
 
 
 def classify(tools) -> str:
-    """Primitive-usage category for behaviour analysis (RSI_LOOP_DESIGN §3.6)."""
+    """Primitive-usage category for behaviour analysis (RSI_LOOP_DESIGN §3.6). mode=weights (any w_* op used):
+    "weights_only", "weights+construct", "weights+ops", "weights+construct+ops"."""
     s = set(tools)
     construct = s & {"rank1", "from_direction", "scale_singular"}
     stack_ops = s & {"interpolate", "combine", "truncate_rank", "intruder_scale", "relchange_prune",
                      "regmean_preserve", "orthogonalize", "ties", "scale", "drop"}
+    if s & {"w_scale", "w_scale_rows", "w_scale_cols", "w_add_lora", "w_toward_original"}:
+        return "weights" + ("+construct" if construct else "") + ("+ops" if stack_ops else "") \
+            + ("" if construct or stack_ops else "_only")
     if "raw_lora" in s:   # mode=edit: what was done to the raw LoRA
         if construct and stack_ops:
             return "raw+construct+ops"

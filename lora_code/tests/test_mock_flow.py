@@ -4,7 +4,7 @@
 
 - test_mock_workspace_*: the sandbox tool surface in mock mode (train-id restriction, budgets, a program
   run through rsicore.sandbox.run_program, checks).
-- test_mode_tool_surface / test_raw_recipe: method.mode (edit / scratch) tool sets, the raw LoRA handle,
+- test_mode_tool_surface / test_raw_recipe: method.mode (scratch default / weights / edit) tool sets, the raw LoRA handle,
   no training / gradient tool in any mode (2026-11-20), and the raw recipe (size) resolution.
 - test_mock_run_end_to_end: lora_code/run.py --mock (default mode=edit) for 1 generation (reduced branches)
   in a temp runs dir, then a second invocation of the same run-id must skip everything.
@@ -202,7 +202,7 @@ def test_mock_run_end_to_end(tmp_path):
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
            "--runs-dir", str(tmp_path), "--run-id", "B_test_mock", "--set", "scope=all",
-           "--set", "e_t.branches=[parent,llm]"]
+           "--set", "e_t.branches=[parent,llm]", "--set", "method.mode=edit"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     run = tmp_path / "B_test_mock"
@@ -302,13 +302,62 @@ def test_mock_scratch_four_gpus(tmp_path):
     assert json.loads((run / "summary.json").read_text())["gens"]["0"]["search"]["candidates"] >= 1
 
 
+def test_mock_eval_overfit_scratch(tmp_path):
+    """objective eval_overfit + scratch: target = math_eval (MATH-500 + GSM8K test); train / signal / gate are all of
+    it (gold answers visible to the editor's tools); no draws; run id _evalfit."""
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
+           "--runs-dir", str(tmp_path), "--set", "method.mode=scratch", "--set", "objective=eval_overfit",
+           "--set", "heldout.limit=2"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    run = tmp_path / "B_math_s42_single_evalfit_mock"
+    assert run.exists() and not (run / "draws").exists()
+    td = json.loads((run / "gen_00" / "train_data.json").read_text())
+    assert len(td) == 1819 and all(v["target"] for v in td.values())                 # every eval item, gold visible
+    assert list(json.loads((run / "baseline" / "gate_scores.json").read_text())) == ["math_eval"]
+    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
+    assert summ["accepted"]["source"] in ("llm", "keep")
+
+
+def test_mock_weights_mode(tmp_path):
+    """method.mode weights (2026-11-21): the editor edits the weights directly (no training); 4 GPUs = editor [0],
+    candidate slots [1], [2] (+ the editor's GPU while it sleeps), train [3]; an accepted edit is written into the
+    weights; the non-LLM branch makes random weight edits; the default mode is scratch."""
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "2", "--mock",
+           "--gpus", "0,1,2,3", "--runs-dir", str(tmp_path), "--run-id", "B_weights", "--set", "method.mode=weights",
+           "--set", "hardware=h20"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    assert "method=weights gate reference=parent fallback=keep" in r.stdout
+    run = tmp_path / "B_weights"
+    summ = json.loads((run / "summary.json").read_text())["gens"]
+    for g in ("0", "1"):
+        s = summ[g]
+        assert s["method"] == "weights" and s["accepted"]["source"] in ("llm", "keep")
+        assert s["nonllm"]["kind"] == "random_weight_search"
+        assert all(k.startswith("weights") or k in ("keep", "error", "none") for k in s["search"]["strategies"]), \
+            s["search"]["strategies"]
+    msgs = [json.loads(x) for x in (run / "gen_00" / "editor" / "thread_0.jsonl").read_text().splitlines() if x.strip()]
+    text = "\n".join(str(m.get("content", "")) for m in msgs)
+    assert "w_scale_rows" in text and '{"edit"' in text                          # weights prompt + programs
+    assert list((run / "gen_00" / "loras").glob("*.wedit.json"))                 # saved weight edits
+    cmd_default = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
+                   "--runs-dir", str(tmp_path), "--run-id", "B_default"]
+    r2 = subprocess.run(cmd_default, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r2.returncode == 0 and "method=scratch" in r2.stdout, r2.stdout[-2000:] + r2.stderr[-3000:]
+
+
 def test_mock_edit_chain_trains_once(tmp_path):
     """mode=edit: only generation 0 trains (the raw LoRA); later generations edit the current LoRA on M_0
     (no training, no merge), the gate compares with the current model, a rejected generation keeps it."""
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "3", "--mock",
-           "--runs-dir", str(tmp_path), "--run-id", "B_chain", "--set", "raw.n_train=64"]
+           "--runs-dir", str(tmp_path), "--run-id", "B_chain", "--set", "raw.n_train=64", "--set", "method.mode=edit"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     run = tmp_path / "B_chain"
@@ -345,7 +394,7 @@ def test_mock_data_sizes_and_fixed_noise(tmp_path):
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
            "--runs-dir", str(tmp_path), "--run-id", "B_sizes", "--set", "data.n=200", "--set", "data.gate_n=100",
            "--set", "data.screen_n=30", "--set", "raw.n_train=40",
-           "--set", "baseline.noise_fixed=0.05"]
+           "--set", "baseline.noise_fixed=0.05", "--set", "method.mode=edit"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     run = tmp_path / "B_sizes"

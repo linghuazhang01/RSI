@@ -22,7 +22,9 @@ max_tokens:
   ifeval_train: 2048
   sealtool_train: 1024
   triviaqa_train: 1024
+  math_eval: 4096
 scope: single
+objective: train_gate
 budget:
   gib: null
   reference:
