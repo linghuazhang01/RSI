@@ -4,6 +4,7 @@
   python -I -m pytest -q eval/tests/rsicore/test_gpu_use.py      (mock servers, no GPU)
 """
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -11,6 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "eval"))
@@ -172,3 +174,20 @@ class TwoPhaseSearchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class GDNBackendTest(unittest.TestCase):
+    def test_env_override_and_explicit_argument_precedence(self):
+        with patch.dict(os.environ, {"RSI_GDN_PREFILL_BACKEND": "triton"}):
+            cmd = servers.VLLMServer("/models/x", "x", [0]).command()
+            self.assertEqual(cmd[cmd.index("--gdn-prefill-backend") + 1], "triton")
+            for args in (["--gdn-prefill-backend", "flashinfer"],
+                         ["--gdn-prefill-backend=flashinfer"]):
+                cmd = servers.VLLMServer("/models/x", "x", [0], extra_args=args).command()
+                self.assertNotIn("triton", cmd)
+                self.assertEqual(sum(a.startswith("--gdn-prefill-backend") for a in cmd), 1)
+            cmd = servers.VLLMServer("mock-x", "x", [0], mock=True).command()
+            self.assertFalse(any(a.startswith("--gdn-prefill-backend") for a in cmd))
+        with patch.dict(os.environ, {}, clear=True):
+            cmd = servers.VLLMServer("/models/x", "x", [0]).command()
+            self.assertNotIn("--gdn-prefill-backend", cmd)

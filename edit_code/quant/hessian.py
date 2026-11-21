@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load, save_file
 
 from .spec import ModelSpec
 
@@ -55,7 +55,10 @@ def hessian_path(out_dir: Path, layer: int, input_key: str) -> Path:
 
 
 def load_hessian(out_dir: Path, layer: int, input_key: str, device="cpu") -> tuple[torch.Tensor, int, torch.Tensor]:
-    d = load_file(str(hessian_path(out_dir, layer, input_key)), device=str(device))
+    # Read sequentially before strided access: remote mmap page faults are costly on JuiceFS.
+    d = load(hessian_path(out_dir, layer, input_key).read_bytes())
+    if str(device) != "cpu":
+        d = {key: value.to(device) for key, value in d.items()}
     return d["H"], int(d["n"].item()), d["absmax"]
 
 

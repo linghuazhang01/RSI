@@ -321,7 +321,7 @@ for r in "${RUNS[@]}"; do
   printf '  %-34s GPUs %-8s %s\n' "$rid" "$g" "${cmd[*]}"
   [ "$DRY" -eq 1 ] && continue
   old="$(ls -t experiment_records/_launch/*/"$rid".pid 2>/dev/null | head -1 || true)"
-  if [ -n "$old" ] && kill -0 "$(cat "$old")" 2>/dev/null; then
+  if [ -n "$old" ] && kill -0 "$(cat "$old")" 2>/dev/null && [[ "$(ps -o stat= -p "$(cat "$old")")" != *Z* ]]; then
     echo "    already running (pid $(cat "$old"), $old); not started again"; continue
   fi
   # CUDA_VISIBLE_DEVICES is left alone: run.py places its servers on --gpus itself.

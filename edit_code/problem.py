@@ -384,8 +384,8 @@ class QuantProblem:
             self.log(f"[prep:{self.tag}] calibration: all {len(keys)} Hessians already in {hdir}, skipped")
         else:
             self.log(f"[prep:{self.tag}] {k} workers on {devs}: loading {self.source_dir}")
-            with ThreadPoolExecutor(max_workers=k) as ex:
-                models = list(ex.map(lambda d: load_hf_model(self.source_dir, d), devs))
+            # Avoid concurrent Transformers lazy imports during HF model construction.
+            models = [load_hf_model(self.source_dir, d) for d in devs]
             parts = [texts[i::k] for i in range(k)]
 
             def calib(i):

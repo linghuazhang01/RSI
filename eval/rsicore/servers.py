@@ -245,6 +245,9 @@ class VLLMServer:
             cmd += ["--enable-lora", "--max-loras", str(self.max_loras), "--max-lora-rank", str(self.max_lora_rank)]
         if self.sleep_mode and "--enable-sleep-mode" not in self.extra_args:
             cmd += ["--enable-sleep-mode"]
+        if os.environ.get("RSI_GDN_PREFILL_BACKEND") and not any(
+                a == "--gdn-prefill-backend" or a.startswith("--gdn-prefill-backend=") for a in extra):
+            cmd += ["--gdn-prefill-backend", os.environ["RSI_GDN_PREFILL_BACKEND"]]
         return cmd + extra
 
     def _clamp_len(self, n: int) -> int:

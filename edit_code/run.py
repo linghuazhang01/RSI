@@ -475,6 +475,9 @@ class Runner:
                 if todo and self.heldout_enabled:   # heldout.enabled false (objective simple): no held-out report
                     h = self.heldout_on(reps, bdir / "heldout")
                     write_json(bdir / "heldout.json", h)
+            # kl_texts creates its own candidate replicas; release the baseline replicas first.
+            for replica in reps[1:]:
+                replica.close()
             kl0 = self.kl_texts(0, m0)       # calibration / KL texts (prompt + M_0 response with kl.self_generated)
         finally:
             for s in reps:
