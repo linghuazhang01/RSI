@@ -10,6 +10,8 @@ search:
   steps: 1                        # ... of one candidate each
 editor:
   tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
+  turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
+  max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)
 gate:
   min_gain: 0.0                   # accept the candidate with the largest strictly positive paired gate gain
   require_significant: false      # no 95% CI requirement
