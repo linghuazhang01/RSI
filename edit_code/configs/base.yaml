@@ -190,7 +190,10 @@ solver:
 # guard) one forced final turn with tool_choice "none"; the proposal is the reply without tool calls that holds a
 # ```python block. tool_rounds 0 = the single call of before (same payload and prompt text; history_keep is then
 # ignored = full history). Exploration never
-# spends the generation's evaluate budget. Changing any key here changes the locked config: use a new --run-id.
+# spends the generation's evaluate budget. search_history (2026-11-21, on by default; code default
+# history_tool: true, set --set editor.history_tool=false to remove it): every candidate already tried (this
+# generation's visible ones and all earlier generations'), one row each with a config description, GiB, KL,
+# scores, gate outcome, same_as = identical config hash; read_record then also opens earlier generations' records. Changing any key here changes the locked config: use a new --run-id.
 editor:
   temperature: 0.6                    # Qwen3 thinking-mode sampling: 0.6 / 0.95 / top_k 20 / min_p 0
   top_p: 0.95

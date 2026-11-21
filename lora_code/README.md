@@ -164,12 +164,25 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 - `acts` / `train_example` 只接受本代 `train` 题号，其他题号抛 `PermissionError`。
 - `regmean_preserve` 的保留集 Gram 矩阵由可信运行时用保留领域的 `kl` 题面算出，改造者只拿到结果 LoRA。
 - 预算：evaluate（相同 LoRA 只计一次）、gpu_seconds（`acts` / `regmean_preserve`，实测；mock 中估计）。
+- 每个程序自己调用 `api.evaluate` 最多 `search.program_evaluate_calls` 次新评测（2026-11-21，代码默认 2，`null` = 不限；
+  已评测过的相同 LoRA 不算；返回候选后的自动评测不算），超了抛 `BudgetExceeded`。`api.budget()` 在程序里还返回
+  `program_seconds_left`（离 `sandbox.timeout_s` 还剩几秒）和 `program_evaluate_calls_left`。
+
+系统提示与每步上下文（2026-11-21，根据 nosig 实验的失败候选改写）：
+- 验收规则按配置生成（`gate.min_gain`、`gate.require_significant`、本代参照 raw / parent、验收题数换算成"约多对几题"），
+  不再写死"95% CI"；单领域实验不再提保留领域。
+- 新增规则：程序里 `api` 只是 `main(api)` 的参数（run_python 里是全局变量），辅助函数要显式传入；模块名只能取自
+  `api.modules()`（各层类型不规则）；rank1 / from_direction 的 u、direction 是输出侧向量（长度 out），v、key 是输入侧
+  （长度 in），取自同一模块的 svd / acts；工具结果可能为空，索引前检查，可选步骤用 try/except 回退；墙钟时限包含所有工具调用。
+- 每步上下文第一行附预算：本代还剩几次 evaluate / GPU 秒、每个程序的评测上限、程序时限、已有程序的运行时间中位数和
+  最大值、超时次数、一次评测大约几秒；剩余 evaluate ≤ 4 时提醒不要在程序里评测。
+- 工具说明：`modules` 是唯一合法的模块名来源；`diagnostics` 可能返回空列表；`rank1` / `from_direction` 写明向量所在侧。
 
 ## 改造者：thinking + 工具轮次（2026-11-21）
 
 改造者（主搜索和 E_t 都一样）写每个候选时开 Qwen3 thinking（`editor.extra_body: {chat_template_kwargs: {enable_thinking: true}, top_k: 20, min_p: 0.0}`，temperature 0.6、top_p 0.95），并且可以先调用函数再交程序：
 - 一轮 = 模型的一次回复里带了函数调用（同一回复里的多个调用算一轮）。最多 `editor.tool_rounds` = 50 轮，之后强制一次不带工具的最终回复（tool_choice none）。回复里**不带函数调用**、含一个 ```python 块，就是这次的程序。空回复、写到长度上限、把调用写成文本时最多提醒 2 次；最后还没有程序就用循环里写过的最后一个代码块（`stop: fallback`）。
-- 两个函数：`run_python(code)` 在同一个沙盒里跑探索代码，`api` 是 `Workspace.explore_api`：和程序的工具一样，但没有 `evaluate`、`raw_lora`（句柄 `RAW` 照样能用），默认也没有 GPU 工具 `acts` / `train_loss` / `regmean_preserve`（`editor.explore.gpu_tools: true` 时可用，记在单独的探索预算 `explore.gpu_seconds` 上）。探索**不花本代的 evaluate / gpu_seconds 预算**，句柄每次调用后释放，工具记录在 `<cid>~xRR_i` 下（不影响 `classify`），完整输出在 `gen_XX/explore/<cid>/rRR_i/`。`read_record(cid, part)` 读本步候选表里某个候选的完整程序或反馈。
+- 两个函数：`run_python(code)` 在同一个沙盒里跑探索代码，`api` 是 `Workspace.explore_api`：和程序的工具一样，但没有 `evaluate`、`raw_lora`（句柄 `RAW` 照样能用），默认也没有 GPU 工具 `acts` / `train_loss` / `regmean_preserve`（`editor.explore.gpu_tools: true` 时可用，记在单独的探索预算 `explore.gpu_seconds` 上）。探索**不花本代的 evaluate / gpu_seconds 预算**，句柄每次调用后释放，工具记录在 `<cid>~xRR_i` 下（不影响 `classify`），完整输出在 `gen_XX/explore/<cid>/rRR_i/`。`read_record(cid, part)` 读本步候选表里某个候选的完整程序或反馈；`search_history(gen, sort, offset)`（2026-11-21，默认开，`editor.history_tool=false` 关）列出所有试过的候选（本代可见的 + 往期所有代），每个一行：strategy、modules、max_rank、用过的工具、target_gain、worst_retention_delta、KL、分数、验收结果，`same_as` = LoRA digest 与更早候选相同；`read_record` 也能打开往期候选。E_t 只看自己的候选。
 - 上限（都可配置，`editor:` 块）：`tool_rounds` 50、`max_tool_calls` 100、`turn_max_tokens` 8192（每个工具轮）、`max_tokens` 16384（最终轮，原来 8192）、`proposal_tokens` 160000、`proposal_wall_s` 2400、`tool_result_chars` 6000、`history_keep` 2，压缩 `compact_at` / `keep_tool_rounds` / `keep_reasoning_rounds` = 0.6 / 8 / 2，探索沙盒 `explore.timeout_s` 300、`mem_gb` 8。
 - **上下文长度只看 `editor.context_tokens`**：客户端用它截每轮 max_tokens、决定何时压缩，同时写成 main 副本（改造者就在上面；weights 模式下候选槽的临时服务器也一样，保证所有打分服务器上下文相同）的 `--max-model-len`，覆盖 `server.main_args` 里写的值（`lora_code.common.main_server_args`）。b300 / h20 = 131072，h20_80 = 49152；theta0 服务器不变（20480）。设成 null 就按 `main_args` 原样。真实服务器上若模型的 `max_position_embeddings` 更小，`rsicore.servers` 会截到它并警告，不加 YaRN。
 - `--set editor.tool_rounds=0`：回到每个候选一次请求，请求里没有 tools，system prompt 和以前逐字相同。

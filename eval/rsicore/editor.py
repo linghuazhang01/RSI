@@ -76,7 +76,7 @@ EDITOR_DEFAULTS = {
     "tool_rounds": 50, "turn_max_tokens": 8192, "max_tool_calls": 100, "proposal_tokens": 160000,
     "proposal_wall_s": 2400, "context_tokens": 131072, "tool_result_chars": 6000, "compact_at": 0.6,
     "keep_tool_rounds": 8, "keep_reasoning_rounds": 2, "reasoning_passback": "think_tag", "history_keep": 2,
-    "timeout_s": 3600, "mock_tool_rounds": 1,
+    "timeout_s": 3600, "mock_tool_rounds": 1, "history_tool": True,
     "explore": {"timeout_s": 300, "mem_gb": 8, "gpu_tools": False, "gpu_seconds": 300},
 }
 _EDITOR_KW = ("temperature", "top_p", "max_tokens", "extra_body", "timeout_s", "tool_rounds", "turn_max_tokens",

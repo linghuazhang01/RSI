@@ -35,15 +35,15 @@ from . import mock as M
 from .common import stable_hash, write_json
 
 TOOL_DOCS = {
-    "modules": "modules(layer=None, leaf=None, group=None) -> list of {module, layer, layer_type, leaf, group, out, in}",
-    "diagnostics": "diagnostics(module=None, layer=None, top=20, sort='w_norm') -> rows of the fixed diagnostics table",
+    "modules": "modules(layer=None, leaf=None, group=None) -> list of {module, layer, layer_type, leaf, group, out, in} (the only valid module names)",
+    "diagnostics": "diagnostics(module=None, layer=None, top=20, sort='w_norm') -> rows of the fixed diagnostics table (a list; can be EMPTY for a module or layer without a row: check before indexing)",
     "train_ids": "train_ids(n=None) -> ids of this generation's train items (the only items activation tools accept)",
     "train_example": "train_example(id) -> {prompt, target} of one train item (truncated)",
     "svd": "svd(module, k=8) -> {handle, S, shape}: top-k singular triplets of the CURRENT weight W",
     "acts": "acts(module, ids=None, k=4) -> {handle, in_norm, out_norm, pc_var}: activation stats on train items",
     "new_lora": "new_lora() -> {lora}: an empty LoRA",
-    "rank1": "rank1(lora, module, u, v, s) -> {lora}: add s * u v^T (u,v vector refs, normalised)",
-    "from_direction": "from_direction(lora, module, direction, key, alpha) -> {lora}: dW = alpha d k^T/|k|^2 so dW k = alpha d",
+    "rank1": "rank1(lora, module, u, v, s) -> {lora}: add s * u v^T (normalised vector refs of the SAME module: u output side, length out: S.u*, A.out_mean; v input side, length in: S.v*, A.in_mean, A.pc*)",
+    "from_direction": "from_direction(lora, module, direction, key, alpha) -> {lora}: dW = alpha d k^T/|k|^2 so dW k = alpha d (direction d: output side, length out: S.u*, A.out_mean; key k: input side, length in: S.v*, A.in_mean, A.pc*)",
     "scale_singular": "scale_singular(lora, module, svd, idx, factors) -> {lora}: dW = sum_i (f_i-1) s_i u_i v_i^T",
     "scale": "scale(lora, s, modules=None) -> {lora}",
     "interpolate": "interpolate(a, b, lam) -> {lora}: (1-lam) a + lam b",
@@ -66,7 +66,7 @@ TOOL_DOCS = {
                "must already be evaluated (free). cid / other: a candidate id or 'parent' (the current model)",
     "train_loss": "train_loss(lora, ids=None, n=64) -> {loss, parent_loss, delta, n}: mean answer NLL of train items "
                   "under the current model + lora vs without it (forward pass only, no training; costs gpu_seconds)",
-    "budget": "budget() -> {spent, left}",
+    "budget": "budget() -> {spent, left, program_seconds_left, program_evaluate_calls_left}: generation budgets, and the wall clock / evaluate calls this program has left",
     # ---- mode=weights only (WEIGHT_TOOLS): edits of the dense weights, applied IN ORDER to the CURRENT weights
     "new_edit": "new_edit() -> {edit}: an empty weight edit (handle 'W..'); every w_* op below returns a NEW edit "
                 "with the op appended; ops apply in order to the CURRENT weights W; per module "
@@ -120,6 +120,14 @@ class BudgetError(Exception):
     pass
 
 
+def program_evaluate_cap(cfg: dict) -> int | None:
+    """search.program_evaluate_calls (2026-11-21; code default 2, null = no cap): NEW api.evaluate calls one program
+    may make (an identical, already evaluated LoRA is free; the automatic evaluation of the returned candidate is
+    not a program call)."""
+    v = (cfg.get("search") or {}).get("program_evaluate_calls", 2)
+    return None if v is None else int(v)
+
+
 def _budget_exc():
     try:
         from rsicore.sandbox import BudgetExceeded
@@ -160,6 +168,8 @@ class Workspace:
         self._lock = threading.RLock()
         self._local = threading.local()
         self._evaluated: dict[str, tuple] = {}
+        self._prog_evals: dict[str, int] = {}     # cid -> new api.evaluate calls made by that program
+        self.program_timeout_s = int((cfg.get("sandbox", {}) or {}).get("timeout_s", 1800))
         self._gram_t, self._gram_r = {}, {}
         self.tool_log: dict[str, list] = {}
         self._registered = False
@@ -184,6 +194,7 @@ class Workspace:
 
     def begin_program(self, cid: str) -> None:
         self._local.cid = cid
+        self._local.t0 = time.time()
         self.tool_log[cid] = []
 
     def end_program(self, cid: str, keep: tuple = ()) -> None:
@@ -192,6 +203,7 @@ class Workspace:
                 self._h.pop(h, None)
                 self._owner.pop(h, None)
         self._local.cid = None
+        self._local.t0 = None
 
     def _cid(self):
         return getattr(self._local, "cid", None) or "_"
@@ -475,8 +487,21 @@ class Workspace:
         return {"prompt": "\n".join(m.get("content", "") for m in msgs)[:2000],
                 "target": (ex.get("target") or "")[:2000], "source": ex.get("source")}
 
+    def budget_status(self) -> dict:
+        """Budgets of this generation for the step context (2026-11-21)."""
+        return {"evaluate_left": self.left("evaluate"), "evaluate": self.budget.get("evaluate"),
+                "gpu_seconds_left": round(self.left("gpu_seconds"), 1), "gpu_seconds": self.budget.get("gpu_seconds"),
+                "program_evaluate_calls": program_evaluate_cap(self.cfg)}
+
     def t_budget(self):
-        return {"spent": dict(self.api.spent), "left": self.api.remaining()}
+        out = {"spent": dict(self.api.spent), "left": self.api.remaining()}
+        cid, t0 = getattr(self._local, "cid", None), getattr(self._local, "t0", None)
+        if cid and "~x" not in str(cid) and t0:          # a candidate program (not run_python exploration)
+            out["program_seconds_left"] = round(max(0.0, self.program_timeout_s - (time.time() - t0)), 1)
+            cap = program_evaluate_cap(self.cfg)
+            if cap is not None:
+                out["program_evaluate_calls_left"] = max(0, cap - self._prog_evals.get(cid, 0))
+        return out
 
     def t_stack(self):
         return [{"handle": f"H{g}", "gen": g, "modules": len(lo.modules()), "max_rank": lo.max_rank()}
@@ -1013,6 +1038,13 @@ class Workspace:
     def t_evaluate(self, lora=None, edit=None):
         with self._lock:
             lo = self._eval_obj({"lora": lora, "edit": edit})
+            cid, cap = getattr(self._local, "cid", None), program_evaluate_cap(self.cfg)
+            if cid and cap is not None and lo.modules() and (self.lora_name(lo), "screen") not in self._evaluated:
+                n = self._prog_evals.get(cid, 0)       # a program's own api.evaluate calls (2026-11-21)
+                if n >= cap:
+                    raise _budget_exc()(f"api.evaluate: at most {cap} new evaluations per program "
+                                        "(search.program_evaluate_calls); return your best LoRA instead")
+                self._prog_evals[cid] = n + 1
         self._local.eval_pending = 1 if lo.modules() else 0
         try:
             _, fb = self.evaluate_lora(lo, "screen", charge=False)   # ws.api charges (cost_fn) and dedupes
@@ -1217,19 +1249,41 @@ def explore_doc(ws: Workspace, gpu_tools: bool = False, gpu_seconds: float = 300
     return out + " Handles made here are freed after the call; the final program must build what it returns."
 
 
-def editor_chat_tools(ws: Workspace, cfg: dict):
+def search_history(past: dict | None = None):
+    """rsicore.chat_tools.SearchHistory for Paper B (2026-11-21): past = {gen: gen_dir} of earlier generations
+    (none for the E task); rows summarized by prompts.history_row, same_as by the LoRA / edit digest, one line per
+    earlier generation from its accepted.json."""
+    from rsicore.chat_tools import SearchHistory
+    from rsicore.records import read_json
+
+    from .prompts import history_row
+
+    def gen_fn(g, d):
+        acc = read_json(Path(d) / "accepted.json", {}) or {}
+        out = {"accepted": acc.get("cid") or acc.get("source")}
+        if acc.get("source") == "keep" and acc.get("reason"):
+            out["reason"] = str(acc["reason"])[:200]
+        return out
+    return SearchHistory(past or {}, row_fn=history_row, gen_fn=gen_fn,
+                         key_fn=lambda r: (r.get("artifact") or {}).get("digest"))
+
+
+def editor_chat_tools(ws: Workspace, cfg: dict, past: dict | None = None):
     """rsicore.chat_tools.ChatTools whose run_python runs on ws.explore_api (editor.explore.gpu_tools /
-    gpu_seconds, timeout_s / mem_gb, editor.tool_result_chars); None when editor.tool_rounds is 0."""
+    gpu_seconds, timeout_s / mem_gb, editor.tool_result_chars), read_record and (editor.history_tool, default on)
+    search_history over this search's candidates and past = {gen: gen_dir} of earlier generations; None when
+    editor.tool_rounds is 0."""
     from rsicore.chat_tools import ChatTools, chat_tools_kwargs
     from rsicore.editor import editor_settings
     s = editor_settings(cfg)
     if int(s.get("tool_rounds") or 0) <= 0:
         return None
+    history = search_history(past) if s.get("history_tool", True) else None
     gpu, secs = bool(s["explore"].get("gpu_tools")), float(s["explore"].get("gpu_seconds") or 0)
 
     def factory(tag, ctx):
         return ws.explore_api(tag, gpu_tools=gpu, gpu_seconds=secs)
-    return ChatTools(factory, run_python_doc=explore_doc(ws, gpu, secs), **chat_tools_kwargs(cfg))
+    return ChatTools(factory, run_python_doc=explore_doc(ws, gpu, secs), history=history, **chat_tools_kwargs(cfg))
 
 
 def editor_mock_policy(policy, cfg: dict):

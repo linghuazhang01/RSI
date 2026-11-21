@@ -15,6 +15,16 @@ Two functions (OpenAI tool schemas from schemas()):
                               ("feedback": gen_dir/feedback/<cid>.json) of a candidate in ctx["visible_cids"]
                               (the history snapshot the proposal was rendered from), in pages of the result size.
 
+  search_history(gen=None, sort="score", offset=0)        (2026-11-21; only with history=SearchHistory(...))
+                              every candidate already tried: this step's visible candidates and all candidates
+                              of the earlier generations in history.past, one compact row each (cid, gen,
+                              scores, error, gate outcome, the paper's summary of what the candidate is via
+                              history.row_fn, same_as = an earlier cid with the same history.key_fn key, i.e.
+                              an identical result), newest generation first; at offset 0 also one line per
+                              earlier generation (history.gen_fn: accepted, gate reason). Paged by result size.
+                              With history, read_record also accepts any cid of an earlier generation in
+                              history.past (its programs/ and feedback/ there).
+
 explore_api_factory(tag: str, ctx: dict) is called once per run_python call, in the proposing thread, with
 tag = f"{cid}~x{r:02d}_{i}" (r = round, i = index of the call in that turn). It returns one of
   * a ToolAPI,
@@ -35,12 +45,14 @@ per round until `rounds` tool messages follow the last user message, then calls 
 WITHOUT the in-loop turns (so the program equals the one of a run without tools).
 """
 import json
+import re
 import shutil
 import signal
 import tempfile
 import time
 from pathlib import Path
 
+from .records import read_json, read_jsonl
 from .sandbox import ToolAPI, run_program
 
 RUN_PYTHON_DOC = (
@@ -53,6 +65,14 @@ RUN_PYTHON_DOC = (
 READ_RECORD_DOC = (
     "Read the full program or the full feedback of an earlier candidate listed in the latest message "
     "(the message shows them shortened). Long texts come in pages: call again with offset=next_offset.")
+
+SEARCH_HISTORY_DOC = (
+    "List every candidate already tried, so you do not repeat one: this generation's candidates (those in the "
+    "latest message) and all candidates of earlier generations, one compact row each (what it is, its scores, "
+    "error, gate outcome; same_as = an earlier candidate with an identical result, which would score the same). "
+    "Newest generation first, best score first within a generation (sort='order': in the order they were tried). "
+    "Scores are relative to the reference model of their own generation: compare within a generation. "
+    "read_record(cid, part) then shows any listed candidate's full program or full feedback.")
 
 FORCED_MARK = "[No more function calls"     # start of the editor's forced-final notice (see editor.py)
 
@@ -91,6 +111,47 @@ def error_json(e) -> str:
     return json.dumps({"ok": False, "error": str(msg)[:2000]}, ensure_ascii=False)
 
 
+_CID_GEN = re.compile(r"^g(\d+)_")
+
+
+def _cid_gen(cid) -> int | None:
+    m = _CID_GEN.match(str(cid or ""))
+    return int(m.group(1)) if m else None
+
+
+def _num(x, nd=4):
+    try:
+        return None if x is None else round(float(x), nd)
+    except (TypeError, ValueError):
+        return None
+
+
+class SearchHistory:
+    """Earlier generations for the search_history / read_record chat tools (2026-11-21).
+    past: {gen: directory} of the earlier generations' searches (candidates.jsonl, programs/, feedback/,
+    gate.json); row_fn(record) -> dict: the paper's short summary of one candidates.jsonl record (artifact,
+    screen, full, score, error); key_fn(record) -> str | None: identity of the result (e.g. a config hash),
+    used for same_as; gen_fn(gen, directory) -> dict: the paper's outcome of an earlier generation.
+    SearchHistory({}) = no earlier generations (e.g. the fresh E_t session): search_history then lists this
+    step's candidates only."""
+
+    def __init__(self, past: dict | None = None, *, row_fn=None, key_fn=None, gen_fn=None):
+        self.past = {int(g): Path(d) for g, d in (past or {}).items()}
+        self.row_fn, self.key_fn, self.gen_fn = row_fn, key_fn, gen_fn
+
+
+def _gate_outcomes(d: Path) -> dict:
+    """cid -> {"passed": bool, "reason": str} from <d>/gate.json (rsicore.search.submit_to_gate)."""
+    out = {}
+    for sub in (read_json(Path(d) / "gate.json", None) or {}).get("submissions") or []:
+        info = sub.get("info") if isinstance(sub.get("info"), dict) else {}
+        why = info.get("reason") or info.get("reasons")
+        if isinstance(why, (list, tuple)):
+            why = "; ".join(map(str, why))
+        out[str(sub.get("cid"))] = {"passed": bool(sub.get("passed")), **({"reason": cut(str(why), 200)} if why else {})}
+    return out
+
+
 def _schema(name, doc, props, required):
     return {"type": "function", "function": {"name": name, "description": doc, "parameters": {
         "type": "object", "properties": props, "required": required}}}
@@ -98,15 +159,17 @@ def _schema(name, doc, props, required):
 
 class ChatTools:
     def __init__(self, explore_api_factory, *, timeout_s: float = 300, mem_gb: float = 8, result_chars: int = 6000,
-                 run_python_doc: str | None = None, read_record: bool = True):
+                 run_python_doc: str | None = None, read_record: bool = True, history: SearchHistory | None = None):
         self.factory = explore_api_factory
+        self.history = history
         self.timeout_s, self.mem_gb, self.result_chars = float(timeout_s), mem_gb, int(result_chars)
         self.run_python_doc = run_python_doc or RUN_PYTHON_DOC
         self.read_record_enabled = bool(read_record)
 
     # ---------------------------------------------------------------- schemas
     def names(self) -> list[str]:
-        return ["run_python"] + (["read_record"] if self.read_record_enabled else [])
+        return (["run_python"] + (["read_record"] if self.read_record_enabled else [])
+                + (["search_history"] if self.history is not None else []))
 
     def schemas(self) -> list[dict]:
         out = [_schema("run_python", self.run_python_doc,
@@ -117,6 +180,11 @@ class ChatTools:
                 "part": {"type": "string", "enum": ["program", "feedback"]},
                 "offset": {"type": "integer", "description": "character offset of the page (default 0)"}},
                 ["cid", "part"]))
+        if self.history is not None:
+            out.append(_schema("search_history", SEARCH_HISTORY_DOC, {
+                "gen": {"type": "integer", "description": "only this generation (default: all)"},
+                "sort": {"type": "string", "enum": ["score", "order"]},
+                "offset": {"type": "integer", "description": "row offset of the page (default 0)"}}, []))
         return out
 
     # ---------------------------------------------------------------- dispatch
@@ -149,6 +217,8 @@ class ChatTools:
                 content, ok = self.run_python(ctx, r, i, deadline_s=deadline_s, **args)
             elif name == "read_record" and self.read_record_enabled:
                 content, ok = self.read_record(ctx, **args)
+            elif name == "search_history" and self.history is not None:
+                content, ok = self.search_history(ctx, **args)
             else:
                 content, ok = error_json(f"unknown tool {name!r}; available: {self.names()}"), False
         except Exception as e:  # noqa: BLE001 - a failing tool must not stop the proposal
@@ -214,14 +284,26 @@ class ChatTools:
         return json.dumps(out, ensure_ascii=False), bool(res.ok)
 
     # ---------------------------------------------------------------- read_record
+    def _past_dir(self, cid) -> Path | None:
+        """Directory of an earlier generation's candidate `cid` (history.past), or None."""
+        if self.history is None:
+            return None
+        g = _cid_gen(cid)
+        d = self.history.past.get(g) if g is not None else None
+        if d is None or not any(r.get("cid") == str(cid) for r in read_jsonl(d / "candidates.jsonl")):
+            return None
+        return d
+
     def read_record(self, ctx: dict, *, cid: str, part: str = "feedback", offset: int = 0) -> tuple[str, bool]:
         visible = [str(c) for c in (ctx.get("visible_cids") or [])]
-        if str(cid) not in visible:
+        gd = ctx.get("gen_dir") if str(cid) in visible else self._past_dir(cid)
+        if str(cid) not in visible and gd is None:
             shown = ", ".join(visible[-12:]) or "(none yet)"
-            return error_json(f"cid {cid!r} is not visible in this step; visible: {shown}"), False
+            past = (f"; or a cid of generation {', '.join(map(str, sorted(self.history.past)))} (search_history lists them)"
+                    if self.history is not None and self.history.past else "")
+            return error_json(f"cid {cid!r} is not visible in this step; visible: {shown}{past}"), False
         if part not in ("program", "feedback"):
             return error_json(f"part must be 'program' or 'feedback', not {part!r}"), False
-        gd = ctx.get("gen_dir")
         if not gd:
             return error_json("no records directory for this proposal"), False
         p = Path(gd) / ("programs" if part == "program" else "feedback") / f"{cid}.{'py' if part == 'program' else 'json'}"
@@ -235,6 +317,92 @@ class ChatTools:
         out = {"ok": True, "cid": cid, "part": part, "offset": offset, "total_chars": len(text), "text": chunk}
         if offset + page < len(text):
             out["next_offset"] = offset + page
+        return json.dumps(out, ensure_ascii=False), True
+
+
+    # ---------------------------------------------------------------- search_history
+    def _history_rows(self, ctx: dict) -> tuple[list[dict], list[dict]]:
+        """(rows of every candidate tried so far, newest generation first; one entry per earlier generation)."""
+        h = self.history
+        visible = [str(c) for c in (ctx.get("visible_cids") or [])]
+        cur = _cid_gen(ctx.get("cid"))
+        groups = []
+        for g in sorted(h.past):
+            groups.append((g, read_jsonl(h.past[g] / "candidates.jsonl"), _gate_outcomes(h.past[g])))
+        gd = ctx.get("gen_dir")
+        if gd and visible:
+            recs = {r.get("cid"): r for r in read_jsonl(Path(gd) / "candidates.jsonl")}
+            groups.append((cur, [recs[c] for c in visible if c in recs], {}))
+        seen, rows = {}, []
+        for g, recs, gate in groups:           # oldest first, so same_as names the first one tried
+            for r in recs:
+                cid = str(r.get("cid"))
+                sc, fu = r.get("screen") or {}, r.get("full") or {}
+                row = {"cid": cid, "gen": g, "score": _num(r.get("score")), "screen": _num(sc.get("score")),
+                       "full": _num(fu.get("score"))}
+                err = (r.get("error") or "").strip()
+                if err:
+                    row["error"] = cut(err.splitlines()[0], 140, head=1.0)
+                if cid in gate:
+                    row["gate"] = gate[cid]
+                for fn, name in ((h.row_fn, "summary"), (h.key_fn, "key")):
+                    if fn is None:
+                        continue
+                    try:
+                        v = fn(r)
+                    except Exception:  # noqa: BLE001 - a bad record must not hide the others
+                        v = None
+                    if name == "summary" and isinstance(v, dict):
+                        row.update({k: x for k, x in v.items() if x is not None})
+                    elif name == "key" and v and not err:
+                        if v in seen:
+                            row["same_as"] = seen[v]
+                        else:
+                            seen[v] = cid
+                rows.append(row)
+        gens = []
+        for g in sorted(h.past):
+            e = {"gen": g, "candidates": sum(1 for r in rows if r["gen"] == g)}
+            if h.gen_fn is not None:
+                try:
+                    e.update(h.gen_fn(g, h.past[g]) or {})
+                except Exception:  # noqa: BLE001
+                    pass
+            gens.append(e)
+        return rows, gens
+
+    def search_history(self, ctx: dict, *, gen=None, sort: str = "score", offset: int = 0) -> tuple[str, bool]:
+        if sort not in ("score", "order"):
+            return error_json(f"sort must be 'score' or 'order', not {sort!r}"), False
+        rows, gens = self._history_rows(ctx)
+        if gen is not None:
+            rows = [r for r in rows if r["gen"] == int(gen)]
+        order = {g: i for i, g in enumerate(dict.fromkeys(r["gen"] for r in rows))}
+
+        def key(r):
+            s = r["score"] if r["score"] is not None else float("-inf")
+            return (-order[r["gen"]], -s if sort == "score" else 0)
+        rows = sorted(rows, key=key)           # stable: 'order' keeps the order tried within a generation
+        offset = max(0, int(offset or 0))
+        out = {"ok": True, "total": len(rows), "offset": offset}
+        if offset == 0:
+            out["note"] = ("score: higher is better, relative to the reference model of that generation (compare "
+                           "within a generation); gate: submitted to the gate (passed or not); same_as: identical "
+                           "result to that earlier candidate")
+            if gens:
+                out["generations"] = gens
+        room = self.result_chars - len(json.dumps(out, ensure_ascii=False)) - 120
+        page, i = [], offset
+        while i < len(rows):
+            t = len(json.dumps(rows[i], ensure_ascii=False)) + 2
+            if page and t > room:
+                break
+            page.append(rows[i])
+            room -= t
+            i += 1
+        out["rows"] = page
+        if i < len(rows):
+            out["next_offset"] = i
         return json.dumps(out, ensure_ascii=False), True
 
 

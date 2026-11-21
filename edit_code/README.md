@@ -84,7 +84,7 @@
 
 改造者写每个候选时开 Qwen3 thinking（`editor.extra_body.chat_template_kwargs.enable_thinking: true`，temperature 0.6 / top_p 0.95 / top_k 20 / min_p 0），并且可以先调用工具再交程序（`rsicore.editor` + `rsicore.chat_tools`）：
 - **一轮** = 模型的一次回复里带了工具调用（并行的几个调用算一轮）。最多 `editor.tool_rounds` 轮（默认 50），之后再给一次 `tool_choice: "none"` 的最终回复。候选 = 不带工具调用、含一个 ```python 块的那次回复。
-- 工具：`run_python(code)` 在同一个沙箱里跑探索代码，`api` 和最终程序的一样，但**没有 `api.evaluate`**（`make_tool_api(explore=True)`），`group_error` 只能查已缓存的设置（`hessian_table` 那些；`editor.explore.gpu_tools: true` 才允许现算）；`read_record(cid, part)` 看表里某个候选的完整程序 / 反馈。探索**不扣**本代的 evaluate 预算，也不占候选槽。每次调用的完整输出在 `gen_XX/explore/<cid>/rNN_i/`。
+- 工具：`run_python(code)` 在同一个沙箱里跑探索代码，`api` 和最终程序的一样，但**没有 `api.evaluate`**（`make_tool_api(explore=True)`），`group_error` 只能查已缓存的设置（`hessian_table` 那些；`editor.explore.gpu_tools: true` 才允许现算）；`read_record(cid, part)` 看表里某个候选的完整程序 / 反馈；`search_history(gen, sort, offset)`（2026-11-21，默认开，`editor.history_tool=false` 关）列出所有试过的候选（本代可见的 + 往期所有代），每个一行：config 描述（默认设置 + 按设置分组的覆盖及其模块类型）、GiB、平均位数、KL、各 domain 相对 incumbent 的差、分数、验收结果，`same_as` = config hash 与更早候选相同；`read_record` 也能打开往期候选。E_t 只看自己的候选。系统提示里的验收规则按 `gate.min_delta` / `gate.require_significant` 生成（2026-11-21，关掉显著性时写明"不做显著性检验"），并写明程序里 `api` 只是 `main(api)` 的参数。探索**不扣**本代的 evaluate 预算，也不占候选槽。每次调用的完整输出在 `gen_XX/explore/<cid>/rNN_i/`。
 - 记录：`gen_XX/editor/thread_K.jsonl`（format 2，每轮的推理、工具调用和结果都在）；`candidates.jsonl` 的 cost 里有 `editor_rounds / editor_tool_calls / editor_tool_s / editor_prompt_tokens / editor_completion_tokens / editor_stop`。
 - E_t 用同一个改造者工厂，也一样。
 

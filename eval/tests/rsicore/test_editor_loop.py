@@ -303,6 +303,64 @@ def test_read_record_visibility(tmp_path):
     assert [s["function"]["name"] for s in t.schemas()] == ["run_python", "read_record"]
 
 
+def _gen(d: Path, recs: list, gate=None):
+    (d / "programs").mkdir(parents=True)
+    (d / "feedback").mkdir()
+    with open(d / "candidates.jsonl", "w") as f:
+        for r in recs:
+            f.write(json.dumps(dict(r, program=f"programs/{r['cid']}.py")) + "\n")
+            (d / "programs" / f"{r['cid']}.py").write_text(f"# {r['cid']}\n" + CODE)
+            (d / "feedback" / f"{r['cid']}.json").write_text(json.dumps({"cid": r["cid"], "artifact": r.get("artifact")}))
+    if gate is not None:
+        (d / "gate.json").write_text(json.dumps({"submissions": gate}))
+
+
+def test_search_history(tmp_path):
+    """search_history (2026-11-21): earlier generations' candidates + this step's visible ones, the paper's row /
+    key / generation functions, same_as, gate outcomes, sorting, paging; read_record of an earlier generation."""
+    from rsicore.chat_tools import SearchHistory
+    g1, g2 = tmp_path / "gen_01", tmp_path / "gen_02"
+    _gen(g1, [{"cid": "g01_t0_s00", "score": 0.1, "artifact": {"h": "A"}},
+              {"cid": "g01_t1_s00", "score": 0.3, "artifact": {"h": "B"}},
+              {"cid": "g01_t2_s00", "score": None, "error": "program failed: boom\nmore", "artifact": None}],
+         gate=[{"cid": "g01_t1_s00", "passed": False, "info": {"reason": "delta below min_delta"}}])
+    _gen(g2, [{"cid": "g02_t0_s00", "score": 0.2, "artifact": {"h": "B"}},
+              {"cid": "g02_t1_s00", "score": 0.5, "artifact": {"h": "C"}}])      # not visible yet (same step)
+    h = SearchHistory({1: g1}, row_fn=lambda r: {"what": (r.get("artifact") or {}).get("h")},
+                      key_fn=lambda r: (r.get("artifact") or {}).get("h"), gen_fn=lambda g, d: {"accepted": False})
+    t = ChatTools(lambda tag, ctx: sandbox.ToolAPI({}), result_chars=6000, history=h)
+    assert [s["function"]["name"] for s in t.schemas()] == ["run_python", "read_record", "search_history"]
+    ctx = {"cid": "g02_t2_s01", "gen_dir": str(g2), "visible_cids": ["g02_t0_s00"]}
+    r = json.loads(t.call("search_history", {}, ctx, 1, 0)["content"])
+    assert r["ok"] and r["total"] == 4 and r["generations"] == [{"gen": 1, "candidates": 3, "accepted": False}]
+    assert [x["cid"] for x in r["rows"]] == ["g02_t0_s00", "g01_t1_s00", "g01_t0_s00", "g01_t2_s00"]
+    rows = {x["cid"]: x for x in r["rows"]}
+    assert rows["g02_t0_s00"]["same_as"] == "g01_t1_s00" and rows["g02_t0_s00"]["gen"] == 2
+    assert rows["g01_t1_s00"]["gate"] == {"passed": False, "reason": "delta below min_delta"}
+    assert rows["g01_t2_s00"]["error"] == "program failed: boom" and "what" not in rows["g01_t2_s00"]
+    assert rows["g01_t0_s00"]["what"] == "A"
+    r = json.loads(t.call("search_history", {"gen": 1, "sort": "order"}, ctx, 1, 0)["content"])
+    assert [x["cid"] for x in r["rows"]] == ["g01_t0_s00", "g01_t1_s00", "g01_t2_s00"]
+    small = ChatTools(lambda tag, ctx: sandbox.ToolAPI({}), result_chars=400, history=h)
+    seen, off = [], 0
+    while off is not None:
+        r = json.loads(small.call("search_history", {"offset": off}, ctx, 1, 0)["content"])
+        seen += [x["cid"] for x in r["rows"]]
+        off = r.get("next_offset")
+    assert len(seen) == 4 and len(set(seen)) == 4
+    r = json.loads(t.call("read_record", {"cid": "g01_t1_s00", "part": "program"}, ctx, 1, 0)["content"])
+    assert r["ok"] and r["text"].startswith("# g01_t1_s00")
+    r = t.call("read_record", {"cid": "g02_t1_s00", "part": "program"}, ctx, 1, 0)      # same step: not visible
+    assert not r["ok"] and "generation 1" in r["content"]
+    r = t.call("read_record", {"cid": "g01_t9_s00", "part": "program"}, ctx, 1, 0)      # no such candidate
+    assert not r["ok"]
+    bad = t.call("search_history", {"sort": "x"}, ctx, 1, 0)
+    assert not bad["ok"]
+    t0 = ChatTools(lambda tag, ctx: sandbox.ToolAPI({}), history=SearchHistory({}))     # E_t: this step only
+    r = json.loads(t0.call("search_history", {}, ctx, 1, 0)["content"])
+    assert [x["cid"] for x in r["rows"]] == ["g02_t0_s00"] and "generations" not in r
+
+
 # ----------------------------------------------------------------------------- transcript / replay
 def _script_two_props():
     return [tool_turn("a"), tool_turn("b"), {"content": ANSWER},

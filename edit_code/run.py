@@ -39,7 +39,8 @@ from rsicore import config as C  # noqa: E402
 from rsicore import draws as D  # noqa: E402
 from rsicore import records as R  # noqa: E402
 from rsicore import search as S  # noqa: E402
-from rsicore.chat_tools import RUN_PYTHON_DOC, ChatTools, chat_tools_kwargs, with_mock_exploration  # noqa: E402
+from rsicore.chat_tools import (RUN_PYTHON_DOC, ChatTools, SearchHistory, chat_tools_kwargs,  # noqa: E402
+                                with_mock_exploration)
 from rsicore.editor import Editor, apply_context_tokens, editor_kwargs, editor_settings  # noqa: E402
 from rsicore.evaluate import score, score_split  # noqa: E402
 from rsicore.gate import fixed_noise_band, measure_noise_band, noise_ids  # noqa: E402
@@ -53,7 +54,7 @@ from edit_code.baselines import run_baselines  # noqa: E402
 from edit_code.common import (candidate_groups, deep_merge, gpu_layout, read_json, read_jsonl, tail,  # noqa: E402
                               write_json)
 from edit_code.problem import EvalBudgetExhausted, QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
-from edit_code.prompts import archive_text, make_render_context, system_prompt  # noqa: E402
+from edit_code.prompts import archive_text, history_row, make_render_context, system_prompt  # noqa: E402
 from edit_code.quant import schema, sizes  # noqa: E402
 from edit_code.tools import make_tool_api  # noqa: E402
 
@@ -344,10 +345,11 @@ class Runner:
         rc, cfg = self.rc, self.cfg
         per_prog = int(scfg.get("program_evaluate_calls", 2))
         doc_api = make_tool_api(prob, cfg, cid="doc", per_program_evaluate=per_prog)
-        sys_prompt = system_prompt(prob, doc_api.describe(), cfg)
         es = editor_settings(cfg)
+        history = self.search_history(prob.gen, task) if es["tool_rounds"] > 0 and es.get("history_tool", True) else None
+        sys_prompt = system_prompt(prob, doc_api.describe(), cfg, history=history is not None)
         ekw = editor_kwargs(cfg, server_args=server_args(cfg, "editor_args"))
-        tools = self.chat_tools(prob) if es["tool_rounds"] > 0 else None
+        tools = self.chat_tools(prob, history) if es["tool_rounds"] > 0 else None
         policy = None
         if rc.mock:                          # the mock editor explores only when the editor has tools
             policy = with_mock_exploration(M.mock_policy, es["mock_tool_rounds"] if tools else 0, MOCK_EXPLORE_CODE)
@@ -392,11 +394,28 @@ class Runner:
         return dict(editor_factory=editor_factory, render_context=render, build_fn=build_fn, screen_fn=screen_fn,
                     full_fn=full_fn)
 
-    def chat_tools(self, prob: QuantProblem) -> ChatTools:
+    def search_history(self, g: int, task: str) -> SearchHistory:
+        """Records for the search_history chat tool (editor.history_tool, default on; 2026-11-21): the main
+        search of generation g sees every earlier generation's candidates (gen_01 .. gen_{g-1}); the E_t
+        session (task "e", a fresh session without archive) sees none."""
+        past = {} if task != "main" else {t: R.gen_dir(self.rc, t) for t in range(1, int(g))
+                                          if (R.gen_dir(self.rc, t) / "candidates.jsonl").exists()}
+
+        def gen_fn(t, d):
+            acc = read_json(d / "accepted.json") or {}
+            out = {"accepted": acc.get("cid") if acc.get("accepted") else False}
+            if not acc.get("accepted") and acc.get("gate_reason"):
+                out["gate_reason"] = str(acc["gate_reason"])[:200]
+            return out
+        return SearchHistory(past, row_fn=history_row, gen_fn=gen_fn,
+                             key_fn=lambda r: (r.get("artifact") or {}).get("config_hash"))
+
+    def chat_tools(self, prob: QuantProblem, history: SearchHistory | None = None) -> ChatTools:
         """The editor's chat tools (editor.tool_rounds > 0): run_python with the exploration API
         (make_tool_api(explore=True): no evaluate; group_error on cached settings only unless
-        editor.explore.gpu_tools) and read_record. Each run_python call gets a fresh API (thread-safe: the
-        editor threads propose at the same time); exploration never spends the generation's evaluate budget."""
+        editor.explore.gpu_tools), read_record and (history given) search_history. Each run_python call gets a
+        fresh API (thread-safe: the editor threads propose at the same time); exploration never spends the
+        generation's evaluate budget."""
         cfg = self.cfg
 
         def explore_api(tag, ctx):
@@ -406,7 +425,7 @@ class Runner:
         if "group_error" in names and not editor_settings(cfg)["explore"].get("gpu_tools"):
             doc += (" group_error here only accepts settings whose error is cached (those of hessian_table); "
                     "other settings raise an error.")
-        return ChatTools(explore_api, run_python_doc=doc, **chat_tools_kwargs(cfg))
+        return ChatTools(explore_api, run_python_doc=doc, history=history, **chat_tools_kwargs(cfg))
 
     def run_search(self, prob, gen, gdir, ed, *, task, archive, scfg) -> list:
         """The search ends with the editor asleep and its GPU lent to `prob` as a candidate slot (editor_sleep):

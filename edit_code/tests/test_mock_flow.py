@@ -310,6 +310,59 @@ class TestMockFlow(unittest.TestCase):
         self.assertEqual(n.get(("screen", "simple_math_train")), 1500)
         self.assertEqual(n.get(("gate", "simple_math_eval")), 500)
 
+    def test_search_history_tool(self):
+        """search_history (2026-11-21): generation 2's editor gets the tool (system prompt) and it lists generation
+        1's candidates with a config description plus generation 2's visible ones; read_record opens generation 1's
+        records; the E_t session sees no earlier generation; editor.history_tool=false removes it."""
+        from types import SimpleNamespace
+        from rsicore.chat_tools import ChatTools
+        from rsicore.sandbox import ToolAPI
+        from edit_code import run as RUN
+        r, _ = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_hist", "--set", "heldout.limit=2"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        rd = self.runs / "A_mock_hist"
+        sysmsg = jl(rd / "gen_02" / "editor" / "thread_0.jsonl")[0]["content"]
+        self.assertIn("search_history(gen, sort, offset)", sysmsg)
+        h = RUN.Runner.search_history(SimpleNamespace(rc=SimpleNamespace(run_dir=rd)), 2, "main")
+        self.assertEqual(sorted(h.past), [1])
+        t = ChatTools(lambda tag, ctx: ToolAPI({}), history=h)
+        vis = [c["cid"] for c in jl(rd / "gen_02" / "candidates.jsonl")][:4]
+        ctx = {"cid": "g02_t0_s01", "gen_dir": str(rd / "gen_02"), "visible_cids": vis}
+        out = json.loads(t.call("search_history", {}, ctx, 1, 0)["content"])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["total"], len(vis) + len(jl(rd / "gen_01" / "candidates.jsonl")))
+        self.assertEqual(out["generations"][0]["gen"], 1)
+        ok = [x for x in out["rows"] if "error" not in x]
+        self.assertTrue(ok and all(x["config"].startswith("default ") and x["GiB"] for x in ok), ok[:2])
+        self.assertTrue(any(x["gen"] == 1 for x in out["rows"]) or out.get("next_offset"))
+        submitted = {s_["cid"] for s_ in json.loads((rd / "gen_01" / "gate.json").read_text())["submissions"]}
+        g1 = {x["cid"]: x for x in out["rows"] if x["gen"] == 1}
+        for cid in submitted & set(g1):
+            self.assertIn("gate", g1[cid])
+        c1 = jl(rd / "gen_01" / "candidates.jsonl")[0]["cid"]
+        rr = json.loads(t.call("read_record", {"cid": c1, "part": "feedback"}, ctx, 1, 0)["content"])
+        self.assertTrue(rr["ok"] and '"config"' in rr["text"])
+        he = RUN.Runner.search_history(SimpleNamespace(rc=SimpleNamespace(run_dir=rd)), 2, "e")
+        self.assertEqual(he.past, {})
+        cfg = load_cfg(["editor.history_tool=false"], self.runs)
+        from rsicore.editor import editor_settings
+        self.assertFalse(editor_settings(cfg)["history_tool"])
+
+    def test_acceptance_text_follows_config(self):
+        """System prompt (2026-11-21): the acceptance rule follows gate.min_delta / require_significant; the
+        api-scope rule is stated."""
+        from edit_code.prompts import acceptance_text
+        self.assertIn("statistically significant", acceptance_text({"gate": {"min_delta": 0.005}}))
+        t = acceptance_text({"gate": {"min_delta": 0.005, "require_significant": False}})
+        self.assertIn("no significance test", t)
+        self.assertNotIn("significant gain", t)
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_nosig_prompt", "--set", "heldout.limit=2",
+                    "--set", "gate.require_significant=false"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        sysmsg = jl(self.runs / "A_mock_nosig_prompt" / "gen_01" / "editor" / "thread_0.jsonl")[0]["content"]
+        self.assertIn("there is no significance test", sysmsg)
+        self.assertIn("it is not a global there", sysmsg)
+
     def test_editor_tool_loop(self):
         """editor tool loop (2026-11-21): by default every proposal makes editor.mock_tool_rounds (1) run_python
         call on the exploration API before the program (transcript format 2); exploration spends no evaluate and
@@ -432,7 +485,7 @@ class TestEditorConfig(unittest.TestCase):
         prob = types.SimpleNamespace(space={"bits": [2, 3, 4, 8, 16], "group_sizes": [32, 64, 128],
                                             "quantizers": ["rtn", "gptq", "awq"]})
         base = P.SYSTEM_PROMPT.format(tools="DOC", bits=prob.space["bits"], group_sizes=prob.space["group_sizes"],
-                                      quantizers=prob.space["quantizers"], min_delta=0.005)
+                                      quantizers=prob.space["quantizers"], acceptance=P.acceptance_text({"gate": {"min_delta": 0.005}}))
         cfg = {"gate": {"min_delta": 0.005}}
         self.assertEqual(P.system_prompt(prob, "DOC", dict(cfg, editor={"tool_rounds": 0})), base)
         t = P.system_prompt(prob, "DOC", dict(cfg, editor={"tool_rounds": 12}))

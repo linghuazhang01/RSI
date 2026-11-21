@@ -32,7 +32,8 @@ Config schema (JSON object):
 - profile_table() gives, per group key and bit width, the whole-model KL increase when only that group is RTN-quantized (forward pass on the original model, 64 texts). hessian_table() gives, per group, quantizer (rtn / gptq / awq) and bit width, the Hessian-weighted output error of that group alone (every calibration token, no forward pass): lower noise, local. Sensitivities are roughly additive at >= 3.5 average bits and underestimate damage at 2-3 bits; evaluate(config) measures the real thing.
 - Analysis (free, no evaluate): group_error(config) shows where a config's quantization error concentrates; compare(cid) compares an evaluated candidate with the incumbent (or another candidate) item by item: which items broke / got fixed (ids only), by output length, truncation.
 - Each program's returned config is evaluated on held-back training items and compared with the INCUMBENT on the same items (retention = your accuracy / the incumbent's; paired delta; KL vs the original BF16 model); you then see the feedback and may improve. api.evaluate(config) inside a program spends the same per-round evaluate budget.
-- Acceptance (after the search, not visible to you): size <= budget and a higher score than the incumbent on a fixed hidden test set (paired per item: mean gain >= {min_delta}, a statistically significant gain and no significant loss on any domain). Otherwise the incumbent stays.
+- {acceptance}
+- In your program `api` exists only as the argument of main(api) (it is not a global there): pass it to helper functions explicitly, e.g. def pick(api, budget): ...
 
 Answer with a short plan, then exactly one ```python code block containing the full program."""
 
@@ -42,7 +43,7 @@ FINAL_RULE = "Answer with a short plan, then exactly one ```python code block co
 # editor.tool_rounds > 0 (2026-11-21): the editor may call chat tools before answering; replaces FINAL_RULE
 TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds:
 - run_python(code) runs exploratory code in the same sandbox with the same `api` (keyword arguments as above), so you can inspect and filter the tables and check configs before you commit to a program. api.evaluate is NOT available there (only your final program may evaluate){group_error}. print() what you need or set `result = ...`; output is cut to a few thousand characters, so filter big tables in the code.
-- read_record(cid, part) shows the full program ("program") or the full feedback ("feedback") of a candidate in the table.
+- read_record(cid, part) shows the full program ("program") or the full feedback ("feedback", with the full config) of a candidate in the table{history_read}.{history}
 Nothing persists between run_python calls or into your final program: it must be self-contained.
 When you are done, reply WITHOUT a function call: a short plan, then exactly one ```python code block containing the full program."""
 
@@ -58,18 +59,37 @@ def _tool_rounds(cfg: dict) -> tuple[int, bool]:
         return int(e.get("tool_rounds", 50) or 0), bool((e.get("explore") or {}).get("gpu_tools"))
 
 
-def system_prompt(problem, tool_doc: str, cfg: dict) -> str:
+def acceptance_text(cfg: dict) -> str:
+    """The acceptance rule as configured (2026-11-21; gate.min_delta / require_significant), not a fixed text."""
+    g = cfg.get("gate") or {}
+    md = float(g.get("min_delta", 0.0))
+    rule = f"mean gain >= {md:g} ({md * 100:g} accuracy points)"
+    rule += (", a statistically significant gain and no significant loss on any domain"
+             if g.get("require_significant", True) else "; there is no significance test")
+    return ("Acceptance (after the search, not visible to you): size <= budget and a higher score than the incumbent "
+            f"on a fixed hidden test set (paired per item: {rule}). Otherwise the incumbent stays.")
+
+
+HISTORY_READ = " or of any earlier candidate that search_history lists"
+HISTORY_LINE = ("\n- search_history(gen, sort, offset) lists every candidate already tried (this generation's and the "
+                "earlier generations') with a one-line description of its config, its size, KL, scores and gate "
+                "outcome; same_as marks a config identical to an earlier one. Check it before you write a program, "
+                "so you do not spend an evaluation on a config that was already tried.")
+
+
+def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False) -> str:
     sp = problem.space
     g = cfg["gate"]
     text = SYSTEM_PROMPT.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
-                                quantizers=sp["quantizers"], min_delta=g.get("min_delta", 0.0))
+                                quantizers=sp["quantizers"], acceptance=acceptance_text(cfg))
     rounds, gpu_tools = _tool_rounds(cfg)
     if rounds > 0:                           # tool_rounds 0: byte-identical to the single-call prompt
         ge = ("" if gpu_tools or not (cfg.get("tools") or {}).get("group_error", True)
               else "; group_error there only accepts settings already cached (those of hessian_table)")
         if text.endswith(FINAL_RULE):
             text = text[:-len(FINAL_RULE)]
-        text += TOOL_PROTOCOL.format(rounds=rounds, group_error=ge)
+        text += TOOL_PROTOCOL.format(rounds=rounds, group_error=ge, history_read=HISTORY_READ if history else "",
+                                     history=HISTORY_LINE if history else "")
     return text
 
 
@@ -87,6 +107,51 @@ def _feedback(c) -> dict | None:
     if isinstance(fb, dict) and "feedback" in fb and "probes" not in fb:
         fb = fb["feedback"]
     return fb
+
+
+def _setting(x: dict) -> str:
+    out = f"{x.get('bits')}b"
+    if x.get("bits") != 16:
+        out += "".join(f"/{p}{x[k]}" for k, p in (("group_size", "g"), ("quantizer", "")) if x.get(k) is not None)
+    return out
+
+
+def config_brief(config: dict | None) -> str | None:
+    """One line describing a (compressed) config: the default setting and the overrides grouped by setting,
+    with the module kinds they hit, e.g. "default 4b/g128/gptq; 16b: gdn_ba x12; 8b/g128/gptq: v x8, gdn_ba x6"."""
+    if not isinstance(config, dict):
+        return None
+    from collections import Counter, defaultdict
+    by = defaultdict(Counter)
+    for k, v in (config.get("groups") or {}).items():
+        by[_setting(v or {})][str(k).split(".", 1)[-1]] += 1
+    parts = ["default " + _setting(config.get("default") or {})]
+    for st, kinds in sorted(by.items(), key=lambda kv: -sum(kv[1].values())):
+        parts.append(f"{st}: " + ", ".join(f"{m} x{n}" for m, n in kinds.most_common(4))
+                     + (f" (+{len(kinds) - 4} kinds)" if len(kinds) > 4 else ""))
+    for k in ("embed", "lm_head"):
+        v = config.get(k)
+        if isinstance(v, dict) and v:
+            parts.append(f"{k} {_setting(v)}")
+    return "; ".join(parts)
+
+
+def history_row(rec: dict) -> dict:
+    """search_history summary of one candidates.jsonl record (2026-11-21): what the config is (config_brief),
+    its size, KL and per-domain delta vs that generation's incumbent (* = significant)."""
+    art = rec.get("artifact") or {}
+    fb = (rec.get("full") or {}).get("feedback") or (rec.get("screen") or {}).get("feedback") or {}
+    if isinstance(fb, dict) and "feedback" in fb and "probes" not in fb:
+        fb = fb["feedback"]
+    fb = fb if isinstance(fb, dict) else {}
+    deltas = {}
+    for d, p in (fb.get("probes") or {}).items():
+        if isinstance(p, dict) and p.get("vs_incumbent") is not None:
+            deltas[d] = f"{p['vs_incumbent']:+.3f}" + ("*" if p.get("significant") else "")
+    kl = (fb.get("kl") or {}).get("overall") if isinstance(fb.get("kl"), dict) else None
+    return {"config": config_brief(art.get("config")), "GiB": art.get("bytes_gib"),
+            "avg_bits": None if art.get("linear_avg_bits") is None else round(float(art["linear_avg_bits"]), 2),
+            "kl": None if kl is None else round(float(kl), 4), "vs_incumbent": deltas or None}
 
 
 def candidate_table(history, domains: list[str]) -> str:

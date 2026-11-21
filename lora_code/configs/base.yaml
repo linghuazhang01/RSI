@@ -122,12 +122,18 @@ search:
   top_full: 3               # top screened candidates re-scored on the full signal draw
   rerun_seeds: 0
   archive: true             # experience channel: show earlier generations' best programs
+  # program_evaluate_calls: 2   # (2026-11-21, code default 2; null = no cap) NEW api.evaluate calls one program may
+                                # make; the automatic evaluation of the returned candidate is not counted
 
 # The editor (2026-11-21): Qwen3 thinking mode + a tool loop while it writes each candidate (rsicore.editor /
 # rsicore.chat_tools; also the E_t editor). One round = one model turn that made function calls; after tool_rounds
 # (or a guard) one forced final turn without tools. The proposal ends with a reply WITHOUT function calls holding one
 # ```python block. Chat tools: run_python(code) (sandbox, the workspace's exploration api: no evaluate / raw_lora,
 # no GPU tools unless explore.gpu_tools; spends no budget; handles freed after each call) and read_record(cid, part).
+# search_history (2026-11-21, on by default; code default history_tool: true, --set editor.history_tool=false removes
+# it): every candidate already tried (this generation's and all earlier generations'), one row each with strategy,
+# modules, rank, tools used, target gain, worst retention change, KL, scores, gate outcome, same_as = identical LoRA
+# digest; read_record then also opens earlier generations' records. The E_t session sees only its own candidates.
 editor:
   temperature: 0.6          # Qwen3 thinking-mode sampling
   top_p: 0.95

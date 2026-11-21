@@ -1033,15 +1033,21 @@ class Run:
         ctx = ContextRenderer(task_text=task_text(gen=g, target=self.target, dataset=self.tds,
                                                   retention=self.retention_domains, n_train=len(ws.train.ids()),
                                                   raw_info=rawinfo, gate_dataset=self.gds),
-                              diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "")
+                              diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "",
+                              budget_fn=lambda: ws.budget_status(), timeout_s=int(cfg.get("sandbox", {}).get("timeout_s", 1800)))
         has_ret = bool(ws.retention_texts)
-        sysmsg = system_prompt(cfg, budget=budget, mode=self.mode, retention=has_ret)
+        # the gate rule as configured (2026-11-21): reference of this generation's gate and its item count
+        gate_kind = "parent" if (self.chain and g > 0) else self.gate_ref
+        gate_n = len(((getattr(ev, "ids", None) or {}).get("gate") or {}).get(self.gds) or []) or None
+        sysmsg = system_prompt(cfg, budget=budget, mode=self.mode, retention=has_ret, gate_kind=gate_kind, gate_n=gate_n)
         editor = self.editor_name(g)   # M_g: in mode=edit the current LoRA's adapter on the M_0 server (pinned)
         policy = (M.make_mock_policy(rc.seed, skill=self.quality(editor) or 0.7, tag=f"g{g}", mode=self.mode,
                                      retention=has_ret) if rc.mock else None)
         # 2026-11-21: Qwen3 thinking + the tool loop (editor.tool_rounds; 0 = one call per candidate) with run_python
         # on the workspace's exploration api (no evaluate / raw_lora / GPU tools, no budget spent) and read_record
-        policy, tools = editor_mock_policy(policy, cfg), editor_chat_tools(ws, cfg)
+        # search_history (2026-11-21): every candidate of the earlier generations' searches, besides this step's
+        past = {k: self.gdir(k) for k in range(g) if (self.gdir(k) / "candidates.jsonl").exists()}
+        policy, tools = editor_mock_policy(policy, cfg), editor_chat_tools(ws, cfg, past=past)
         ekw = editor_kwargs(cfg, server_args=main_server_args(cfg))
 
         def editor_factory(th):

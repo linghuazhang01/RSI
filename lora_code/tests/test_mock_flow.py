@@ -315,7 +315,11 @@ def test_mock_scratch_four_gpus(tmp_path):
     run = tmp_path / "B_4gpu"
     assert len(list((run / "baseline" / "gate" / "dapo_math").glob("_part*"))) == 3
     assert len(list((run / "gen_00" / "evals" / "__parent__" / "screen" / "dapo_math_raw").glob("_part*"))) == 3
-    assert {p.name for p in (run / "gen_00" / "heldout" / "_par").iterdir()} == {"math500", "gsm8k", "aime24", "aime25"}
+    # held-out tasks in parallel: gen 0's own run, or (gate kept the model, 2026-11-21: gen 0 reuses the baseline's
+    # held-out) the baseline's
+    acc = json.loads((run / "gen_00" / "accepted.json").read_text())
+    hd = run / ("baseline" if acc.get("source") == "keep" else "gen_00") / "heldout" / "_par"
+    assert {p.name for p in hd.iterdir()} == {"math500", "gsm8k", "aime24", "aime25"}
     assert json.loads((run / "summary.json").read_text())["gens"]["0"]["search"]["candidates"] >= 1
 
 
@@ -648,3 +652,100 @@ def test_mock_tool_loop_scratch(tmp_path):
         assert cl[cid]["score"] == cs[cid]["score"]                          # exploration spends no evaluate
     ev = sorted(p.relative_to(gl / "evals") for p in (gl / "evals").rglob("*.json"))
     assert ev == sorted(p.relative_to(gs / "evals") for p in (gs / "evals").rglob("*.json"))
+
+
+def test_search_history_tool_scratch(tmp_path):
+    """search_history (2026-11-21): generation 1's editor gets the tool; it lists generation 0's candidates with
+    Paper B's summary (strategy, modules, target gain, ...) and same_as by digest; read_record opens them."""
+    from rsicore.chat_tools import ChatTools
+    from rsicore.sandbox import ToolAPI
+
+    from lora_code.tools import search_history
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "2", "--mock",
+           "--runs-dir", str(tmp_path), "--run-id", "B_test_hist", "--set", "method.mode=scratch"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    run = tmp_path / "B_test_hist"
+    sysmsg = json.loads((run / "gen_01" / "editor" / "thread_0.jsonl").read_text().splitlines()[0])["content"]
+    assert "search_history(gen, sort, offset)" in sysmsg
+    g0 = [json.loads(x) for x in (run / "gen_00" / "candidates.jsonl").read_text().splitlines() if x.strip()]
+    t = ChatTools(lambda tag, ctx: ToolAPI({}), history=search_history({0: run / "gen_00"}))
+    ctx = {"cid": "g01_t0_s00", "gen_dir": str(run / "gen_01"), "visible_cids": []}
+    rows, off = [], 0
+    while off is not None:
+        out = json.loads(t.call("search_history", {"offset": off}, ctx, 1, 0)["content"])
+        rows += out["rows"]
+        off = out.get("next_offset")
+    assert len(rows) == len(g0) and all(x["gen"] == 0 for x in rows)
+    ok = [x for x in rows if "error" not in x]
+    assert ok and all("strategy" in x and "modules" in x for x in ok)
+    digests = [(c.get("artifact") or {}).get("digest") for c in g0 if not c.get("error")]
+    assert sum("same_as" in x for x in ok) == len(digests) - len(set(digests))
+    rr = json.loads(t.call("read_record", {"cid": g0[0]["cid"], "part": "program"}, ctx, 1, 0)["content"])
+    assert rr["ok"] and rr["text"] == (run / "gen_00" / "programs" / f"{g0[0]['cid']}.py").read_text()
+
+
+def test_prompt_gate_text_and_rules():
+    """System prompt (2026-11-21): the gate rule follows the config (min_gain, require_significant, raw reference,
+    gate item count), the per-program evaluate cap, the api-scope / module-name / vector-side / robust-code rules."""
+    from lora_code.prompts import gate_text, system_prompt
+    base = {"gate": {"min_gain": 0.01, "require_significant": True}}
+    sig = gate_text(base, kind="parent", gate_n=500, retention=False)
+    assert "statistically significant" in sig and "about 5 more correct items out of 500" in sig
+    nosig = gate_text({"gate": {"min_gain": 0.01, "require_significant": False}}, kind="parent", gate_n=500,
+                      retention=False)
+    assert "no significance test" in nosig and "95% CI" not in nosig and "Retention" not in nosig
+    assert "raw LoRA" in gate_text({"gate": {"epsilon": 0.01}}, kind="raw")
+    cfg = {"gate": {"min_gain": 0.01, "require_significant": False}, "sandbox": {"timeout_s": 1800}}
+    sp = system_prompt(cfg, budget={"evaluate": 32, "gpu_seconds": 7200}, mode="scratch", retention=False,
+                       gate_kind="parent", gate_n=500)
+    assert "no significance test" in sp and "95% CI" not in sp
+    assert "at most 2 per program" in sp and "1800 s of wall clock" in sp
+    assert "NOT a global there" in sp and "api.modules()" in sp and "OUTPUT-side" in sp and "try/except" in sp
+    sp0 = system_prompt(dict(cfg, search={"program_evaluate_calls": None}), budget={"evaluate": 32}, mode="scratch",
+                        retention=False)
+    assert "per program" not in sp0.split("Tools")[0].split("Budgets")[1].split("GPU-seconds")[0]
+    assert "hidden items of the target task" in system_prompt(cfg, budget={}, e_task=True, mode="scratch")
+
+
+def test_program_evaluate_cap_and_budget(tmp_path):
+    """search.program_evaluate_calls (default 2): a program's own NEW api.evaluate calls are capped (BudgetExceeded),
+    the automatic screen (no program running) is not; api.budget() shows the program's time and calls left."""
+    ws = _ws(tmp_path, {"evaluate": 32, "gpu_seconds": 100})
+    ws.evaluate_lora = lambda lo, level="screen", charge=True: (0.1, {"score": 0.1})
+    from lora_code.mock import m_sgd
+    loras = [ws._new("L", m_sgd(None, [f"layers.{i}.mlp.down_proj"], ["t/1"], 5, 1e-4, 4)) for i in range(4)]
+    ws.begin_program("g00_t0_s00")
+    b = ws.t_budget()
+    assert 1790 < b["program_seconds_left"] <= 1800 and b["program_evaluate_calls_left"] == 2
+    ws.t_evaluate(lora=loras[0])
+    ws.t_evaluate(lora=loras[1])
+    assert ws.t_budget()["program_evaluate_calls_left"] == 0
+    with pytest.raises(Exception) as ei:
+        ws.t_evaluate(lora=loras[2])
+    assert type(ei.value).__name__ == "BudgetExceeded" and "per program" in str(ei.value)
+    ws.end_program("g00_t0_s00")
+    ws.t_evaluate(lora=loras[3])                       # the automatic screen of a returned candidate: no cap
+    assert "program_seconds_left" not in ws.t_budget()
+    st = ws.budget_status()
+    assert st["evaluate"] == 32 and st["program_evaluate_calls"] == 2
+
+
+def test_context_budget_line():
+    """Step context (2026-11-21): evaluate / GPU budget left, program time limit and observed timings."""
+    from types import SimpleNamespace
+    from lora_code.prompts import ContextRenderer
+    st = {"evaluate_left": 3, "evaluate": 32, "gpu_seconds_left": 50.0, "gpu_seconds": 7200,
+          "program_evaluate_calls": 2}
+    r = ContextRenderer(task_text="T", diag_text="D", budget_fn=lambda: st, timeout_s=1800)
+    hist = [SimpleNamespace(cid="g00_t0_s00", thread=0, step=0, artifact={"seconds": 600.0}, cost={"screen_s": 90.0},
+                            error=None, screen={"score": 0.1, "feedback": {}}, full=None, score=0.1, program="x"),
+            SimpleNamespace(cid="g00_t1_s00", thread=1, step=0, artifact=None, cost={}, score=None, screen=None,
+                            full=None, program="y", error="program failed: timeout after 1800 s")]
+    msg = r(hist, 0)
+    assert "3 of 32 evaluate calls" in msg and "at most 2 new ones" in msg and "50 of 7200 GPU-seconds" in msg
+    assert "600 s (median)" in msg and "1 program(s) were killed" in msg and "about 90 s" in msg
+    assert "Few evaluations are left" in msg
+    assert "Budget left" not in ContextRenderer(task_text="T", diag_text="D")([], 0)
