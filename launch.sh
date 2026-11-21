@@ -6,7 +6,7 @@
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20]
 #               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all] [--eval-overfit]
 #               [--eval-set humanevalplus,ifeval,...] [--simple] [--train-set X] [--gate-set X] [--eval-on X,Y]
-#               [--all-domains] [--set KEY=VALUE ...] [--tag NAME] [--dry-run] [--mock] [--skip-checks]
+#               [--all-domains] [--config FILE] [--set KEY=VALUE ...] [--tag NAME] [--dry-run] [--mock] [--skip-checks]
 #
 #   --paper     A, B or both (default both)
 #   --domains   all = math,code,knowledge,instruction_following,tool_calling (default all)
@@ -55,6 +55,9 @@
 #               A train / gate other than the default adds _train-<x> / _gate-<x> to the run id.
 #   --all-domains  the original design (scope all): the other four domains are retention probes / KL texts,
 #               held-out on all five domains, Paper B E_t on. Run ids without _single.
+#   --config FILE  experiment config (2026-11-21; repeatable): YAML overrides merged after the hardware / scope /
+#               objective profiles and before --set; `objective: simple` in the file works like --simple. Hardware stays
+#               on --hw, so one file runs on B300 and H20. Example: plan/configs/run/B_math_r30_nosig.yaml
 #   --tag NAME  append _NAME to every run id (letters, digits, - and _), e.g. --tag nosig ->
 #               B_math_s42_single_simple_nosig: a separate run (own locked config) next to the untagged one,
 #               for runs that change --set values of an existing run id. Not applied to A_all (--with-all).
@@ -89,7 +92,7 @@ cd "$ROOT"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$ROOT/launch.sh"; }
 
 PAPER=both; DOMAINS=all; GENS=5; GPUS=""; PER_RUN=""; MODEL=qwen3.8-27b; SEED=42; HW=b300
-WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; EVALFIT=0; EVAL_SETS=""; SIMPLE=0; TRAIN_SET=""; GATE_SET=""; EVAL_ON=""; TAG=""; SETS=()
+WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; EVALFIT=0; EVAL_SETS=""; SIMPLE=0; TRAIN_SET=""; GATE_SET=""; EVAL_ON=""; TAG=""; SETS=(); CONFIGS=()
 need() { [ $# -ge 2 ] || { echo "ERROR: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -102,6 +105,10 @@ while [ $# -gt 0 ]; do
     --hw) need "$@"; HW="$2"; shift ;;
     --set) need "$@"; SETS+=(--set "$2"); shift ;;
     --tag) need "$@"; TAG="$2"; shift ;;
+    --config) need "$@"; [ -f "$2" ] || { echo "ERROR: --config $2: file not found" >&2; exit 2; }
+              CONFIGS+=(--config "$2")
+              grep -Eq '^objective:[[:space:]]*simple([[:space:]]|$)' "$2" && SIMPLE=1     # file selects objective simple
+              shift ;;
     --model) need "$@"; MODEL="$2"; shift ;;
     --seed) need "$@"; SEED="$2"; shift ;;
     --with-all) WITH_ALL=1 ;;
@@ -321,7 +328,7 @@ for r in "${RUNS[@]}"; do
   g="$(IFS=,; echo "${GPU_LIST[*]:$off:$n}")"
   off=$((off + n))
   cmd=(./run_rsi.sh --paper "$p" --domain "$d" --gens "$GENS" --model "$MODEL" --seed "$SEED"
-       --gpus "$g" --run-id "$rid" --runs-dir "$RUNS_DIR" --set "hardware=$HW" ${SETS[@]+"${SETS[@]}"})
+       --gpus "$g" --run-id "$rid" --runs-dir "$RUNS_DIR" ${CONFIGS[@]+"${CONFIGS[@]}"} --set "hardware=$HW" ${SETS[@]+"${SETS[@]}"})
   [ "$e" != - ] && cmd+=(--set "eval_target.dataset=$e")
   [ -n "$TRAIN_SET" ] && cmd+=(--set "data_roles.train=$TRAIN_SET")
   [ -n "$GATE_SET" ] && cmd+=(--set "data_roles.gate=$GATE_SET")

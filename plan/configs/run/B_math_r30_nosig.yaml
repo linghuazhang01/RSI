@@ -1,0 +1,17 @@
+# Paper B experiment config (2026-11-21): math · 8 x 1 candidates per generation · up to 30 tool rounds · threshold 0 ·
+# no significance test · no non-LLM control. Overrides only: merged after base.yaml + domains/math.yaml + the hardware
+# profile (--hw) + scope single + objective simple, and before any --set. Hardware is NOT set here (B300 / H20 alike).
+#   ./launch.sh --hw b300 --paper B --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/B_math_r30_nosig.yaml --tag r30_nosig
+objective: simple                 # simple v2 (fresh 500 screen items per generation, gate 500, test 500)
+method:
+  mode: scratch                   # build LoRAs from zero (no training); weights = the dense-edit comparison arm
+search:
+  threads: 8                      # 8 independent sessions per generation ...
+  steps: 1                        # ... of one candidate each
+editor:
+  tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
+gate:
+  min_gain: 0.0                   # accept the candidate with the largest strictly positive paired gate gain
+  require_significant: false      # no 95% CI requirement
+nonllm:
+  enabled: false                  # no random-construction control branch

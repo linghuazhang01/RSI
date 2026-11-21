@@ -65,7 +65,33 @@ def build_arg_parser(paper: str) -> argparse.ArgumentParser:
     ap.add_argument("--paper-dir", default=None, help="override the paper code dir holding configs/")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a paper config value (dotted key, YAML value); repeatable")
+    ap.add_argument("--config", action="append", default=[], metavar="YAML",
+                    help="experiment config file(s) (2026-11-21): merged after the hardware / scope / objective profiles "
+                         "and before --set (later files win); its objective / scope keys select those profiles")
     return ap
+
+
+PROFILE_KEYS = ("hardware", "scope", "objective")
+
+
+def _load_config_files(paths) -> list[dict]:
+    """--config files (2026-11-21): YAML mappings of paper config overrides. *_profiles keys are refused (a config file
+    selects a profile by name, e.g. objective: simple; it does not redefine one)."""
+    out = []
+    for p in paths or []:
+        path = Path(p)
+        if not path.is_absolute() and not path.exists() and (ROOT / path).exists():
+            path = ROOT / path
+        if not path.exists():
+            raise SystemExit(f"--config {p}: file not found")
+        d = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(d, dict):
+            raise SystemExit(f"--config {p}: expected a YAML mapping, got {type(d).__name__}")
+        bad = sorted(k for k in d if str(k).endswith("_profiles"))
+        if bad:
+            raise SystemExit(f"--config {p}: profile definitions are not allowed in a config file: {bad}")
+        out.append(d)
+    return out
 
 
 def _deep_merge(a: dict, b: dict) -> dict:
@@ -357,9 +383,14 @@ def load_run_config(paper: str, args) -> RunConfig:
         print(f"[rsicore] warning: {cdir / 'base.yaml'} not found; using empty paper config", file=sys.stderr)
     cfg = _deep_merge(_load_yaml(cdir / "base.yaml"), _load_yaml(cdir / "domains" / f"{args.domain}.yaml"))
     sets = list(getattr(args, "set", []) or [])
+    files = _load_config_files(getattr(args, "config", None))
+    for f in files:                              # a config file's hardware / scope / objective select the profile
+        cfg.update({k: f[k] for k in PROFILE_KEYS if f.get(k) is not None})   # (--set key=... still wins)
     cfg = _apply_hardware(cfg, sets)
     cfg = _apply_scope(cfg, sets, args.domain)
     cfg = _apply_objective(cfg, sets)
+    for f in files:                              # then the file's values, over the profiles, under --set
+        cfg = _deep_merge(cfg, {k: v for k, v in f.items() if k not in PROFILE_KEYS})
     cfg = _apply_set(cfg, sets)
     cfg = _resolve_run_domain(cfg, args.domain)
     cfg = _resolve_eval_target(cfg, args.domain)

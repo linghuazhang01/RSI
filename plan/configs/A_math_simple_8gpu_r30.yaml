@@ -4,7 +4,9 @@
 # + objective simple + --set editor.tool_rounds=30. Not read by the code; the run locks its own copy in
 # experiment_records/A_math_s42_single_simple_r30/run_config.yaml.
 #
-# Start (one experiment uses all 8 GPUs):
+# Runnable experiment file (overrides only, hardware from --hw): plan/configs/run/A_math_r30_nosig.yaml
+#   ./launch.sh --hw b300 --paper A --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_r30_nosig.yaml --tag r30_nosig
+# Equivalent with --set (one experiment uses all 8 GPUs):
 #   ./launch.sh --hw b300 --paper A --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30 --set editor.tool_rounds=30
 # Without the significance test (nosig):
 #   ./launch.sh --hw b300 --paper A --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30_nosig --set editor.tool_rounds=30 --set gate.require_significant=false
