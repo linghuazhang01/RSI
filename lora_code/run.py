@@ -159,7 +159,9 @@ class WeightSlots:
             self.q.put(g)
         self.lent = None
 
-    def score(self, name: str, path, ids_by_ds: dict, dirs_by_ds: dict) -> dict:  # pragma: no cover - GPU path
+    def score(self, name: str, path, ids_by_ds: dict, dirs_by_ds: dict,
+              decoding: dict | None = None) -> dict:  # pragma: no cover - GPU path
+        """decoding: the level's rsicore decoding dict (the same as the parent's; None = tasks.yaml greedy)."""
         from rsicore.evaluate import score_split
         from rsicore.servers import VLLMServer
 
@@ -177,7 +179,8 @@ class WeightSlots:
                              seed=run.rc.seed, log_dir=run.rc.run_dir / "logs")
             srv.start()
             try:
-                return {ds: score_split([srv.endpoint], name, ds, pool="pool", ids=ids, out_dir=dirs_by_ds[ds])
+                return {ds: score_split([srv.endpoint], name, ds, pool="pool", ids=ids, out_dir=dirs_by_ds[ds],
+                                        decoding=decoding)
                         for ds, ids in ids_by_ds.items()}
             finally:
                 srv.stop()
@@ -209,13 +212,18 @@ class _WeightPhases:
 class _ReplicaPhases:
     """inner_search phases with several main replicas (2026-11-20): every thread proposes at once (thread k on
     replica k mod n), then the candidates are built and evaluated one at a time, each scoring job split over all
-    replicas (the editor workspace serialises its tool calls)."""
+    replicas (the editor workspace serialises its tool calls). n > 1 (search.parallel_builds, 2026-11-21): up to n
+    candidates (at most the number of replicas) are built and screened at once; tool calls stay serialised by the
+    workspace lock except evaluate / tensor_compute (Workspace.parallel_eval)."""
+
+    def __init__(self, n: int = 1):
+        self.n = max(1, int(n))
 
     def editor_phase(self):
         pass
 
     def eval_phase(self) -> int:
-        return 1
+        return self.n
 
 
 # ============================================================================ helpers
@@ -234,6 +242,7 @@ class Run:
         from rsicore.state import RunState
         self.rc, self.cfg = rc, cfg
         self.st = RunState(rc.run_dir)
+        self._gate_lock = threading.Lock()       # gen_XX/gate.json while candidates are gated at once (2026-11-21)
         self.servers = Servers(rc, cfg, weights=method_mode(cfg) == "weights")
         self.wslots = WeightSlots(self) if method_mode(cfg) == "weights" else None
         self.registry = rc.run_dir / "mock_registry.json"
@@ -488,9 +497,16 @@ class Run:
         return ex
 
     # ------------------------------------------------------------------ evaluator / workspace factories
+    def decodings(self) -> dict:
+        """{level: rsicore decoding dict | None} of the scoring stages (paper config `decoding`, 2026-11-21; null
+        seeds = the run's --seed); None everywhere = tasks.yaml greedy (every objective but simple)."""
+        from rsicore.config import stage_decoding
+        return {lv: stage_decoding(self.cfg, lv, self.rc.seed) for lv in ("screen", "full", "gate")}
+
     def evaluator(self, g, out_dir, srv, served, ids, kl_texts, store):
         from lora_code.evaluator import Evaluator
         return Evaluator(self.rc, self.cfg, out_dir=out_dir, endpoint=srv.endpoint, served=served, server=srv,
+                         decoding=self.decodings(),
                          replicas=self.servers.replicas("main"),
                          ids=ids, target_dataset=self.tds, gate_dataset=self.gds, kl_texts=kl_texts, store=store,
                          mock=self.rc.mock,
@@ -527,9 +543,9 @@ class Run:
             gate = self.gate_level()
             res = {}
             for ds, ids in gate.items():
-                # gate score: greedy, like every candidate's gate evaluation
+                # gate score: the gate decoding (greedy unless decoding.gate is set), like every candidate's gate
                 er = score_split(eps, self.served(0), ds, pool="pool", ids=ids, out_dir=bdir / "gate" / ds,
-                                 mock=self.rc.mock)
+                                 mock=self.rc.mock, decoding=self.decodings()["gate"])
                 recs = [{"id": x.get("id"), "score": x.get("score")} for x in er.records]
                 sc = [x["score"] for x in recs if x["score"] is not None]
                 m = mean_or_none(sc)
@@ -640,6 +656,8 @@ class Run:
     # ================================================================== one generation
     def generation(self, g: int):
         from rsicore import draws
+
+        from lora_code.tools import search_settings
         rc, cfg, st = self.rc, self.cfg, self.st
         gd = self.gdir(g)
         P = f"gen{g:02d}"
@@ -659,6 +677,7 @@ class Run:
 
         # ---- train data (sampled answers only when the raw LoRA is trained, see train_data_mode)
         tmode = self.train_data_mode(g)
+        tdata = None
         if not st.done(f"{P}/train_data"):
             srv = main_srv() if tmode != "gold" else None
             ex = self.build_train_data(self.tds, train_ids, gd / "train_data.json", mode=tmode,
@@ -666,7 +685,9 @@ class Run:
                                        served=served)
             st.mark(f"{P}/train_data", {"n": len(ex), "with_target": sum(1 for e in ex.values() if e["target"]),
                                         "self": sum(1 for e in ex.values() if e["source"] == "self")})
-        tdata = read_json(gd / "train_data.json")
+            tdata = {k: ex[k] for k in sorted(ex)}         # = the file's (sorted) order, not read back (~72k items)
+        if tdata is None:
+            tdata = read_json(gd / "train_data.json")
         kl_texts = self.kl_texts(g)
 
         # ---- diagnostics
@@ -684,7 +705,8 @@ class Run:
             diag = D.load_or_compute(gd / "diagnostics.json", real_diag)
         st.mark(f"{P}/diagnostics", {"rows": diag["n_modules"]}) if not st.done(f"{P}/diagnostics") else None
 
-        budget = {"evaluate": int(cfg.get("search", {}).get("max_evaluate", 32)),
+        # evaluate = search.max_evaluate, or (search.charge_screens false, 2026-11-21) the programs' api.evaluate pool
+        budget = {"evaluate": search_settings(cfg)["pool"],
                   "gpu_seconds": float(cfg.get("budget", {}).get("gpu_seconds", 7200))}
         state = {}
 
@@ -720,6 +742,9 @@ class Run:
                 raw_info = dict(rj["train"], source=rj.get("source", "trained"))
             ws = self.workspace(gd, ev, store, self.hf(parent), tdata, budget, f"g{g:02d}", stack=stack, diag=diag,
                                 ret_texts=kl_texts, raw=raw, raw_info=raw_info)
+            ss = search_settings(cfg)
+            ws.charge_screens = ss["charge_screens"]      # false: automatic screens are free (2026-11-21)
+            ws.parallel_eval = self.mode != "weights" and self.eval_parallelism(ev) > 1
             ws.build_api()
             state["ws"] = ws
             return ev, ws
@@ -766,8 +791,10 @@ class Run:
         ranked = None
         if not st.done(f"{P}/search"):
             ranked = self.search(g, gd, ctx_objects, diag, budget, raw)
+            spent = dict(state["ws"].spent) if "ws" in state else {}
             st.mark(f"{P}/search", {"candidates": len(ranked), "built": sum(1 for c in ranked if c.artifact),
-                                    "best": ranked[0].cid if ranked else None})
+                                    "best": ranked[0].cid if ranked else None,
+                                    "evaluate_spent": spent.get("evaluate"), "evaluate_budget": budget["evaluate"]})
         # ---- gate
         if not st.done(f"{P}/gate"):
             from rsicore.search import load_candidates, ranked as rank_fn, submit_to_gate
@@ -785,9 +812,15 @@ class Run:
             # reference = the current model: submit only candidates that beat it on the signal items (score =
             # target gain vs the current model - penalties > 0), like Paper A (2026-11-20). Reference = raw
             # (mode=edit, generation 0): every ranked candidate, the gate checks target >= raw - epsilon.
-            subs = [c for c in ranked if c.score is not None and c.score > 0] if ref["kind"] == "parent" else ranked
-            acc = submit_to_gate(rc, g, subs, gate_fn, max_submissions=int(cfg.get("gate", {}).get("max_submissions", 3)),
-                                 parallel=len(ev.endpoints))      # submissions gate-evaluated at once
+            if search_settings(cfg)["gate_every_candidate"]:
+                # every candidate was gate-evaluated during the search (2026-11-21): the largest passing paired gain
+                ref = self.gate_reference(gd, ev, raw, kind="parent")
+                acc = self.accept_best_gate(gd, ranked)
+            else:
+                subs = [c for c in ranked if c.score is not None and c.score > 0] if ref["kind"] == "parent" else ranked
+                acc = submit_to_gate(rc, g, subs, gate_fn,
+                                     max_submissions=int(cfg.get("gate", {}).get("max_submissions", 3)),
+                                     parallel=len(ev.endpoints))      # submissions gate-evaluated at once
             if acc is not None:
                 lo = ws.load_candidate(acc.cid)
                 rec = {"source": "llm", "cid": acc.cid, "name": ws.lora_name(lo) if lo.modules() else None,
@@ -1012,17 +1045,30 @@ class Run:
         return {k: sorted(v) for k, v in shown.items()}
 
     # ------------------------------------------------------------------ search
+    def eval_parallelism(self, ev) -> int:
+        """Candidates built / screened at once outside mode=weights (2026-11-21): the number of main replicas when
+        search.parallel_builds is on and there are several, else 1 (one after another, as before)."""
+        from lora_code.tools import search_settings
+        n_rep = len(ev.endpoints)
+        return n_rep if (self.mode != "weights" and n_rep > 1 and search_settings(self.cfg)["parallel_builds"]) else 1
+
     def search(self, g, gd, ctx_objects, diag, budget, raw=None):
-        from rsicore.editor import Editor, editor_kwargs
+        from rsicore.editor import Editor, editor_kwargs, editor_settings
         from rsicore.search import inner_search
 
         from lora_code import diagnostics as D
         from lora_code import mock as M
         from lora_code.prompts import ContextRenderer, system_prompt, task_text
-        from lora_code.tools import editor_chat_tools, editor_mock_policy, program_build
+        from lora_code.prompts import screen_text
+        from lora_code.tools import (editor_chat_tools, editor_mock_policy, paper_tools_enabled, program_build,
+                                     screen_tools_enabled, search_settings, tensor_compute_enabled)
         rc, cfg = self.rc, self.cfg
         ev, ws = ctx_objects()
         sc = cfg.get("search", {})
+        ss = search_settings(cfg)
+        # one step (objective simple: 8 sessions x 1 step): no session sees this generation's other candidates, so
+        # each is told its index and to use search_history / the archive to differ from earlier generations
+        hist_tool = int(editor_settings(cfg).get("tool_rounds") or 0) > 0 and editor_settings(cfg).get("history_tool", True)
         rawinfo = None
         if raw:
             rp = (raw.get("points") or {}).get("screen") or {}
@@ -1034,15 +1080,25 @@ class Run:
                                                   retention=self.retention_domains, n_train=len(ws.train.ids()),
                                                   raw_info=rawinfo, gate_dataset=self.gds),
                               diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "",
-                              budget_fn=lambda: ws.budget_status(), timeout_s=int(cfg.get("sandbox", {}).get("timeout_s", 1800)))
+                              budget_fn=lambda: ws.budget_status(), timeout_s=int(cfg.get("sandbox", {}).get("timeout_s", 1800)),
+                              sessions=ss["threads"] if ss["steps"] == 1 and ss["threads"] > 1 else None,
+                              history_tool=bool(hist_tool), gate_mode=ss["gate_every_candidate"])
         has_ret = bool(ws.retention_texts)
         # the gate rule as configured (2026-11-21): reference of this generation's gate and its item count
         gate_kind = "parent" if (self.chain and g > 0) else self.gate_ref
         gate_n = len(((getattr(ev, "ids", None) or {}).get("gate") or {}).get(self.gds) or []) or None
-        sysmsg = system_prompt(cfg, budget=budget, mode=self.mode, retention=has_ret, gate_kind=gate_kind, gate_n=gate_n)
+        sysmsg = system_prompt(cfg, budget=budget, mode=self.mode, retention=has_ret, gate_kind=gate_kind, gate_n=gate_n,
+                               free_screens=not ss["charge_screens"])
         editor = self.editor_name(g)   # M_g: in mode=edit the current LoRA's adapter on the M_0 server (pinned)
+        # mock: with the tensor tool on (objective simple), thread 1 of a scratch search uses api.tensor_compute (a
+        # T-handle vector into rank1 + LoRA factors) and api.evaluate, so a mock run exercises both end to end
+        # (paper tools on, objective simple: thread 1 uses the paper-style recipe instead, without api.evaluate)
         policy = (M.make_mock_policy(rc.seed, skill=self.quality(editor) or 0.7, tag=f"g{g}", mode=self.mode,
-                                     retention=has_ret) if rc.mock else None)
+                                     retention=has_ret,
+                                     tensor_compute=self.mode == "scratch" and tensor_compute_enabled(cfg),
+                                     paper=self.mode in ("scratch", "weights") and paper_tools_enabled(cfg)
+                                     and screen_tools_enabled(cfg))
+                  if rc.mock else None)
         # 2026-11-21: Qwen3 thinking + the tool loop (editor.tool_rounds; 0 = one call per candidate) with run_python
         # on the workspace's exploration api (no evaluate / raw_lora / GPU tools, no budget spent) and read_record
         # search_history (2026-11-21): every candidate of the earlier generations' searches, besides this step's
@@ -1062,12 +1118,13 @@ class Run:
 
         def screen(art, cid):
             if self.mode != "weights":
-                return ws.screen_candidate(art["cid"])   # charged on the workspace's ToolAPI (identical LoRA: free)
+                # charged on the workspace's ToolAPI (identical LoRA: free); free with charge_screens false
+                return ws.screen_candidate(art["cid"])
             # weights mode: several candidates are exported / served at once, so the evaluation must not hold the
             # workspace lock (the evaluate tool does): reserve the budget under the lock, then evaluate
             lo = ws.load_candidate(art["cid"])
             with ws._lock:
-                if lo.modules() and (ws.lora_name(lo), "screen") not in ws._evaluated:
+                if ws.charge_screens and lo.modules() and (ws.lora_name(lo), "screen") not in ws._evaluated:
                     if ws.left("evaluate") <= 0:
                         return None, {"error": "not evaluated: evaluate budget of this generation exhausted"}
                     ws.api.charge("evaluate", 1)
@@ -1075,6 +1132,24 @@ class Run:
 
         def full(art, cid):
             return ws.evaluate_lora(ws.load_candidate(art["cid"]), "full", charge=False)
+
+        screen_plain = screen
+        if ss["gate_every_candidate"]:
+            # gate per candidate (2026-11-21, objective simple): every built candidate gets ONE gate evaluation
+            # (decoding.gate) paired vs the current model, whose gate records are computed once per generation
+            # (gate_reference); the result is recorded in gen_XX/gate.json at once, so later steps / generations see it
+            gref = self.gate_reference(gd, ev, raw, kind="parent")
+            learned = (self.st.get("learned") or {}).get("scores", {})
+
+            def screen(art, cid):
+                sc, fb = (screen_plain(art, cid) if ss["screen_candidates"] else (None, {}))
+                fb = dict(fb or {})
+                if ss["screen_candidates"]:
+                    fb["screen_score"] = sc
+                ok, info = self.gate_check(ev, ws, ws.load_candidate(art["cid"]), gref, learned)
+                fb["gate"] = self.gate_feedback(ok, info, self.gds)
+                self.record_gate(gd, cid, fb["gate"])
+                return (sc if ss["screen_candidates"] else fb["gate"].get("gain")), fb
 
         n_rep = len(ev.endpoints)
         if self.mode == "weights":
@@ -1085,10 +1160,18 @@ class Run:
                 ev.run(None, lv)
             phases, parallel = _WeightPhases(self), 2
         else:
-            phases, parallel = (_ReplicaPhases(), 2) if n_rep > 1 else (None, 1)
+            # several replicas: all threads propose at once, then the builds + screens run one at a time, or
+            # (search.parallel_builds, 2026-11-21) up to one per replica at once
+            phases, parallel = (_ReplicaPhases(self.eval_parallelism(ev)), 2) if n_rep > 1 else (None, 1)
+        if screen_tools_enabled(cfg):
+            # the current model's own answers on the screen items (once per generation): a summary in every step's
+            # context, the details through api.screen_results / screen_output / acts(source='own')
+            sd = self.reference_screen(gd, ev)
+            ws.screen = sd
+            ctx.screen_text = screen_text(sd["summary"])
         return inner_search(rc, g, editor_factory=editor_factory, render_context=ctx, build_fn=build, screen_fn=screen,
-                            full_fn=full, threads=int(sc.get("threads", 4)), steps=int(sc.get("steps", 8)),
-                            max_candidates=int(sc.get("max_evaluate", 32)), top_full=int(sc.get("top_full", 3)),
+                            full_fn=full, threads=ss["threads"], steps=ss["steps"],
+                            max_candidates=ss["max_candidates"], top_full=int(sc.get("top_full", 3)),
                             rerun_seeds=int(sc.get("rerun_seeds", 0)), parallel=parallel, phases=phases)
 
     def archive(self, g: int) -> str:
@@ -1100,12 +1183,86 @@ class Run:
         for k in range(g):
             cs = ranked(load_candidates(self.rc, k).values())
             acc = read_json(self.gdir(k) / "accepted.json", {}) or {}
+            gate_every = (read_json(self.gdir(k) / "gate.json", {}) or {}).get("rule", "").startswith("gate_every")
             parts.append(f"- generation {k}: accepted={acc.get('source')} {acc.get('cid') or ''}; "
-                         f"{len(cs)} candidates; best scores " +
+                         f"{len(cs)} candidates; best " + ("paired gate gains " if gate_every else "scores ") +
                          ", ".join(f"{c.cid}={c.score:.4f}" for c in cs[:3] if c.score is not None))
+            rs = (read_json(self.gdir(k) / "reference_screen.json", {}) or {}).get("summary") or {}
+            if rs.get("n_items"):                   # the then-current model's own screen answers (2026-11-21)
+                parts.append(f"  current model on that generation's screen: accuracy {rs.get('accuracy')} over "
+                             f"{rs['n_items']} items x {rs.get('samples_per_item')} samples, correct-count "
+                             f"distribution {rs.get('correct_counts')}, truncation {rs.get('truncation_rate')}")
             if cs and cs[0].program:
                 parts.append(f"  best program of generation {k}:\n```python\n{cs[0].program[:3000]}```")
         return "\n".join(parts)
+
+    # ------------------------------------------------------------------ reference screen (2026-11-21, objective simple)
+    def reference_screen(self, gd, ev) -> dict:
+        """The current model's own answers on this generation's screen items (decoding.screen; objective simple:
+        thinking, n 4), scored ONCE per generation (the evaluator's parent cache, keyed by the decoding) and shared by
+        every session: {"records": {ds: [run_eval records with every sample's text and thinking]}, "items": {ds: {id:
+        {prompt, reference, messages}}}, "summary": screen_view.summary}. gen_XX/reference_screen.json keeps the
+        summary for later generations (search_history, archive)."""
+        from rsicore import screen_view as SV
+        ev.run(None, "screen")
+        recs = ev.full_records(None, "screen")
+        items = {}
+        for ds, rs in recs.items():
+            items[ds] = {}
+            for i, it in load_records(ds, [r["id"] for r in rs]).items():
+                try:
+                    msgs = render_messages(ds, it)
+                except Exception:  # noqa: BLE001
+                    msgs = []
+                items[ds][i] = {"prompt": prompt_text(ds, it), "messages": msgs,
+                                "reference": it.get("reference") if it.get("reference") is not None else gold_target(ds, it)}
+        summ = SV.summary(recs, items, examples=3)
+        if read_json(gd / "reference_screen.json") is None:
+            write_json(gd / "reference_screen.json", {"summary": summ, "decoding": ev.level_decoding("screen")})
+        return {"records": recs, "items": items, "summary": summ}
+
+    @staticmethod
+    def gate_feedback(ok: bool, info: dict, gds: str) -> dict:
+        """The editor-visible gate result of one candidate (gate per candidate, 2026-11-21): statistics and item ids
+        only (keys as rsicore.chat_tools.GATE_STATS reads them from gen_XX/gate.json)."""
+        sc = info.get("scores") or {}
+        out = {"passed": bool(ok), "accuracy": sc.get(gds), "reference_accuracy": info.get("reference_score"),
+               "gain": info.get("paired_gain"), "ci": info.get("paired_ci"), "n": info.get("gate_n"),
+               "broken": info.get("broken"), "fixed": info.get("fixed"), "broken_ids": info.get("broken_ids"),
+               "fixed_ids": info.get("fixed_ids"), "reasons": list(info.get("reasons") or [])}
+        return {k: v for k, v in out.items() if v is not None}
+
+    def record_gate(self, gd, cid: str, fb: dict) -> None:
+        """Append / replace one candidate's gate result in gen_XX/gate.json during the search (submissions shape)."""
+        with self._gate_lock:
+            p = gd / "gate.json"
+            log = read_json(p) or {"submissions": []}
+            log["submissions"] = [x for x in log["submissions"] if x.get("cid") != cid]
+            log["submissions"].append({"cid": cid, "passed": bool(fb.get("passed")), "info": fb,
+                                       "t": time.strftime("%Y-%m-%dT%H:%M:%S")})
+            log["submissions"].sort(key=lambda x: str(x.get("cid")))
+            log["rule"] = "gate_every_candidate: the passing candidate with the largest paired gain is accepted"
+            write_json(p, log)
+
+    def accept_best_gate(self, gd, cands):
+        """End of a gate-per-candidate generation: among the candidates whose gate result passed (min_gain, CI with
+        require_significant, retention / learned rules), the largest paired gain wins (ties: higher screen score,
+        then the earlier cid); None when none passed. Marks it in gen_XX/gate.json ("accepted")."""
+        by = {c.cid: c for c in cands}
+        log = read_json(gd / "gate.json") or {"submissions": []}
+        ok = [x for x in log["submissions"] if x.get("passed") and x["cid"] in by
+              and (x.get("info") or {}).get("gain") is not None
+              and float(x["info"]["gain"]) > 0]       # a candidate that changes nothing is never accepted (min_gain 0)
+
+        def key(x):
+            scr = ((by[x["cid"]].screen or {}).get("feedback") or {}).get("screen_score")
+            return (-float(x["info"]["gain"]), -(scr if scr is not None else -1e9), x["cid"])
+        best = sorted(ok, key=key)[0] if ok else None
+        log["accepted"] = best["cid"] if best else None
+        for x in log["submissions"]:
+            x["accepted"] = best is not None and x["cid"] == best["cid"]
+        write_json(gd / "gate.json", log)
+        return by[best["cid"]] if best else None
 
     # ------------------------------------------------------------------ gate
     def gate_reference(self, gd, ev, raw, kind: str | None = None) -> dict:
@@ -1143,6 +1300,7 @@ class Run:
         scores = {ds: r["score"] for ds, r in res.items()}
         info["scores"] = scores
         info["reference"] = ref["kind"]
+        info["reference_score"] = (ref.get("scores") or {}).get(self.gds)
         gds = self.gds                               # the gate dataset (data_roles.gate; default = the train one)
         t, s = scores.get(gds), (ref.get("scores") or {}).get(gds)
         if t is None:
@@ -1154,9 +1312,17 @@ class Run:
             d = paired_delta([r for r in par if r.get("score") is not None],
                              [r for r in cand if r.get("score") is not None], seed=self.rc.seed)
             info["paired_gain"], info["paired_ci"] = d["delta"], d["ci"]
+            # item flips vs the parent (ids and counts only; a record is right when its score > 0.5, 2026-11-21)
+            pm = {r["id"]: r["score"] for r in par if r.get("score") is not None}
+            cm = {r["id"]: r["score"] for r in cand if r.get("score") is not None}
+            both = sorted(set(pm) & set(cm))
+            broken = [i for i in both if pm[i] > 0.5 >= cm[i]]
+            fixed = [i for i in both if cm[i] > 0.5 >= pm[i]]
+            info.update(gate_n=len(both), broken=len(broken), fixed=len(fixed), broken_ids=broken[:50],
+                        fixed_ids=fixed[:50])
             if s is None or d["delta"] is None:
                 info["reasons"].append("parent target gate score unavailable")
-            elif d["delta"] < min_gain:
+            elif d["delta"] < min_gain or (min_gain <= 0 and d["delta"] <= 0):   # threshold 0: strictly positive
                 info["reasons"].append(f"paired gain {d['delta']:+.4f} vs parent ({s:.4f}) < min_gain {min_gain}")
             elif bool(gcfg.get("require_significant", True)) and not (d["ci"][0] is not None and d["ci"][0] > 0):
                 info["reasons"].append(f"paired gain {d['delta']:+.4f} not significant "
@@ -1274,6 +1440,31 @@ class Run:
               f"-> {self.rc.run_dir}", flush=True)
 
 
+def context_shortfall(cfg: dict, prompt_tokens: int = 4096) -> str | None:
+    """A configured scoring max_tokens (decoding.screen / full / gate, heldout.decoding) + prompt_tokens that does not
+    fit the --max-model-len of the servers that score it (2026-11-21): the main replicas / weights slots
+    (main_server_args), and theta0 when E_t is on (held-out decoding). None when everything fits / nothing is set."""
+    from rsicore.config import stage_decoding
+    from rsicore.servers import max_model_len
+    need = [(lv, (stage_decoding(cfg, lv) or {}).get("max_tokens")) for lv in ("screen", "full", "gate")]
+    hd = (cfg.get("heldout") or {}).get("decoding") or {}
+    need.append(("heldout", hd.get("max_tokens") if isinstance(hd, dict) else None))
+    servers = [("main", main_server_args(cfg))]
+    if (cfg.get("e_t") or {}).get("enabled", True):
+        servers.append(("theta0", list((cfg.get("server") or {}).get("theta0_args", []) or [])))
+    for stage, mt in need:
+        if not mt:
+            continue
+        for name, args in servers:
+            if name == "theta0" and stage != "heldout":
+                continue
+            n = max_model_len(args)
+            if n and int(mt) + prompt_tokens > n:
+                return (f"{stage} decoding max_tokens {mt} + ~{prompt_tokens} prompt tokens > {name} --max-model-len "
+                        f"{n}: raise it (editor.context_tokens / server.theta0_args) or lower max_tokens")
+    return None
+
+
 def main(argv=None):
     from rsicore.config import build_arg_parser, load_run_config
     ap = build_arg_parser("B")
@@ -1283,6 +1474,8 @@ def main(argv=None):
     hw = cfg.get("hardware", "b300")
     if rc.mock:
         cfg = deep_merge(cfg, cfg.get("mock_overrides", {}) or {})
+        # then the objective's own mock sizes (2026-11-21, e.g. simple keeps k sessions x 1 step at mock size)
+        cfg = deep_merge(cfg, (cfg.get("mock_objective_overrides") or {}).get(cfg.get("objective")) or {})
     from rsicore.evaluate import set_max_tokens
     set_max_tokens(cfg.get("max_tokens"))                # per-task max generation length for every run_eval call
     try:
@@ -1297,6 +1490,10 @@ def main(argv=None):
         return 1
     if not (cfg.get("e_t") or {}).get("enabled", True):
         roles = {k: v for k, v in roles.items() if k != "theta0"}               # theta0 server never starts
+    short = context_shortfall(cfg) if not rc.mock else None                     # fail fast: prompt + max_tokens fit?
+    if short:
+        print(f"[lora_code] {short}", flush=True)
+        return 1
     print(f"[lora_code] hardware={hw} scope={cfg.get('scope', 'all')} gpus={rc.gpus} roles {roles} method={mode} "
           f"gate reference={gref} fallback={gfb}"
           + (f" (UNUSED {unused}: tensor parallelism needs 1/2/4/8 GPUs per role)" if unused else ""), flush=True)

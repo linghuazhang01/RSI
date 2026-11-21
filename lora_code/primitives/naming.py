@@ -70,6 +70,63 @@ def parse_key(key: str):
     return pre, f"layers.{m.group('layer')}.{m.group('block')}.{m.group('leaf')}"
 
 
+# ---- tensor catalogue (2026-11-21, Paper B's tensor_compute): every language-model tensor, not only the linear
+# leaves above. A tensor NAME is the checkpoint key minus the language-model prefix, e.g.
+# 'layers.3.linear_attn.dt_bias', 'layers.3.input_layernorm.weight', 'layers.3.mlp.down_proj.weight', 'norm.weight';
+# lm_head (key 'lm_head.weight', outside the prefix) is named 'lm_head.weight'. Verified on the transformers 5.x tiny
+# Qwen3.5 (test_primitives.py): no linear biases; linear_attn.{A_log [nv], dt_bias [nv], conv1d.weight
+# [conv_dim, 1, k], norm.weight [head_v_dim]}; self_attn.{q_norm, k_norm}.weight [head_dim];
+# {input,post_attention}_layernorm.weight [hidden]; embed_tokens.weight; norm.weight; lm_head.weight.
+# Qwen3_5RMSNorm (input / post_attention layernorm, q_norm / k_norm, the final norm) is ZERO-CENTRED
+# (out = x_hat * (1 + w), stored w near 0); linear_attn.norm (RMSNormGated) is not (out = w * x_hat, w near 1).
+EDIT_EXCLUDED = ("embed_tokens.weight", "norm.weight", "lm_head.weight")   # readable, never editable
+
+
+def parse_tensor_key(key: str, prefix: str | None = None):
+    """checkpoint key -> (prefix, tensor name) for every language-model tensor (visual / mtp excluded), else None.
+    prefix None: inferred from 'layers.' / 'embed_tokens.' / 'norm.' in the key (2026-11-21)."""
+    if key.startswith(EXCLUDE_PREFIXES):
+        return None
+    if key.startswith("lm_head."):
+        return "", key
+    if prefix is None:
+        for marker in ("layers.", "embed_tokens.", "norm."):
+            i = key.find(marker)
+            if i >= 0 and (i == 0 or key[i - 1] == "."):
+                prefix = key[:i]
+                break
+        else:
+            return None
+    if not key.startswith(prefix):
+        return None
+    if "visual" in prefix or "mtp" in prefix:
+        return None
+    name = key[len(prefix):]
+    return (prefix, name) if name else None
+
+
+def is_edit_excluded(name: str) -> bool:
+    """Never editable: embed_tokens, the final norm, lm_head (2026-11-21)."""
+    return name in EDIT_EXCLUDED or name.startswith(("lm_head.", "embed_tokens."))
+
+
+def linear_short(name: str) -> str | None:
+    """'layers.3.mlp.down_proj.weight' -> 'layers.3.mlp.down_proj' (a linear module of LEAVES), else None."""
+    if not name.endswith(".weight"):
+        return None
+    short = name[: -len(".weight")]
+    try:
+        parse_short(short)
+    except ValueError:
+        return None
+    return short
+
+
+def tensor_layer(name: str) -> int | None:
+    m = re.match(r"^layers\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+
+
 def vllm_packed_name(leaf: str) -> str:
     for packed, subs in VLLM_PACKED.items():
         if leaf in subs:

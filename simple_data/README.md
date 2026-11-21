@@ -1,7 +1,8 @@
-# simple_data/：五个领域的最终数据集，以及各 1,500 训练 + 500 评测的抽样
+# simple_data/：五个领域的最终数据集，以及各 1,500 训练 + 500 评测 + 500 测试的抽样
 
 每个领域只用该领域唯一的训练集，去掉与该领域所有评测集的重合部分和训练集内部的重复题，得到最终数据集
-（`pool.jsonl`），再从中随机抽 1,500 道作训练、500 道作评测。
+（`pool.jsonl`，id 列表在 `pool_ids.json`），再从中随机抽 1,500 道作训练、500 道作评测、500 道作测试
+（测试集 2026-11-21 起加入，是 `objective: simple` 的 held-out 报告；同一次打乱，train / eval 与之前逐字节相同）。
 生成脚本：`data/scripts/make_simple_data.py`（种子 `20261118:simple_data:<domain>`，可重复生成）。
 
 ```bash
@@ -13,14 +14,16 @@ eval/.venv/bin/python -I data/scripts/make_simple_data.py --only math,code # 部
 
 ```
 simple_data/<domain>/pool.jsonl         最终数据集（去污染、去重后的全部题，按 id 排序；共约 210 MB，不进 git，用脚本重新生成）
-simple_data/<domain>/train.jsonl        1,500 条，从 pool.jsonl 抽
-simple_data/<domain>/eval.jsonl           500 条，从 pool.jsonl 抽，与 train 不重叠
+simple_data/<domain>/pool_ids.json      pool.jsonl 全部 id（排序，每行一个；进 git）：objective simple 每代 screen 抽样的来源
+simple_data/<domain>/train.jsonl        1,500 条，从 pool.jsonl 抽（simple_<domain>_train，旧 simple 运行用；保留）
+simple_data/<domain>/eval.jsonl           500 条，从 pool.jsonl 抽，与 train 不重叠（simple_<domain>_eval = gate）
+simple_data/<domain>/test.jsonl           500 条，从 pool.jsonl 抽，与 train / eval 不重叠（simple_<domain>_test = held-out）
 simple_data/<domain>/build_report.json  每一步的数量、按评测集统计的重合、被移除的 id
 ```
 
 `pool.jsonl` 与 `data/processed/<训练集>.jsonl` 中 `split_pool == "pool"` 的部分完全相同，也就是正式运行用的抽样池。
 schema 与 `data/processed/*.jsonl` 相同（`id, dataset, category, split_pool, prompt, messages, reference, metadata`），
-train / eval 文件的 `split_pool` 改写为 `train` / `eval`。代码题的测试用例仍在 `data/processed/aux/taco_verified_tests.jsonl`，按 `id` 关联。
+train / eval / test 文件的 `split_pool` 改写为 `train` / `eval` / `test`。代码题的测试用例仍在 `data/processed/aux/taco_verified_tests.jsonl`，按 `id` 关联。
 
 ## 来源与对照的评测集
 
@@ -44,20 +47,34 @@ train / eval 文件的 `split_pool` 改写为 `train` / `eval`。代码题的测
      IF 和工具两个领域里，出现在 ≥5 道评测题中的 13-gram 视为模板句（约束说明、调用格式说明），不计入。
    - 比较的文本：`prompt`，没有时取 `messages` 中的 user 轮；Seal-Tools 只比较 `task_instruction` 一行（与 `make_splits.py` 相同）。
 3. 去掉训练集内部的重复题面（按第二条规范化，保留 id 最小的一条），这样训练和评测按题面也不重叠。
-4. 排序后打乱，前 1,500 道作训练，接下来 500 道作评测。脚本断言两者按 id 和按题面都不重叠。
+4. 排序后打乱，前 1,500 道作训练，接下来 500 道作评测，再接下来 500 道作测试。脚本断言三者两两按 id 和按题面都不重叠。
+
+## objective simple 怎么用这些文件（2026-11-21 起）
+
+`eval/configs/tasks.yaml` 的 `eval_targets` 把它们注册为数据集（`data/scripts/build_eval_target.py` 按需复制到
+`data/processed/` 和 `data/splits/`，都不进 git）：
+
+- `simple_<domain>_pool`：训练集 `data/processed/<训练集>.jsonl` 中 id 在 `pool_ids.json` 里的记录（`ids_file` 形式；
+  `pool_ids.json` 变化时重建）。第 g 代的 screen = signal = 从 pool − eval − test 中用种子
+  `<seed>:simple:<domain>:<g>` 抽 500 道（不含 run id 和 paper，所以 Paper A / B 同一代 screen 完全相同；每代独立重抽，
+  与前几代可以重叠）；train = pool − eval − test − 本代 screen；kl = train 中用种子 `<seed>:simple_kl:<domain>:<g>` 抽 400 道。
+  写在运行目录的 `draws/gen_XX/ids/simple_<domain>_pool.<role>.json`。
+- `simple_<domain>_eval`：gate，每代都是全部 500 道。
+- `simple_<domain>_test`：held-out 报告（`data_roles.eval: test`）。
+- `simple_<domain>_train`：仍然注册（兼容旧运行），新的 simple 配置不用它。
 
 ## 各领域数量
 
 2026-11-21 起 `make_splits.py` 已做同样的去污染和去重（重复题放进 `train_duplicate`），所以这里的复查在当前池子上
 不再移除任何题，只作为独立校验。
 
-| 领域 | 原始 | 去污染（`train_excluded`） | 内部重复（`train_duplicate`） | 最终数据集 `pool.jsonl` | 训练 | 评测 |
-|---|---|---|---|---|---|---|
-| math | 17,382 | 1,541 | 1,103 | 14,738 | 1,500 | 500 |
-| code | 10,806 | 0 | 15 | 10,791 | 1,500 | 500 |
-| knowledge | 76,523 | 3,185 | 237 | 73,101 | 1,500 | 500 |
-| instruction_following | 14,970 | 21 | 0 | 14,949 | 1,500 | 500 |
-| tool_calling | 12,022 | 5 | 2 | 12,015 | 1,500 | 500 |
+| 领域 | 原始 | 去污染（`train_excluded`） | 内部重复（`train_duplicate`） | 最终数据集 `pool.jsonl` | 训练 | 评测 | 测试 |
+|---|---|---|---|---|---|---|---|
+| math | 17,382 | 1,541 | 1,103 | 14,738 | 1,500 | 500 | 500 |
+| code | 10,806 | 0 | 15 | 10,791 | 1,500 | 500 | 500 |
+| knowledge | 76,523 | 3,185 | 237 | 73,101 | 1,500 | 500 | 500 |
+| instruction_following | 14,970 | 21 | 0 | 14,949 | 1,500 | 500 | 500 |
+| tool_calling | 12,022 | 5 | 2 | 12,015 | 1,500 | 500 | 500 |
 
 这套规则第一次（在旧池子上）运行时，比 `make_splits.py` 旧规则多抓出的重合题如下；它们现在已在 `train_excluded` 里。
 

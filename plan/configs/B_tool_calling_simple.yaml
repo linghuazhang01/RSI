@@ -1,21 +1,21 @@
-# Paper B · self-written LoRA (method.mode scratch: nothing is trained) · tool_calling only · objective simple · B300 planned at 220 GB per card
-# Generated snapshot (2026-11-21) of the MERGED config: lora_code/configs/base.yaml + domains/tool_calling.yaml + hardware b300
-# + scope single + objective simple. Not read by the code (source of truth: base.yaml + --set); the run locks its own
-# copy in experiment_records/B_tool_calling_s42_single_simple/run_config.yaml.
-# Data (simple_data/tool_calling/, committed; data/scripts/make_simple_data.py): the decontaminated, de-duplicated sealtool_train pool,
-# 1,500 items sampled for training and 500 disjoint ones for the gate. Graded by the Seal-Tools call match (sealtool).
-#   train role = simple_tool_calling_train (all 1,500 items every generation, nothing drawn)
-#   gate role  = simple_tool_calling_eval (all 500 items)
-#   held-out evaluation: disabled (heldout.enabled false)
-# Each generation: the editor M_t writes LoRAs from zero; its tools (train_example / acts / train_loss)
-# see the 1,500 train items and their gold answers; candidates are screened on all 1,500 against M_t
-# (greedy) and only those with a positive gain go to the gate on the 500 gate items, paired with M_t
-# (gate.min_gain and the 95% CI lower bound > 0); an accepted LoRA is merged. No retention probes, no E_t.
-# Editor (改造者): Qwen3 thinking mode (editor.extra_body enable_thinking, temperature 0.6 / top_p 0.95 / top_k 20);
-# per candidate up to editor.tool_rounds (50) rounds of tool calls (run_python with the explore api, read_record), then
-# a forced final turn; context editor.context_tokens (131072, also the editor server's --max-model-len).
-# Search / gate / noise decoding: greedy.
-# Start: ./launch.sh --paper B --domains tool_calling --simple --gens 5 --gpus <ids>   (run id B_tool_calling_s42_single_simple)
+# Paper B · self-written LoRA (method.mode scratch: nothing is trained; the merged model is the next editor) · tool_calling only · objective simple (v2, 2026-11-21) · B300 planned at 220 GB per card
+# Generated snapshot of the MERGED config (lora_code/configs/base.yaml + domains/tool_calling.yaml + hardware b300 + scope single
+# + objective simple). Not read by the code (source of truth: base.yaml + --set); a run locks its own copy in
+# experiment_records/<run id>/run_config.yaml. Regenerate after changing base.yaml.
+# Data (simple_data/tool_calling/, data/scripts/make_simple_data.py): the decontaminated, de-duplicated sealtool_train pool (pool_ids.json)
+#   gate  = simple_tool_calling_eval, 500 fixed items (hidden; the editor sees only statistics of earlier candidates' gate results)
+#   test  = simple_tool_calling_test, 500 fixed items (held-out report only, never visible, never used for selection)
+#   screen = 500 items drawn afresh every generation from the pool minus gate and test (the same items for Papers A and
+#            B in the same search round); train = all remaining pool items (the editor's train ids)
+# Each generation (search.threads 8 x search.steps 1 candidates, editor.tool_rounds 20):
+#   1. the latest model answers the 500 screen items, 4 samples each, once; the editor sees the detailed
+#      results (summary in the context; screen_results / screen_output tools, incl. the thinking text);
+#   2. each candidate: a program (persistent run_python session while exploring; no api.evaluate) builds it; ONE gate
+#      evaluation (500 x 4, paired with the latest model); its gate statistics are visible to later steps / generations;
+#   3. accept the candidate with the largest paired gate gain >= gate.min_gain 0.0 (require_significant
+#      True); then the test set (500 x 4).
+# Decoding (screen / gate / test): thinking on, temperature 0.6, top_p 0.95, top_k 20, max_tokens 16384.
+# Start: ./launch.sh --hw b300 --paper B --domains tool_calling --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag <name>
 draw_config: data/draw/paper_b.yaml
 data:
   n: null
@@ -36,6 +36,8 @@ method:
 weights:
   norm_cap_tau: 0.05
   max_modules: null
+  vector_cap_tau: 0.5
+  rescale_tol: 0.05
 scope: single
 objective: simple
 raw:
@@ -65,12 +67,19 @@ lora:
 budget:
   gpu_seconds: 7200
 search:
-  threads: 4
-  steps: 8
+  threads: 8
+  steps: 1
   max_evaluate: 32
-  top_full: 3
+  top_full: 0
   rerun_seeds: 0
   archive: true
+  max_candidates: 8
+  charge_screens: false
+  program_evaluate_calls: 0
+  program_evaluate_total: 0
+  parallel_builds: true
+  screen_candidates: false
+  gate_every_candidate: true
 editor:
   temperature: 0.6
   top_p: 0.95
@@ -97,8 +106,9 @@ editor:
   explore:
     timeout_s: 300
     mem_gb: 8
-    gpu_tools: false
-    gpu_seconds: 300
+    gpu_tools: true
+    gpu_seconds: 600
+    persistent: true
 sandbox:
   timeout_s: 1800
   mem_gb: 16
@@ -114,10 +124,38 @@ loop:
 tools:
   compare: true
   train_loss: true
+  tensor_compute: true
+  paper_tools: true
+tensor_compute:
+  max_tensors: 4
+  timeout_s: 300
+  mem_gb: 16
+  threads: 4
+  max_concurrent: 2
+  result_chars: 4000
+  explore: true
+  max_input_mb: 8192
+decoding:
+  screen:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
+  gate:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
 gate:
   reference: auto
   fallback: auto
-  min_gain: 0.01
+  min_gain: 0.0
   require_significant: true
   epsilon: 0.01
   delta: 0.02
@@ -139,7 +177,7 @@ train:
   max_len: 4608
   micro_batch: null
 nonllm:
-  evaluate: 32
+  evaluate: 8
   search_scales:
   - 0.5
   - 0.75
@@ -168,7 +206,15 @@ heldout:
   enabled: true
   domains: tool_calling
   limit: null
-  decoding: null
+  decoding:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    seed: 42
+    n: 4
+    n_by_task: null
+    thinking: true
+    max_tokens: 16384
 baseline:
   noise_repeats: 3
   noise_temperature: 0.0
@@ -211,4 +257,4 @@ gpu_layout:
   train_gpus: 1
 hardware: b300
 data_roles:
-  eval: eval:simple_tool_calling_eval
+  eval: eval:simple_tool_calling_test

@@ -32,14 +32,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import mock as M
-from .common import (append_jsonl, candidate_groups, config_hash, free_cuda, load_processed, read_json, read_jsonl,
-                     record_text, role_gpus, tail, write_json)
+from .common import (append_jsonl, candidate_args, candidate_groups, config_hash, free_cuda, load_processed,
+                     read_json, read_jsonl, record_text, role_gpus, tail, write_json)
 from .diagnostics import bytes_table, load_tables, save_tables, summarize_profile
 from .quant import schema, sizes
 from .quant.spec import ModelSpec, spec_from_checkpoint, synthetic_spec
 
 DATASET_DOMAIN = {"dapo_math": "math", "taco_verified": "code", "triviaqa_train": "knowledge",
                   "ifeval_train": "instruction_following", "sealtool_train": "tool_calling"}
+# objective simple (2026-11-21): simple_<domain>_{train,pool,eval,test} belong to their domain
+DATASET_DOMAIN.update({f"simple_{d}_{r}": d for d in ("math", "code", "knowledge", "instruction_following",
+                                                       "tool_calling") for r in ("train", "pool", "eval", "test")})
 
 
 class EvalBudgetExhausted(RuntimeError):
@@ -85,6 +88,9 @@ class QuantProblem:
         self.incumbent = incumbent
         self.incumbent_scores: dict = {}                  # {"screen": x, "full": y} on this problem's items
         self.eval_budget = int(eval_budget)
+        # search.screen_candidates false (2026-11-21, objective simple): candidates are not screened; the editor sees
+        # the incumbent's screen run through screen_results / screen_output (tools.make_tool_api) instead of compare
+        self.screen_tools = not bool((cfg.get("search") or {}).get("screen_candidates", True))
         self.show_examples = int(show_examples)
         self.log = log
         self.space = dict(schema.DEFAULT_ACTION_SPACE, **(cfg.get("action_space") or {}))
@@ -107,9 +113,16 @@ class QuantProblem:
         self._pool: queue.Queue = queue.Queue()
         for i in range(len(self.slots)):
             self._pool.put(i)
+        # decoding of each scoring stage (2026-11-21, paper config `decoding`, rsicore.config.stage_decoding; None =
+        # tasks.yaml greedy). The same dict (seed included) for the incumbent and every candidate. It is part of
+        # every evaluation record ("decoding", absent when None) and a cached record is reused only under the
+        # same decoding.
+        from rsicore.config import stage_decoding
+        self.decoding = {st: stage_decoding(cfg, st, getattr(rc, "seed", None)) for st in ("screen", "full", "gate")}
         self._evals = {}
         for r in read_jsonl(self.out_dir / "evals.jsonl"):
-            self._evals[(r["hash"], r["stage"])] = r
+            if r.get("decoding") == self._dec_key(r["stage"]):
+                self._evals[(r["hash"], r["stage"])] = r
         self._herr_lock = threading.Lock()
         self._herr: dict | None = None             # {"module|q|b|gs": [h_err, tr(W H W^T), tokens]} (persisted)
 
@@ -144,6 +157,23 @@ class QuantProblem:
             self._pool.put(j)
         with self._lock:
             self._removed.add(i)
+
+    def _dec_key(self, stage: str) -> str | None:
+        """The stage's decoding as a canonical string (None = tasks.yaml decoding), stored in evaluation records."""
+        import json
+        dec = self.decoding.get(stage)
+        return None if dec is None else json.dumps(dec, sort_keys=True)
+
+    def evaluated(self, config_or_art, stage: str = "screen") -> bool:
+        """True when this config already has (or is getting) a `stage` evaluation in this problem: evaluate() then
+        returns the cached record without charging (2026-11-21: tools.make_tool_api(free_repeats=True))."""
+        try:
+            h = config_or_art["config_hash"] if "config_hash" in config_or_art else \
+                config_hash(self.normalize(config_or_art))
+        except Exception:  # noqa: BLE001 - an invalid config is reported by evaluate()
+            return False
+        with self._lock:
+            return (h, stage) in self._evals or (h, stage) in self._inflight
 
     @property
     def evals_used(self) -> int:
@@ -545,7 +575,7 @@ class QuantProblem:
             else:  # pragma: no cover - GPU path
                 ckpt = self.materialize(art, slot=slot)
                 with VLLMServer(ckpt, name, gpus, seed=self.rc.seed, log_dir=logs,
-                                extra_args=self.cfg["vllm"].get("candidate_args", [])) as srv:
+                                extra_args=candidate_args(self.cfg)) as srv:
                     yield srv
         finally:
             self._pool.put(slot)
@@ -597,8 +627,10 @@ class QuantProblem:
         return out
 
     def evaluate(self, config_or_art, stage: str, cid: str, *, charge: bool = True, origin: str = "candidate") -> dict:
-        """Evaluate a config at `stage` (screen | full | gate). Cached by (config hash, stage).
-        Returns {"score", "feedback", ...}. Screen evaluations count against the evaluate budget."""
+        """Evaluate a config at `stage` (screen | full | gate) with the stage's decoding (self.decoding). Cached by
+        (config hash, stage); a cached result is free. Returns {"score", "feedback", ...}. Charged screen
+        evaluations count against the evaluate budget (charge=False: automatic screens when search.charge_screens is
+        false, the incumbent, baselines, gates)."""
         art = config_or_art if "config_hash" in config_or_art else self.build(config_or_art, cid)
         key = (art["config_hash"], stage)
         charged = bool(charge and stage == "screen")
@@ -630,12 +662,14 @@ class QuantProblem:
         edir = self.out_dir / "evals" / f"{cid}" / stage
         probes, regressions, scored = {}, [], {}
         # the same datasets AND items as an existing screen evaluation of this config (objective eval_overfit: every
-        # stage is the whole eval set): reuse its records instead of scoring them again. A gate on another dataset
-        # than the train role (data_roles) is always scored.
+        # stage is the whole eval set; objective simple: full = screen): reuse its records instead of scoring them
+        # again. A gate on another dataset than the train role (data_roles) is always scored, and so is a stage with
+        # another decoding than the screen's (2026-11-21: e.g. a gate with n 4 never reuses n 1 screen records).
         dsets = self.stage_datasets(stage)
+        dec = self.decoding.get(stage)
         scr = self._evals.get((art["config_hash"], "screen")) if stage != "screen" else None
         reuse = None
-        if scr is not None and dsets == self.datasets \
+        if scr is not None and dsets == self.datasets and dec == self.decoding.get("screen") \
                 and all(sorted(self._ids(ds, stage)) == sorted(self._ids(ds, "screen")) for ds in dsets):
             src = {ds: self.records_path(scr["cid"], "screen", ds) for ds in dsets}
             if all(p.exists() for p in src.values()):
@@ -650,7 +684,8 @@ class QuantProblem:
                                                               for r in reuse[ds]))
                     res = SimpleNamespace(records=reuse[ds])
                 else:
-                    res = score(srv.endpoint, name, ds, pool="pool", ids=ids, out_dir=edir, mock=self.mock)
+                    res = score(srv.endpoint, name, ds, pool="pool", ids=ids, out_dir=edir, mock=self.mock,
+                                decoding=dec)
                 acc, per, pending = _mean_per_id(res.records)
                 dom = DATASET_DOMAIN.get(ds, ds)
                 p = {"dataset": ds, "score": None if acc is None else round(acc, 4), "n": len(per), "pending": pending}
@@ -725,6 +760,8 @@ class QuantProblem:
             fb["retention"] = None if ret is None else round(ret, 4)
         rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "origin": origin, "score": sc, "feedback": fb,
                "charged": charged, "seconds": round(time.time() - t0, 1)}
+        if self._dec_key(stage) is not None:
+            rec["decoding"] = self._dec_key(stage)
         with self._lock:
             self._evals[key] = rec
             append_jsonl(self.out_dir / "evals.jsonl", rec)
@@ -749,7 +786,8 @@ class QuantProblem:
         mean = sum(p["vs_incumbent"] for p in deltas.values()) / len(deltas)
         desc = ", ".join(f"{d} {p['vs_incumbent']:+.4f} [{p['delta_ci'][0]:+.4f}, {p['delta_ci'][1]:+.4f}]"
                          for d, p in deltas.items())
-        if mean < float(g.get("min_delta", 0.0)):
+        md = float(g.get("min_delta", 0.0))
+        if mean < md or (md <= 0 and mean <= 0):          # threshold 0 (2026-11-21): a strictly positive gain
             return False, f"mean delta vs incumbent {mean:+.4f} < {g.get('min_delta', 0.0)} ({desc})"
         if g.get("require_significant", True):
             worse = [d for d, p in deltas.items() if p["delta_ci"][1] < 0]
@@ -816,7 +854,10 @@ class QuantProblem:
 
     def evaluate_incumbent(self, stages=("screen", "full")) -> dict:
         """Score the incumbent on this problem's items (uncharged; cid 'incumbent'): the reference of every
-        candidate's retention, paired deltas and regression examples. -> {stage: score}."""
+        candidate's retention, paired deltas and regression examples. -> {stage: score}. Sampled ONCE per problem
+        (generation) with the stage's decoding and seed and cached (evals.jsonl, evals/incumbent/<stage>/): every
+        candidate is paired with the same records (2026-11-21; full reuses the screen records when items and
+        decoding are the same)."""
         if not self.incumbent:
             return {}
         art = self.build(self.incumbent["config"], "incumbent")
@@ -874,6 +915,66 @@ class QuantProblem:
                 "mean_output_chars": round(sum(olen(A[i]) for i in ids) / n, 1),
                 "mean_output_chars_other": round(sum(olen(B[i]) for i in ids) / n, 1)}
         return out
+
+    # ------------------------------------------------------------------ reference screen + gate stats (simple, 2026-11-21)
+    def screen_records(self, gen: int | None = None) -> dict:
+        """{dataset: run_eval records} of the incumbent's screen run (the latest model's answers to this
+        generation's screen items, decoding.screen; gen = an earlier generation of the main search: its own
+        incumbent screen, gen_XX/evals/incumbent/screen/)."""
+        if gen is None or int(gen) == int(self.gen):
+            base = self.out_dir
+        else:
+            from rsicore.records import gen_dir
+            base = gen_dir(self.rc, int(gen))
+        out = {}
+        for ds in self.datasets:
+            p = base / "evals" / "incumbent" / "screen" / f"{ds}.jsonl"
+            if p.exists():
+                out[ds] = read_jsonl(p)
+        return out
+
+    def screen_items(self, records_by_ds: dict) -> dict:
+        """{dataset: {id: processed record}} for the ids in records_by_ds (prompt + gold; training-pool items)."""
+        return {ds: load_processed(ds, [r["id"] for r in recs]) for ds, recs in records_by_ds.items()}
+
+    def screen_summary(self, examples: int = 3) -> dict:
+        """rsicore.screen_view.summary of the incumbent's screen run (accuracy avg@n, correct-count distribution,
+        truncation rate, a few failing items with prompt / gold / answers)."""
+        from rsicore import screen_view
+        recs = self.screen_records()
+        return screen_view.summary(recs, self.screen_items(recs), examples=examples) if recs else {"n_items": 0}
+
+    def gate_stats(self, art: dict, r: dict) -> dict:
+        """Statistics of one gate evaluation r (evaluate(..., 'gate')) for the editor / gate.json (no item content):
+        passed, reason, accuracy, reference_accuracy (the incumbent's), gain (mean paired delta), ci (95% CI of the
+        paired delta; {dataset: ci} with several gate datasets), broken / fixed counts (incumbent right ->
+        candidate wrong / the reverse; per-item mean over the samples > 0.5 = right) and their ids, size."""
+        fb = r["feedback"]
+        probes = [p for p in (fb.get("probes") or {}).values() if isinstance(p, dict)]
+        gi = fb.get("gate") or {}
+        accs = [p["score"] for p in probes if p.get("score") is not None]
+        refs = [p["incumbent"] for p in probes if p.get("incumbent") is not None]
+        gains = [p["vs_incumbent"] for p in probes if p.get("vs_incumbent") is not None]
+        cis = {p["dataset"]: p.get("delta_ci") for p in probes if p.get("delta_ci") is not None}
+        broken, fixed = [], []
+        for p in probes:
+            inc = ((self.incumbent or {}).get("gate") or {}).get(p["dataset"]) or {}
+            if not inc.get("records") or not p.get("records") or not Path(p["records"]).exists() \
+                    or not Path(inc["records"]).exists():
+                continue
+            _, a, _ = _mean_per_id(read_jsonl(Path(p["records"])))
+            _, b, _ = _mean_per_id(read_jsonl(Path(inc["records"])))
+            ids = sorted(set(a) & set(b))
+            broken += [i for i in ids if b[i] > 0.5 >= a[i]]
+            fixed += [i for i in ids if a[i] > 0.5 >= b[i]]
+        rd = lambda v, k=5: None if v is None else round(v, k)  # noqa: E731
+        return {"passed": bool(gi.get("passed")), "reason": gi.get("reason"),
+                "accuracy": rd(sum(accs) / len(accs), 4) if accs else None,
+                "reference_accuracy": rd(sum(refs) / len(refs), 4) if refs else None,
+                "gain": rd(sum(gains) / len(gains)) if gains else None,
+                "ci": (next(iter(cis.values())) if len(cis) == 1 else cis) or None,
+                "broken": len(broken), "fixed": len(fixed), "broken_ids": broken[:50], "fixed_ids": fixed[:50],
+                "bytes_gib": art.get("bytes_gib")}
 
     def heldout_kl(self, art: dict) -> dict | None:
         if not self.kl_heldout:

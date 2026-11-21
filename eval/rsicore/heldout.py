@@ -2,7 +2,10 @@
 
 Decoding (2026-11-20): search, gate and noise are greedy; the held-out evaluation uses the paper config's
 `heldout.decoding` (Qwen's non-thinking recommendation: temperature 0.7, top_p 0.8, top_k 20, seed 42) with
-n samples per item (avg@n; per-task n in `n_by_task`). decoding=None keeps the task's tasks.yaml decoding."""
+n samples per item (avg@n; per-task n in `n_by_task`). decoding=None keeps the task's tasks.yaml decoding.
+2026-11-21: heldout.decoding may also set thinking (bool) and max_tokens (wins over the max_tokens table); both enter
+the resume key. An eval-set held-out task (eval:<dataset>, e.g. objective simple's simple_<d>_test) is built
+(data/scripts/build_eval_target.py) before it is read."""
 import json
 import shutil
 import threading
@@ -59,13 +62,32 @@ def heldout_tasks(domains="all") -> list[tuple[str, str]]:
 
 
 def decoding_args(decoding: dict | None, task: str) -> dict:
-    """score() keyword arguments + extra CLI args for one held-out task from a `heldout.decoding` block."""
+    """score() keyword arguments + extra CLI args for one held-out task from a `heldout.decoding` block, the resume
+    key (compared with the stored summary's run_eval decoding) and the same settings as one decoding dict
+    (2026-11-21, "decoding", for score(..., decoding=...); absent for a null block). thinking / max_tokens go to
+    extra (--thinking, --max-tokens)."""
     if not decoding:
         return {"kw": {}, "extra": [], "key": None}
     n = int((decoding.get("n_by_task") or {}).get(task, decoding.get("n", 1)))
     kw = {k: decoding[k] for k in ("temperature", "top_p", "top_k", "seed") if decoding.get(k) is not None}
-    key = dict(kw, n=n)
-    return {"kw": kw, "extra": ["--n", str(n)], "key": key}
+    key, extra = dict(kw, n=n), ["--n", str(n)]
+    if decoding.get("thinking") is not None:         # only when set: older summaries keep matching
+        key["thinking"] = bool(decoding["thinking"])
+        extra += ["--thinking", "on" if decoding["thinking"] else "off"]
+    if decoding.get("max_tokens") is not None:       # wins over the run-wide max_tokens table
+        key["max_tokens"] = int(decoding["max_tokens"])
+        extra += ["--max-tokens", str(int(decoding["max_tokens"]))]
+    dec = dict(key, **({"min_p": decoding["min_p"]} if decoding.get("min_p") is not None else {}))
+    return {"kw": kw, "extra": extra, "key": key, "decoding": dec}
+
+
+def ensure_built(domains="all") -> None:
+    """Build every eval-set dataset among the held-out tasks of `domains` (eval:<dataset>, pool `pool`), so run_eval
+    and _task_ids find data/processed/<dataset>.jsonl and data/splits/<dataset>/pool.json (once per process)."""
+    from .draws import build_eval_set, is_eval_set
+    for task, pool in heldout_tasks(domains):
+        if pool == "pool" and is_eval_set(task):
+            build_eval_set(task)
 
 
 def _same_decoding(prev_dec: dict | None, key: dict | None) -> bool:
@@ -81,6 +103,7 @@ def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=Non
     in parallel, one replica per task (each task in out_dir/_par/<task>/, merged into out_dir afterwards).
     A single task (eval_target: the run's eval set, 2026-11-21) is instead split item-wise over all
     replicas (score_split), so every GPU works on it."""
+    ensure_built(domains)
     if isinstance(endpoint, (list, tuple)) and len(endpoint) > 1:
         tasks = heldout_tasks(domains)
         if len(tasks) == 1 and _task_ids(*tasks[0], limit) is not None:

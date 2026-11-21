@@ -13,8 +13,16 @@
     bytes_table()         rows {key, layer, group, params, modules, mib: {"b4_g128": ..., "bf16": ...}}
     bytes(config)         packed size of a config {gib, total_bytes, linear_avg_bits, by_group_gib, fits_budget}
     evaluate(config)      build the candidate and run the screen evaluation -> L1 feedback   [cost: evaluate=1]
+                          (free_repeats, 2026-11-21: free for a config already evaluated; see make_tool_api)
     solve_allocation(...) knapsack over the profile table -> config (removable: tools.solve_allocation=false)
 Invalid configs raise a tool error whose message lists every problem (schema.ConfigError).
+
+Reference screen + gate per candidate (2026-11-21, objective simple: search.screen_candidates false):
+    screen_results(ids, filter, limit, offset)  the incumbent's (latest model's) answers to this round's screen items:
+                          prompt, gold, per-sample scores / extracted answers / finish / lengths (rsicore.screen_view)
+    screen_output(id, sample, offset)            one sample's full output text (thinking + answer) in pages
+compare is then not registered (candidates have no screen records) and evaluate_tool=False
+(search.program_evaluate_calls 0) removes evaluate from the program API, its docs and the prompt.
 
 explore=True (2026-11-21): the API of the editor's run_python chat tool (rsicore.chat_tools), used while it
 writes a candidate. evaluate is NOT registered (it would take a candidate slot and spend the generation's
@@ -33,11 +41,24 @@ class ToolError(RuntimeError):
     pass
 
 
-def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_evaluate: int, explore: bool = False):
-    from rsicore.sandbox import ToolAPI
+def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_evaluate: int | None,
+                  explore: bool = False, free_repeats: bool = False, evaluate_tool: bool = True):
+    """The program's API. Its evaluate budget = min(per_program_evaluate, the problem's evaluate budget left);
+    per_program_evaluate None = no per-program cap. free_repeats (2026-11-21, search.charge_screens false: the
+    automatic screens are free and problem.evals_left is the generation's api.evaluate pool): an api.evaluate of a
+    config already evaluated in this generation is free (no pool, no per-program charge), and a call that fails
+    (invalid config, empty pool) costs nothing. Without free_repeats every call costs one (as before).
+    evaluate_tool False (2026-11-21, search.program_evaluate_calls 0 with uncharged screens): no evaluate tool.
+    problem.screen_tools (search.screen_candidates false): screen_results / screen_output are registered (also when
+    exploring) and compare is not."""
+    from rsicore.sandbox import BudgetExceeded, ToolAPI
     tcfg = cfg.get("tools", {})
     gpu_tools = bool(((cfg.get("editor") or {}).get("explore") or {}).get("gpu_tools", False))
-    api = ToolAPI({} if explore else {"evaluate": max(0, min(per_program_evaluate, problem.evals_left))})
+    cap = problem.evals_left if per_program_evaluate is None else min(int(per_program_evaluate), problem.evals_left)
+    evaluate_tool = bool(evaluate_tool) and not explore
+    api = ToolAPI({"evaluate": max(0, cap)} if evaluate_tool else {})
+    screen_tools = bool(getattr(problem, "screen_tools", False))
+    out_chars = int(tcfg.get("screen_output_chars", 4000))
     spec = problem.spec
     calls = {"evaluate": 0}
 
@@ -55,8 +76,8 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
                 "allowed_bits": problem.space["bits"], "group_sizes": problem.space["group_sizes"],
                 "quantizers": problem.space["quantizers"], "embed_options": problem.space["embed"],
                 "incumbent_config": (problem.incumbent or {}).get("config"),
-                "incumbent_scores": problem.incumbent_scores, "evaluate_left": problem.evals_left,
-                "tools": api.names()}
+                "incumbent_scores": problem.incumbent_scores,
+                **({"evaluate_left": problem.evals_left} if evaluate_tool else {}), "tools": api.names()}
 
     def profile_table():
         """Whole-model DeltaKL when ONLY this module group is RTN-quantized (original model = reference)."""
@@ -122,13 +143,57 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         """Build this config as a candidate and run the screen evaluation (KL + screen items); returns
         the same structured feedback you get for submitted programs. Uses one evaluate."""
         calls["evaluate"] += 1
+        if free_repeats and not problem.evaluated(config, "screen"):
+            left = api.remaining().get("evaluate", 0)
+            if left < 1:
+                raise BudgetExceeded(f"budget 'evaluate' exhausted for this program: {api.spent.get('evaluate', 0):g} "
+                                     f"of {api.budget.get('evaluate', 0):g} api.evaluate calls used (a config "
+                                     "already evaluated stays free)")
         try:
             r = problem.evaluate(config, "screen", f"{cid}_e{calls['evaluate']}", origin=f"tool:{cid}")
         except schema.ConfigError as e:
             raise ToolError(str(e)) from None
         except (ValueError, EvalBudgetExhausted) as e:
             raise ToolError(str(e)) from None
+        if free_repeats and not r.get("cached"):
+            api.charge("evaluate", 1)
         return {"score": r["score"], "cached": bool(r.get("cached")), **r["feedback"]}
+
+    if free_repeats:
+        evaluate.__doc__ = ("Build this config as a candidate and run the screen evaluation (KL + screen items); "
+                            "returns the same structured feedback your returned config gets. Uses one api.evaluate "
+                            "of this program's allowance and of the round's pool; a config already evaluated this "
+                            "round (by anyone, incl. returned candidates) is free and returns its cached result.")
+
+    def screen_results(ids: list = None, filter: str = "all", limit: int = 50, offset: int = 0, gen: int = None):
+        """The incumbent's (latest model's) answers to this round's screen items (held-back TRAINING items, k sampled
+        answers each, thinking mode): [{id, dataset, prompt (cut), gold, scores [k], answers (extracted final
+        answers), finish (stop | length), lengths (chars incl. thinking), truncated_thinking}]. filter: all | wrong
+        (no sample right) | unstable (some right) | right (every sample right); sorted by id; page with limit /
+        offset. gen = an earlier round's screen (default: this round)."""
+        from rsicore import screen_view
+        recs = problem.screen_records(gen)
+        if not recs:
+            raise ToolError("no screen records of the incumbent for this round" if gen is None
+                            else f"no screen records of the incumbent for round {gen}")
+        try:
+            return screen_view.rows(recs, problem.screen_items(recs), ids=ids, filter=str(filter),
+                                    limit=min(int(limit), 200), offset=int(offset))
+        except ValueError as e:
+            raise ToolError(str(e)) from None
+
+    def screen_output(id: str, sample: int = 0, offset: int = 0, gen: int = None):  # noqa: A002 - tool argument name
+        """One sample's full output text (its thinking + the answer) of the incumbent on a screen item, in pages:
+        {id, sample, n_samples, score, answer, finish, has_thinking, offset, total_chars, text, next_offset}."""
+        from rsicore import screen_view
+        for recs in problem.screen_records(gen).values():
+            rec = next((r for r in recs if str(r.get("id")) == str(id)), None)
+            if rec is not None:
+                try:
+                    return screen_view.output(rec, sample=int(sample), offset=int(offset), chars=out_chars)
+                except ValueError as e:
+                    raise ToolError(str(e)) from None
+        raise ToolError(f"{id!r} is not a screen item of this round (see screen_results)")
 
     def solve_allocation(budget_gib: float = None, weights: dict = None, bits: list = None, group_sizes: list = None,
                          quantizer: str = "gptq", fixed_rules: list = None, fixed_groups: dict = None,
@@ -166,12 +231,15 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         api.register("hessian_table", hessian_table)
     if tcfg.get("group_error", True):
         api.register("group_error", group_error)
-    if tcfg.get("compare", True):
+    if tcfg.get("compare", True) and not screen_tools:
         api.register("compare", compare)
+    if screen_tools:
+        api.register("screen_results", screen_results)
+        api.register("screen_output", screen_output)
     api.register("bytes_table", bytes_table)
     api.register("bytes", bytes)
-    if not explore:
-        api.register("evaluate", evaluate, cost={"evaluate": 1})
+    if evaluate_tool:
+        api.register("evaluate", evaluate, cost={} if free_repeats else {"evaluate": 1})
     if tcfg.get("solve_allocation", True):
         api.register("solve_allocation", solve_allocation)
     return api

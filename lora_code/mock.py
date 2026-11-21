@@ -12,6 +12,10 @@ candidate can raise the target while lowering retention; merged successors inher
 mode=weights: MockWeightEdit (kind "weights", no rank) with the m_w_* primitives (small multiplicative tweaks near 1
 give a little gain, large ones cost damage ~ change^2; an added LoRA brings its gain / damage scaled by alpha;
 moving toward the original weights shrinks both) and the WEIGHTS_PROGRAM mock editor program.
+tensor_compute (2026-11-21): MockStore also has the full tensor catalogue (norms, dt_bias / A_log, conv1d, embed /
+final norm / lm_head) with 27B shapes; a mock tensor_compute really runs the code in the sandbox on seeded synthetic
+tensors (SYNTH_SRC; needs torch), and its outputs become a MockLoRA (m_tensor_lora) or MockWeightEdit entries
+(m_w_delta) whose rel comes from the actual factors / deltas.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ import random
 import re
 
 from .common import stable_hash
-from .primitives.naming import LEAVES
+from .primitives.naming import LEAVES, is_edit_excluded, linear_short, tensor_layer
 
 # Qwen3.8-27B-like geometry (64 layers, 3 GDN : 1 full attention)
 N_LAYERS = 64
@@ -37,8 +41,35 @@ LINEAR = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"]
 MLP = ["gate_proj", "up_proj", "down_proj"]
 
 
+VOCAB = 248320
+HEAD_DIM, LIN_HEADS, LIN_V_DIM, CONV_DIM, CONV_K = 256, 48, 128, 10240, 4
+FULL_TENSORS = {"self_attn.q_norm.weight": (HEAD_DIM,), "self_attn.k_norm.weight": (HEAD_DIM,)}
+LINEAR_TENSORS = {"linear_attn.conv1d.weight": (CONV_DIM, 1, CONV_K), "linear_attn.dt_bias": (LIN_HEADS,),
+                  "linear_attn.A_log": (LIN_HEADS,), "linear_attn.norm.weight": (LIN_V_DIM,)}
+LAYER_TENSORS = {"input_layernorm.weight": (HIDDEN,), "post_attention_layernorm.weight": (HIDDEN,)}
+GLOBAL_TENSORS = {"embed_tokens.weight": (VOCAB, HIDDEN), "norm.weight": (HIDDEN,), "lm_head.weight": (VOCAB, HIDDEN)}
+ZERO_CENTRED = ("input_layernorm.weight", "post_attention_layernorm.weight", "q_norm.weight", "k_norm.weight")
+
+
 def layer_type(i: int) -> str:
     return "full_attention" if i % 4 == 3 else "linear_attention"
+
+
+# Seeded synthetic tensors of the mock tensor_compute (2026-11-21): exec'd in the parent (to know the "current"
+# tensor of a write) and embedded in the sandbox wrapper (the child cannot import lora_code), so both see the same
+# values. spec = {"shape", "seed", "mean", "std"}.
+SYNTH_SRC = """
+def synth_tensor(torch, spec):
+    g = torch.Generator().manual_seed(int(spec["seed"]))
+    return torch.randn(*spec["shape"], generator=g) * float(spec["std"]) + float(spec["mean"])
+"""
+
+
+def synth_tensor(spec):
+    import torch
+    ns = {}
+    exec(SYNTH_SRC, ns)
+    return ns["synth_tensor"](torch, spec)
 
 
 class MockStore:
@@ -76,6 +107,84 @@ class MockStore:
     def norm(self, m):
         h = int(stable_hash("norm", m), 16) % 1000 / 1000
         return 40.0 + 30.0 * h
+
+    # ---- tensor catalogue (2026-11-21), same interface as WeightStore
+    def _catalogue(self) -> dict:
+        if getattr(self, "_tensors", None) is None:
+            t = {}
+            t["embed_tokens.weight"] = GLOBAL_TENSORS["embed_tokens.weight"]
+            for i in range(self.n_layers):
+                extra = FULL_TENSORS if layer_type(i) == "full_attention" else LINEAR_TENSORS
+                for suffix, shape in {**LAYER_TENSORS, **extra}.items():
+                    t[f"layers.{i}.{suffix}"] = shape
+            for m in self._mods:
+                t[m + ".weight"] = self.shape(m)
+            t["norm.weight"] = GLOBAL_TENSORS["norm.weight"]
+            t["lm_head.weight"] = GLOBAL_TENSORS["lm_head.weight"]
+            self._tensors = t
+        return self._tensors
+
+    def _canon(self, name):
+        return name + ".weight" if self.has(name) else name
+
+    def tensor_names(self):
+        return sorted(self._catalogue(), key=lambda n: (-1 if n.startswith("embed") else
+                                                        (10 ** 6 if tensor_layer(n) is None else tensor_layer(n)), n))
+
+    def has_tensor(self, name):
+        return self._canon(name) in self._catalogue()
+
+    def tensor_key(self, name):
+        n = self._canon(name)
+        if n not in self._catalogue():
+            raise KeyError(f"tensor {name!r} not in model (see api.tensors())")
+        return n if n.startswith("lm_head.") else self.prefix + n
+
+    def tensor_shape(self, name):
+        self.tensor_key(name)
+        return tuple(self._catalogue()[self._canon(name)])
+
+    def tensor_dtype(self, name):
+        return "float32" if self._canon(name).endswith("A_log") else "bfloat16"
+
+    def editable(self, name):
+        return self.has_tensor(name) and not is_edit_excluded(self._canon(name))
+
+    def edit_name(self, name):
+        n = self._canon(name)
+        self.tensor_key(n)
+        s = linear_short(n)
+        return s if s is not None and self.has(s) else n
+
+    def tensor_info(self, name):
+        n = self._canon(name)
+        return {"name": n, "shape": list(self.tensor_shape(n)), "dtype": self.tensor_dtype(n),
+                "editable": not is_edit_excluded(n), "layer": tensor_layer(n)}
+
+    def synth_spec(self, name) -> dict:
+        """Seeded synthetic values of a tensor: linear weights with ||W||_F = norm(module); zero-centred RMSNorm
+        weights near 0; linear_attn.norm near 1; dt_bias / A_log positive; conv1d / embeddings small."""
+        n = self._canon(name)
+        shape = list(self.tensor_shape(n))
+        numel = 1
+        for x in shape:
+            numel *= x
+        short = linear_short(n)
+        if short is not None and self.has(short):
+            mean, std = 0.0, self.norm(short) / math.sqrt(numel)
+        elif n.endswith(ZERO_CENTRED) or n == "norm.weight":
+            mean, std = 0.0, 0.05
+        elif n.endswith("linear_attn.norm.weight"):
+            mean, std = 1.0, 0.05
+        elif n.endswith("dt_bias"):
+            mean, std = 1.0, 0.5
+        elif n.endswith("A_log"):
+            mean, std = 1.5, 0.5
+        elif n.endswith("conv1d.weight"):
+            mean, std = 0.0, 0.1
+        else:
+            mean, std = 0.0, 0.02
+        return {"shape": shape, "seed": int(stable_hash("synth", n), 16) % (2 ** 31), "mean": mean, "std": std}
 
 
 # ============================================================================ mock LoRA
@@ -363,6 +472,32 @@ def m_w_toward(edit, mods, alpha, base_rel=None, undo_gain=0.0):
     return lo
 
 
+def m_tensor_lora(info: dict) -> "MockLoRA":
+    """A LoRA built by tensor_compute from explicit factors (2026-11-21): info = {module: (rank, rel)} with rel =
+    ||B A||_F / ||W||_F of the actual factors; gain / damage like the constructors (m_construct, strength rel/0.01)."""
+    lo = MockLoRA()
+    for m, (rank, rel) in sorted(info.items()):
+        a = float(rel) / 0.01
+        lo.gain += 0.006 * min(1.0, a)
+        lo.damage += 0.008 * a ** 2
+        lo.touch([m], int(rank), float(rel))
+    lo.ops.append(["tensor_compute", sorted(info)])
+    return lo
+
+
+def m_w_delta(edit, name: str, rel: float, ndim: int, tau_ratio: float = 0.1):
+    """W <- W + D on one tensor (a tensor_compute write, 2026-11-21). rel = the capped measure: ||D||_F/||W||_F for
+    >= 2-D tensors, rms(D) / max(rms(W), 1) for 1-D ones (scaled by tau_ratio = norm_cap_tau / vector_cap_tau for the
+    gain / damage model). modules_[name] keeps ndim so the mock check applies the right cap."""
+    lo = edit.copy()
+    d = float(rel) if ndim >= 2 else float(rel) * tau_ratio
+    _w_effect(lo, 1, d, d, 0.006)
+    cur = lo.modules_.get(name, {"rank": 0, "rel": 0.0})
+    lo.modules_[name] = {"rank": 0, "rel": _wrel(cur["rel"], float(rel)), "ndim": int(ndim)}
+    lo.ops.append(["w_delta", [name], round(float(rel), 6)])
+    return lo
+
+
 # ============================================================================ diagnostics
 def mock_diagnostics(store: MockStore, stack: list, seed: int = 42) -> dict:
     rows = []
@@ -393,12 +528,17 @@ def mock_diagnostics(store: MockStore, stack: list, seed: int = 42) -> dict:
 
 
 # ============================================================================ mock editor policy
-def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "scratch", retention: bool = True):
+def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "scratch", retention: bool = True,
+                     tensor_compute: bool = False, paper: bool = False):
     """Return policy(history) -> program text. Choices vary with (thread, step) parsed from the last user
     message ("[thread=K step=S]"); a higher `skill` (the editor model's mock quality) picks better
     hyper-parameters and protective operators more often. mode (method.mode): edit = edits of the raw LoRA
     (EDIT_PROGRAM); scratch = gradient-free constructions from zero (SCRATCH_PROGRAM); weights = structured edits
-    of the dense weights returned as {"edit": handle} (WEIGHTS_PROGRAM)."""
+    of the dense weights returned as {"edit": handle} (WEIGHTS_PROGRAM). tensor_compute (2026-11-21, scratch, the
+    tool is on): thread 1 writes TENSOR_PROGRAM instead (api.evaluate x2 + api.tensor_compute vectors / LoRA
+    factors); every other choice is unchanged. paper (2026-11-21, objective simple: paper and screen tools on, no
+    api.evaluate; scratch / weights): thread 1 writes PAPER_PROGRAM instead (screen_results / screen_output, acts on
+    its own screen answers, direction / unit / tensor_compute(vectors=...), project_out, save_edit / load_edit)."""
 
     def policy(history):
         last = ""
@@ -421,6 +561,11 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
                                        s=rng.choice([0.8, 0.9] if good else [0.5, 1.4]),
                                        boost=rng.choice([1.6, 2.0] if good else [1.05]),
                                        lo=rng.choice([0, 8, 16]), hi=rng.choice([48, 56, 64]))
+        if paper and th == 1 and mode in ("scratch", "weights"):
+            key = "edit" if mode == "weights" else "lora"
+            return PAPER_PROGRAM.format(th=th, st=st, mode=mode, key=key, layer=rng.choice([40, 44, 48]),
+                                        new="api.new_edit()['edit']" if mode == "weights" else "api.new_lora()['lora']",
+                                        alpha=rng.choice([0.05, 0.1] if good else [0.5]))
         if mode == "weights":
             recipe = WEIGHTS_RECIPES[(th + 2 * st + rng.randrange(len(WEIGHTS_RECIPES))) % len(WEIGHTS_RECIPES)]
             return WEIGHTS_PROGRAM.format(recipe=recipe, th=th, st=st, n=rng.choice([4, 8] if good else [2, 16]),
@@ -432,6 +577,10 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
         recipe = SCRATCH_RECIPES[(th + st + rng.randrange(len(SCRATCH_RECIPES))) % len(SCRATCH_RECIPES)]
         if recipe == "singular_regmean" and not retention:
             recipe = "singular_scale"
+        if tensor_compute and th == 1:
+            return TENSOR_PROGRAM.format(th=th, st=st, n=rng.choice([8, 16] if good else [2, 32]),
+                                         f=rng.choice([1.04, 1.06] if good else [1.3, 0.7]),
+                                         lo=rng.choice([8, 16]), hi=rng.choice([48, 56]))
         return SCRATCH_PROGRAM.format(recipe=recipe, th=th, st=st, n=rng.choice([8, 16] if good else [2, 32]),
                                       f=rng.choice([1.04, 1.06] if good else [1.3, 0.7]),
                                       alpha=rng.choice([0.3, 0.5] if good else [2.0]),
@@ -494,6 +643,61 @@ def main(api):
     except Exception as e:  # noqa: BLE001  (e.g. nothing evaluated yet, tool switched off)
         print("analysis tools:", type(e).__name__, str(e)[:120])
     return {{"lora": lora}}
+'''
+
+
+# (2026-11-21) scratch with the tensor tool: two api.evaluate calls (the program pool) and one tensor_compute call
+# whose vectors feed rank1 and whose LoRA factors are combined in
+TENSOR_PROGRAM = '''\
+# mock editor program (mode=scratch): thread {th} step {st}, recipe tensor_compute
+def main(api):
+    mods = [m["module"] for m in api.modules() if m["leaf"] == "down_proj" and {lo} <= m["layer"] < {hi}][: {n}]
+    lora = api.new_lora()["lora"]
+    for m in mods:
+        s = api.svd(module=m, k=4)
+        lora = api.scale_singular(lora=lora, module=m, svd=s["handle"], idx=[0, 1], factors=[{f}, {f}])["lora"]
+    print("singular only", api.evaluate(lora=lora).get("score"))
+    small = [m["module"] for m in api.modules() if m["leaf"] == "in_proj_b"][0]
+    code = ("U, S, V = torch.svd_lowrank(T[%r], q=4)\\n"
+            "vectors = {{'u': U[:, 0], 'v': V[:, 0]}}\\n"
+            "lora = {{%r: (V[:, :1].T.contiguous(), (U[:, :1] * S[:1] * 0.002).contiguous())}}\\n"
+            "result = [float(x) for x in S[:2]]") % (small, small)
+    tc = api.tensor_compute(code=code, tensors=[small])
+    print("top singular values", tc.get("json"), "sizes", tc.get("vector_sizes"), "lora", tc.get("lora_check"))
+    lora = api.rank1(lora=lora, module=small, u=tc["vectors"]["u"], v=tc["vectors"]["v"], s=0.5)["lora"]
+    lora = api.combine(loras=[lora, tc["lora"]], weights=[1.0, 1.0])["lora"]
+    print("combined", api.evaluate(lora=lora).get("score"))
+    return {{"lora": lora}}
+'''
+
+
+# (2026-11-21) objective simple: the paper-style recipe on the current model's own screen answers (no api.evaluate)
+PAPER_PROGRAM = '''\
+# mock editor program (mode={mode}): thread {th} step {st}, recipe paper
+def main(api):
+    rows = api.screen_results(filter="all", limit=200)
+    wrong = [r["id"] for r in rows if 2 * sum(1 for s in r["scores"] if s is not None and s > 0.5) <= len(r["scores"])][:8]
+    right = [r["id"] for r in rows if r["scores"] and all(s is not None and s > 0.5 for s in r["scores"])][:8]
+    if rows:
+        out = api.screen_output(id=rows[0]["id"], sample=0)
+        print("screen output", out["total_chars"], "chars, thinking", out["has_thinking"])
+    mats = api.output_matrices(layer={layer})
+    mod = [m["module"] for m in mats if m["kind"] == "down_proj"][0]
+    target = {new}
+    if wrong and right:
+        a = api.acts(module=mod, ids=wrong, source="own")
+        b = api.acts(module=mod, ids=right, source="own", sample="all")
+        d = api.direction(a=a["handle"] + ".out_mean", b=b["handle"] + ".out_mean")
+        u = api.unit(ref=d["vector"])
+        tc = api.tensor_compute(code="result = float(V[%r] @ V[%r])" % (d["vector"], u["vector"]),
+                                vectors=[d["vector"], u["vector"]])
+        print("cos(direction, unit)", tc.get("json"))
+        target = api.project_out(target=target, module=mod, u=u["vector"], alpha={alpha})["{key}"]
+    api.save_edit(handle=target, name="best")
+    api.save_edit(handle=target, name="scratch_copy")
+    api.drop_edit(name="scratch_copy")
+    print("saved", [e["name"] for e in api.list_edits()])
+    return {{"{key}": api.load_edit(name="best")["{key}"]}}
 '''
 
 

@@ -10,6 +10,15 @@ set_max_tokens() installs a run-wide {task: max generation tokens} table (the pa
 every score() call of a listed task then passes run_eval --max-tokens (unless `extra` already does).
 score_split() splits one scoring job over several replicas of the same model (data parallelism).
 
+decoding (2026-11-21; score / score_split `decoding=`): a dict with any of temperature, top_p, top_k, min_p (0 only),
+n, thinking, max_tokens, seed (rsicore.config.check_decoding / stage_decoding); None = the task's tasks.yaml
+decoding. The explicit seed / temperature / top_p / top_k keyword arguments win over it; its max_tokens wins over
+the run-wide table; `extra` CLI flags win over everything. n > 1: every record's "score" is the mean of its n
+samples (avg@n, in [0, 1]) and "scores" the per-sample list; the summary accuracy is the mean of the record scores.
+thinking: run_eval --thinking on (chat_template_kwargs enable_thinking); only the final answer is graded (the
+servers' reasoning parser moves the thinking out of `content`; run_eval strips any <think> block left in it), and a
+sample cut at max_tokens while still thinking (finish_reason length, no reasoning_content, no </think>) scores 0.
+
 Token KL uses vLLM's /v1/completions with `prompt_logprobs=k` (an extra sampling param that vLLM's
 OpenAI server accepts in the request body); the response's choices[0].prompt_logprobs is a list
 (first entry null) of {token_id: {"logprob", "rank", "decoded_token"}} with the top-k tokens plus the
@@ -26,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import _net
-from .config import EVAL_DIR, eval_python
+from .config import EVAL_DIR, check_decoding, eval_python
 from .draws import DOMAIN_TRAIN
 
 RUN_EVAL = EVAL_DIR / "run_eval.py"
@@ -71,12 +80,77 @@ def domain_eval_tasks(domain: str) -> list[str]:
     return list(DOMAIN_TRAIN[domain])
 
 
+def _decoding_flags(task: str, dec: dict, extra) -> list[str]:
+    """run_eval flags of a merged decoding dict (a flag already in `extra` is left to it)."""
+    xs, cmd = [str(x) for x in extra], []
+    for k, flag, cast in (("seed", "--seed", int), ("temperature", "--temperature", float),
+                          ("top_p", "--top-p", float), ("top_k", "--top-k", int), ("n", "--n", int)):
+        if dec.get(k) is not None and flag not in xs:
+            cmd += [flag, str(cast(dec[k]))]
+    if dec.get("thinking") is not None and "--thinking" not in xs:
+        cmd += ["--thinking", "on" if dec["thinking"] else "off"]
+    mt = dec.get("max_tokens") or _MAX_TOKENS.get(task)      # an explicit max_tokens wins over the table
+    if mt and "--max-tokens" not in xs:
+        cmd += ["--max-tokens", str(int(mt))]
+    return cmd
+
+
+def _as_list(v, n: int) -> list:
+    return list(v) if isinstance(v, list) else [v] * n
+
+
+def _normalise(task: str, summary: dict, recs: list[dict], thinking: bool, out_dir: Path) -> dict:
+    """One place for n > 1 and thinking (2026-11-21): records with several samples get "scores" (their per-sample
+    list; "score" is already the mean, run_eval's avg@n); with thinking on, a sample cut at max_tokens while still
+    thinking scores 0 (record score, summary and the files on disk are updated). Returns the summary."""
+    changed, multi = False, False
+    for r in recs:
+        ss = r.get("sample_scores") or []
+        if thinking and ss:
+            fr = r.get("finish_reason") or []
+            outs, reas = _as_list(r.get("raw_output"), len(ss)), _as_list(r.get("reasoning"), len(ss))
+            cut = [i for i in range(len(ss)) if ss[i] and i < len(fr) and fr[i] == "length" and not reas[i]
+                   and "</think>" not in str(outs[i] or "")]
+            for i in cut:
+                ss[i] = 0.0
+            if cut:
+                r["truncated_thinking"] = len(cut)
+                r["score"] = (sum(ss) / len(ss)) if all(x is not None for x in ss) else None
+                changed = True
+        if len(ss) > 1:
+            r["scores"] = list(ss)
+            multi = True
+    if not (changed or multi):
+        return summary
+    if changed:
+        graded = [r for r in recs if r.get("score") is not None]
+        per = _per_id(recs)
+        summary = dict(summary, accuracy=(sum(r["score"] for r in graded) / len(graded)) if graded else None,
+                       item_accuracy=(sum(per.values()) / len(per)) if per else None,
+                       truncated_thinking=sum(r.get("truncated_thinking", 0) for r in recs))
+        if multi:
+            summary["avg_at_n"] = summary["accuracy"]
+            summary["pass_at_n"] = (sum(float(any(x for x in r["sample_scores"] if x)) for r in graded) / len(graded)) \
+                if graded else None
+        sp = out_dir / "summary.json"
+        allsum = json.loads(sp.read_text()) if sp.exists() else {}
+        allsum[task] = summary
+        sp.write_text(json.dumps(allsum, indent=1, ensure_ascii=False))
+    (out_dir / f"{task}.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs))
+    return summary
+
+
 def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
           lora: str | None = None, extra: list[str] = (), mock: bool = False,
           seed: int | None = None, temperature: float | None = None, top_p: float | None = None,
-          top_k: int | None = None) -> EvalResult:
+          top_k: int | None = None, decoding: dict | None = None) -> EvalResult:
+    """Score `task` items `ids` (None = the whole pool) on one endpoint. decoding: see the module doc."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    dec = dict(check_decoding(decoding) or {})
+    for k, v in (("seed", seed), ("temperature", temperature), ("top_p", top_p), ("top_k", top_k)):
+        if v is not None:                               # explicit keyword arguments win over `decoding`
+            dec[k] = v
     cmd = [eval_python(), "-I", str(RUN_EVAL), "--task", task, "--pool", pool, "--endpoint", endpoint,
            "--model", served_name, "--out", str(out_dir), "--no-cache", "--quiet"]
     if ids is not None:
@@ -90,16 +164,7 @@ def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None,
         cmd += ["--ids-file", str(idf)]
     if lora:
         cmd += ["--lora", lora]
-    if seed is not None:
-        cmd += ["--seed", str(int(seed))]
-    if temperature is not None:
-        cmd += ["--temperature", str(float(temperature))]
-    if top_p is not None:
-        cmd += ["--top-p", str(float(top_p))]
-    if top_k is not None:
-        cmd += ["--top-k", str(int(top_k))]
-    if task in _MAX_TOKENS and "--max-tokens" not in [str(x) for x in extra]:
-        cmd += ["--max-tokens", str(_MAX_TOKENS[task])]
+    cmd += _decoding_flags(task, dec, extra)
     if mock and "--no-sandbox" not in extra:
         cmd += ["--no-sandbox"]
     cmd += [str(x) for x in extra]
@@ -110,22 +175,25 @@ def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None,
     if task not in summ_all:  # e.g. "no items in pool"
         return EvalResult({"accuracy": None, "n": 0, "n_pending": 0, "note": r.stdout[-500:]}, [], out_dir)
     recs = [json.loads(l) for l in (out_dir / f"{task}.jsonl").read_text().splitlines() if l.strip()]
-    return EvalResult(summ_all[task], recs, out_dir)
+    xs = [str(x) for x in extra]
+    thinking = (xs[xs.index("--thinking") + 1] == "on") if "--thinking" in xs[:-1] else bool(dec.get("thinking"))
+    return EvalResult(_normalise(task, summ_all[task], recs, thinking, out_dir), recs, out_dir)
 
 
 def score_split(endpoints: list[str], served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
                 lora: str | None = None, extra: list[str] = (), mock: bool = False, seed: int | None = None,
                 temperature: float | None = None, top_p: float | None = None,
-                top_k: int | None = None) -> EvalResult:
+                top_k: int | None = None, decoding: dict | None = None) -> EvalResult:
     """score() with the items split over several replicas of the same model (2026-11-20: data parallelism on
     every GPU). endpoints: one URL per replica. Each replica scores a contiguous chunk of the sorted ids into
     out_dir/_part<k>/; the records are merged (sorted by id) into out_dir/<task>.jsonl and a summary entry
-    (accuracy = item-level mean, n, n_pending) is merged into out_dir/summary.json. One endpoint or ids None
-    (the whole pool) -> plain score() on the first endpoint."""
+    (accuracy = item-level mean, n, n_pending; avg_at_n / pass_at_n when n > 1) is merged into out_dir/summary.json.
+    One endpoint or ids None (the whole pool) -> plain score() on the first endpoint. decoding: see the module doc
+    (every replica gets the same dict, seed included)."""
     eps = [e for e in endpoints if e]
     if len(eps) <= 1 or ids is None or len(set(ids)) < 2:
         return score(eps[0], served_name, task, pool=pool, ids=ids, out_dir=out_dir, lora=lora, extra=extra,
-                     mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k)
+                     mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k, decoding=decoding)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ids = sorted(set(ids))
@@ -135,17 +203,26 @@ def score_split(endpoints: list[str], served_name, task: str, *, pool: str, ids:
 
     def run(i):
         return score(eps[i], served_name, task, pool=pool, ids=chunks[i], out_dir=out_dir / f"_part{i}", lora=lora,
-                     extra=extra, mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k)
+                     extra=extra, mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k,
+                     decoding=decoding)
     with ThreadPoolExecutor(max_workers=k) as ex:
         parts = list(ex.map(run, range(k)))
     recs = sorted((r for p in parts for r in p.records), key=lambda r: (str(r.get("id")), str(r.get("unit_id", ""))))
     per = _per_id(recs)
     pend = sum(1 for r in recs if r.get("score") is None)
     summ = dict(parts[0].summary)
-    for key in ("avg_at_n", "pass_at_n", "maj_at_n", "em", "f1", "prompt_strict", "note"):
+    for key in ("avg_at_n", "pass_at_n", "maj_at_n", "em", "f1", "prompt_strict", "note", "item_accuracy",
+                "truncated_thinking"):
         summ.pop(key, None)
     summ.update({"accuracy": (sum(per.values()) / len(per)) if per else None, "n": len({r.get("id") for r in recs}),
                  "n_pending": pend, "split_over_replicas": k})
+    graded = [r for r in recs if r.get("score") is not None]
+    if any("scores" in r for r in recs):                # n > 1: keep avg@n / pass@n
+        summ["avg_at_n"] = summ["accuracy"]
+        summ["pass_at_n"] = (sum(float(any(x for x in r.get("sample_scores") or [] if x)) for r in graded)
+                             / len(graded)) if graded else None
+    if any(r.get("truncated_thinking") for r in recs):
+        summ["truncated_thinking"] = sum(r.get("truncated_thinking", 0) for r in recs)
     (out_dir / f"{task}.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs))
     sp = out_dir / "summary.json"
     allsum = json.loads(sp.read_text()) if sp.exists() else {}

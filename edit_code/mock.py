@@ -206,6 +206,12 @@ def main(api):
                 dmg[(best[0], choice[best[0]])] = 0.0   # cannot afford: skip this group
                 improved = True
     {maybe_eval}
+    if "screen_results" in tools:           # the incumbent's screen run (objective simple, 2026-11-21)
+        rows = api.screen_results(filter="wrong", limit=2) or api.screen_results(limit=1)
+        print("screen_results", [(r["id"], r["scores"]) for r in rows])
+        if rows:
+            out = api.screen_output(id=rows[0]["id"], sample=0)
+            print("screen_output", out["total_chars"], "thinking" if out["has_thinking"] else "no thinking")
     if "group_error" in tools:              # analysis tools (free): where the error concentrates
         ge = api.group_error(config=cfg_of(choice), top=3)
         print("group_error top", ge["top"])
@@ -214,6 +220,22 @@ def main(api):
         print("compare vs incumbent", {{k: v["net"] for k, v in cmp["datasets"].items()}})
     return cfg_of(choice)
 '''
+
+
+PROBE_EVAL = """try:
+        if "evaluate" not in tools:         # program_evaluate_calls 0 (gate per candidate): no evaluate tool
+            raise api.ToolError("no evaluate tool")
+        fb = api.evaluate(config=cfg_of(choice))
+        print("probe evaluate:", fb.get("score"))
+        again = api.evaluate(config=cfg_of(choice))
+        print("probe again cached:", again.get("cached"))
+        other = dict(cfg_of(choice), lm_head=4)
+        api.evaluate(config=other)
+        print("probe second config evaluated")
+    except api.BudgetExceeded as e:
+        print("probe cap:", str(e)[:120])
+    except api.ToolError as e:
+        print("probe tool error:", str(e)[:120])"""
 
 
 REFINE_TEMPLATE = """
@@ -311,7 +333,12 @@ def mock_program(thread: int, step: int, task: str = "main", gen: int = 0) -> st
     gs = [128, 128, 64, 128][(step + thread + gen) % 4]
     maybe_eval = ""
     if strategy == "greedy" and step == 1:
-        maybe_eval = 'fb = api.evaluate(config=cfg_of(choice))\n    print("probe evaluate:", fb.get("score"))'
+        maybe_eval = ('if "evaluate" in tools:\n        fb = api.evaluate(config=cfg_of(choice))\n'
+                      '        print("probe evaluate:", fb.get("score"))')
+    elif strategy == "greedy" and step == 0 and thread >= 2:
+        # 2026-11-21: the k x 1 layout (objective simple; never reached by the 2-thread mocks): evaluate, the same
+        # config again (free with free screens: cached) and a second config (over a per-program cap of 1)
+        maybe_eval = PROBE_EVAL
     return PROGRAM_TEMPLATE.format(strategy=strategy, margin=margin, protect=protect, quantizer=quantizer,
                                    gs=gs, down_w=1.0 + 0.5 * step, embed=repr("bf16" if step % 2 == 0 else 8),
                                    maybe_eval=maybe_eval)

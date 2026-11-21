@@ -4,6 +4,11 @@ Uses only the standard library. Order: apply rlimits -> install the audit hook (
 the workdir; no reads of denied roots; no subprocess / socket connect / os.kill) -> read program.py ->
 exec it -> call main(api) -> send the JSON result. `api.<tool>(**kwargs)` is a JSON-lines RPC to the
 parent's ToolAPI; tool errors come back as exceptions (api.BudgetExceeded / api.ToolError).
+Kernel mode (2026-11-21, cfg "kernel": true; rsicore.sandbox.Kernel): after the hello, a loop reads
+{"type": "exec", code, dir, cpu_s} messages and execs each code string in ONE persistent globals dict (with `api`),
+print output going to <dir>/stdout.txt / stderr.txt, and answers {"type": "final", ok, result, error}; {"type":
+"exit"} or EOF ends it. RLIMIT_CPU there is a soft limit raised to (CPU used + cpu_s) before every exec; the program
+may not change rlimits itself.
 """
 import json
 import os
@@ -11,6 +16,7 @@ import sys
 import traceback
 
 CFG = json.load(open(sys.argv[1]))
+KERNEL = bool(CFG.get("kernel"))
 REQ = os.fdopen(int(sys.argv[2]), "w", buffering=1)
 RESP = os.fdopen(int(sys.argv[3]), "r")
 
@@ -28,7 +34,7 @@ def _limits():
         try:
             soft, hard = resource.getrlimit(r)
             v2 = v if hard == resource.RLIM_INFINITY else min(v, hard)
-            resource.setrlimit(r, (v2, v2))
+            resource.setrlimit(r, (v2, hard if KERNEL and name == "RLIMIT_CPU" else v2))
             applied[name] = v2
         except (ValueError, OSError) as e:
             applied[name] = f"unsupported: {e}"
@@ -48,6 +54,8 @@ DENY_READ = [_real(p) for p in CFG["deny_read"]]
 BLOCK = {"subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty",
          "os.kill", "os.killpg", "socket.connect", "socket.bind", "socket.sendto", "socket.sendmsg",
          "socket.getaddrinfo", "pty.spawn", "os.chroot", "os.setuid", "winreg.OpenKey", "webbrowser.open"}
+if KERNEL:
+    BLOCK |= {"resource.setrlimit", "resource.prlimit"}
 WRITE_EVENTS = {"os.remove", "os.rename", "os.rmdir", "os.mkdir", "os.chmod", "os.chown", "os.symlink",
                 "os.link", "os.truncate", "os.utime", "shutil.rmtree", "shutil.move", "shutil.copyfile"}
 _IN = [False]
@@ -140,12 +148,74 @@ class _API:
         return call
 
 
+def _encode(res):
+    try:
+        return json.loads(json.dumps(res, allow_nan=False))
+    except (TypeError, ValueError):
+        return {"__repr__": repr(res)[:20000]}
+
+
+def kernel(api):
+    """Kernel mode: exec code strings in one persistent globals dict until 'exit' / EOF."""
+    import resource
+    g = {"__name__": "__explore__", "api": api, "BudgetExceeded": BudgetExceeded, "ToolError": ToolError}
+    while True:
+        line = RESP.readline()
+        if not line:
+            return
+        msg = json.loads(line)
+        if msg.get("type") == "exit":
+            return
+        if msg.get("type") != "exec":
+            continue
+        out = {"type": "final", "id": msg.get("id"), "ok": False, "result": None, "error": None}
+        d = os.path.join(WORK, msg.get("dir") or ".")
+        so, se = open(os.path.join(d, "stdout.txt"), "w"), open(os.path.join(d, "stderr.txt"), "w")
+        old = sys.stdout, sys.stderr
+        _IN[0] = True                   # our own rlimit change (the program may not do this)
+        try:
+            ru = resource.getrusage(resource.RUSAGE_SELF)
+            hard = resource.getrlimit(resource.RLIMIT_CPU)[1]
+            want = int(ru.ru_utime + ru.ru_stime) + int(msg.get("cpu_s") or 60)
+            resource.setrlimit(resource.RLIMIT_CPU, (want if hard == resource.RLIM_INFINITY else min(want, hard), hard))
+        except (ValueError, OSError):
+            pass
+        finally:
+            _IN[0] = False
+        sys.stdout, sys.stderr = so, se
+        try:
+            g.pop("result", None)
+            main0 = g.get("main")
+            exec(compile(msg.get("code") or "", f"<explore {msg.get('dir')}>", "exec"), g)
+            if "result" in g:
+                res = g["result"]
+            elif callable(g.get("main")) and g.get("main") is not main0:
+                res = g["main"](api)
+            else:
+                res = None
+            out.update(ok=True, result=_encode(res))
+        except BaseException as e:  # noqa: BLE001 - report everything, including SystemExit
+            tb = traceback.format_exc(limit=20)
+            out["error"] = f"{type(e).__name__}: {e}\n{tb[-6000:]}"
+        finally:
+            sys.stdout, sys.stderr = old
+            for f in (so, se):
+                try:
+                    f.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        REQ.write(json.dumps(out) + "\n")
+        REQ.flush()
+
+
 def main():
     hello = json.loads(RESP.readline())
     api = _API(hello["tools"], hello["docs"])
     REQ.write(json.dumps({"type": "hello", "limits": LIMITS}) + "\n")
     os.chdir(WORK)
     sys.addaudithook(_hook)
+    if KERNEL:
+        return kernel(api)
     out = {"type": "final", "ok": False, "result": None, "error": None}
     try:
         src = open(os.path.join(WORK, CFG["program"])).read()

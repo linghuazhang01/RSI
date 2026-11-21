@@ -167,6 +167,7 @@ class Mock:
         md = req.get("metadata") or {}
         with self.lock:
             self.stats["requests"] += 1
+        hit_info = None
         if md.get("mock_editor") or str(model).endswith("editor"):
             with self.lock:
                 self.stats["editor"] += 1
@@ -180,6 +181,7 @@ class Mock:
                 outs = [{"content": "UNKNOWN REQUEST"}] * n
             else:
                 task, iid, uid = hit
+                hit_info = (task, iid)
                 q = self.quality(model, task)
                 t, it = self.tasks[task], self.item(task, iid)
                 temp = float(req.get("temperature") or 0.0)
@@ -197,9 +199,13 @@ class Mock:
                         outs.append({"content": ""})
                     else:
                         outs.append(t.oracle(it, uid, "wrong"))
+        # thinking requested (chat_template_kwargs.enable_thinking, 2026-11-21): a short deterministic reasoning_content
+        # per sample, like vLLM's qwen3 reasoning parser returns it (run_eval keeps it as the record's "reasoning")
+        think = bool((req.get("chat_template_kwargs") or {}).get("enable_thinking")) and hit_info is not None
         choices = []
         for i, o in enumerate(outs):
-            m = {"role": "assistant", "content": o.get("content", ""), "reasoning_content": None}
+            rc = f"[mock thinking] {hit_info[0]} item {hit_info[1]} sample {i}: working it out." if think else None
+            m = {"role": "assistant", "content": o.get("content", ""), "reasoning_content": rc}
             if o.get("tool_calls"):
                 m["tool_calls"] = o["tool_calls"]
             choices.append({"index": i, "message": m, "finish_reason": "tool_calls" if o.get("tool_calls") else "stop"})

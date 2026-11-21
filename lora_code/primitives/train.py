@@ -128,6 +128,21 @@ class HFModel:
     def module(self, short: str):
         return self.model.get_submodule(self.store.full_name(short))
 
+    def param(self, name: str):
+        """The nn.Parameter of a weight-edit name (2026-11-21): a linear module's .weight, or any other
+        language-model tensor by its checkpoint key (HF parameter names equal the checkpoint keys for
+        Qwen3_5ForConditionalGeneration; a 'model.' prefix difference is tolerated)."""
+        if self.store.has(name):
+            return self.module(name).weight
+        key = self.store.tensor_key(name)
+        cands = [key, key[len("model."):] if key.startswith("model.") else "model." + key]
+        for k in cands:
+            try:
+                return self.model.get_parameter(k)
+            except AttributeError:
+                continue
+        raise KeyError(f"no parameter for tensor {name!r} (tried {cands})")
+
     # ------------------------------------------------------------------ tokenisation
     def encode(self, ex: dict):
         """(input_ids, labels) with the prompt masked (-100); Qwen chat template, thinking off
@@ -182,20 +197,21 @@ class HFModel:
     def applied(self, lora, trainable: bool = False):
         """Temporarily add x Aᵀ Bᵀ to the outputs of the LoRA's modules (forward hooks). A weight edit
         (method.mode weights, kind "weights") instead swaps in the edited weights W' = edit.apply(W) for the
-        duration and restores the originals afterwards (toward_base ops read self.base_store, the original model)."""
+        duration and restores the originals afterwards (toward_base ops read self.base_store, the original model);
+        2026-11-21: also non-linear tensors (norms, dt_bias / A_log, conv1d) via param()."""
         import torch
         handles = []
         saved = {}
         if lora is not None and getattr(lora, "kind", "lora") == "weights":
             with torch.no_grad():
                 for m in lora.modules():
-                    mod = self.module(m)
-                    w = mod.weight
+                    w = self.param(m)
                     base = None
                     if lora.needs_base(m):
-                        if getattr(self, "base_store", None) is None:
+                        bs = getattr(self, "base_store", None)
+                        if bs is None:
                             raise ValueError(f"{m}: toward_base needs HFModel.base_store (the original model)")
-                        base = self.base_store.weight(m, device=w.device)
+                        base = bs.weight(m, device=w.device) if bs.has(m) else bs.tensor(m, device=w.device)
                     saved[m] = w.data.clone()
                     w.data.copy_(lora.apply(m, w.data.float(), base).to(w.dtype))
             try:
@@ -203,7 +219,7 @@ class HFModel:
             finally:
                 with torch.no_grad():
                     for m, orig in saved.items():
-                        self.module(m).weight.data.copy_(orig)
+                        self.param(m).data.copy_(orig)
             return
         if lora is not None:
             for m in lora.modules():

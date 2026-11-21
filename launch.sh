@@ -34,10 +34,13 @@
 #               aime25 amc23 | humanevalplus mbppplus livecodebench | gpqa_diamond mmlu_pro triviaqa |
 #               ifeval ifbench | sealtool apibank bfcl  (eval/configs/tasks.yaml eval_targets).
 #               Run ids end in _evalfit (math) or _evalfit_<set>, e.g. A_code_s42_single_evalfit_humanevalplus.
-#   --simple    objective simple (2026-11-21): train on simple_data/<domain>'s 1,500 items (all of them every
-#               generation), accept on its 500 (the usual paired gate), held-out report on the same 500 (greedy);
-#               editor at most 20 tool rounds per candidate. simple_data/ comes from data/scripts/make_simple_data.py.
-#               Run ids end in _simple, e.g. B_code_s42_single_simple. Merged configs: plan/configs/{A,B}_<domain>_simple.yaml.
+#   --simple    objective simple (2026-11-21): every generation screens a fresh 500 items drawn from simple_data/<domain>'s
+#               clean pool minus its eval and test items (same items for Papers A and B; the rest of the pool is the
+#               train data), accepts on its 500 eval items (the usual paired gate) and reports held-out on its 500 test
+#               items (data_roles.eval: test). Decoding per the paper config's decoding / heldout.decoding blocks.
+#               simple_data/ (test.jsonl, pool_ids.json) comes from data/scripts/make_simple_data.py. Run ids end in
+#               _simple, e.g. B_code_s42_single_simple. Merged configs: plan/configs/{A,B}_<domain>_simple.yaml.
+#               A changed simple profile cannot resume an older _simple run (locked config): use --tag / --run-id.
 #   Data roles (2026-11-21, paper config data_roles; each run's train / gate must belong to its domain):
 #   --train-set what the editor works from (signal / screen items, Paper B's train_example / acts / train_loss,
 #               Paper A's KL / calibration prompts): the domain's training set (dapo_math, taco_verified,
@@ -47,7 +50,8 @@
 #               eval sets (math_eval = MATH-500 + GSM8K merged), or train / gate (when that role is an eval set).
 #               Default: --eval-overfit -> the eval set; otherwise the run's domain (sampled avg@n, heldout.decoding).
 #               Defaults of train / gate: the domain's training set; with --eval-overfit / --eval-set the eval set;
-#               with --simple simple_<domain>_train / simple_<domain>_eval (also accepted: simple_train / simple_eval).
+#               with --simple simple_<domain>_pool / simple_<domain>_eval, held-out simple_<domain>_test (also
+#               accepted: simple_pool / simple_train / simple_eval / simple_test; --eval-on test).
 #               A train / gate other than the default adds _train-<x> / _gate-<x> to the run id.
 #   --all-domains  the original design (scope all): the other four domains are retention probes / KL texts,
 #               held-out on all five domains, Paper B E_t on. Run ids without _single.
@@ -77,7 +81,7 @@
 #   ./launch.sh --hw h20 --paper B --domains math --gate-set math500 --eval-on math500,gsm8k --gens 5 --gpus 0,1,2,3
 #       # train on DAPO-Math draws, accept on all of MATH-500, report MATH-500 + GSM8K: B_math_s42_single_gate-math500
 #   ./launch.sh --hw h20 --paper A --domains code --train-set humanevalplus --gate-set mbppplus --eval-on livecodebench
-#   ./launch.sh --hw h20 --paper both --simple --gens 5          # 1,500 / 500 per domain, five domains, both papers
+#   ./launch.sh --hw h20 --paper both --simple --gens 5          # 500-item screens / 500 gate / 500 test, five domains
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -166,7 +170,8 @@ train_of() {  # domain -> training set (same table as ds_of below)
     instruction_following) echo ifeval_train ;; tool_calling) echo sealtool_train ;; esac
 }
 any_domain() {  # training set, simple set or eval set -> its domain
-  case "$1" in simple_*_train|simple_*_eval) s="${1#simple_}"; s="${s%_train}"; echo "${s%_eval}" ;; dapo_math) echo math ;; taco_verified) echo code ;; triviaqa_train) echo knowledge ;;
+  case "$1" in simple_*_train|simple_*_eval|simple_*_test|simple_*_pool) s="${1#simple_}"; echo "${s%_*}" ;;
+    dapo_math) echo math ;; taco_verified) echo code ;; triviaqa_train) echo knowledge ;;
     ifeval_train) echo instruction_following ;; sealtool_train) echo tool_calling ;; *) set_domain "$1" ;; esac
 }
 
@@ -195,9 +200,9 @@ if [ -n "$TRAIN_SET$GATE_SET$EVAL_ON" ]; then
     set -- $r; p=$1; d=$2; rid=$3; e=$4
     for pair in "train:$TRAIN_SET" "gate:$GATE_SET"; do
       role="${pair%%:*}"; v="$(norm_set "${pair#*:}")"; [ -n "$v" ] || continue
-      case "$v" in simple_train|simple_eval) v="simple_${d}_${v#simple_}" ;; esac
+      case "$v" in simple_train|simple_eval|simple_test|simple_pool) v="simple_${d}_${v#simple_}" ;; esac
       dflt="$e"; [ "$e" = - ] && dflt="$(train_of "$d")"
-      [ "$SIMPLE" -eq 1 ] && { if [ "$role" = train ]; then dflt="simple_${d}_train"; else dflt="simple_${d}_eval"; fi; }
+      [ "$SIMPLE" -eq 1 ] && { if [ "$role" = train ]; then dflt="simple_${d}_pool"; else dflt="simple_${d}_eval"; fi; }
       vd="$(any_domain "$v")"
       [ -n "$vd" ] || { echo "ERROR: --$role-set: unknown dataset $v (see --help)" >&2; exit 2; }
       [ "$vd" = "$d" ] || { echo "ERROR: --$role-set $v is a $vd dataset but run $rid is $d" >&2; exit 2; }
@@ -277,8 +282,12 @@ if [ "$SKIP" -eq 0 ]; then
   fi
   if [ "$SIMPLE" -eq 1 ]; then
     for d in $CHECK_DOMS; do
-      if [ -s "simple_data/$d/train.jsonl" ] && [ -s "simple_data/$d/eval.jsonl" ]; then ok "simple_data/$d (1,500 train / 500 gate)"
-      else bad "simple_data/$d missing ($PY -I data/scripts/make_simple_data.py --only $d)"; fi
+      if [ -s "simple_data/$d/pool_ids.json" ] && [ -s "simple_data/$d/eval.jsonl" ] && [ -s "simple_data/$d/test.jsonl" ]; then
+        ok "simple_data/$d (pool ids / 500 gate / 500 test)"
+      else bad "simple_data/$d incomplete: needs pool_ids.json, eval.jsonl, test.jsonl ($PY -I data/scripts/make_simple_data.py --only $d)"; fi
+      ds="$(ds_of "$d")"   # simple_<d>_pool is built from the training set's processed records
+      if [ -s "data/processed/$ds.jsonl" ]; then ok "data $ds (source of simple_${d}_pool)"
+      else bad "data $ds missing (./download_data.sh; source of simple_${d}_pool)"; fi
     done
   elif [ "$EVALFIT" -eq 0 ]; then
     for d in $CHECK_DOMS; do

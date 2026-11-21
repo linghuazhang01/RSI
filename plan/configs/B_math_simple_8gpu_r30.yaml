@@ -1,0 +1,268 @@
+# Paper B · math · 8 GPUs (B300) · 8 threads x 1 step · up to 30 tool rounds per candidate · objective simple v2
+# self-written LoRA (scratch, nothing trained): the current model M_g writes LoRAs; the accepted one is merged and M_{g+1} is the next editor.
+# Generated (2026-11-21) from the merged config: lora_code/configs/base.yaml + domains/math.yaml + hardware b300 + scope single
+# + objective simple + --set editor.tool_rounds=30. Not read by the code; the run locks its own copy in
+# experiment_records/B_math_s42_single_simple_r30/run_config.yaml.
+#
+# Start (one experiment uses all 8 GPUs):
+#   ./launch.sh --hw b300 --paper B --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30 --set editor.tool_rounds=30
+# Without the significance test and without the non-LLM control (nosig):
+#   ./launch.sh --hw b300 --paper B --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30_nosig --set editor.tool_rounds=30 --set gate.require_significant=false --set nonllm.enabled=false
+# H20 (110 GB): replace --hw b300 with --hw h20.
+#
+# GPU roles: GPUs 0-6 = 7 replicas of the current model M_g (editor, screen / gate / test scoring, LoRA serving);
+#   GPU 7 = HF model for the tools (svd, acts, train_loss, merge)
+# Data (simple_data/math/): gate = simple_math_eval (500 fixed, hidden: the editor sees only statistics of earlier
+#   candidates' gate results); test = simple_math_test (500 fixed, held-out report only); screen = 500 items drawn afresh
+#   each generation from the dapo_math pool minus gate and test; train = all remaining pool items (~13,200).
+# Each generation:
+#   1. the latest model answers the 500 screen items 4 times each, once; the editor sees the detailed results (summary in
+#      every message; screen_results / screen_output tools incl. the thinking text);
+#   2. 8 independent sessions (search.threads 8, steps 1), each up to editor.tool_rounds 30 rounds of tool calls in ONE
+#      persistent Python session (editor.explore.persistent), then a program (no api.evaluate) -> one candidate;
+#   3. each candidate: ONE gate evaluation (500 x 4, paired with the latest model); statistics visible to later sessions;
+#   4. accept the candidate with the largest paired gate gain >= gate.min_gain 0.0 (any strictly positive gain) (require_significant True
+#      here; the nosig command sets it false); then the test set (500 x 4).
+# Decoding (screen / gate / test): thinking on, temperature 0.6, top_p 0.95, top_k 20, max_tokens 16384.
+draw_config: data/draw/paper_b.yaml
+data:
+  n: null
+  target_train_frac: null
+  screen_n: null
+  gate_n: null
+  retention_n: null
+  retention_kl: null
+max_tokens:
+  dapo_math: 4096
+  taco_verified: 4096
+  ifeval_train: 2048
+  sealtool_train: 1024
+  triviaqa_train: 1024
+  math_eval: 4096
+method:
+  mode: scratch
+weights:
+  norm_cap_tau: 0.05
+  max_modules: null
+  vector_cap_tau: 0.5
+  rescale_tol: 0.05
+scope: single
+objective: simple
+raw:
+  n_train: null
+  rank: 16
+  lr: 0.0001
+  epochs: 1.0
+  steps: null
+  batch_size: 4
+  leaves:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - in_proj_qkv
+  - in_proj_z
+  - out_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  gpu_seconds: null
+lora:
+  rank_cap: 64
+  norm_cap_tau: 0.1
+  allowed_leaves: null
+  save_dtype: bfloat16
+budget:
+  gpu_seconds: 7200
+search:
+  threads: 8
+  steps: 1
+  max_evaluate: 32
+  top_full: 0
+  rerun_seeds: 0
+  archive: true
+  max_candidates: 8
+  charge_screens: false
+  program_evaluate_calls: 0
+  program_evaluate_total: 0
+  parallel_builds: true
+  screen_candidates: false
+  gate_every_candidate: true
+editor:
+  temperature: 0.6
+  top_p: 0.95
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: true
+    top_k: 20
+    min_p: 0.0
+  max_tokens: 16384
+  tool_rounds: 30
+  turn_max_tokens: 8192
+  max_tool_calls: 100
+  proposal_tokens: 160000
+  proposal_wall_s: 2400
+  context_tokens: 131072
+  tool_result_chars: 6000
+  compact_at: 0.6
+  keep_tool_rounds: 8
+  keep_reasoning_rounds: 2
+  reasoning_passback: think_tag
+  history_keep: 2
+  timeout_s: 3600
+  mock_tool_rounds: 1
+  explore:
+    timeout_s: 300
+    mem_gb: 8
+    gpu_tools: true
+    gpu_seconds: 600
+    persistent: true
+sandbox:
+  timeout_s: 1800
+  mem_gb: 16
+feedback:
+  lambda_retention: 1.0
+  lambda_kl: 0.5
+  n_examples: 3
+  mark_shown: true
+retention:
+  domains: []
+loop:
+  patience: 3
+tools:
+  compare: true
+  train_loss: true
+  tensor_compute: true
+  paper_tools: true
+tensor_compute:
+  max_tensors: 4
+  timeout_s: 300
+  mem_gb: 16
+  threads: 4
+  max_concurrent: 2
+  result_chars: 4000
+  explore: true
+  max_input_mb: 8192
+decoding:
+  screen:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
+  gate:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
+gate:
+  reference: auto
+  fallback: auto
+  min_gain: 0.0
+  require_significant: true
+  epsilon: 0.01
+  delta: 0.02
+  use_noise_band: true
+  max_submissions: 3
+eval:
+  screen_limit: null
+  full_limit: null
+  gate_limit: null
+  kl_limit: null
+train_data:
+  mode: self_correct
+  samples: 4
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+train:
+  dtype: bfloat16
+  max_len: 4608
+  micro_batch: null
+nonllm:
+  evaluate: 8
+  search_scales:
+  - 0.5
+  - 0.75
+  - 1.0
+  - 1.25
+diagnostics:
+  svd_k: 8
+e_t:
+  enabled: false
+  task: tool_calling
+  task_when_target_is_tool_calling: code
+  branches:
+  - parent
+  - llm
+  - nonllm
+  evaluate: 16
+  gpu_seconds: 3600
+  threads: 4
+  steps: 4
+  top_full: 1
+  n_train: 1600
+  n_signal: 200
+  items_seed: 20261118
+  test_limit: null
+heldout:
+  enabled: true
+  domains: math
+  limit: null
+  decoding:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    seed: 42
+    n: 4
+    n_by_task: null
+    thinking: true
+    max_tokens: 16384
+baseline:
+  noise_repeats: 3
+  noise_temperature: 0.0
+  noise_top_p: 1.0
+  noise_n: null
+  noise_fixed: null
+merge:
+  gpu: true
+server:
+  max_loras: 8
+  main_args:
+  - --rsi-gpu-memory-gib
+  - '220'
+  - --gpu-memory-utilization
+  - '0.81'
+  - --max-model-len
+  - '131072'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  theta0_args:
+  - --rsi-gpu-memory-gib
+  - '100'
+  - --gpu-memory-utilization
+  - '0.37'
+  - --max-model-len
+  - '20480'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  mock_tasks: null
+gpu_roles: null
+gpu_layout:
+  theta0_own_gpu: false
+  share_single_gpu: false
+  main_replicas: true
+  main_tp: 1
+  train_gpus: 1
+hardware: b300
+data_roles:
+  eval: eval:simple_math_test

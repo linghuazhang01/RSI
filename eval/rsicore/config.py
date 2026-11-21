@@ -134,8 +134,81 @@ def _apply_scope(cfg: dict, sets, domain: str) -> dict:
 
 def _apply_objective(cfg: dict, sets) -> dict:
     """objective: train_gate (default: train / signal / gate split) | eval_overfit (2026-11-20: optimise directly on
-    the eval sets, objective_profiles.eval_overfit) | simple (2026-11-21: simple_data's 1,500 train / 500 gate items)."""
+    the eval sets, objective_profiles.eval_overfit) | simple (2026-11-21: simple_data: a fresh 500-item screen of the
+    clean pool every generation, gate on its 500 eval items, held-out report on its 500 test items)."""
     return _apply_profile(cfg, sets, "objective", "train_gate")
+
+
+# ---------------------------------------------------------------------------- decoding (2026-11-21)
+# A decoding dict (rsicore.evaluate.score / score_split `decoding=`): any of these keys; absent / null = the task's
+# eval/configs/tasks.yaml value (greedy, thinking off). max_tokens wins over the run-wide max_tokens table. n > 1:
+# each record's score is the mean over its n samples (avg@n). thinking: chat_template_kwargs enable_thinking; only
+# the final answer is graded. min_p: only 0 / null (run_eval sends none; vLLM's default is 0).
+# Paper config: `decoding: {screen: ..., full: ..., gate: ...}` (null = tasks.yaml; full falls back to screen) and
+# heldout.decoding (also n_by_task). A null seed = the run's --seed.
+DECODING_KEYS = ("temperature", "top_p", "top_k", "min_p", "n", "thinking", "max_tokens", "seed")
+DECODING_STAGES = ("screen", "full", "gate")
+
+
+def check_decoding(dec, where: str = "decoding", extra_keys=()) -> dict | None:
+    """Validated copy of a decoding dict without its null values; None / {} -> None (tasks.yaml decoding)."""
+    if dec is None:
+        return None
+    if not isinstance(dec, dict):
+        raise SystemExit(f"{where} must be a mapping or null, got {dec!r}")
+    bad = sorted(set(dec) - set(DECODING_KEYS) - set(extra_keys))
+    if bad:
+        raise SystemExit(f"{where}: unknown key(s) {bad}; known: {list(DECODING_KEYS) + list(extra_keys)}")
+    out = {k: v for k, v in dec.items() if v is not None}
+    for k in ("n", "max_tokens", "top_k", "seed"):
+        lo = 1 if k in ("n", "max_tokens") else 0
+        if k in out and (isinstance(out[k], bool) or not isinstance(out[k], int) or out[k] < lo):
+            raise SystemExit(f"{where}.{k} must be an integer >= {lo}, got {out[k]!r}")
+    for k in ("temperature", "top_p", "min_p"):
+        if k in out and (isinstance(out[k], bool) or not isinstance(out[k], (int, float)) or out[k] < 0):
+            raise SystemExit(f"{where}.{k} must be a non-negative number, got {out[k]!r}")
+    if "thinking" in out and not isinstance(out["thinking"], bool):
+        raise SystemExit(f"{where}.thinking must be true / false, got {out['thinking']!r}")
+    if out.get("min_p"):
+        raise SystemExit(f"{where}.min_p: only 0 / null is supported (run_eval sends no min_p; vLLM's default is 0)")
+    return out or None
+
+
+def stage_decoding(cfg: dict, stage: str, run_seed: int | None = None) -> dict | None:
+    """Decoding dict of a scoring stage (screen / full / gate) from the paper config's `decoding` block, for
+    rsicore.evaluate.score(..., decoding=...). None = tasks.yaml decoding (greedy). full falls back to screen.
+    A null seed = run_seed (one experiment seed). The same dict must be used for the reference (incumbent / parent)
+    and the candidates (common random numbers)."""
+    if stage not in DECODING_STAGES:
+        raise ValueError(f"stage must be one of {DECODING_STAGES}")
+    block = cfg.get("decoding") or {}
+    raw = block.get(stage)
+    if raw is None and stage == "full":
+        raw = block.get("screen")
+    dec = check_decoding(raw, f"decoding.{stage}")
+    if dec is not None and dec.get("seed") is None and run_seed is not None:
+        dec["seed"] = int(run_seed)
+    return dec
+
+
+def _resolve_decoding(cfg: dict, seed: int) -> dict:
+    """Validate the decoding blocks; a null seed = the run's --seed (written into the locked paper config)."""
+    block = cfg.get("decoding")
+    if block is not None:
+        if not isinstance(block, dict):
+            raise SystemExit(f"decoding must be a mapping {{screen, full, gate}}, got {block!r}")
+        bad = sorted(set(block) - set(DECODING_STAGES))
+        if bad:
+            raise SystemExit(f"decoding: unknown stage(s) {bad}; known: {list(DECODING_STAGES)}")
+        for st, d in block.items():
+            if check_decoding(d, f"decoding.{st}") is not None and d.get("seed") is None:
+                d["seed"] = int(seed)
+    hd = (cfg.get("heldout") or {}).get("decoding")
+    if isinstance(hd, dict):
+        check_decoding(hd, "heldout.decoding", extra_keys=("n_by_task",))
+        if hd.get("seed") is None:                   # one experiment seed (2026-11-20)
+            hd["seed"] = int(seed)
+    return cfg
 
 
 def _resolve_eval_target(cfg: dict, domain: str) -> dict:
@@ -172,7 +245,7 @@ def _resolve_data_roles(cfg: dict, domain: str, scope_single: bool) -> dict:
     if not scope_single and any(evalsets.is_eval_set(roles[k]) for k in ("train", "gate")):
         raise SystemExit("data_roles: an eval-set train / gate needs scope single")
     if dr.get("eval"):
-        dr["eval"] = evalsets.eval_tokens(dr["eval"], roles)
+        dr["eval"] = evalsets.eval_tokens(dr["eval"], roles, domain)
     return cfg
 
 
@@ -291,10 +364,8 @@ def load_run_config(paper: str, args) -> RunConfig:
     cfg = _resolve_run_domain(cfg, args.domain)
     cfg = _resolve_eval_target(cfg, args.domain)
     cfg = _resolve_data_roles(cfg, args.domain, cfg.get("scope") == "single" and args.domain != "all")
-    # one experiment seed (2026-11-20): the held-out decoding seed null = the run's --seed
-    hd = (cfg.get("heldout") or {}).get("decoding")
-    if isinstance(hd, dict) and hd.get("seed") is None:
-        hd["seed"] = int(args.seed)
+    # one experiment seed (2026-11-20): a null decoding seed (decoding.<stage>, heldout.decoding) = the run's --seed
+    cfg = _resolve_decoding(cfg, int(args.seed))
     draw_cfg = cfg.get("draw_config")
     draw_cfg = base_draw = (ROOT / draw_cfg).resolve() if draw_cfg else DRAW_CONFIGS[paper]
     apply_data_sizes(_load_yaml(base_draw), cfg.get("data"), paper)   # validate the `data:` sizes early

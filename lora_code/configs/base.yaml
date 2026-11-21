@@ -47,6 +47,11 @@ method:
 weights:                    # method.mode weights
   norm_cap_tau: 0.05        # [pilot] per-module ||W' - W||_F / ||W||_F cap of an edit (dense, any rank)
   max_modules: null         # max modules one edit may touch (null = no limit)
+  # (2026-11-21, tensor_compute writes) 1-D tensors (norms, dt_bias, A_log): rms(W' - W) <= vector_cap_tau *
+  # max(rms(W), 1) (Qwen3.5's RMSNorm weights are zero-centred: the layer multiplies by 1 + w, so a purely relative
+  # cap is meaningless); a dense delta within rescale_tol of a uniform rescale of W (||D - cW|| / ||D||) is refused
+  vector_cap_tau: 0.5
+  rescale_tol: 0.05
 
 # Domain scope (default single since 2026-11-19; --set scope=all or ./launch.sh --all-domains for the original
 # design). single = ONLY the run's --domain: training, gate, feedback and token-KL use the target domain only
@@ -82,17 +87,47 @@ objective_profiles:
     feedback: {n_examples: 5, lambda_kl: 0.0}
     heldout: {domains: eval_target, decoding: null}   # evaluated on the same eval set, greedy (2026-11-21)
     e_t: {enabled: false}
-  # simple (2026-11-21; ./launch.sh --simple): simple_data/<domain> (data/scripts/make_simple_data.py, sampled from the
-  # decontaminated training pool): train on its 1,500 items (train_example / acts / train_loss, signal / screen = all
-  # of them every generation), accept on its 500 (the usual paired gate vs the current model), and the held-out report
-  # is the same 500 items (data_roles.eval = gate, greedy like the gate). The editor gets at most 20 tool rounds per
-  # candidate (context editor.context_tokens = 131072 from the hardware profile). Run ids end in _simple.
+  # simple v2 (2026-11-21; ./launch.sh --simple): simple_data/<domain> (data/scripts/make_simple_data.py, sampled from
+  # the decontaminated training pool). Every generation rsicore.draws draws a FRESH screen of 500 items from the clean
+  # pool (simple_<d>_pool minus the 500 gate and 500 test items; seeded by the search round, so Paper A and B screen
+  # the same items); train = the rest of the pool (train_example / acts / train_loss; 13,238 items for math, ~72k for
+  # knowledge). The gate is simple_<d>_eval (500, paired vs the current model), the held-out report simple_<d>_test
+  # (500, data_roles.eval = test). Scoring samples in Qwen3 thinking mode (0.6 / 0.95 / top_k 20, 16384 tokens, the run
+  # seed for reference and candidates alike). Flow per generation (FINAL, 2026-11-21): the CURRENT model answers the
+  # 500 screen items once (n 4; the editor sees a summary in every step and every item / full output, thinking
+  # included, through api.screen_results / api.screen_output / acts(source='own')); candidates are NOT screened; each
+  # of the search.threads x search.steps candidates (8 x 1 here) gets ONE gate evaluation (500 x 4, paired vs the
+  # current model's gate records, computed once per generation), shown to later steps / generations; at the end the
+  # passing candidate with the largest paired gain is accepted; then the test set (500 x 4). No api.evaluate
+  # (program_evaluate_calls 0). Cost: 8 candidates x 500 x 4 thinking samples on the gate set per generation.
+  # tensor_compute / tensors and the paper tools (save_edit / load_edit, output_matrices, unit / direction,
+  # project_out, acts on own outputs) are on; run_python keeps one Python session per candidate. The editor gets
+  # at most editor.tool_rounds (20) tool rounds per candidate (context editor.context_tokens = 131072 from the hardware profile; every
+  # Paper B scoring server is a main replica / weights slot with that --max-model-len >= 32768, so prompt + 16384
+  # fits; theta0 (20480) is only used by E_t, off here). Run ids end in _simple; a changed profile changes the locked
+  # paper config, so runs locked before need a new --run-id / --tag.
   simple:
-    data_roles: {eval: gate}  # held-out evaluation = simple_<domain>_eval (the 500 gate items)
+    data_roles: {eval: test}  # held-out evaluation = simple_<domain>_test (500 items never screened or gated)
+    gate: {min_gain: 0.0}              # (2026-11-21) acceptance threshold of the simple runs: any strictly positive paired gate gain
     retention: {domains: []}
-    heldout: {enabled: true, decoding: null}   # greedy (each task's tasks.yaml decoding)
+    heldout:
+      enabled: true
+      decoding: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null,
+                 n_by_task: null}
+    decoding:
+      screen: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
+      gate: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
+    # threads x steps are parameters (the prompts use the configured numbers); screen_candidates false + gate_every_
+    # candidate true = the FINAL flow above; program_evaluate_calls 0 removes api.evaluate everywhere
+    search: {threads: 8, steps: 1, max_candidates: 8, charge_screens: false, program_evaluate_calls: 0,
+             program_evaluate_total: 0, top_full: 0, parallel_builds: true, screen_candidates: false,
+             gate_every_candidate: true}
+    tools: {tensor_compute: true, paper_tools: true}   # screen_results / screen_output: on (screen_candidates false)
+    nonllm: {evaluate: 8}     # the same candidate count as the editor
     e_t: {enabled: false}
-    editor: {tool_rounds: 20}
+    # tool_rounds: tool rounds per candidate (configurable; the prompt states it); explore.persistent: one Python
+    # session per candidate for run_python (rsicore.chat_tools); gpu_tools: acts (also on own outputs) while exploring
+    editor: {tool_rounds: 20, explore: {persistent: true, gpu_tools: true, gpu_seconds: 600}}
 
 raw:                        # mode=edit only: recipe of the raw LoRA (trained once, generation 0; the only training)
   n_train: null             # train items used (deterministic subset; null = all of generation 0's train items =
@@ -118,12 +153,26 @@ budget:
 search:
   threads: 4
   steps: 8
-  max_evaluate: 32          # evaluate calls per generation (every candidate costs 1)
+  max_evaluate: 32          # evaluate calls per generation (every candidate costs 1, while charge_screens is true)
   top_full: 3               # top screened candidates re-scored on the full signal draw
   rerun_seeds: 0
   archive: true             # experience channel: show earlier generations' best programs
   # program_evaluate_calls: 2   # (2026-11-21, code default 2; null = no cap) NEW api.evaluate calls one program may
                                 # make; the automatic evaluation of the returned candidate is not counted
+  # (2026-11-21, read with these code defaults, set by objective simple; not written here so earlier locked run
+  # configs still resume):
+  #   charge_screens: true        # the automatic screen of every returned candidate spends the evaluate budget
+  #                               # (false: screens are free and api.evaluate draws on program_evaluate_total)
+  #   max_candidates: null        # candidate cap per generation (null = max_evaluate while charge_screens, else
+  #                               # threads x steps)
+  #   program_evaluate_total: null  # charge_screens false: the generation's pool of in-program api.evaluate calls
+  #                               # (null = threads x program_evaluate_calls)
+  #   parallel_builds: false      # true: with several main replicas, up to that many candidates are built and
+  #                               # screened at once (non-weights modes; weights mode always uses its slots)
+  #   screen_candidates: true     # false: candidates are not screened (the current model's screen is still scored
+  #                               # once per generation and shown through api.screen_results / screen_output)
+  #   gate_every_candidate: false # true: ONE gate evaluation per candidate during the search (paired vs the current
+  #                               # model; gen_XX/gate.json), the passing one with the largest paired gain is accepted
 
 # The editor (2026-11-21): Qwen3 thinking mode + a tool loop while it writes each candidate (rsicore.editor /
 # rsicore.chat_tools; also the E_t editor). One round = one model turn that made function calls; after tool_rounds
@@ -162,6 +211,8 @@ editor:
     mem_gb: 8
     gpu_tools: false        # true: acts / train_loss / regmean_preserve allowed while exploring, charged to
     gpu_seconds: 300        # this separate budget (per search; never the generation's gpu_seconds)
+    # persistent: false     # (2026-11-21, code default; objective simple: true) one Python session per candidate:
+    #                       # variables / handles persist across run_python calls (rsicore.chat_tools)
 
 sandbox:
   timeout_s: 1800
@@ -183,6 +234,32 @@ loop:
 tools:                      # editor tools that can be switched off (ablations)
   compare: true             # item-level comparison with the current model (ids / statistics only)
   train_loss: true          # mean answer NLL on train items under a LoRA (forward only, costs gpu_seconds)
+  # tensor_compute: (2026-11-21) absent = on for objective simple only; true / false forces it (with api.tensors)
+  # paper_tools: (2026-11-21) absent = on for objective simple only: save_edit / load_edit / list_edits / drop_edit,
+  #   output_matrices, unit, direction, project_out, acts(source='own'), tensor_compute(vectors=...)
+  # screen_results: (2026-11-21) absent = on when search.screen_candidates is false: screen_results / screen_output
+
+# api.tensor_compute(code, tensors) (2026-11-21, every mode; on when tools.tensor_compute, default objective simple):
+# CPU torch code in a fresh sandbox process on fp32 copies of the CURRENT model's tensors (any language-model tensor,
+# api.tensors()); it returns JSON, vectors (handle T<n>, refs "T<n>.name" for rank1 / from_direction), LoRA factors
+# (handle L<n>) or, in mode=weights, dense writes (delta ops on a W edit, capped by weights.*).
+tensor_compute:
+  max_tensors: 4            # tensors per call
+  timeout_s: 300            # per call; never longer than the calling program's / run_python call's time left
+  mem_gb: 16                # address-space limit of the child
+  threads: 4                # OMP / MKL / torch threads of the child (CUDA hidden)
+  max_concurrent: 2         # jobs at once in the whole process (a semaphore; others wait within their timeout)
+  result_chars: 4000        # the JSON result is cut to this many characters
+  explore: true             # also offered in the run_python exploration api (no budget spent)
+  max_input_mb: 8192        # fp32 MB of all input tensors of one call
+
+# Scoring decoding per stage (2026-11-21; rsicore.config.stage_decoding): null = each task's eval/configs/tasks.yaml
+# decoding (greedy). A dict takes temperature, top_p, top_k, n (avg@n per item), thinking, max_tokens, seed (null =
+# the run's --seed). The same dict scores the current model (parent / M_0 references, sampled once per generation)
+# and every candidate. full falls back to screen. objective simple sets thinking-mode sampling.
+decoding:
+  screen: null
+  gate: null
 
 gate:
   reference: auto           # auto = by method.mode (edit: raw, scratch: parent) | raw | parent
@@ -343,3 +420,9 @@ mock_overrides:
   baseline: {noise_repeats: 3}
   sandbox: {timeout_s: 120, mem_gb: 4}
   editor: {explore: {timeout_s: 60, mem_gb: 4}}   # mock_tool_rounds (1) run_python calls per proposal
+
+# Applied after mock_overrides when --mock runs this objective (2026-11-21): objective simple keeps its layout
+# (k sessions x 1 step, free screens, a program api.evaluate pool, full = screen) at mock size.
+mock_objective_overrides:
+  simple:
+    search: {threads: 3, steps: 1, max_candidates: 3, top_full: 0}

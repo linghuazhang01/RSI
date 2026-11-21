@@ -26,7 +26,7 @@
 | 噪声重评用的题数 | `noise.n` | 空 = 第 0 代全部 screen 题 |
 | 每个任务的最大生成长度 | `max_tokens.<任务>`（覆盖 `eval/configs/tasks.yaml`） | dapo_math 4096、taco_verified 4096、ifeval_train 2048、sealtool_train 1024、triviaqa_train 1024 |
 | 噪声重评的解码参数 | `noise.temperature` / `noise.top_p` | 0.0 / 1.0（贪心：重跑结果完全一样，所以不重跑，噪声带 = 0；> 0 才做采样重评） |
-| 留出评测的解码参数 | `heldout.decoding` | temperature 0.7、top_p 0.8、top_k 20、种子 42，avg@n（AIME / AMC 8 个，MATH-500 / GPQA 4 个，其余 1 个）；搜索、验收、噪声都是贪心 |
+| 留出评测的解码参数 | `heldout.decoding` | temperature 0.7、top_p 0.8、top_k 20、种子 42，avg@n（AIME / AMC 8 个，MATH-500 / GPQA 4 个，其余 1 个）；搜索、验收、噪声默认贪心（`decoding:` 见下文；`simple` 用 thinking 采样） |
 | 校准文本 / 诊断表 / 留出评测 | `calibration.max_texts`、`diagnostics.profile_contexts`、`heldout.limit`、`e_task.heldout_limit` | |
 
 **固定噪声带**：`noise.fixed` 给了值就跳过 M_0 的采样重评，直接写进 `baseline/noise.json`：
@@ -64,7 +64,28 @@
 --domain instruction_following --set data_roles.gate=ifeval --set data_roles.eval=gate
 ```
 
-**`simple`（2026-11-21，`--set objective=simple` / `./launch.sh --simple`）**：用 `simple_data/<领域>/`（`data/scripts/make_simple_data.py`，从去污染、去重后的训练集池子里抽）——训练 = 那 1,500 道（每代快速筛、完整评测都用全部 1,500 道，不抽题；KL / 校准文本取其中 400 道 + M_0 的回答；反馈例题带标准答案），验收 = 那 500 道（照常的配对验收：`gate.min_delta` 且 95% CI 下界 > 0，与 incumbent 比），**留出评测也是那 500 道**（`data_roles.eval: gate`，贪心，`heldout.decoding: null`）；改造者每个候选最多 20 轮工具调用（`editor.tool_rounds: 20`，上下文 `editor.context_tokens` 131072）。五个领域都可以用，数据集名 `simple_<领域>_train / simple_<领域>_eval`；运行名带 `_simple`。各领域合并后的配置见 `plan/configs/A_<领域>_simple.yaml`。服务器上需要先有 `simple_data/<领域>/train.jsonl`、`eval.jsonl`。
+**`simple`（2026-11-21 v2，`--set objective=simple` / `./launch.sh --simple`）**：用 `simple_data/<领域>/`（`data/scripts/make_simple_data.py`，从去污染、去重后的训练集池子里抽），配置在 `objective_profiles.simple`：
+- **数据**：训练角色 = `simple_<领域>_pool`（整个干净池子减去验收 / 测试题）。**每代重新抽** `simple.screen_n`（默认 500）道当快速筛（= 完整评测，`search.top_full: 0`，完整评测直接复用快速筛结果），种子只含 `--seed`、领域和轮次（`rsicore.draws`，Paper A 第 g 代和 Paper B 第 g-1 代抽到同一批题）；KL / 校准文本 = 本代池子里另外 400 道（kl 角色）+ M_0 的回答。各代的快速筛可以重叠，不标记展示过的题；题号写在 `draws/gen_XX/ids/`。验收 = `simple_<领域>_eval` 的 500 道（照常的配对验收，与 incumbent 比）；**留出评测 = `simple_<领域>_test` 的另外 500 道**（`data_roles.eval: test`）。
+- **打分解码**：快速筛、验收、留出评测全部用 Qwen3 thinking 采样（temperature 0.6 / top_p 0.95 / top_k 20，max_tokens 16384，种子 = 运行的 `--seed`），三者都是 n 4（每题分数 = 4 次的平均，avg@4）。incumbent、Q_0、M_0 的验收基线和所有候选用完全相同的解码和种子。候选服务的 `--max-model-len` 提到 32768（`vllm.candidate_max_model_len`），保证 prompt + 16384 放得下。
+- **最终流程（2026-11-21）**：每代先让**最新模型（incumbent）**回答本代的快速筛题一次（n 4，所有线程 / 步共用）；**候选不跑快速筛**（`search.screen_candidates: false`）。改造者在每步上下文里看到 incumbent 快速筛的摘要（avg@4、每题答对次数分布、截断率、几道失败题的题目 / 标准答案 / 抽取答案），并可以用程序和 run_python 里的只读工具 `api.screen_results(ids, filter='all'|'wrong'|'unstable'|'right', limit, offset, gen)`、`api.screen_output(id, sample, offset, gen)`（整段输出，含 thinking，分页）看全部数据。**没有 `api.evaluate`**（`program_evaluate_calls: 0`：工具、文档和提示词里都去掉；`compare` 也不注册）。每个候选建好后做**一次验收评测**（`search.gate_every_candidate: true`，500 题 × 4 次，和 incumbent 的验收记录逐题配对、同一种子；超出预算的配置不评测直接拒绝），结果按候选写进 `gen_XX/gate.json`（submissions 列表，每个候选一条：准确率、配对增益、CI、是否通过 / 原因、broken / fixed 个数和题号，不含题目内容），后面的步和后面的代都能看到（候选表、自己的反馈、`search_history`、`read_record`、存档；存档里还有往期 incumbent 的快速筛摘要，`screen_results(gen=k)` 可读往期数据）。一代结束时，在通过验收规则（尺寸、`gate.min_delta`、`require_significant` 时的 CI）的候选里接受**增益最大**的那个（平分时 cid 靠前者）；都不通过就保持。然后新 incumbent 跑测试集（500 × 4，唯一无偏的数字）。代价：每代 线程 × 步 × 500 × 4 个 thinking 采样花在验收集上。
+- **搜索**：8 个线程 × 1 步（`search.threads` / `search.steps` 都可配置，提示词用配置的数字）：1 步时提示"你是本轮 N 个会话中的第 k 个、彼此独立"，并让它用 `search_history` / 存档避开往期思路；多步时保留"改进本线程最好的配置"。
+- 改造者每个候选最多 `editor.tool_rounds` 轮工具调用（simple 为 20，可配置，提示词里的轮数跟着配置走；上下文 `editor.context_tokens` 131072）；`editor.explore.persistent: true`：run_python 每个提案一个持久会话，变量跨轮保留（超时则重启、变量丢失；最终程序仍须自包含）。五个领域都可以用；运行名带 `_simple`。profile 改了，旧的 `*_simple` 运行不能续跑，要换 `--run-id` / `--tag`。各领域合并后的配置见 `plan/configs/A_<领域>_simple.yaml`（由协调方更新）。服务器上需要先有 `simple_data/<领域>/` 的 `eval.jsonl`、`test.jsonl`、`pool_ids.json` 和 `data/processed/` 里对应的训练集。
+- mock：`mock_overrides` 优先于 profile；`mock_objective_overrides.simple` 再把 mock 的 simple 运行改回"3 线程 × 1 步、候选不筛、每个候选一次验收、没有 api.evaluate"的布局；快速筛题数用 `--set simple.screen_n=20` 缩小。
+
+## 打分解码与搜索预算（2026-11-21）
+
+**打分解码 `decoding: {screen, gate}`**（顶层，`full` 可选，空 = 跟 screen）：每个阶段一个 dict（temperature、top_p、top_k、min_p、n、thinking、max_tokens、seed），经 `rsicore.config.stage_decoding(cfg, stage, seed)` 传给每一次 `score` / `score_split`：候选和 incumbent 的快速筛 / 完整评测 / 验收、Q_0 的验收、M_0 的验收基线（`baseline/gate.json`）。null = `eval/configs/tasks.yaml`（贪心），即默认行为不变。种子为空时用运行的 `--seed`。评测记录（`evals.jsonl`）里记下 `decoding`；缓存的评测（同一配置、同一阶段）以及"完整评测 / 验收复用快速筛逐题结果"都要求解码相同（n 4 的验收不会复用 n 1 的快速筛）。incumbent 在本代题上只采样一次（cid `incumbent`），所有候选都和这一份记录配对比较。
+
+**搜索预算键**（`edit_code.common.search_settings`，默认值 = 原来的行为）：
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `search.charge_screens` | true | true：每个返回配置的自动快速筛扣 `max_evaluate`（和 `api.evaluate` 共用；预算用完就不再运行程序）。false：自动快速筛免费、程序总是运行，`api.evaluate` 走单独的池子，本代已评测过的同一配置再评测免费，失败的调用（配置无效、池子空了）不扣 |
+| `search.program_evaluate_total` | null | 免费快速筛时每代的 `api.evaluate` 池子（null = threads × program_evaluate_calls；没有每程序上限时 = max_evaluate） |
+| `search.program_evaluate_calls` | 2 | 每个程序最多几次 `api.evaluate`（null = 不设每程序上限） |
+| `search.max_candidates` | null | 每代候选数上限（null = threads × steps；扣快速筛时同时不超过 max_evaluate，和原来一样） |
+
+steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、看不到同代其他候选，并删掉"在最好的候选（你的或别的线程的）上改进"；免费快速筛时预算行写"返回的配置自动免费评测；api.evaluate 池子还剩 N 次、每个程序最多 k 次"。E_t 用 `e_task` 的 threads / steps / evaluate，候选数和池子按它自己的形状推出。
 
 ## 分析工具与保存的数据（2026-11-20）
 
@@ -91,7 +112,7 @@
 | 配置（`editor.*`） | 默认 | 作用 |
 |---|---|---|
 | `tool_rounds` | 50 | 每个候选最多几轮工具调用；**0 = 以前的单次调用**（请求里没有 tools，提示词逐字不变） |
-| `context_tokens` | 131072（`h20_80`: 49152） | **上下文长度的唯一旋钮**：客户端按它限制每轮 max_tokens、触发压缩，同时作为改造者 vLLM 服务的 `--max-model-len`（覆盖 `vllm.editor_args` 里写的值；候选服务的 20480 不变）。null = 用 `editor_args` 原样 |
+| `context_tokens` | 131072（`h20_80`: 49152） | **上下文长度的唯一旋钮**：客户端按它限制每轮 max_tokens、触发压缩，同时作为改造者 vLLM 服务的 `--max-model-len`（覆盖 `vllm.editor_args` 里写的值；候选服务的 20480 不变，`simple` 用 `vllm.candidate_max_model_len` 改成 32768）。null = 用 `editor_args` 原样 |
 | `turn_max_tokens` / `max_tokens` | 8192 / 16384 | 工具轮 / 最终回复的 max_tokens |
 | `max_tool_calls` / `proposal_tokens` / `proposal_wall_s` | 100 / 160000 / 2400 | 任一到顶就强制进入最终回复 |
 | `tool_result_chars` | 6000 | 工具结果截断长度 |

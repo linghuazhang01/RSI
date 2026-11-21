@@ -9,9 +9,15 @@ A WeightEdit is {short module name: [op, ...]}; the ops of a module are applied 
   {"op": "cols", "idx": [j, ...] | None, "f": f}  W[:, idx] *= f   (input channels, same rules)
   {"op": "lowrank", "A": [r, in], "B": [out, r]}  W <- W + B @ A   (fp32 CPU tensors)
   {"op": "toward_base", "alpha": a}               W <- W + a * (W_base - W)   (W_base = original model M_0)
+  {"op": "delta", "D": tensor same shape as W}    W <- W + D   (2026-11-21, tensor_compute writes; any rank and
+                                                  any tensor: linear weights, norms, dt_bias / A_log, conv1d)
 
+Names (2026-11-21): a linear weight is addressed by its module short name, any other language-model tensor by its
+tensor name (WeightStore.tensor_names(), e.g. 'layers.3.linear_attn.dt_bias'); rows / cols / lowrank stay 2-D only.
 check_wedit is the sandbox check (modules exist, indices / lengths / shapes valid, result finite,
-||W' - W||_F / ||W||_F <= tau); edit_into_model writes the edited checkpoint the same way merge_into_model
+||W' - W||_F / ||W||_F <= tau for tensors with >= 2 dims, rms(W' - W) <= vector_tau * max(rms(W), 1) for 1-D tensors
+(Qwen3.5 RMSNorm weights are zero-centred, so a purely relative cap is meaningless there), no delta op that is
+(almost) a uniform rescale of W, never embed_tokens / the final norm / lm_head); edit_into_model writes the edited checkpoint the same way merge_into_model
 writes a merged LoRA (shared shard writer in lora.py). torch / safetensors are imported lazily.
 """
 from __future__ import annotations
@@ -21,15 +27,15 @@ import json
 import operator
 from pathlib import Path
 
-from .naming import SHORT_RE
+from .naming import is_edit_excluded, tensor_layer
 
-OPS = ("scale", "rows", "cols", "lowrank", "toward_base")
-_TENSOR_FIELDS = ("A", "B")
+OPS = ("scale", "rows", "cols", "lowrank", "toward_base", "delta")
+_TENSOR_FIELDS = ("A", "B", "D")
 
 
 def _sort_key(short: str):
-    m = SHORT_RE.match(short)
-    return (int(m.group(1)) if m else 10 ** 9, short)
+    layer = tensor_layer(short)
+    return (layer if layer is not None else 10 ** 9, short)
 
 
 def _is_scalar(f) -> bool:
@@ -57,6 +63,11 @@ def _normalize(op: dict) -> dict:
             f = op["f"]
             f = float(f) if _is_scalar(f) else [float(x) for x in f]
             return {"op": kind, "idx": idx, "f": f}
+        if kind == "delta":
+            D = op["D"]
+            if not hasattr(D, "dim"):
+                raise TypeError("D must be a tensor")
+            return {"op": kind, "D": D.detach().float().cpu().contiguous()}
         A, B = op["A"], op["B"]
         if not (hasattr(A, "dim") and hasattr(B, "dim")):
             raise TypeError("A and B must be tensors")
@@ -69,6 +80,8 @@ def _plain(op: dict) -> dict:
     """Op without tensors (JSON-safe)."""
     if op["op"] == "lowrank":
         return {"op": "lowrank", "rank": int(op["A"].shape[0])}
+    if op["op"] == "delta":
+        return {"op": "delta", "shape": list(op["D"].shape), "norm": round(float(op["D"].norm()), 6)}
     return {k: (list(v) if isinstance(v, list) else v) for k, v in op.items()}
 
 
@@ -78,6 +91,7 @@ class WeightEdit:
     def __init__(self, ops: dict | None = None, meta: dict | None = None):
         self.ops: dict[str, list[dict]] = {}
         self.meta = dict(meta or {})
+        self._hash_cache: dict[int, tuple] = {}   # id(tensor) -> (tensor, _version, sha256 of its bytes)
         for short, lst in (ops or {}).items():
             for op in lst:
                 self.add(short, op)
@@ -93,10 +107,12 @@ class WeightEdit:
         self.ops.setdefault(str(short), []).append(_normalize(op))
 
     def copy(self) -> "WeightEdit":
+        """A new op list. Op tensors (A / B / D) are SHARED, not cloned (2026-11-21: dense deltas are up to ~356 MB
+        each): ops are never modified in place (apply only reads them), and the digest cache carries over."""
         new = WeightEdit(meta=dict(self.meta))
         for m, lst in self.ops.items():
-            new.ops[m] = [{k: (v.clone() if hasattr(v, "clone") else (list(v) if isinstance(v, list) else v))
-                           for k, v in op.items()} for op in lst]
+            new.ops[m] = [{k: (list(v) if isinstance(v, list) else v) for k, v in op.items()} for op in lst]
+        new._hash_cache = dict(self._hash_cache)
         return new
 
     def needs_base(self, short: str | None = None) -> bool:
@@ -115,8 +131,18 @@ class WeightEdit:
                     if k in op:
                         t = op[k]
                         h.update(f"{k}{tuple(t.shape)}".encode())
-                        h.update(t.contiguous().float().numpy().tobytes())
+                        h.update(self._tensor_hash(t))
         return h.hexdigest()[:16]
+
+    def _tensor_hash(self, t) -> bytes:
+        """sha256 of a tensor's fp32 bytes, cached per tensor object and in-place version (2026-11-21: a dense delta
+        of a 17408x5120 weight is 356 MB and the digest is part of every evaluate dedupe key)."""
+        ent = self._hash_cache.get(id(t))
+        if ent is not None and ent[0] is t and ent[1] == t._version:
+            return ent[2]
+        d = hashlib.sha256(t.contiguous().float().numpy().tobytes()).digest()
+        self._hash_cache[id(t)] = (t, t._version, d)
+        return d
 
     # ------------------------------------------------------------------ math
     def apply(self, short: str, W, W_base=None):
@@ -209,13 +235,25 @@ def _apply_op(op: dict, W, W_base):
         if tuple(Wb.shape) != tuple(W.shape):
             raise ValueError(f"toward_base: base shape {tuple(Wb.shape)} != {tuple(W.shape)}")
         return W.add_(Wb - W, alpha=op["alpha"])
+    if kind == "delta":
+        D = op["D"]
+        if tuple(D.shape) != tuple(W.shape):
+            raise ValueError(f"delta: shape {tuple(D.shape)} != {tuple(W.shape)}")
+        return W.add_(D.to(W.device, torch.float32))
     raise ValueError(f"unknown op {kind!r}")
 
 
-def _op_errors(short: str, i: int, op: dict, shape: tuple[int, int]) -> list[str]:
-    """Static checks of one op against the weight shape (no tensor math beyond factor shapes)."""
-    out_f, in_f = shape
+def _op_errors(short: str, i: int, op: dict, shape: tuple) -> list[str]:
+    """Static checks of one op against the tensor shape (no tensor math beyond factor shapes); rows / cols / lowrank
+    need a 2-D weight, delta the exact shape."""
+    shape = tuple(shape)
     kind, where = op["op"], f"{short} op {i} ({op['op']})"
+    if kind == "delta":
+        D = op["D"]
+        return [] if tuple(D.shape) == shape else [f"{where}: shape {tuple(D.shape)} != {shape}"]
+    if kind in ("rows", "cols", "lowrank") and len(shape) != 2:
+        return [f"{where}: only for 2-D weights, {short} has shape {shape}"]
+    out_f, in_f = shape if len(shape) == 2 else (0, 0)
     errs = []
     if kind in ("rows", "cols"):
         n = out_f if kind == "rows" else in_f
@@ -246,11 +284,57 @@ def lora_to_edit(lora) -> WeightEdit:
     return edit
 
 
+def _has(store, m) -> bool:
+    return store.has(m) or (hasattr(store, "has_tensor") and store.has_tensor(m))
+
+
+def _shape(store, m) -> tuple:
+    return tuple(store.shape(m)) if store.has(m) else tuple(store.tensor_shape(m))
+
+
+def _tensor(store, m, device):
+    return store.weight(m, device=device) if store.has(m) else store.tensor(m, device=device)
+
+
+def _ckpt_key(store, m) -> str:
+    return store.key(m) if store.has(m) else store.tensor_key(m)
+
+
+def rescale_ratio(D, W) -> float | None:
+    """||D - cW|| / ||D|| with c = <D,W>/<W,W> (0 = D is exactly a uniform rescale of W); None when D or W is 0."""
+    import torch
+    D, W = D.to(torch.float32), W.to(D.device, torch.float32)
+    dn, ww = float(D.norm()), float((W * W).sum())
+    if dn <= 0 or ww <= 0:
+        return None
+    c = float((D * W).sum()) / ww
+    return float((D - c * W).norm()) / dn
+
+
+def change_errors(name: str, D, W, *, tau: float, vector_tau: float) -> tuple[list[str], dict]:
+    """Cap of one tensor's total change D = W' - W (2026-11-21): >= 2 dims ||D||_F/||W||_F <= tau; 1-D
+    rms(D) <= vector_tau * max(rms(W), 1). Returns (errors, stats {rel_norm[, rms_change, rms_cap]})."""
+    import math
+    if D.dim() >= 2:
+        rel = float(D.norm()) / max(float(W.norm()), 1e-12)
+        return ([f"{name}: ||W'-W||/||W|| = {rel:.4f} > tau {tau}"] if rel > tau else []), {"rel_norm": rel}
+    n = max(D.numel(), 1)
+    rms = float(D.norm()) / math.sqrt(n)
+    cap = vector_tau * max(float(W.norm()) / math.sqrt(n), 1.0)
+    # 1-D: rel_norm is the capped measure rms(D) / max(rms(W), 1) (zero-centred norms store w ~ 0, so ||D||/||W||
+    # would be meaningless and huge in reports / sums)
+    stats = {"rel_norm": rms / max(float(W.norm()) / math.sqrt(n), 1.0), "rms_change": rms, "rms_cap": cap}
+    return ([f"{name}: rms(W'-W) = {rms:.4g} > {vector_tau} * max(rms(W), 1) = {cap:.4g} (1-D tensor)"]
+            if rms > cap else []), stats
+
+
 def check_wedit(edit: WeightEdit, store, base_store=None, *, tau: float, max_modules: int | None = None,
-                device="cpu") -> tuple[bool, dict]:
-    """Sandbox checks: modules exist, indices / factor counts / low-rank shapes valid, toward_base has a
-    base model, applied W' finite, ||W' - W||_F / ||W||_F <= tau, at most max_modules modules.
-    Returns (ok, report) with report['modules'][short] = {rel_norm, ops}."""
+                device="cpu", vector_tau: float = 0.5, rescale_tol: float = 0.05) -> tuple[bool, dict]:
+    """Sandbox checks: modules / tensors exist and are editable (never embed_tokens, the final norm, lm_head),
+    indices / factor counts / low-rank and delta shapes valid, toward_base has a base model, applied W' finite,
+    change cap (change_errors: tau for >= 2-D, vector_tau for 1-D tensors), no delta op that is within rescale_tol of a
+    uniform rescale of the tensor it is applied to, at most max_modules modules.
+    Returns (ok, report) with report['modules'][short] = {rel_norm, ops[, rms_change, rms_cap]}."""
     import torch
     errors, mods = [], {}
     modules = edit.modules()
@@ -260,35 +344,47 @@ def check_wedit(edit: WeightEdit, store, base_store=None, *, tau: float, max_mod
         errors.append(f"{len(modules)} modules edited > max_modules {max_modules}")
     for m in modules:
         ops = edit.ops[m]
-        if not store.has(m):
+        if not _has(store, m):
             errors.append(f"{m}: not in model")
             continue
-        shape = tuple(store.shape(m))
+        if not store.has(m) and is_edit_excluded(m):
+            errors.append(f"{m}: never editable (embed_tokens, the final norm and lm_head are excluded)")
+            continue
+        shape = _shape(store, m)
         errs = [e for i, op in enumerate(ops) for e in _op_errors(m, i, op, shape)]
         W_base = None
         if edit.needs_base(m):
             if base_store is None:
                 errs.append(f"{m}: toward_base needs the base model (no base_store given)")
-            elif not base_store.has(m) or tuple(base_store.shape(m)) != shape:
+            elif not _has(base_store, m) or _shape(base_store, m) != shape:
                 errs.append(f"{m}: not in the base model or shape differs")
         if errs:
             errors.extend(errs)
             continue
-        W = store.weight(m, device=device)
+        W = _tensor(store, m, device)
         if edit.needs_base(m):
-            W_base = base_store.weight(m, device=device)
+            W_base = _tensor(base_store, m, device)
         try:
-            new = edit.apply(m, W, W_base)
+            new = W.to(torch.float32).clone()
+            for i, op in enumerate(ops):
+                if op["op"] == "delta":
+                    r = rescale_ratio(op["D"], new)
+                    if r is not None and r < rescale_tol:
+                        errs.append(f"{m} op {i} (delta): (almost) a uniform rescale of the tensor "
+                                    f"(||D - cW||/||D|| = {r:.4f} < {rescale_tol}); use a structured change")
+                new = _apply_op(op, new, W_base)
         except (ValueError, RuntimeError) as e:
             errors.append(f"{m}: {e}")
+            continue
+        if errs:
+            errors.extend(errs)
             continue
         if not bool(torch.isfinite(new).all()):
             errors.append(f"{m}: non-finite values after the edit")
             continue
-        rel = float((new - W).norm()) / max(float(W.norm()), 1e-12)
-        if rel > tau:
-            errors.append(f"{m}: ||W'-W||/||W|| = {rel:.4f} > tau {tau}")
-        mods[m] = {"rel_norm": rel, "ops": len(ops)}
+        cerrs, stats = change_errors(m, new - W, W, tau=tau, vector_tau=vector_tau)
+        errors.extend(cerrs)
+        mods[m] = {**stats, "ops": len(ops)}
         del new
     return not errors, {"errors": errors[:50], "n_errors": len(errors), "modules": mods}
 
@@ -312,16 +408,17 @@ def edit_into_model(edit: WeightEdit, src_dir, out_dir, *, store=None, base_stor
     store = store or WeightStore(src_dir)
     if edit.needs_base() and base_store is None:
         raise ValueError("edit has toward_base ops but no base_store was given")
-    shorts = {store.key(m): m for m in edit.modules()}
+    shorts = {_ckpt_key(store, m): m for m in edit.modules()}   # linear modules and other tensors (2026-11-21)
     report = {"src": str(src_dir), "modules": {}}
 
     def transform(k, t):
         m = shorts[k]
         w = t.to(device=device, dtype=torch.float32)
-        wb = base_store.weight(m, device="cpu").to(device) if edit.needs_base(m) else None
+        wb = _tensor(base_store, m, "cpu").to(device) if edit.needs_base(m) else None
         new32 = edit.apply(m, w, wb)
         new = new32.to(t.dtype)
-        wn = max(float(w.norm()), 1e-30)
+        # 1-D tensors: normalise like change_errors (||D|| / max(||w||, sqrt(n)) = rms(D) / max(rms(w), 1))
+        wn = max(float(w.norm()), float(w.numel()) ** 0.5 if w.dim() < 2 else 1e-30)
         report["modules"][k] = {"short": m, "rel_change": float((new.to(torch.float32) - w).norm()) / wn,
                                 "intended_rel_change": float((new32 - w).norm()) / wn}
         return new.cpu()

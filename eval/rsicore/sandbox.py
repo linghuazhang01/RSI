@@ -3,6 +3,8 @@
     api = ToolAPI({"evaluate": 24, "gpu_seconds": 7200})
     api.register("evaluate", my_eval, cost={"evaluate": 1}, doc="evaluate(config) -> L1 feedback")
     res = run_program(code, api, timeout_s=600, mem_gb=8, workdir=gen_dir / "work" / cid)
+    k = Kernel(workdir, mem_gb=8); k.run(code, api, timeout_s=300, subdir="r01_0"); k.close()
+        (2026-11-21: persistent kernel, code strings exec'd in the same globals; see Kernel)
 
 Child isolation (defence in depth; the tools themselves are trusted parent code):
   * separate process `python -I` (same interpreter as the parent), new session, environment cleared
@@ -11,7 +13,11 @@ Child isolation (defence in depth; the tools themselves are trusted parent code)
     as unsupported), RLIMIT_CPU (timeout_s + 5), RLIMIT_FSIZE (4 GiB), RLIMIT_NOFILE, RLIMIT_CORE=0;
   * a Python audit hook: writes only under workdir, no reads under the repo / $HOME / /proc (except the
     interpreter's own prefixes), no subprocess / exec / fork / kill / socket connect|bind|getaddrinfo.
-    C extensions (e.g. via ctypes) can bypass audit hooks; this is not a security boundary on its own;
+    C extensions (e.g. via ctypes) can bypass audit hooks; this is not a security boundary on its own.
+    In particular (2026-11-21) code that has torch / safetensors (lora_code tensor_compute children) can read and
+    WRITE files natively (torch.save, safetensors save_file / safe_open never raise an audit 'open' event): a
+    hostile or careless program could overwrite model shards. Run real jobs on a copy-on-write / read-only model
+    directory, or under an OS-level read-only bind mount (bwrap / Landlock), if that matters;
   * network: Linux -> `unshare -rn` (new user+net namespace) when it works; macOS -> `sandbox-exec`
     with a deny-network profile; otherwise none. ProgramResult.info["network_isolation"] says which;
   * wall-clock timeout (includes time spent inside tool calls; checked between RPC messages) -> SIGKILL
@@ -208,80 +214,82 @@ def _tail(p: Path, n: int = 65536) -> str:
     return b[-n:].decode("utf-8", "replace")
 
 
-def run_program(code: str, api: ToolAPI, *, timeout_s: int, mem_gb: int, workdir: Path,
-                save_output: bool = False) -> ProgramResult:
-    """save_output (2026-11-21): after the child has exited, copy its complete stdout / stderr to
-    workdir/stdout.txt and workdir/stderr.txt (ProgramResult keeps only the last 64 KiB)."""
-    workdir = Path(workdir).resolve()
-    (workdir / "tmp").mkdir(parents=True, exist_ok=True)
-    (workdir / "program.py").write_text(code)
+def _sender(wf):
+    def send(obj):
+        try:
+            wf.write((json.dumps(obj) + "\n").encode())
+        except (BrokenPipeError, OSError):
+            pass
+    return send
+
+
+def _spawn(workdir: Path, *, mem_gb, cpu_s: int, extra_allow_read=(), extra_env=None, extra_cfg=None):
+    """Start the child (rlimits, audit hook, network isolation) in workdir -> (proc, rf, wf, ctl, net_label);
+    rf / wf: the request / response pipe ends of the parent; ctl: control dir (cfg.json, stdout.txt, stderr.txt)."""
     ctl = Path(tempfile.mkdtemp(prefix="rsi_sbx_"))   # outside workdir: config + captured output
-    cfg = {"workdir": str(workdir), "program": "program.py", "mem_bytes": int(mem_gb * 2 ** 30),
-           "cpu_s": int(timeout_s) + 5, "fsize_bytes": 4 * 2 ** 30, "allow_read": _allow_read(),
-           "deny_read": [str(ROOT), str(Path.home()), "/proc", str(ctl)]}
+    allow = _allow_read() + sorted({str(Path(p).resolve()) for p in (extra_allow_read or ())})
+    cfg = {"workdir": str(workdir), "mem_bytes": int(mem_gb * 2 ** 30), "cpu_s": int(cpu_s),
+           "fsize_bytes": 4 * 2 ** 30, "allow_read": allow,
+           "deny_read": [str(ROOT), str(Path.home()), "/proc", str(ctl)], **(extra_cfg or {})}
     (ctl / "cfg.json").write_text(json.dumps(cfg))
     req_r, req_w = os.pipe()
     resp_r, resp_w = os.pipe()
     env = {"PATH": "/usr/bin:/bin", "HOME": str(workdir / "tmp"), "TMPDIR": str(workdir / "tmp"),
            "LANG": "C.UTF-8", "PYTHONHASHSEED": "0", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
            "MKL_NUM_THREADS": "1"}
+    env.update({str(k): str(v) for k, v in (extra_env or {}).items()})
     prefix, net_label = _network_prefix()
     cmd = prefix + [sys.executable, "-I", str(CHILD), str(ctl / "cfg.json"), str(req_w), str(resp_r)]
     out_f, err_f = open(ctl / "stdout.txt", "wb"), open(ctl / "stderr.txt", "wb")
-    t0 = time.time()
-    info = {"network_isolation": net_label, "tool_calls": 0, "limits": None}
-    final, timed_out = None, False
     try:
         proc = subprocess.Popen(cmd, cwd=str(workdir), env=env, stdin=subprocess.DEVNULL, stdout=out_f,
                                 stderr=err_f, pass_fds=(req_w, resp_r), start_new_session=True)
+    except BaseException:
+        os.close(req_r)
+        os.close(resp_w)
+        raise
     finally:
         os.close(req_w)
         os.close(resp_r)
         out_f.close()
         err_f.close()
-    rf, wf = os.fdopen(req_r, "rb"), os.fdopen(resp_w, "wb", buffering=0)
+    return proc, os.fdopen(req_r, "rb"), os.fdopen(resp_w, "wb", buffering=0), ctl, net_label
 
-    def send(obj):
-        try:
-            wf.write((json.dumps(obj) + "\n").encode())
-        except (BrokenPipeError, OSError):
-            pass
 
-    send({"tools": api.names(), "docs": api.describe()})
-    sel = selectors.DefaultSelector()
-    sel.register(rf, selectors.EVENT_READ)
-    buf = b""
+def _kill(proc) -> None:
     try:
-        while True:
-            left = timeout_s - (time.time() - t0)
-            if left <= 0:
-                timed_out = True
-                break
-            if not sel.select(timeout=min(left, 1.0)):
-                if proc.poll() is not None:
-                    break
-                continue
-            chunk = os.read(rf.fileno(), 1 << 20)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if msg.get("type") == "hello":
-                    info["limits"] = msg.get("limits")
-                elif msg.get("type") == "final":
-                    final = msg
-                elif msg.get("type") == "call":
-                    info["tool_calls"] += 1
-                    send(_serve(api, msg))
-            if final is not None:
-                break
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_program(code: str, api: ToolAPI, *, timeout_s: int, mem_gb: int, workdir: Path,
+                save_output: bool = False, extra_allow_read=(), extra_env: dict | None = None,
+                cpu_s: int | None = None) -> ProgramResult:
+    """save_output (2026-11-21): after the child has exited, copy its complete stdout / stderr to
+    workdir/stdout.txt and workdir/stderr.txt (ProgramResult keeps only the last 64 KiB).
+    extra_allow_read (2026-11-21): further paths the child may read although they lie under a denied root (exact files,
+    e.g. the model shards a tensor_compute job reads; resolved, allow wins over deny). extra_env: variables added to
+    the child's cleared environment (e.g. CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='4'; they override the
+    single-thread defaults). cpu_s: RLIMIT_CPU in seconds (default timeout_s + 5; a multi-threaded child needs more)."""
+    workdir = Path(workdir).resolve()
+    (workdir / "tmp").mkdir(parents=True, exist_ok=True)
+    (workdir / "program.py").write_text(code)
+    t0 = time.time()
+    proc, rf, wf, ctl, net_label = _spawn(workdir, mem_gb=mem_gb, cpu_s=int(cpu_s) if cpu_s else int(timeout_s) + 5,
+                                          extra_allow_read=extra_allow_read, extra_env=extra_env,
+                                          extra_cfg={"program": "program.py"})
+    info = {"network_isolation": net_label, "tool_calls": 0, "limits": None}
+    final, timed_out = None, False
+    send = _sender(wf)
+    send({"tools": api.names(), "docs": api.describe()})
+    try:
+        final, timed_out = _pump(rf, send, proc, api, t0 + timeout_s, info)
     finally:
-        sel.close()
         if timed_out or final is None:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -313,6 +321,154 @@ def run_program(code: str, api: ToolAPI, *, timeout_s: int, mem_gb: int, workdir
             why += " (CPU-time or memory limit?)"
         return ProgramResult(False, None, stdout, stderr, why, secs, info)
     return ProgramResult(bool(final.get("ok")), final.get("result"), stdout, stderr, final.get("error"), secs, info)
+
+
+RESTARTED = "session restarted: variables lost"
+
+
+class Kernel:
+    """Persistent sandbox kernel (2026-11-21, editor.explore.persistent): ONE long-lived child with the same
+    restrictions as run_program (rlimits, audit hook, network isolation, no subprocess), started lazily by the first
+    run(); each run(code, api, timeout_s, subdir) execs `code` in the SAME globals (variables, imports, functions
+    persist), with `api` a persistent global (tool calls RPC to the given ToolAPI as in run_program), `result` cleared
+    before every call (set it to return a JSON value; a `main(api)` (re)defined by the call is called when `result`
+    is not set). Per call: workdir/<subdir>/program.py, stdout.txt, stderr.txt (the call's print output).
+    RLIMIT_CPU: the kernel's CPU time so far + timeout_s + 5 before each call. A call that times out (wall clock) or
+    crashes the child kills the kernel: the result's error ends with RESTARTED and info["restarted"] is true; the next
+    run() starts a fresh kernel. Not thread-safe per instance (one proposal = one kernel). close() shuts it down."""
+
+    def __init__(self, workdir: Path, *, mem_gb: float, extra_allow_read=(), extra_env: dict | None = None):
+        self.workdir = Path(workdir).resolve()
+        self.mem_gb, self.extra_allow_read, self.extra_env = mem_gb, tuple(extra_allow_read or ()), extra_env
+        self.proc = self.rf = self.wf = self.ctl = None
+        self.net_label, self.limits, self.starts, self.execs = None, None, 0, 0
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _start(self, api: ToolAPI, timeout_s: float):
+        (self.workdir / "tmp").mkdir(parents=True, exist_ok=True)
+        # RLIMIT_CPU soft limit only (hard limit unchanged): raised by the kernel before each call
+        self.proc, self.rf, self.wf, self.ctl, self.net_label = _spawn(
+            self.workdir, mem_gb=self.mem_gb, cpu_s=int(timeout_s) + 5, extra_allow_read=self.extra_allow_read,
+            extra_env=self.extra_env, extra_cfg={"kernel": True})
+        self.starts += 1
+        _sender(self.wf)({"tools": api.names(), "docs": api.describe()})
+        info = {}
+        hello, _ = _pump(self.rf, _sender(self.wf), self.proc, api, time.time() + 60, info, want="hello")
+        if hello is None:
+            err = _tail(self.ctl / "stderr.txt", 4000)
+            self._shutdown(kill=True)
+            raise RuntimeError(f"sandbox kernel did not start: {err}")
+        self.limits = hello.get("limits")
+
+    def run(self, code: str, api: ToolAPI, *, timeout_s: float, subdir: str = "call") -> ProgramResult:
+        t0 = time.time()
+        fresh = not self.alive
+        if fresh:
+            if self.proc is not None:
+                self._shutdown(kill=True)
+            self._start(api, timeout_s)
+        sub = Path(str(subdir))
+        if sub.is_absolute() or ".." in sub.parts:
+            raise ValueError(f"bad subdir {subdir!r}")
+        d = self.workdir / sub
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "program.py").write_text(code)
+        for name in ("stdout.txt", "stderr.txt"):
+            (d / name).unlink(missing_ok=True)
+        self.execs += 1
+        info = {"network_isolation": self.net_label, "tool_calls": 0, "limits": self.limits, "kernel": True,
+                "fresh_kernel": fresh, "kernel_starts": self.starts, "restarted": False}
+        send = _sender(self.wf)
+        send({"type": "exec", "id": self.execs, "code": code, "dir": str(sub), "cpu_s": int(timeout_s) + 5})
+        final, timed_out = _pump(self.rf, send, self.proc, api, t0 + float(timeout_s), info)
+        secs = round(time.time() - t0, 3)
+        stdout, stderr = _tail(d / "stdout.txt"), _tail(d / "stderr.txt")
+        if final is not None:
+            return ProgramResult(bool(final.get("ok")), final.get("result"), stdout, stderr, final.get("error"),
+                                 secs, info)
+        crash = _tail(self.ctl / "stderr.txt", 4000) if self.ctl else ""
+        self._shutdown(kill=True)
+        info.update(restarted=True, returncode=self.proc.returncode if self.proc else None)
+        if timed_out:
+            why = f"timeout: killed after {timeout_s:g}s"
+        else:
+            rc = info["returncode"]
+            why = f"kernel exited with code {rc}"
+            if rc in (-signal.SIGXCPU, -signal.SIGKILL):
+                why += " (CPU-time or memory limit?)"
+        return ProgramResult(False, None, stdout, (stderr + ("\n" + crash if crash.strip() else "")).strip(),
+                             f"{why}; {RESTARTED}", secs, info)
+
+    def _shutdown(self, kill: bool):
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            if not kill:
+                _sender(self.wf)({"type": "exit"})
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.poll() is None:
+                _kill(proc)
+            else:   # the child left; make sure nothing of its process group survives
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+        for f in (self.rf, self.wf):
+            try:
+                f and f.close()
+            except OSError:
+                pass
+        if self.ctl is not None:
+            shutil.rmtree(self.ctl, ignore_errors=True)
+        self.rf = self.wf = self.ctl = None
+
+    def close(self):
+        """Shut the kernel down (exit message, then SIGKILL of its process group if needed); idempotent."""
+        self._shutdown(kill=False)
+        self.proc = None
+
+
+def _pump(rf, send, proc, api: ToolAPI, deadline: float, info: dict, want: str = "final"):
+    """Serve the child's tool calls until a message of type `want` arrives -> (that message, False); the child
+    exits / closes the pipe -> (None, False); the wall clock passes `deadline` -> (None, True)."""
+    sel = selectors.DefaultSelector()
+    sel.register(rf, selectors.EVENT_READ)
+    buf = b""
+    try:
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return None, True
+            if not sel.select(timeout=min(left, 1.0)):
+                if proc.poll() is not None:
+                    return None, False
+                continue
+            chunk = os.read(rf.fileno(), 1 << 20)
+            if not chunk:
+                return None, False
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("type") == "hello":
+                    info["limits"] = msg.get("limits")
+                    if want == "hello":
+                        return msg, False
+                elif msg.get("type") == want:
+                    return msg, False
+                elif msg.get("type") == "call":
+                    info["tool_calls"] = info.get("tool_calls", 0) + 1
+                    send(_serve(api, msg))
+    finally:
+        sel.close()
 
 
 def _serve(api: ToolAPI, msg: dict) -> dict:

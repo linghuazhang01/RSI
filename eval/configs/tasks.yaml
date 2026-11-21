@@ -111,21 +111,38 @@ eval_targets:
   apibank: [[apibank, test]]
   bfcl: [[bfcl, test]]
   # Fixed sets from simple_data/ (2026-11-21, data/scripts/make_simple_data.py): per domain 1,500 train + 500 eval
-  # items sampled from the decontaminated, de-duplicated training pool, graded like the domain's training set.
-  # Form {task, file, dataset}: the items of `file` become dataset / task `dataset` (pool `pool`). objective simple
-  # uses simple_<domain>_train as the train role and simple_<domain>_eval as the gate role.
+  # + 500 test items sampled from the decontaminated, de-duplicated training pool, graded like the domain's training
+  # set. Form {task, file, dataset}: the items of `file` become dataset / task `dataset` (pool `pool`). Form
+  # {task, ids_file, dataset}: the task dataset's records whose id is in `ids_file` (simple_<domain>_pool = the whole
+  # clean pool, simple_data/<domain>/pool_ids.json). objective simple: train role simple_<domain>_pool (per-generation
+  # screen draws, rsicore.draws), gate simple_<domain>_eval, held-out (data_roles.eval: test) simple_<domain>_test.
+  # simple_<domain>_train stays registered for older runs.
   simple_math_train: {task: dapo_math, file: simple_data/math/train.jsonl, dataset: simple_math_train}
   simple_math_eval: {task: dapo_math, file: simple_data/math/eval.jsonl, dataset: simple_math_eval}
+  simple_math_test: {task: dapo_math, file: simple_data/math/test.jsonl, dataset: simple_math_test}
+  simple_math_pool: {task: dapo_math, ids_file: simple_data/math/pool_ids.json, dataset: simple_math_pool}
   simple_code_train: {task: taco_verified, file: simple_data/code/train.jsonl, dataset: simple_code_train}
   simple_code_eval: {task: taco_verified, file: simple_data/code/eval.jsonl, dataset: simple_code_eval}
+  simple_code_test: {task: taco_verified, file: simple_data/code/test.jsonl, dataset: simple_code_test}
+  simple_code_pool: {task: taco_verified, ids_file: simple_data/code/pool_ids.json, dataset: simple_code_pool}
   simple_knowledge_train: {task: triviaqa_train, file: simple_data/knowledge/train.jsonl, dataset: simple_knowledge_train}
   simple_knowledge_eval: {task: triviaqa_train, file: simple_data/knowledge/eval.jsonl, dataset: simple_knowledge_eval}
+  simple_knowledge_test: {task: triviaqa_train, file: simple_data/knowledge/test.jsonl, dataset: simple_knowledge_test}
+  simple_knowledge_pool: {task: triviaqa_train, ids_file: simple_data/knowledge/pool_ids.json,
+                          dataset: simple_knowledge_pool}
   simple_instruction_following_train: {task: ifeval_train, file: simple_data/instruction_following/train.jsonl,
                                        dataset: simple_instruction_following_train}
   simple_instruction_following_eval: {task: ifeval_train, file: simple_data/instruction_following/eval.jsonl,
                                       dataset: simple_instruction_following_eval}
+  simple_instruction_following_test: {task: ifeval_train, file: simple_data/instruction_following/test.jsonl,
+                                      dataset: simple_instruction_following_test}
+  simple_instruction_following_pool: {task: ifeval_train, ids_file: simple_data/instruction_following/pool_ids.json,
+                                      dataset: simple_instruction_following_pool}
   simple_tool_calling_train: {task: sealtool_train, file: simple_data/tool_calling/train.jsonl, dataset: simple_tool_calling_train}
   simple_tool_calling_eval: {task: sealtool_train, file: simple_data/tool_calling/eval.jsonl, dataset: simple_tool_calling_eval}
+  simple_tool_calling_test: {task: sealtool_train, file: simple_data/tool_calling/test.jsonl, dataset: simple_tool_calling_test}
+  simple_tool_calling_pool: {task: sealtool_train, ids_file: simple_data/tool_calling/pool_ids.json,
+                             dataset: simple_tool_calling_pool}
 # eval_target.dataset null -> the domain's default
 eval_target_defaults: {math: math, code: humanevalplus, knowledge: gpqa_diamond, instruction_following: ifeval,
                        tool_calling: sealtool}

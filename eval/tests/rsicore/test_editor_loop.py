@@ -583,8 +583,9 @@ def test_editor_kwargs_and_context_helpers():
     assert kw["context_tokens"] == 32768 and kw["extra_body"] == {}
     assert editor.editor_kwargs({"editor": {"context_tokens": None}})["context_tokens"] is None
     s = editor.editor_settings({"editor": {"explore": {"gpu_tools": True}}})
-    assert s["explore"] == {"timeout_s": 300, "mem_gb": 8, "gpu_tools": True, "gpu_seconds": 300}
-    assert chat_tools.chat_tools_kwargs({}) == {"timeout_s": 300, "mem_gb": 8, "result_chars": 6000}
+    assert s["explore"] == {"timeout_s": 300, "mem_gb": 8, "gpu_tools": True, "gpu_seconds": 300, "persistent": False}
+    assert chat_tools.chat_tools_kwargs({}) == {"timeout_s": 300, "mem_gb": 8, "result_chars": 6000,
+                                                "persistent": False}
     args = ["--gpu-memory-utilization", "0.9", "--max-model-len", "32768", "--max-logprobs", "20"]
     assert editor.apply_context_tokens(args, {"editor": {"context_tokens": 49152}}) == \
         ["--gpu-memory-utilization", "0.9", "--max-model-len", "49152", "--max-logprobs", "20"]

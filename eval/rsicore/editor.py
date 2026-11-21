@@ -77,7 +77,8 @@ EDITOR_DEFAULTS = {
     "proposal_wall_s": 2400, "context_tokens": 131072, "tool_result_chars": 6000, "compact_at": 0.6,
     "keep_tool_rounds": 8, "keep_reasoning_rounds": 2, "reasoning_passback": "think_tag", "history_keep": 2,
     "timeout_s": 3600, "mock_tool_rounds": 1, "history_tool": True,
-    "explore": {"timeout_s": 300, "mem_gb": 8, "gpu_tools": False, "gpu_seconds": 300},
+    # persistent (2026-11-21): one sandbox kernel per proposal for run_python (rsicore.chat_tools; simple: true)
+    "explore": {"timeout_s": 300, "mem_gb": 8, "gpu_tools": False, "gpu_seconds": 300, "persistent": False},
 }
 _EDITOR_KW = ("temperature", "top_p", "max_tokens", "extra_body", "timeout_s", "tool_rounds", "turn_max_tokens",
               "max_tool_calls", "proposal_tokens", "proposal_wall_s", "context_tokens", "tool_result_chars",
@@ -543,6 +544,14 @@ class Editor:
             self._n += 1
             self.last_stats = None
             raise
+        finally:
+            if self.loop:               # e.g. ChatTools: shut the proposal's persistent kernel down (2026-11-21)
+                end = getattr(self.tools, "end", None)
+                if callable(end):
+                    try:
+                        end(ctx or {})
+                    except Exception:  # noqa: BLE001 - housekeeping only
+                        pass
         final = dict(final, p=p, role="assistant", final=True, stats=stats)
         emit(final)
         self._finish_prop(user_msg, final, lines)

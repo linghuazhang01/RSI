@@ -1,22 +1,39 @@
-# Paper A · self-quantization (frozen editor M_0, fixed W4 GPTQ budget) · instruction_following only · objective simple · B300 planned at 220 GB per card
-# Generated snapshot (2026-11-21) of the MERGED config: edit_code/configs/base.yaml + domains/instruction_following.yaml + hardware b300
-# + scope single + objective simple. Not read by the code (source of truth: base.yaml + --set); the run locks its own
-# copy in experiment_records/A_instruction_following_s42_single_simple/run_config.yaml.
-# Data (simple_data/instruction_following/, committed; data/scripts/make_simple_data.py): the decontaminated, de-duplicated ifeval_train pool,
-# 1,500 items sampled for training and 500 disjoint ones for the gate. Graded by the RLVR-IFeval verifiers (rlvr_if).
-#   train role = simple_instruction_following_train (all 1,500 items every generation, nothing drawn)
-#   gate role  = simple_instruction_following_eval (all 500 items)
-#   held-out evaluation: disabled (heldout.enabled false)
-# Each generation: the editor writes quantization programs; candidates are screened on ALL 1,500 train
-# items against the incumbent (greedy); the best go to the gate on the 500 gate items, paired with the
-# incumbent (gate.min_delta and the 95% CI lower bound > 0). KL / calibration texts = 400 of the 1,500
-# items + M_0's answers. Feedback examples also show the reference answer.
-# Editor (改造者): Qwen3 thinking mode (editor.extra_body enable_thinking, temperature 0.6 / top_p 0.95 / top_k 20);
-# per candidate up to editor.tool_rounds (50) rounds of tool calls (run_python with the explore api, read_record), then
-# a forced final turn; context editor.context_tokens (131072, also the editor server's --max-model-len).
-# Search / gate / noise decoding: greedy.
-# Start: ./launch.sh --paper A --domains instruction_following --simple --gens 5 --gpus <ids>   (run id A_instruction_following_s42_single_simple)
+# Paper A · self-quantization (fixed W4-size budget; the editor is the frozen M_0, the incumbent is the latest model) · instruction_following only · objective simple (v2, 2026-11-21) · B300 planned at 220 GB per card
+# Generated snapshot of the MERGED config (edit_code/configs/base.yaml + domains/instruction_following.yaml + hardware b300 + scope single
+# + objective simple). Not read by the code (source of truth: base.yaml + --set); a run locks its own copy in
+# experiment_records/<run id>/run_config.yaml. Regenerate after changing base.yaml.
+# Data (simple_data/instruction_following/, data/scripts/make_simple_data.py): the decontaminated, de-duplicated ifeval_train pool (pool_ids.json)
+#   gate  = simple_instruction_following_eval, 500 fixed items (hidden; the editor sees only statistics of earlier candidates' gate results)
+#   test  = simple_instruction_following_test, 500 fixed items (held-out report only, never visible, never used for selection)
+#   screen = 500 items drawn afresh every generation from the pool minus gate and test (the same items for Papers A and
+#            B in the same search round); train = all remaining pool items (the editor's train ids)
+# Each generation (search.threads 8 x search.steps 1 candidates, editor.tool_rounds 20):
+#   1. the latest model answers the 500 screen items, 4 samples each, once; the editor sees the detailed
+#      results (summary in the context; screen_results / screen_output tools, incl. the thinking text);
+#   2. each candidate: a program (persistent run_python session while exploring; no api.evaluate) builds it; ONE gate
+#      evaluation (500 x 4, paired with the latest model); its gate statistics are visible to later steps / generations;
+#   3. accept the candidate with the largest paired gate gain >= gate.min_delta 0.0 (require_significant
+#      True); then the test set (500 x 4).
+# Decoding (screen / gate / test): thinking on, temperature 0.6, top_p 0.95, top_k 20, max_tokens 16384.
+# Start: ./launch.sh --hw b300 --paper A --domains instruction_following --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag <name>
 draw_config: data/draw/paper_a.yaml
+decoding:
+  screen:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
+  gate:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
 data:
   n: null
   screen_n: null
@@ -67,15 +84,20 @@ action_space:
   - 8
   - 4
 search:
-  threads: 4
-  steps: 6
+  threads: 8
+  steps: 1
   max_evaluate: 24
-  program_evaluate_calls: 2
-  top_full: 3
+  program_evaluate_calls: 0
+  max_candidates: 8
+  charge_screens: false
+  program_evaluate_total: 0
+  screen_candidates: false
+  gate_every_candidate: true
+  top_full: 0
   rerun_seeds: 0
   kl_weight: 0.5
 gate:
-  min_delta: 0.005
+  min_delta: 0.0
   require_significant: true
   max_submissions: 3
   allow_unscored: false
@@ -195,6 +217,7 @@ editor:
     timeout_s: 300
     mem_gb: 8
     gpu_tools: false
+    persistent: true
     gpu_seconds: 300
 sandbox:
   timeout_s: 1800
@@ -205,7 +228,15 @@ archive:
 heldout:
   domains: instruction_following
   limit: null
-  decoding: null
+  decoding:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    seed: 42
+    n: 4
+    n_by_task: null
+    thinking: true
+    max_tokens: 16384
   enabled: true
 e_task:
   enabled: false
@@ -242,6 +273,7 @@ vllm:
   - '128'
   - --max-logprobs
   - '20'
+  candidate_max_model_len: 32768
 gpu_roles: null
 gpu_layout:
   share_single_gpu: true
@@ -253,4 +285,4 @@ gpu_layout:
 hardware: b300
 domain: instruction_following
 data_roles:
-  eval: eval:simple_instruction_following_eval
+  eval: eval:simple_instruction_following_test

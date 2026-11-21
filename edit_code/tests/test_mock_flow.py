@@ -295,20 +295,80 @@ class TestMockFlow(unittest.TestCase):
         self.assertNotIn("math500_eval", led.get("items") or {})                  # eval sets: nothing marked shown
 
     def test_simple_objective(self):
-        """objective simple (2026-11-21): train on simple_data's 1,500 items, accept on its 500, held-out = the same 500."""
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_simple", "--set", "objective=simple"],
-                   self.runs)
+        """objective simple, FINAL flow (2026-11-21): train role simple_math_pool with a fresh per-generation screen
+        (simple.screen_n), gate on simple_math_eval (500 items, thinking n 4), held-out = simple_math_test (avg@4).
+        The incumbent answers the screen items once (n 4; shared, shown via the context summary and screen_results /
+        screen_output); candidates are not screened, have no api.evaluate and get ONE gate evaluation each
+        (gen_XX/gate.json, one entry per candidate); the largest passing gain is accepted. The mock keeps the simple
+        layout (mock_objective_overrides: 3 threads x 1 step)."""
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_simple", "--set", "objective=simple",
+                    "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_simple"
-        self.assertIn("datasets=['simple_math_train'] gate_datasets=['simple_math_eval'] "
-                      "kl_datasets=['simple_math_train']", r.stdout)
+        self.assertIn("datasets=['simple_math_pool'] gate_datasets=['simple_math_eval'] "
+                      "kl_datasets=['simple_math_pool']", r.stdout)
         self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"simple_math_eval"})
-        self.assertEqual(set(json.loads((rd / "baseline" / "heldout.json").read_text())), {"simple_math_eval"})
-        self.assertFalse((rd / "draws").exists())                                     # fixed sets: nothing drawn
-        n = {(e["stage"], k): v.get("n") for e in jl(rd / "gen_01" / "evals.jsonl")
-             for k, v in (e["feedback"].get("probes") or {}).items()}
-        self.assertEqual(n.get(("screen", "simple_math_train")), 1500)
+        for h in (rd / "baseline" / "heldout.json", rd / "baseline" / "q0" / "heldout.json"):
+            ho = json.loads(h.read_text())
+            self.assertEqual(set(ho), {"simple_math_test"})                          # the test set, avg@4
+            self.assertIn("avg_at_n", ho["simple_math_test"])
+        ids = rd / "draws" / "gen_01" / "ids"                                         # per-generation draw
+        scr_ids = json.loads((ids / "simple_math_pool.screen.json").read_text())
+        self.assertEqual(len(scr_ids), 20)
+        ev = jl(rd / "gen_01" / "evals.jsonl")
+        n = {(e["stage"], v["dataset"]): v.get("n") for e in ev for v in (e["feedback"].get("probes") or {}).values()}
+        self.assertEqual(n.get(("screen", "simple_math_pool")), 20)
         self.assertEqual(n.get(("gate", "simple_math_eval")), 500)
+        for e in ev:                                  # thinking decoding, n 4 everywhere (screen, full, gate)
+            dec = json.loads(e["decoding"])
+            self.assertEqual((dec["thinking"], dec["temperature"], dec["top_k"], dec["max_tokens"], dec["seed"],
+                              dec["n"]), (True, 0.6, 20, 16384, 42, 4))
+        # the incumbent's screen: sampled once (n 4), the only screen record; candidates are not screened
+        self.assertEqual(sorted(e["stage"] for e in ev if e["origin"] == "incumbent"), ["full", "screen"])
+        self.assertFalse([e for e in ev if e["stage"] in ("screen", "full") and e["origin"] != "incumbent"
+                          and not str(e["origin"]).startswith("baseline")])
+        inc_recs = jl(rd / "gen_01" / "evals" / "incumbent" / "screen" / "simple_math_pool.jsonl")
+        self.assertTrue(len(inc_recs) == 20 and all(len(x["sample_scores"]) == 4 for x in inc_recs))
+        self.assertTrue((rd / "gen_01" / "reference_screen.json").exists())
+        # 3 threads x 1 step, no api.evaluate, ONE gate evaluation per candidate (n 4), recorded in gate.json
+        cands = jl(rd / "gen_01" / "candidates.jsonl")
+        self.assertEqual([(c["thread"], c["step"]) for c in cands], [(0, 0), (1, 0), (2, 0)])
+        self.assertFalse([c for c in cands if c["error"]])
+        self.assertFalse([e for e in ev if str(e["origin"]).startswith("tool:")])
+        gates = [e for e in ev if e["stage"] == "gate"]
+        self.assertEqual(sorted(e["cid"] for e in gates), sorted({c["cid"] for c in cands}))
+        for e in gates:
+            recs = jl(rd / "gen_01" / "evals" / e["cid"] / "gate" / "simple_math_eval.jsonl")
+            self.assertTrue(all(len(x["sample_scores"]) == 4 for x in recs))
+        subs = json.loads((rd / "gen_01" / "gate.json").read_text())["submissions"]
+        self.assertEqual([s["cid"] for s in subs], [c["cid"] for c in cands])
+        for s, c in zip(subs, cands):
+            self.assertTrue({"gain", "ci", "accuracy", "broken", "fixed", "broken_ids"} <= set(s["info"]))
+            self.assertEqual(c["screen"]["feedback"]["gate"]["gain"], s["info"]["gain"])
+            self.assertEqual(c["score"], s["info"]["gain"])
+        acc = json.loads((rd / "gen_01" / "accepted.json").read_text())
+        passing = [s for s in subs if s["passed"]]
+        if passing:
+            best = max(passing, key=lambda s: s["info"]["gain"])
+            self.assertEqual((acc["accepted"], acc["cid"]), (True, best["cid"]))
+        else:
+            self.assertFalse(acc["accepted"])
+        st = json.loads((rd / "state.json").read_text())
+        self.assertEqual(st["gen01/search"]["evaluations"], 0)
+        out = cands[2]["artifact"]["stdout_tail"]                   # the greedy mock program reads the screen
+        self.assertIn("screen_results", out)
+        self.assertIn("screen_output", out)
+        # prompts: session k of N, no api.evaluate, the configured tool rounds, the screen summary
+        th1 = jl(rd / "gen_01" / "editor" / "thread_1.jsonl")
+        sys_p = th1[0]["content"]
+        self.assertIn("There is no api.evaluate.", sys_p)
+        self.assertNotIn("api.evaluate(config", sys_p)
+        self.assertIn("for up to 20 rounds", sys_p)
+        self.assertIn("persist between your run_python calls", sys_p)
+        user = next(x for x in th1 if x.get("role") == "user")["content"]
+        self.assertIn("You are session 2 of 3 in this round", user)
+        self.assertIn("accuracy avg@4", user)
+        self.assertNotIn("improve on the best candidate", user)
 
     def test_search_history_tool(self):
         """search_history (2026-11-21): generation 2's editor gets the tool (system prompt) and it lists generation

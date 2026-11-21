@@ -187,6 +187,52 @@ class DataSizeAndNoiseTest(unittest.TestCase):
             eff = yaml.safe_load(rc.draw_config.read_text())
             self.assertEqual((eff["seed"], eff["gate"]["seed"]), (7, 20261118))
 
+    def test_simple_profile_paper_b(self):
+        """objective simple v2, FINAL flow (2026-11-21): thinking-mode sampled reference screen, gate and held-out
+        (avg@4) with the run seed, held-out = the test set, 8 x 1 search, candidates not screened, one gate
+        evaluation each, no api.evaluate, tensor / paper / screen tools on, persistent run_python, nonllm 8; other
+        objectives keep greedy scoring and the old search accounting."""
+        from rsicore.config import stage_decoding
+
+        from lora_code.run import context_shortfall
+        from lora_code.tools import (paper_tools_enabled, screen_tools_enabled, search_settings,
+                                     tensor_compute_enabled)
+        rc, _ = self.rc("B", "objective=simple", seed=7)
+        cfg = rc.paper_cfg
+        samp = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "thinking": True, "max_tokens": 16384, "seed": 7}
+        self.assertEqual(stage_decoding(cfg, "screen", 7), dict(samp, n=4))
+        self.assertEqual(stage_decoding(cfg, "full", 7), dict(samp, n=4))          # full falls back to screen
+        self.assertEqual(stage_decoding(cfg, "gate", 7), dict(samp, n=4))
+        hd = cfg["heldout"]["decoding"]
+        self.assertEqual({k: hd[k] for k in samp}, samp)
+        self.assertEqual((hd["n"], hd.get("n_by_task"), cfg["heldout"]["enabled"]), (4, None, True))
+        self.assertEqual(cfg["data_roles"]["eval"], "eval:simple_math_test")
+        self.assertEqual(search_settings(cfg), {"threads": 8, "steps": 1, "charge_screens": False, "pool": 0,
+                                                "program_cap": 0, "max_candidates": 8, "parallel_builds": True,
+                                                "screen_candidates": False, "gate_every_candidate": True,
+                                                "evaluate_tool": False})
+        self.assertEqual(cfg["search"]["top_full"], 0)
+        self.assertTrue(tensor_compute_enabled(cfg) and paper_tools_enabled(cfg) and screen_tools_enabled(cfg))
+        self.assertTrue(cfg["editor"]["explore"]["persistent"])
+        self.assertEqual((cfg["nonllm"]["evaluate"], cfg["e_t"]["enabled"], cfg["editor"]["tool_rounds"]),
+                         (8, False, 20))
+        self.assertEqual(cfg["method"]["mode"], "scratch")
+        self.assertIsNone(context_shortfall(cfg))                   # main replicas 131072 >= prompt + 16384
+        small = dict(cfg, editor=dict(cfg["editor"], context_tokens=18432))
+        self.assertIn("--max-model-len 18432", context_shortfall(small))
+        for hw in ("h20", "h20_80"):
+            rc, _ = self.rc("B", "objective=simple", f"hardware={hw}")
+            self.assertIsNone(context_shortfall(rc.paper_cfg))
+        rc, _ = self.rc("B")                                        # train_gate: unchanged
+        cfg = rc.paper_cfg
+        self.assertEqual([stage_decoding(cfg, lv, 42) for lv in ("screen", "full", "gate")], [None, None, None])
+        self.assertEqual(search_settings(cfg), {"threads": 4, "steps": 8, "charge_screens": True, "pool": 32,
+                                                "program_cap": 2, "max_candidates": 32, "parallel_builds": False,
+                                                "screen_candidates": True, "gate_every_candidate": False,
+                                                "evaluate_tool": True})
+        self.assertFalse(tensor_compute_enabled(cfg) or paper_tools_enabled(cfg) or screen_tools_enabled(cfg))
+        self.assertIsNone(context_shortfall(cfg))
+
     def test_eval_overfit_objective(self):
         """objective eval_overfit: the run's data is math_eval (MATH-500 + GSM8K test); every role and the gate are
         all of it, kl a fixed subset; nothing is drawn or marked shown; accept on any higher score; run id _evalfit."""

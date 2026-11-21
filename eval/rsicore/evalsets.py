@@ -22,10 +22,11 @@ def targets() -> dict:
     """{key: {"dataset": K_eval, "domain", "sources": [(task, pool)], "source_datasets": [(dataset, pool)]}}."""
     tasks, out = _cfg().get("tasks") or {}, {}
     for key, sources in (_cfg().get("eval_targets") or {}).items():
-        if isinstance(sources, dict):              # a fixed item file (simple_data): {task, file, dataset}
-            t = sources["task"]
-            out[key] = {"dataset": sources["dataset"], "domain": tasks[t]["category"], "sources": [(t, "file")],
-                        "source_datasets": [], "file": sources["file"]}
+        if isinstance(sources, dict):              # simple_data: {task, file, dataset} / {task, ids_file, dataset}
+            t, form = sources["task"], ("ids_file" if sources.get("ids_file") else "file")
+            out[key] = {"dataset": sources["dataset"], "domain": tasks[t]["category"], "sources": [(t, form)],
+                        "source_datasets": [(tasks[t]["dataset"], "pool")] if form == "ids_file" else [],
+                        "file": sources[form]}
             continue
         src = [(str(t), str(p)) for t, p in sources]
         out[key] = {"dataset": f"{key}_eval", "domain": tasks[src[0][0]]["category"], "sources": src,
@@ -77,10 +78,20 @@ def task_names() -> set:
 #   gate  : what accepts a candidate. A training set (its fixed gate split) or an eval set (all items).
 #   eval  : the held-out report, comma-separated: domains (math = math500,gsm8k,aime24,aime25), held-out tasks
 #           (math500, humanevalplus, ...; pool test), eval sets (math, humanevalplus, ...: the K_eval copy),
-#           or train / gate (the role's dataset, when it is an eval set).
+#           train / gate (the role's dataset, when it is an eval set), or test (objective simple: simple_<d>_test).
 # train and gate must belong to the run's --domain; an eval-set train or gate needs scope single.
+# objective simple (2026-11-21): train = simple_<d>_pool (the whole clean pool; rsicore.draws draws a fresh screen of
+# it every generation), gate = simple_<d>_eval (500), test = simple_<d>_test (500, the held-out report).
 TRAIN_SETS = {"math": "dapo_math", "code": "taco_verified", "knowledge": "triviaqa_train",
               "instruction_following": "ifeval_train", "tool_calling": "sealtool_train"}
+
+
+SIMPLE_ALIASES = ("simple_train", "simple_eval", "simple_test", "simple_pool")
+
+
+def simple_sets(domain: str) -> dict:
+    """objective simple's datasets of a domain (2026-11-21): {train: pool, gate: eval, test: test}."""
+    return {"train": f"simple_{domain}_pool", "gate": f"simple_{domain}_eval", "test": f"simple_{domain}_test"}
 
 
 def train_set_domain(name: str) -> str | None:
@@ -91,14 +102,15 @@ def train_set_domain(name: str) -> str | None:
 
 
 def is_eval_set(dataset: str | None) -> bool:
-    """True for an eval-set dataset (K_eval): every item is used, nothing is drawn or marked shown."""
+    """True for an eval-set dataset (K_eval, simple_*): nothing is marked shown; every item is used, except the
+    simple_<d>_pool train role of objective simple (per-generation draws, rsicore.draws)."""
     return bool(dataset) and any(v["dataset"] == dataset for v in targets().values())
 
 
 def resolve_set(name: str, domain: str, role: str) -> str:
     """Dataset name of a train / gate role value: a training set (dapo_math, ...) or an eval set (key or K_eval)."""
     name = str(name)
-    if name in ("simple_train", "simple_eval"):    # simple_data's 1,500 / 500 items of the run's domain
+    if name in SIMPLE_ALIASES:                     # simple_data sets of the run's domain (simple_pool = whole pool)
         name = f"simple_{domain}_{name.split('_')[1]}"
     d = train_set_domain(name)
     if d is None:
@@ -118,10 +130,11 @@ def short(dataset: str) -> str:
 
 
 def default_roles(cfg: dict, domain: str) -> dict:
-    """{train, gate} datasets of the objective: eval_overfit -> the eval set for both; else the domain's training set."""
+    """{train, gate} datasets of the objective: eval_overfit -> the eval set for both; else the domain's training set.
+    objective simple (2026-11-21): train simple_<d>_pool, gate simple_<d>_eval, plus test simple_<d>_test."""
     et = cfg.get("eval_target") or {}
-    if cfg.get("objective") == "simple":           # simple_data: train on the 1,500, accept on the 500
-        return {"train": f"simple_{domain}_train", "gate": f"simple_{domain}_eval"}
+    if cfg.get("objective") == "simple":           # simple_data: draw from the pool, accept on eval, report on test
+        return simple_sets(domain)
     if cfg.get("objective") == "eval_overfit" and et.get("enabled"):
         ds = resolve(et.get("dataset"), domain)[1]["dataset"]
         return {"train": ds, "gate": ds}
@@ -129,13 +142,20 @@ def default_roles(cfg: dict, domain: str) -> dict:
     return {"train": ds, "gate": ds}
 
 
-def eval_tokens(spec, roles: dict) -> str:
-    """Normalise a data_roles.eval value into heldout_tasks tokens (comma-separated)."""
+def eval_tokens(spec, roles: dict, domain: str | None = None) -> str:
+    """Normalise a data_roles.eval value into heldout_tasks tokens (comma-separated). domain: the run's, for the
+    simple_test / simple_eval / ... shorthands."""
     from .heldout import HELDOUT
     toks = [t.strip() for t in (spec.split(",") if isinstance(spec, str) else spec) if str(t).strip()]
     out = []
     for t in toks:
-        if t in ("train", "gate"):
+        if t in SIMPLE_ALIASES and domain:
+            t = f"simple_{domain}_{t.split('_')[1]}"
+        if t == "test":                             # objective simple's held-out test set
+            if not roles.get("test"):
+                raise SystemExit("data_roles.eval: test needs objective simple (simple_<domain>_test)")
+            out.append(f"eval:{roles['test']}")
+        elif t in ("train", "gate"):
             if not is_eval_set(roles[t]):
                 raise SystemExit(f"data_roles.eval: {t} = {roles[t]} is a training set; name eval sets / tasks instead")
             out.append(f"eval:{roles[t]}")
@@ -146,5 +166,6 @@ def eval_tokens(spec, roles: dict) -> str:
         elif key_of(t):
             out.append(f"eval:{targets()[key_of(t)]['dataset']}")
         else:
-            raise SystemExit(f"data_roles.eval: unknown {t!r} (a domain, a held-out task, an eval set, train or gate)")
+            raise SystemExit(f"data_roles.eval: unknown {t!r} (a domain, a held-out task, an eval set, train, gate "
+                             "or test)")
     return ",".join(out)

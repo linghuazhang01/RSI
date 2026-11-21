@@ -30,8 +30,23 @@ tag = f"{cid}~x{r:02d}_{i}" (r = round, i = index of the call in that turn). It 
   * a ToolAPI,
   * (ToolAPI, cleanup) where cleanup() is called after the run (e.g. Paper B: begin_program(tag) inside the
     factory, end_program in cleanup, so exploration handles are freed and the tool log lives under "~x" keys),
+  * (ToolAPI, cleanup, before_call) (2026-11-21): before_call(timeout_s) is called before every run (cleanup may
+    be None),
   * a context manager whose __enter__ returns the ToolAPI.
 The factory must not register evaluate (or anything that spends a generation budget).
+
+Persistent session (2026-11-21, persistent=True <- editor.explore.persistent; default False = the per-call mode
+above): ONE rsicore.sandbox.Kernel per proposal (keyed by ctx["cid"]), started lazily by the first run_python call;
+every call execs its code in the same globals (variables, imports, functions persist; `api` is a persistent global;
+`result` is cleared before each call). The explore api is made ONCE per proposal: factory(f"{cid}~x", ctx) (same
+return forms; before_call(timeout_s) runs before every exec, e.g. Paper B's tensor_compute deadline). A call that
+times out (editor.explore.timeout_s) or crashes kills the kernel and reports "session restarted: variables lost"
+(error + "restarted": true); the next call starts a fresh kernel with the SAME api object (workspace handles
+persist). end(ctx) (the Editor calls it when a proposal finishes, on every path) shuts the kernel down and runs
+cleanup; begin(ctx) also discards a stale kernel of the same cid. Workdir gen_dir/explore/<cid>/session/ with
+r{r:02d}_{i}/ (program.py, stdout.txt, stderr.txt, result.json) per call. Thread-safe across proposals (each
+proposal's calls are sequential). A run_python_doc that starts with RUN_PYTHON_DOC gets that prefix replaced by
+RUN_PYTHON_DOC_PERSISTENT.
 
 call(name, arguments, ctx, r, i, deadline_s=None) never raises: every failure (bad JSON arguments, unknown
 tool, wrong parameters, factory / sandbox errors, timeout) becomes '{"ok": false, "error": "<Type>: msg"}'.
@@ -49,11 +64,12 @@ import re
 import shutil
 import signal
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 from .records import read_json, read_jsonl
-from .sandbox import ToolAPI, run_program
+from .sandbox import RESTARTED, Kernel, ToolAPI, run_program
 
 RUN_PYTHON_DOC = (
     "Run exploratory Python in the program sandbox (new process, no network, no files outside its own "
@@ -62,6 +78,21 @@ RUN_PYTHON_DOC = (
     "top-level code: print() what you need, or set `result = ...` to get a JSON value back (defining "
     "main(api) also works). Filter big tables inside the code instead of printing them whole. Output is "
     "cut to a few thousand characters. Nothing persists between calls or into your final program.")
+RUN_PYTHON_DOC_PERSISTENT = (
+    "Run exploratory Python in a persistent sandbox session (no network, no files outside its own workdir), like a "
+    "notebook kernel: variables, imports and functions you define stay available in your later run_python calls of "
+    "this candidate. The same `api` object as in your final program is a global (call tools by keyword: "
+    "api.<tool>(...)); api.evaluate and other budget-spending tools are NOT available here. Write top-level code: "
+    "print() what you need, or set `result = ...` to get a JSON value back (`result` is cleared before every call). "
+    "Filter big tables inside the code instead of printing them whole. Output is cut to a few thousand characters. "
+    "A call that runs past the time limit or crashes restarts the session (the reply says 'session restarted: "
+    "variables lost'; recompute what you need). Nothing carries into your final program: it must build everything "
+    "it returns itself.")
+
+
+def run_python_doc(persistent: bool = False) -> str:
+    """The rsicore run_python description for the per-call (default) or persistent session mode (2026-11-21)."""
+    return RUN_PYTHON_DOC_PERSISTENT if persistent else RUN_PYTHON_DOC
 READ_RECORD_DOC = (
     "Read the full program or the full feedback of an earlier candidate listed in the latest message "
     "(the message shows them shortened). Long texts come in pages: call again with offset=next_offset.")
@@ -72,6 +103,8 @@ SEARCH_HISTORY_DOC = (
     "error, gate outcome; same_as = an earlier candidate with an identical result, which would score the same). "
     "Newest generation first, best score first within a generation (sort='order': in the order they were tried). "
     "Scores are relative to the reference model of their own generation: compare within a generation. "
+    "gate = the candidate's gate result (passed, reason and, when the gate scored it, statistics such as the paired "
+    "gain, its CI, accuracy and the counts / ids of items broken or fixed; never item content). "
     "read_record(cid, part) then shows any listed candidate's full program or full feedback.")
 
 FORCED_MARK = "[No more function calls"     # start of the editor's forced-final notice (see editor.py)
@@ -140,15 +173,28 @@ class SearchHistory:
         self.row_fn, self.key_fn, self.gen_fn = row_fn, key_fn, gen_fn
 
 
-def _gate_outcomes(d: Path) -> dict:
-    """cid -> {"passed": bool, "reason": str} from <d>/gate.json (rsicore.search.submit_to_gate)."""
+# gate statistics copied from a gate.json submission's info into search_history rows (2026-11-21, gate per candidate:
+# statistics only, never item content; absent keys are skipped, so older gate.json files give passed / reason only)
+GATE_STATS = ("gain", "ci", "accuracy", "reference_accuracy", "broken", "fixed", "broken_ids", "fixed_ids")
+
+
+def _gate_outcomes(d: Path, cids=None) -> dict:
+    """cid -> {"passed": bool, "reason": str, + GATE_STATS present in info} from <d>/gate.json
+    (rsicore.search.submit_to_gate, or a paper's gate-per-candidate records); cids: only these."""
     out = {}
     for sub in (read_json(Path(d) / "gate.json", None) or {}).get("submissions") or []:
+        if cids is not None and str(sub.get("cid")) not in cids:
+            continue
         info = sub.get("info") if isinstance(sub.get("info"), dict) else {}
         why = info.get("reason") or info.get("reasons")
         if isinstance(why, (list, tuple)):
             why = "; ".join(map(str, why))
-        out[str(sub.get("cid"))] = {"passed": bool(sub.get("passed")), **({"reason": cut(str(why), 200)} if why else {})}
+        row = {"passed": bool(sub.get("passed")), **({"reason": cut(str(why), 200)} if why else {})}
+        for k in GATE_STATS:
+            if info.get(k) is not None:
+                v = info[k]
+                row[k] = v[:20] if isinstance(v, list) and k.endswith("_ids") else v
+        out[str(sub.get("cid"))] = row
     return out
 
 
@@ -159,12 +205,19 @@ def _schema(name, doc, props, required):
 
 class ChatTools:
     def __init__(self, explore_api_factory, *, timeout_s: float = 300, mem_gb: float = 8, result_chars: int = 6000,
-                 run_python_doc: str | None = None, read_record: bool = True, history: SearchHistory | None = None):
+                 run_python_doc: str | None = None, read_record: bool = True, history: SearchHistory | None = None,
+                 persistent: bool = False):
         self.factory = explore_api_factory
         self.history = history
         self.timeout_s, self.mem_gb, self.result_chars = float(timeout_s), mem_gb, int(result_chars)
-        self.run_python_doc = run_python_doc or RUN_PYTHON_DOC
+        self.persistent = bool(persistent)
+        doc = run_python_doc or RUN_PYTHON_DOC
+        if self.persistent and doc.startswith(RUN_PYTHON_DOC):
+            doc = RUN_PYTHON_DOC_PERSISTENT + doc[len(RUN_PYTHON_DOC):]
+        self.run_python_doc = doc
         self.read_record_enabled = bool(read_record)
+        self._sessions: dict[str, dict] = {}      # persistent: cid -> {kernel, api, cleanup, before_call, dir}
+        self._slock = threading.Lock()
 
     # ---------------------------------------------------------------- schemas
     def names(self) -> list[str]:
@@ -189,14 +242,44 @@ class ChatTools:
 
     # ---------------------------------------------------------------- dispatch
     def begin(self, ctx: dict | None):
-        """A proposal starts live: remove gen_dir/explore/<cid>/ of a discarded earlier attempt."""
+        """A proposal starts live: discard a stale persistent session of the same cid, remove
+        gen_dir/explore/<cid>/ of a discarded earlier attempt."""
         ctx = ctx or {}
+        self.end(ctx)
         cid, gd = str(ctx.get("cid") or ""), ctx.get("gen_dir")
         if not gd or not cid or "/" in cid or "\\" in cid or cid in (".", ".."):
             return
         d = Path(gd) / "explore" / cid
         if d.is_dir() and not d.is_symlink():
             shutil.rmtree(d, ignore_errors=True)
+
+    def end(self, ctx: dict | None):
+        """The proposal is finished (2026-11-21): shut its persistent kernel down and run the explore api's
+        cleanup. Never raises; a no-op in the per-call mode or when no session exists."""
+        cid = str((ctx or {}).get("cid") or "explore")
+        with self._slock:
+            sess = self._sessions.pop(cid, None)
+        if sess is not None:
+            self._close(sess)
+
+    def end_all(self):
+        """Shut every open persistent session down (e.g. at the end of a search)."""
+        with self._slock:
+            sessions, self._sessions = list(self._sessions.values()), {}
+        for sess in sessions:
+            self._close(sess)
+
+    @staticmethod
+    def _close(sess: dict):
+        try:
+            sess["kernel"].close()
+        except Exception:  # noqa: BLE001 - housekeeping only
+            pass
+        if sess.get("cleanup") is not None:
+            try:
+                sess["cleanup"]()
+            except Exception:  # noqa: BLE001
+                pass
 
     def call(self, name: str, arguments, ctx: dict | None, r: int, i: int, deadline_s: float | None = None) -> dict:
         t0 = time.time()
@@ -227,35 +310,68 @@ class ChatTools:
 
     # ---------------------------------------------------------------- run_python
     def _enter(self, tag: str, ctx: dict):
+        """factory(tag, ctx) -> (api, cleanup | None, before_call | None)."""
         made = self.factory(tag, ctx)
         if isinstance(made, ToolAPI):
-            return made, None
-        if isinstance(made, tuple) and len(made) == 2:
-            return made[0], made[1]
+            return made, None, None
+        if isinstance(made, tuple) and len(made) in (2, 3):
+            return made[0], made[1], (made[2] if len(made) == 3 else None)
         if hasattr(made, "__enter__") and hasattr(made, "__exit__"):
             api = made.__enter__()
-            return api, lambda: made.__exit__(None, None, None)
-        raise TypeError(f"explore_api_factory returned {type(made).__name__}; expected ToolAPI, (api, cleanup) "
-                        "or a context manager")
+            return api, lambda: made.__exit__(None, None, None), None
+        raise TypeError(f"explore_api_factory returned {type(made).__name__}; expected ToolAPI, (api, cleanup), "
+                        "(api, cleanup, before_call) or a context manager")
+
+    def _session(self, ctx: dict, cid: str) -> dict:
+        """The proposal's persistent session (explore api made once; kernel started lazily by Kernel.run)."""
+        with self._slock:
+            sess = self._sessions.get(cid)
+        if sess is not None:
+            return sess
+        gd = ctx.get("gen_dir")
+        base = Path(gd) if gd else Path(tempfile.mkdtemp(prefix="rsi_explore_"))
+        api, cleanup, before = self._enter(f"{cid}~x", ctx)
+        d = base / "explore" / cid / "session"
+        sess = {"kernel": Kernel(d, mem_gb=self.mem_gb), "api": api, "cleanup": cleanup, "before_call": before,
+                "dir": d}
+        with self._slock:
+            old = self._sessions.get(cid)
+            if old is None:
+                self._sessions[cid] = sess
+        if old is not None:             # another thread made it first (same cid; should not happen)
+            self._close(sess)
+            return old
+        return sess
 
     def run_python(self, ctx: dict, r: int, i: int, *, code: str, deadline_s: float | None = None) -> tuple[str, bool]:
         if not isinstance(code, str):
             raise TypeError("code must be a string")
         cid = str(ctx.get("cid") or "explore")
-        tag = f"{cid}~x{int(r):02d}_{int(i)}"
-        gd = ctx.get("gen_dir")
-        base = Path(gd) if gd else Path(tempfile.mkdtemp(prefix="rsi_explore_"))
-        wd = base / "explore" / cid / f"r{int(r):02d}_{int(i)}"
+        sub = f"r{int(r):02d}_{int(i)}"
         timeout = self.timeout_s if deadline_s is None else min(self.timeout_s, max(5.0, float(deadline_s)))
-        api, cleanup = self._enter(tag, ctx)
-        try:
+        if self.persistent:
+            sess = self._session(ctx, cid)
+            api, wd = sess["api"], sess["dir"] / sub
+            if sess["before_call"] is not None:
+                sess["before_call"](timeout)
             before = dict(getattr(api, "calls", {}) or {})
-            res = run_program(_WRAP.format(src=repr(code)), api, timeout_s=int(round(timeout)), mem_gb=self.mem_gb,
-                              workdir=wd, save_output=True)
+            res = sess["kernel"].run(code, api, timeout_s=int(round(timeout)), subdir=sub)
             after = dict(getattr(api, "calls", {}) or {})
-        finally:
-            if cleanup is not None:
-                cleanup()
+        else:
+            gd = ctx.get("gen_dir")
+            base = Path(gd) if gd else Path(tempfile.mkdtemp(prefix="rsi_explore_"))
+            wd = base / "explore" / cid / sub
+            api, cleanup, before_call = self._enter(f"{cid}~x{sub[1:]}", ctx)
+            try:
+                if before_call is not None:
+                    before_call(timeout)
+                before = dict(getattr(api, "calls", {}) or {})
+                res = run_program(_WRAP.format(src=repr(code)), api, timeout_s=int(round(timeout)),
+                                  mem_gb=self.mem_gb, workdir=wd, save_output=True)
+                after = dict(getattr(api, "calls", {}) or {})
+            finally:
+                if cleanup is not None:
+                    cleanup()
         try:
             wd.mkdir(parents=True, exist_ok=True)
             (wd / "result.json").write_text(json.dumps({"ok": res.ok, "result": res.result, "error": res.error,
@@ -264,12 +380,16 @@ class ChatTools:
             pass
         calls = {k: after.get(k, 0) - before.get(k, 0) for k in after if after.get(k, 0) - before.get(k, 0)}
         out = {"ok": bool(res.ok), "seconds": round(res.seconds, 2), "tool_calls": calls}
+        if (res.info or {}).get("restarted"):
+            out["restarted"] = True
         error = res.error
         xcpu = getattr(signal, "SIGXCPU", None)
         if not res.ok and xcpu is not None and (res.info or {}).get("returncode") == -xcpu:
             error = f"timeout: CPU-time limit reached ({error})"   # the CPU limit can fire before the wall clock
         if error:
             out["error"] = cut(error, 2000, head=0.3)
+            if out.get("restarted") and RESTARTED not in out["error"]:
+                out["error"] += f" ({RESTARTED})"
         if not res.ok and res.stderr:
             out["stderr"] = cut(res.stderr, 1500, head=0.0)
         room = max(400, self.result_chars - len(json.dumps(out, ensure_ascii=False)) - 80)
@@ -332,7 +452,9 @@ class ChatTools:
         gd = ctx.get("gen_dir")
         if gd and visible:
             recs = {r.get("cid"): r for r in read_jsonl(Path(gd) / "candidates.jsonl")}
-            groups.append((cur, [recs[c] for c in visible if c in recs], {}))
+            # gate results of this generation's visible (earlier-step) candidates, when a paper gates every
+            # candidate during the search (2026-11-21); empty otherwise (gate.json is written after the search)
+            groups.append((cur, [recs[c] for c in visible if c in recs], _gate_outcomes(Path(gd), set(visible))))
         seen, rows = {}, []
         for g, recs, gate in groups:           # oldest first, so same_as names the first one tried
             for r in recs:
@@ -407,12 +529,12 @@ class ChatTools:
 
 
 def chat_tools_kwargs(cfg: dict | None) -> dict:
-    """ChatTools keyword arguments from a paper config: editor.explore.timeout_s / mem_gb and
-    editor.tool_result_chars (defaults 300 / 8 / 6000)."""
+    """ChatTools keyword arguments from a paper config: editor.explore.timeout_s / mem_gb / persistent and
+    editor.tool_result_chars (defaults 300 / 8 / false / 6000)."""
     from .editor import editor_settings
     s = editor_settings(cfg)
     return {"timeout_s": s["explore"]["timeout_s"], "mem_gb": s["explore"]["mem_gb"],
-            "result_chars": s["tool_result_chars"]}
+            "result_chars": s["tool_result_chars"], "persistent": bool(s["explore"].get("persistent", False))}
 
 
 def strip_loop(messages: list[dict]) -> list[dict]:

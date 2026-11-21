@@ -1,5 +1,7 @@
 """Build simple_data/<domain>/: the final clean dataset of each domain (pool.jsonl: the training set with every
-eval-set overlap and every internal duplicate removed) and 1,500 train + 500 eval items sampled from it.
+eval-set overlap and every internal duplicate removed), its sorted ids (pool_ids.json, committed: the source of the
+per-generation screen draws of objective simple, dataset simple_<domain>_pool) and 1,500 train + 500 eval + 500 test
+items sampled from it (test since 2026-11-21: the held-out report of objective simple).
 
 Since 2026-11-21 make_splits.py applies the same decontamination and de-duplication, so steps 2-3 below remove
 nothing from the current split_pool == "pool"; they are kept as an independent re-check.
@@ -22,10 +24,12 @@ Steps per domain (seed 20261118, the data seed):
       (constraint sentences, tool-call instructions) and are not counted as shared.
    Text = prompt, else the user turns of `messages`; Seal-Tools items use only their task_instruction line
    (same rule as make_splits.py).
-3. Drop internal duplicates (same text under rule b), keeping the smallest id, so train and eval are
+3. Drop internal duplicates (same text under rule b), keeping the smallest id, so train, eval and test are
    disjoint by content, not only by id.
-4. Write the remaining items sorted by id to pool.jsonl. Shuffle them with random.Random("20261118:simple_data:<domain>"); the first
-   1,500 -> train, the next 500 -> eval.
+4. Write the remaining items sorted by id to pool.jsonl (and their ids to pool_ids.json). Shuffle them with
+   random.Random("20261118:simple_data:<domain>"); the first 1,500 -> train, the next 500 -> eval, the next 500 ->
+   test (2026-11-21; the same shuffle, so train / eval are byte-identical to the earlier 1,500 / 500 build).
+   train / eval / test are asserted pairwise disjoint by id and by normalized text.
 
 Run: eval/.venv/bin/python -I data/scripts/make_simple_data.py [--only math,code]
 """
@@ -40,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PROC = ROOT / "data" / "processed"
 OUT = ROOT / "simple_data"
 SEED = 20261118
-N_TRAIN, N_EVAL = 1500, 500
+N_TRAIN, N_EVAL, N_TEST = 1500, 500, 500
 NGRAM, NEAR_THR, TEMPLATE_DF = 13, 0.5, 5
 DOMAINS = {
     "math": {"train": "dapo_math",
@@ -149,17 +153,22 @@ def build(domain, cfg):
 
     final = sorted(dedup, key=lambda r: r["id"])  # the final clean dataset, written as pool.jsonl
     random.Random(f"{SEED}:simple_data:{domain}").shuffle(dedup)
-    assert len(dedup) >= N_TRAIN + N_EVAL, f"{domain}: only {len(dedup)} clean items"
-    train, evals = dedup[:N_TRAIN], dedup[N_TRAIN:N_TRAIN + N_EVAL]
-    assert not {r["id"] for r in train} & {r["id"] for r in evals}
-    assert not {norm_strict(text_of(r)) for r in train} & {norm_strict(text_of(r)) for r in evals}
+    assert len(dedup) >= N_TRAIN + N_EVAL + N_TEST, f"{domain}: only {len(dedup)} clean items"
+    a, b = N_TRAIN, N_TRAIN + N_EVAL
+    parts = [("train", dedup[:a]), ("eval", dedup[a:b]), ("test", dedup[b:b + N_TEST])]
+    for i, (n1, p1) in enumerate(parts):          # pairwise disjoint by id and by normalized text
+        for n2, p2 in parts[i + 1:]:
+            assert not {r["id"] for r in p1} & {r["id"] for r in p2}, f"{domain}: {n1} / {n2} share ids"
+            assert not {norm_strict(text_of(r)) for r in p1} & {norm_strict(text_of(r)) for r in p2}, \
+                f"{domain}: {n1} / {n2} share texts"
 
     d = OUT / domain
     d.mkdir(parents=True, exist_ok=True)
     with open(d / "pool.jsonl", "w") as f:
         for r in final:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    for name, part in [("train", train), ("eval", evals)]:
+    (d / "pool_ids.json").write_text(json.dumps([r["id"] for r in final], indent=0) + "\n")   # one id per line
+    for name, part in parts:
         with open(d / f"{name}.jsonl", "w") as f:
             for r in part:
                 f.write(json.dumps(dict(r, split_pool=name), ensure_ascii=False) + "\n")
@@ -179,8 +188,9 @@ def build(domain, cfg):
         "removed_here": {k: len(v) for k, v in removed.items()},
         "overlap_hits_by_eval_set": dict(sorted(hit_by.items())),
         "clean_after_dedup": len(dedup),
-        "train": len(train),
-        "eval": len(evals),
+        "train": len(parts[0][1]),
+        "eval": len(parts[1][1]),
+        "test": len(parts[2][1]),
         "removed_ids": removed,
     }
     (d / "build_report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False) + "\n")

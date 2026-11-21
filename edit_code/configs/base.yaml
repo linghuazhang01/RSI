@@ -4,6 +4,14 @@
 
 draw_config: data/draw/paper_a.yaml
 
+# Scoring decoding per stage (2026-11-21): a dict {temperature, top_p, top_k, min_p, n, thinking, max_tokens, seed} for
+# rsicore.evaluate.score(decoding=...), the same for the incumbent / Q_0 / M_0 and every candidate (seed null = the
+# run's --seed); null = each task's eval/configs/tasks.yaml decoding (greedy). full falls back to screen. n > 1:
+# each item's score is the mean of its n samples. Cached evaluations are reused only under the same decoding.
+decoding:
+  screen: null
+  gate: null
+
 # Data size of every step (null = keep the draw config's value). The draw sizes below override
 # data/draw/paper_a.yaml for this run (written to <run>/draw_config.effective.yaml and locked with the run).
 # n / gate_n: a number (every domain) or {math: 1000, code: 500}. Other step sizes live next to their step:
@@ -58,15 +66,39 @@ objective_profiles:
     gate: {min_delta: 1.0e-6, require_significant: false}        # accept any strictly higher eval-set score
     feedback: {examples: 5}
     heldout: {domains: eval_target, decoding: null}   # evaluated on the same eval set, greedy (2026-11-21)
-  # simple (2026-11-21; ./launch.sh --simple): simple_data/<domain> (data/scripts/make_simple_data.py, sampled from the
-  # decontaminated training pool): train on its 1,500 items (signal / screen = all of them every generation, KL /
-  # calibration texts = 400 of them), accept on its 500 (the usual paired gate), and the held-out report is the same
-  # 500 items (data_roles.eval = gate, greedy like the gate). The editor gets at most 20 tool rounds per candidate
-  # (context editor.context_tokens = 131072 from the hardware profile). Run ids end in _simple.
+  # simple (2026-11-21, v2; ./launch.sh --simple): simple_data/<domain> (data/scripts/make_simple_data.py, sampled from
+  # the decontaminated training pool). Train role simple_<d>_pool: every generation draws a fresh screen of
+  # simple.screen_n (default 500) items from the pool minus the eval / test items (rsicore.draws; the same items in
+  # Paper A's generation g and Paper B's g-1), KL / calibration texts = 400 other pool items of that generation.
+  # Gate = simple_<d>_eval (500 items, the usual paired gate); held-out report = simple_<d>_test (500 other items).
+  # Every score is sampled in Qwen3 thinking mode (0.6 / 0.95 / top_k 20, 16384 tokens, the run seed for the
+  # incumbent and every candidate). FINAL flow (2026-11-21): the incumbent (latest model) answers the generation's
+  # screen items ONCE (n 4; shared by every thread / step; full = screen, top_full 0); candidates are NOT screened
+  # (screen_candidates false): the editor reads the incumbent's results (context summary + screen_results /
+  # screen_output tools, full outputs incl. thinking). There is no api.evaluate (program_evaluate_calls 0). Every
+  # candidate gets ONE gate evaluation (gate_every_candidate: 500 x 4, paired vs the incumbent's gate records;
+  # recorded in gen_XX/gate.json, visible to later steps / generations); the passing candidate with the largest gain
+  # is accepted. Cost: threads x steps x 500 x 4 thinking samples per generation on the gate set; the held-out test
+  # set (500 x 4) is the only unbiased number. Search: 8 independent threads x 1 step (both configurable; prompts use
+  # the configured numbers). Candidate servers get --max-model-len 32768 (prompt + 16384). The editor gets at most
+  # editor.tool_rounds = 20 tool rounds per candidate (configurable; context editor.context_tokens = 131072 from the
+  # hardware profile); run_python keeps one persistent session per proposal (editor.explore.persistent). Run ids end
+  # in _simple; a changed profile needs a new --run-id / --tag.
   simple:
-    data_roles: {eval: gate}          # held-out evaluation = simple_<domain>_eval (the 500 gate items)
-    heldout: {enabled: true, decoding: null}   # greedy (each task's tasks.yaml decoding)
-    editor: {tool_rounds: 20}
+    data_roles: {eval: test}          # held-out evaluation = simple_<domain>_test (train / gate: the defaults
+                                      # simple_<d>_pool / simple_<d>_eval from rsicore.evalsets)
+    gate: {min_delta: 0.0}              # (2026-11-21) acceptance threshold of the simple runs: any strictly positive paired gate gain
+    heldout:
+      enabled: true
+      decoding: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null,
+                 n_by_task: null}
+    decoding:
+      screen: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
+      gate: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
+    search: {threads: 8, steps: 1, max_candidates: 8, charge_screens: false, program_evaluate_calls: 0,
+             program_evaluate_total: 0, top_full: 0, screen_candidates: false, gate_every_candidate: true}
+    vllm: {candidate_max_model_len: 32768}
+    editor: {tool_rounds: 20, explore: {persistent: true}}
 
 # One fixed size for every generation. Every candidate quantizes the ORIGINAL BF16 model M_0 (the layer
 # cache is built once); generation g must beat the incumbent (best accepted quantization so far).
@@ -93,7 +125,19 @@ search:                               # inner search (RSI_LOOP_DESIGN §1.2)
   threads: 4
   steps: 6
   max_evaluate: 24                    # evaluations per generation: candidates + api.evaluate calls
-  program_evaluate_calls: 2           # max api.evaluate calls inside one program
+  program_evaluate_calls: 2           # max api.evaluate calls inside one program (null = no per-program cap)
+  # 2026-11-21 (simple v2; edit_code.common.search_settings, code defaults = the behaviour above):
+  max_candidates: null                # candidates per generation (null = threads x steps, at most max_evaluate
+                                      # while screens are charged)
+  charge_screens: true                # true: every returned config's screen spends max_evaluate (shared with
+                                      # api.evaluate). false: screens are free, programs always run, api.evaluate
+                                      # draws on program_evaluate_total and a config already evaluated is free
+  program_evaluate_total: null        # api.evaluate pool per generation when screens are free (null = threads x
+                                      # program_evaluate_calls)
+  screen_candidates: true             # false (objective simple): candidates are not screened; the incumbent's screen
+                                      # is still computed once per generation and shown (screen_results / screen_output)
+  gate_every_candidate: false         # true (objective simple): ONE gate evaluation per candidate during the search
+                                      # (gen_XX/gate.json); the largest passing gain is accepted (no submit_to_gate)
   top_full: 3                         # best screened candidates re-evaluated on the full signal set
   rerun_seeds: 0
   kl_weight: 0.5                      # score = retention (candidate acc / incumbent acc) - kl_weight * KL vs BF16 [pilot]
@@ -222,6 +266,8 @@ editor:
     timeout_s: 300                    # per call
     mem_gb: 8
     gpu_tools: false                  # true: group_error may compute uncached settings (lazy GPTQ / AWQ on the GPU)
+    persistent: false                 # true (objective simple; rsicore.chat_tools, 2026-11-21): one sandbox session
+                                      # per proposal, variables persist across run_python calls (timeout -> restart)
     gpu_seconds: 300                  # (Paper B only; kept for a shared editor block)
 
 sandbox:
@@ -236,7 +282,8 @@ heldout:
   domains: all                        # all | run (= the run's --domain; scope=single) | a domain list
   limit: null                         # per-task item limit (null = full held-out sets)
   # Held-out decoding (2026-11-20): sampled, Qwen's non-thinking recommendation, same seed as the run; avg@n.
-  # (Search, gate and noise stay greedy.) null = each task's tasks.yaml decoding (greedy).
+  # (Search, gate and noise stay greedy unless `decoding:` above says otherwise.) null = each task's tasks.yaml
+  # decoding (greedy).
   decoding:
     temperature: 0.7
     top_p: 0.8
@@ -262,6 +309,9 @@ baselines:
 vllm:                                 # editor_args' --max-model-len is replaced by editor.context_tokens (see editor:)
   editor_args: [--gpu-memory-utilization, "0.90", --max-model-len, "131072", --max-logprobs, "20"]
   candidate_args: [--gpu-memory-utilization, "0.55", --max-model-len, "20480", --max-logprobs, "20"]
+  candidate_max_model_len: null       # 2026-11-21: replaces --max-model-len of candidate_args (also the hardware
+                                      # profiles' ones; candidate servers, M_0 replicas, exported models); null = as
+                                      # written. objective simple: 32768 (prompt + 16384 thinking tokens)
 
 
 # GPU roles (edit_code/common.py gpu_layout). gpu_roles unset = EVERY GPU of --gpus is used: the editor
@@ -334,3 +384,6 @@ mock_overrides:                       # applied in --mock runs only (fast local 
   baselines: {methods: [uniform, kl_greedy]}
   sandbox: {timeout_s: 300, mem_gb: 4}
   editor: {proposal_wall_s: 600, explore: {timeout_s: 120, mem_gb: 4}}   # (mock_overrides win over --set)
+mock_objective_overrides:             # --mock runs of that objective, applied after mock_overrides (2026-11-21):
+  simple:                             # the simple layout (k threads x 1 step, gate per candidate, no evaluate), small
+    search: {threads: 3, steps: 1, max_candidates: 3, top_full: 0, program_evaluate_calls: 0}

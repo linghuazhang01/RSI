@@ -1,0 +1,296 @@
+# Paper A · math · 8 GPUs (B300) · 8 threads x 1 step · up to 30 tool rounds per candidate · objective simple v2
+# self-quantization: the frozen M_0 writes quantization configs (fixed W4-size budget); the incumbent is the latest model.
+# Generated (2026-11-21) from the merged config: edit_code/configs/base.yaml + domains/math.yaml + hardware b300 + scope single
+# + objective simple + --set editor.tool_rounds=30. Not read by the code; the run locks its own copy in
+# experiment_records/A_math_s42_single_simple_r30/run_config.yaml.
+#
+# Start (one experiment uses all 8 GPUs):
+#   ./launch.sh --hw b300 --paper A --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30 --set editor.tool_rounds=30
+# Without the significance test (nosig):
+#   ./launch.sh --hw b300 --paper A --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30_nosig --set editor.tool_rounds=30 --set gate.require_significant=false
+# H20 (110 GB): replace --hw b300 with --hw h20.
+#
+# GPU roles: GPU 0 = editor (M_0, vLLM; sleeps while candidates are evaluated and lends its GPU); GPUs 1-7 = 7 candidate
+#   servers (each candidate's gate evaluation and the incumbent's screen / gate / test runs are spread over them)
+# Data (simple_data/math/): gate = simple_math_eval (500 fixed, hidden: the editor sees only statistics of earlier
+#   candidates' gate results); test = simple_math_test (500 fixed, held-out report only); screen = 500 items drawn afresh
+#   each generation from the dapo_math pool minus gate and test; train = all remaining pool items (~13,200).
+# Each generation:
+#   1. the latest model answers the 500 screen items 4 times each, once; the editor sees the detailed results (summary in
+#      every message; screen_results / screen_output tools incl. the thinking text);
+#   2. 8 independent sessions (search.threads 8, steps 1), each up to editor.tool_rounds 30 rounds of tool calls in ONE
+#      persistent Python session (editor.explore.persistent), then a program (no api.evaluate) -> one candidate;
+#   3. each candidate: ONE gate evaluation (500 x 4, paired with the latest model); statistics visible to later sessions;
+#   4. accept the candidate with the largest paired gate gain >= gate.min_delta 0.0 (any strictly positive gain) (require_significant True
+#      here; the nosig command sets it false); then the test set (500 x 4).
+# Decoding (screen / gate / test): thinking on, temperature 0.6, top_p 0.95, top_k 20, max_tokens 16384.
+draw_config: data/draw/paper_a.yaml
+decoding:
+  screen:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
+  gate:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    thinking: true
+    max_tokens: 16384
+    n: 4
+    seed: 42
+data:
+  n: null
+  screen_n: null
+  kl_contexts: null
+  gate_n: null
+max_tokens:
+  dapo_math: 4096
+  taco_verified: 4096
+  ifeval_train: 2048
+  sealtool_train: 1024
+  triviaqa_train: 1024
+  math_eval: 4096
+scope: single
+objective: simple
+budget:
+  gib: null
+  reference:
+    default:
+      bits: 4
+      group_size: 128
+      quantizer: gptq
+    embed: 8
+    lm_head: 8
+loop:
+  editor: frozen
+  patience: 2
+action_space:
+  bits:
+  - 2
+  - 3
+  - 4
+  - 8
+  - 16
+  group_sizes:
+  - 32
+  - 64
+  - 128
+  quantizers:
+  - rtn
+  - gptq
+  - awq
+  embed:
+  - bf16
+  - 8
+  - 4
+  lm_head:
+  - bf16
+  - 8
+  - 4
+search:
+  threads: 8
+  steps: 1
+  max_evaluate: 24
+  program_evaluate_calls: 0
+  max_candidates: 8
+  charge_screens: false
+  program_evaluate_total: 0
+  screen_candidates: false
+  gate_every_candidate: true
+  top_full: 0
+  rerun_seeds: 0
+  kl_weight: 0.5
+gate:
+  min_delta: 0.0
+  require_significant: true
+  max_submissions: 3
+  allow_unscored: false
+feedback:
+  examples: 2
+noise:
+  repeats: 3
+  temperature: 0.0
+  top_p: 1.0
+  n: null
+  fixed: null
+kl:
+  domains: run
+  top_k: 20
+  max_chars: 8000
+  self_generated: true
+  self_generated_max_tokens: 2048
+  self_generated_batch: 64
+  eval_texts: 400
+calibration:
+  max_texts: 256
+  max_len: 2560
+  layers_per_pass: 16
+diagnostics:
+  profile_bits:
+  - 2
+  - 3
+  - 4
+  profile_group_size: 128
+  profile_contexts: 64
+  profile_max_len: 512
+  hessian_quantizers:
+  - rtn
+  - gptq
+  - awq
+  hessian_bits: null
+cache:
+  device: cuda
+  lazy: true
+  gptq_damp: 0.01
+  warm:
+  - quantizer: rtn
+    bits: 2
+    group_size: 128
+  - quantizer: rtn
+    bits: 3
+    group_size: 128
+  - quantizer: rtn
+    bits: 4
+    group_size: 128
+  - quantizer: rtn
+    bits: 8
+    group_size: 128
+  - quantizer: gptq
+    bits: 2
+    group_size: 128
+  - quantizer: gptq
+    bits: 3
+    group_size: 128
+  - quantizer: gptq
+    bits: 4
+    group_size: 128
+  - quantizer: gptq
+    bits: 8
+    group_size: 128
+  - quantizer: awq
+    bits: 2
+    group_size: 128
+  - quantizer: awq
+    bits: 3
+    group_size: 128
+  - quantizer: awq
+    bits: 4
+    group_size: 128
+candidates:
+  keep_checkpoints: 1
+bytes:
+  count_visual: true
+tools:
+  profile_table: true
+  activation_table: true
+  solve_allocation: true
+  hessian_table: true
+  group_error: true
+  compare: true
+solver:
+  group_sizes:
+  - 128
+  group_size_factor:
+    128: 1.0
+    64: 0.8
+    32: 0.65
+editor:
+  temperature: 0.6
+  top_p: 0.95
+  max_tokens: 16384
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: true
+    top_k: 20
+    min_p: 0.0
+  tool_rounds: 30
+  turn_max_tokens: 8192
+  max_tool_calls: 100
+  proposal_tokens: 160000
+  proposal_wall_s: 2400
+  context_tokens: 131072
+  tool_result_chars: 6000
+  compact_at: 0.6
+  keep_tool_rounds: 8
+  keep_reasoning_rounds: 2
+  reasoning_passback: think_tag
+  history_keep: 2
+  timeout_s: 3600
+  mock_tool_rounds: 1
+  explore:
+    timeout_s: 300
+    mem_gb: 8
+    gpu_tools: false
+    persistent: true
+    gpu_seconds: 300
+sandbox:
+  timeout_s: 1800
+  mem_gb: 16
+archive:
+  enabled: true
+  top_candidates: 3
+heldout:
+  domains: math
+  limit: null
+  decoding:
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    seed: 42
+    n: 4
+    n_by_task: null
+    thinking: true
+    max_tokens: 16384
+  enabled: true
+e_task:
+  enabled: false
+  budget_gib: null
+  evaluate: 24
+  threads: 4
+  steps: 6
+  top_full: 1
+  heldout_limit: 200
+baselines:
+  methods: []
+  full: false
+  evo_evaluations: 24
+vllm:
+  editor_args:
+  - --rsi-gpu-memory-gib
+  - '220'
+  - --gpu-memory-utilization
+  - '0.81'
+  - --max-model-len
+  - '131072'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  candidate_args:
+  - --rsi-gpu-memory-gib
+  - '220'
+  - --gpu-memory-utilization
+  - '0.81'
+  - --max-model-len
+  - '20480'
+  - --max-num-seqs
+  - '128'
+  - --max-logprobs
+  - '20'
+  candidate_max_model_len: 32768
+gpu_roles: null
+gpu_layout:
+  share_single_gpu: true
+  candidate_group_size: 1
+  editor_sleep: true
+  m0_replicas: true
+  parallel_heldout: true
+  prep_all_gpus: true
+hardware: b300
+domain: math
+data_roles:
+  eval: eval:simple_math_test

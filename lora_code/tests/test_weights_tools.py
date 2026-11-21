@@ -85,6 +85,15 @@ def test_tool_surface_per_mode(tmp_path):
     assert W_TOOLS <= names and "raw_lora" not in names
     sc = _ws(tmp_path / "s", mode="scratch")
     assert not (W_TOOLS & set(sc.api.names()))
+    # tensor tools (2026-11-21): every mode when enabled (objective simple by default), not a WEIGHT_TOOL; the
+    # weights doc documents writes / caps / the edit arg
+    assert not {"tensors", "tensor_compute"} & names                   # this workspace's cfg has no objective
+    on = {"objective": "simple"}
+    w = tools_for_mode("weights", cfg=on)
+    assert {"tensors", "tensor_compute"} <= set(w) and {"tensors", "tensor_compute"} <= set(tools_for_mode("scratch", cfg=on))
+    assert "writes" in w["tensor_compute"] and "edit=None" in w["tensor_compute"] and "vector_cap_tau" in w["tensor_compute"]
+    assert "writes" not in tools_for_mode("scratch", cfg=on)["tensor_compute"]
+    assert not {"tensors", "tensor_compute"} & set(tools_for_mode("weights", cfg={"tools": {"tensor_compute": False}}))
 
 
 def test_weight_tools_change_gain_damage_rel(tmp_path):
@@ -173,6 +182,33 @@ def test_check_rejects(tmp_path):
     assert rep["top_rel_norm"][0]["ops"] == 1
 
 
+def test_check_nonlinear_tensor_entries(tmp_path):
+    """Mock edits of non-linear tensors (tensor_compute writes, 2026-11-21): 1-D entries use weights.vector_cap_tau,
+    >= 2-D ones norm_cap_tau; embed_tokens / final norm / lm_head are refused."""
+    from lora_code.mock import MockStore, MockWeightEdit, m_w_delta
+    ws = _ws(tmp_path, cfg={"weights": {"norm_cap_tau": 0.05, "vector_cap_tau": 0.4}})
+    dt, conv = "layers.0.linear_attn.dt_bias", "layers.0.linear_attn.conv1d.weight"
+    e = m_w_delta(MockWeightEdit(), dt, 0.3, 1, tau_ratio=0.05 / 0.4)
+    e = m_w_delta(e, conv, 0.04, 3)
+    assert e.modules_[dt] == {"rank": 0, "rel": 0.3, "ndim": 1} and e.modules_[conv]["ndim"] == 3
+    assert e.gain > 0 and e.ops[-1] == ["w_delta", [conv], 0.04]
+    ok, rep = ws.check(e)
+    assert ok, rep
+    assert rep["modules"][dt] == {"rel_norm": 0.3, "ops": 1}
+    ok, rep = ws.check(m_w_delta(e, dt, 0.3, 1))                       # sqrt(0.3^2 + 0.3^2) = 0.42 > 0.4
+    assert not ok and "(1-D tensor)" in rep["errors"][0]
+    ok, rep = ws.check(m_w_delta(MockWeightEdit(), conv, 0.06, 3))
+    assert not ok and "tau 0.05" in rep["errors"][0]
+    for bad, needle in (("norm.weight", "never editable"), ("lm_head.weight", "never editable"),
+                        ("layers.0.linear_attn.nope", "not in model")):
+        ok, rep = ws.check(MockWeightEdit({bad: {"rank": 0, "rel": 0.01, "ndim": 1}}))
+        assert not ok and needle in rep["errors"][0], rep
+    st = MockStore()
+    assert st.edit_name("layers.0.mlp.down_proj.weight") == "layers.0.mlp.down_proj" and st.editable(dt)
+    assert st.tensor_shape(conv) == (10240, 1, 4) and st.tensor_key("lm_head.weight") == "lm_head.weight"
+    assert st.synth_spec("layers.0.input_layernorm.weight")["mean"] == 0.0               # zero-centred RMSNorm
+
+
 def test_resolve_result(tmp_path):
     from lora_code.mock import MockLoRA, MockWeightEdit, m_construct
     ws = _ws(tmp_path)
@@ -252,6 +288,8 @@ def test_program_build_weights(tmp_path):
     assert classify(["new_edit", "w_scale_rows", "scale"]) == "weights+ops"
     assert classify(["scale_singular", "truncate_rank", "w_add_lora"]) == "weights+construct+ops"
     assert classify(["scale_singular"]) == "pure_construct"
+    assert classify(["tensor_compute", "tensor_compute.writes"]) == "weights_only"
+    assert classify(["tensor_compute", "tensor_compute.lora", "tensor_compute.writes"]) == "weights+construct"
 
 
 def test_evaluate_tool_with_edits(tmp_path):

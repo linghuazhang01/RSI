@@ -71,30 +71,48 @@ class DataRolesTest(unittest.TestCase):
         self.assertTrue(draws.is_eval_set("math_eval") and not draws.is_eval_set("dapo_math"))
 
     def test_simple_objective(self):
-        """objective simple: simple_data's 1,500 train / 500 gate items per domain; the held-out report is the same 500
-        (data_roles.eval = gate, greedy); editor at most 20 tool rounds."""
+        """objective simple (v2, 2026-11-21): train role = the whole clean pool (simple_<d>_pool; a fresh 500-item
+        screen every generation, drawn from pool - gate - test), gate = simple_<d>_eval (500), held-out =
+        simple_<d>_test (500, data_roles.eval: test, set here explicitly: the base.yaml simple profiles belong to the
+        papers); editor at most 20 tool rounds."""
         for paper in ("A", "B"):
             for d in ("math", "code", "knowledge", "instruction_following", "tool_calling"):
-                rc = self.load(paper, d, "objective=simple")
+                rc = self.load(paper, d, "objective=simple", "data_roles.eval=test")
                 r = draws.roles(rc)
-                self.assertEqual(r, {"train": f"simple_{d}_train", "gate": f"simple_{d}_eval"})
+                self.assertEqual(r, {"train": f"simple_{d}_pool", "gate": f"simple_{d}_eval"})
                 self.assertTrue(rc.run_id.endswith("_single_simple_mock"), rc.run_id)
                 self.assertTrue(rc.paper_cfg["heldout"]["enabled"])
-                self.assertIsNone(rc.paper_cfg["heldout"]["decoding"])
-                self.assertEqual(heldout_tasks(heldout_domains(rc.paper_cfg)), [(f"simple_{d}_eval", "pool")])
+                self.assertEqual(heldout_tasks(heldout_domains(rc.paper_cfg)), [(f"simple_{d}_test", "pool")])
                 self.assertEqual(rc.paper_cfg["editor"]["tool_rounds"], 20)
-                self.assertEqual(len(draws.ids(rc, 2, r["train"], "screen")), 1500)
-                self.assertEqual(len(draws.gate_ids(rc, r["gate"])), 500)
-                self.assertTrue(set(draws.ids(rc, 2, r["train"], "train")).isdisjoint(draws.gate_ids(rc, r["gate"])))
+                gate, test = draws.gate_ids(rc, r["gate"]), draws.build_eval_set(f"simple_{d}_test")
+                pool = draws.build_eval_set(r["train"])
+                self.assertEqual((len(gate), len(test)), (500, 500))
+                self.assertEqual(sorted(pool), json.loads((ROOT / "simple_data" / d / "pool_ids.json").read_text()))
+                scr2, scr3 = (draws.ids(rc, g, r["train"], "screen") for g in (2, 3))
+                tr2 = draws.ids(rc, 2, r["train"], "train")
+                self.assertEqual(len(scr2), 500)
+                self.assertNotEqual(scr2, scr3)                                  # a fresh screen every generation
+                self.assertEqual(draws.ids(rc, 2, r["train"], "signal"), scr2)
+                self.assertEqual(set(scr2) | set(tr2), set(pool) - set(gate) - set(test))
+                for a, b in ((scr2, tr2), (scr2, gate), (scr2, test), (tr2, gate), (tr2, test), (gate, test)):
+                    self.assertTrue(set(a).isdisjoint(b))
+                self.assertFalse((rc.run_dir / "draws" / "gate").exists())       # draw.py never ran
         rc = self.load("B", "math", "objective=simple", "data_roles.gate=simple_train")      # shorthand
         self.assertEqual(draws.roles(rc)["gate"], "simple_math_train")
         self.assertTrue(rc.run_id.endswith("_simple_gate-simple_math_train_mock"), rc.run_id)
+        rc = self.load("A", "code", "objective=simple", "data_roles.eval=simple_test,gate")
+        self.assertEqual(heldout_tasks(heldout_domains(rc.paper_cfg)), [("simple_code_test", "pool"),
+                                                                        ("simple_code_eval", "pool")])
+        rc = self.load("A", "math", "objective=simple", "data_roles.train=simple_train")      # the older 1,500 items
+        self.assertEqual(len(draws.ids(rc, 1, "simple_math_train", "screen")), 1500)
+        self.assertTrue(rc.run_id.endswith("_simple_train-simple_math_train_mock"), rc.run_id)
 
     def test_refusals(self):
         bad = [("A", "math", "data_roles.train=humanevalplus"),           # other domain
                ("B", "math", "data_roles.gate=nope"),                      # unknown
                ("A", "math", "data_roles.gate=math500", "scope=all"),      # eval set needs scope single
                ("B", "math", "data_roles.eval=train"),                     # train is a training set
+               ("B", "math", "data_roles.eval=test"),                      # test needs objective simple
                ("B", "math", "data_roles.other=x")]
         for paper, domain, *sets in bad:
             with self.assertRaises(SystemExit, msg=sets):

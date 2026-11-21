@@ -5,6 +5,21 @@ The editor (the original model M_0, frozen; or the incumbent with loop.editor=cu
 evaluates, a compact diagnostics summary (first step), the table of all candidates so far (all
 threads), the best candidate's config, this thread's last feedback with 2-3 regression examples,
 and the archive of earlier generations (experience channel; switchable).
+
+simple v2 (2026-11-21, search_settings from edit_code.common): with free automatic screens
+(search.charge_screens false) the budget text says that returned configs are scored at no cost and that api.evaluate
+draws on a separate per-round pool (left N, at most k per program); with steps 1 each thread is told that it is
+session k of N working independently this round and should use search_history / the archive to try something
+different from earlier rounds; the "improve on the best candidate" line is dropped while nothing of this round is
+visible. With the old settings (charged screens, several steps) the text is unchanged.
+
+Gate per candidate (2026-11-21, objective simple: search.screen_candidates false, gate_every_candidate true,
+program_evaluate_calls 0): no api.evaluate anywhere (tool, docs and prompt text removed); the editor sees the
+incumbent's (latest model's) answers to this round's screen items (summary in the context, full data through
+screen_results / screen_output); every returned config gets ONE gate evaluation and later steps / rounds see its gate
+statistics (candidate table, own feedback, search_history, archive); the acceptance text names the end-of-round rule
+(largest passing gain). Thread / step / tool-round numbers always come from the config. editor.explore.persistent:
+the protocol says that run_python variables persist within a proposal.
 """
 from __future__ import annotations
 
@@ -38,36 +53,113 @@ Config schema (JSON object):
 Answer with a short plan, then exactly one ```python code block containing the full program."""
 
 
+NO_EVAL_EXPLORE = " api.evaluate is NOT available there (only your final program may evaluate)"
+PERSIST_NONE = "Nothing persists between run_python calls or into your final program: it must be self-contained."
+PERSIST_SESSION = ("Variables, imports and functions persist between your run_python calls while you write this program "
+                   "(one session; a timeout or crash restarts it and loses them), but not into your final program: it "
+                   "must be self-contained.")
+
 FINAL_RULE = "Answer with a short plan, then exactly one ```python code block containing the full program."
 
 # editor.tool_rounds > 0 (2026-11-21): the editor may call chat tools before answering; replaces FINAL_RULE
 TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds:
-- run_python(code) runs exploratory code in the same sandbox with the same `api` (keyword arguments as above), so you can inspect and filter the tables and check configs before you commit to a program. api.evaluate is NOT available there (only your final program may evaluate){group_error}. print() what you need or set `result = ...`; output is cut to a few thousand characters, so filter big tables in the code.
+- run_python(code) runs exploratory code in the same sandbox with the same `api` (keyword arguments as above), so you can inspect and filter the tables and check configs before you commit to a program.{no_eval}{group_error}. print() what you need or set `result = ...`; output is cut to a few thousand characters, so filter big tables in the code.
 - read_record(cid, part) shows the full program ("program") or the full feedback ("feedback", with the full config) of a candidate in the table{history_read}.{history}
-Nothing persists between run_python calls or into your final program: it must be self-contained.
+{persist}
 When you are done, reply WITHOUT a function call: a short plan, then exactly one ```python code block containing the full program."""
 
 
-def _tool_rounds(cfg: dict) -> tuple[int, bool]:
-    """(editor.tool_rounds, editor.explore.gpu_tools) with the rsicore.editor defaults."""
+def _tool_rounds(cfg: dict) -> tuple[int, bool, bool]:
+    """(editor.tool_rounds, editor.explore.gpu_tools, editor.explore.persistent) with the rsicore.editor defaults
+    (the round count is always the configured one, e.g. 20 in the simple profile)."""
     try:
         from rsicore.editor import editor_settings
         s = editor_settings(cfg)
-        return int(s["tool_rounds"] or 0), bool(s["explore"].get("gpu_tools"))
+        ex = s.get("explore") or {}
     except ImportError:                      # pragma: no cover - rsicore not on sys.path
-        e = cfg.get("editor") or {}
-        return int(e.get("tool_rounds", 50) or 0), bool((e.get("explore") or {}).get("gpu_tools"))
+        s = cfg.get("editor") or {}
+        s = {"tool_rounds": s.get("tool_rounds", 50)}
+        ex = (cfg.get("editor") or {}).get("explore") or {}
+    if "persistent" not in ex:               # rsicore.editor_settings may not know the key yet
+        ex = dict(ex, persistent=((cfg.get("editor") or {}).get("explore") or {}).get("persistent", False))
+    return int(s["tool_rounds"] or 0), bool(ex.get("gpu_tools")), bool(ex.get("persistent"))
 
 
-def acceptance_text(cfg: dict) -> str:
-    """The acceptance rule as configured (2026-11-21; gate.min_delta / require_significant), not a fixed text."""
+def acceptance_text(cfg: dict, gate_every: bool = False) -> str:
+    """The acceptance rule as configured (2026-11-21; gate.min_delta / require_significant), not a fixed text.
+    gate_every (search.gate_every_candidate): every candidate is gated; the largest passing gain is accepted."""
     g = cfg.get("gate") or {}
     md = float(g.get("min_delta", 0.0))
-    rule = f"mean gain >= {md:g} ({md * 100:g} accuracy points)"
+    rule = (f"mean gain >= {md:g} ({md * 100:g} accuracy points)" if md > 0
+            else "a positive mean gain")       # (2026-11-21) threshold 0: any strictly positive gain
     rule += (", a statistically significant gain and no significant loss on any domain"
              if g.get("require_significant", True) else "; there is no significance test")
+    if gate_every:
+        return ("Acceptance (end of the round): a config passes its gate evaluation when size <= budget and it beats "
+                f"the incumbent on the fixed gate set (paired per item: {rule}); among the passing configs of the "
+                "round the one with the LARGEST gain becomes the new incumbent. None passes: the incumbent stays.")
     return ("Acceptance (after the search, not visible to you): size <= budget and a higher score than the incumbent "
             f"on a fixed hidden test set (paired per item: {rule}). Otherwise the incumbent stays.")
+
+
+EVAL_BLOCK = ("Each program's returned config is evaluated on held-back training items and compared with the INCUMBENT on "
+              "the same items (retention = your accuracy / the incumbent's; paired delta; KL vs the original BF16 "
+              "model); you then see the feedback and may improve. api.evaluate(config) inside a program spends the "
+              "same per-round evaluate budget.")
+COMPARE_SENTENCE = ("; compare(cid) compares an evaluated candidate with the incumbent (or another candidate) item by "
+                    "item: which items broke / got fixed (ids only), by output length, truncation")
+EVAL_SENTENCE = "api.evaluate(config) inside a program spends the same per-round evaluate budget."
+FREE_EVAL_SENTENCE = ("Every config a program returns is scored automatically at no cost. api.evaluate(config) inside a "
+                      "program draws on a separate pool of {total} calls shared by this round's programs ({cap}); "
+                      "evaluating a config that was already evaluated this round is free.")
+
+
+FEEDBACK_SENTENCE = "; you then see the feedback and may improve."
+ONE_STEP_FEEDBACK = ("; you write one program per round, and later rounds see its feedback (search_history, the "
+                     "archive).")
+
+
+def _cap_text(per_program) -> str:
+    return "no per-program limit" if per_program is None else f"at most {per_program} per program"
+
+
+def gate_flow(search: dict | None) -> bool:
+    """search_settings with one gate evaluation per candidate and no candidate screen (objective simple)."""
+    return bool(search) and bool(search.get("gate_every_candidate")) and not search.get("screen_candidates", True)
+
+
+def _sizes(problem) -> dict:
+    """Screen / gate sizes for the prompt texts: items and samples per item (decoding n; 1 = greedy)."""
+    dec = getattr(problem, "decoding", None) or {}
+    out = {"screen_k": int((dec.get("screen") or {}).get("n") or 1), "gate_k": int((dec.get("gate") or {}).get("n") or 1)}
+    try:
+        out["screen_n"] = sum(len(problem.data[ds]["screen"]) for ds in problem.datasets)
+    except (AttributeError, KeyError, TypeError):
+        out["screen_n"] = None
+    try:
+        out["gate_n"] = sum(len(problem._ids(ds, "gate")) for ds in problem.gate_datasets)
+    except Exception:  # noqa: BLE001 - informative only
+        out["gate_n"] = None
+    return out
+
+
+def _items(n, k) -> str:
+    return (f"{n} items" if n else "the items") + (f" x {k} sampled answers" if k > 1 else "")
+
+
+GATE_FLOW_SENTENCE = ("The incumbent answered this round's screen items ({screen}, held-back TRAINING items; thinking "
+                      "mode): a summary is in your context and api.screen_results / api.screen_output give every item "
+                      "with its prompt, gold answer, extracted answers and the full outputs incl. the thinking, so you "
+                      "can see what the incumbent gets wrong, gets right only sometimes, or truncates. Your returned "
+                      "config is NOT scored on these items: it gets ONE evaluation on the fixed gate set ({gate}), "
+                      "paired per item with the incumbent; its gate result (accuracy, paired gain, CI, passed or not "
+                      "and why, ids of broken / fixed gate items, never their content) is shown to later sessions and "
+                      "rounds. There is no api.evaluate.")
+
+
+def free_screens(search: dict | None) -> bool:
+    """search_settings with free automatic screens (search.charge_screens false)."""
+    return bool(search) and not search.get("charge_screens", True)
 
 
 HISTORY_READ = " or of any earlier candidate that search_history lists"
@@ -77,19 +169,40 @@ HISTORY_LINE = ("\n- search_history(gen, sort, offset) lists every candidate alr
                 "so you do not spend an evaluation on a config that was already tried.")
 
 
-def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False) -> str:
+def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False, search: dict | None = None) -> str:
+    """search: edit_code.common.search_settings (2026-11-21); free automatic screens change the budget sentence."""
     sp = problem.space
-    g = cfg["gate"]
+    gflow = gate_flow(search)
+    no_eval = bool(search) and not search.get("evaluate_tool", True)
     text = SYSTEM_PROMPT.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
-                                quantizers=sp["quantizers"], acceptance=acceptance_text(cfg))
-    rounds, gpu_tools = _tool_rounds(cfg)
+                                quantizers=sp["quantizers"],
+                                acceptance=acceptance_text(cfg, gate_every=bool(search and search.get("gate_every_candidate"))))
+    if no_eval:                              # program_evaluate_calls 0: no evaluate tool anywhere (2026-11-21)
+        text = (text.replace(", `api.evaluate(config=cfg)`)", ")")
+                .replace("; evaluate(config) measures the real thing.", "; only a real evaluation measures the real thing.")
+                .replace("Analysis (free, no evaluate)", "Analysis (free)"))
+    if gflow:
+        sz = _sizes(problem)
+        text = text.replace(EVAL_BLOCK, GATE_FLOW_SENTENCE.format(screen=_items(sz["screen_n"], sz["screen_k"]),
+                                                                  gate=_items(sz["gate_n"], sz["gate_k"])))
+        text = text.replace(COMPARE_SENTENCE, "")
+    elif free_screens(search):
+        text = text.replace(EVAL_SENTENCE, FREE_EVAL_SENTENCE.format(total=search["eval_budget"],
+                                                                     cap=_cap_text(search.get("per_program"))))
+    if search and int(search.get("steps", 0)) == 1:   # one program per session and round: no feedback this round
+        text = text.replace(FEEDBACK_SENTENCE, ONE_STEP_FEEDBACK)
+    rounds, gpu_tools, persistent = _tool_rounds(cfg)
     if rounds > 0:                           # tool_rounds 0: byte-identical to the single-call prompt
         ge = ("" if gpu_tools or not (cfg.get("tools") or {}).get("group_error", True)
               else "; group_error there only accepts settings already cached (those of hessian_table)")
         if text.endswith(FINAL_RULE):
             text = text[:-len(FINAL_RULE)]
+        hl = HISTORY_LINE
+        if free_screens(search) or no_eval:
+            hl = hl.replace("so you do not spend an evaluation on a config", "so you do not repeat a config")
         text += TOOL_PROTOCOL.format(rounds=rounds, group_error=ge, history_read=HISTORY_READ if history else "",
-                                     history=HISTORY_LINE if history else "")
+                                     history=hl if history else "", no_eval="" if no_eval else NO_EVAL_EXPLORE,
+                                     persist=PERSIST_SESSION if persistent else PERSIST_NONE)
     return text
 
 
@@ -154,6 +267,46 @@ def history_row(rec: dict) -> dict:
             "kl": None if kl is None else round(float(kl), 4), "vs_incumbent": deltas or None}
 
 
+def gate_cell(g: dict | None) -> str:
+    """One-line gate result (2026-11-21, gate per candidate): passed / failed, gain [CI], broken / fixed counts."""
+    if not isinstance(g, dict):
+        return "-"
+    ci = g.get("ci")
+    ci = f" [{ci[0]:+.4f}, {ci[1]:+.4f}]" if isinstance(ci, list) and len(ci) == 2 and None not in ci else ""
+    gain = "-" if g.get("gain") is None else f"{g['gain']:+.4f}"
+    out = f"{'PASSED' if g.get('passed') else 'failed'} gain {gain}{ci}, broken {g.get('broken')} / fixed {g.get('fixed')}"
+    if not g.get("passed") and g.get("reason"):
+        out += f" ({str(g['reason']).split(' (')[0][:80]})"
+    return out
+
+
+def gate_table(history) -> str:
+    """Candidate table of the gate-per-candidate flow: size and the gate result (no screen / KL columns)."""
+    head = "| cid | thread | step | GiB | avg bits | gate accuracy | gain vs incumbent [95% CI] / broken / fixed |"
+    lines = [head, "|" + "---|" * (head.count("|") - 1)]
+    for c in history:
+        fb = _feedback(c) or {}
+        art = c.artifact or {}
+        g = fb.get("gate") if isinstance(fb.get("gate"), dict) else None
+        cell = "error: " + c.error.splitlines()[0][:80] if c.error else gate_cell(g)
+        lines.append(f"| {c.cid} | {c.thread} | {c.step} | {_fmt(art.get('bytes_gib'))} | "
+                     f"{_fmt(art.get('linear_avg_bits'), 2)} | {_fmt((g or {}).get('accuracy'), 4)} | {cell} |")
+    return "\n".join(lines)
+
+
+def screen_summary_text(summary: dict, chars: int = 3500) -> str:
+    """The incumbent's screen run for the context (rsicore.screen_view.summary)."""
+    if not summary or not summary.get("n_items"):
+        return "The incumbent's screen results are not available."
+    k = summary.get("samples_per_item")
+    head = (f"The incumbent on this round's {summary['n_items']} screen items ({k} sampled answers each, thinking): "
+            f"accuracy avg@{k} {summary.get('accuracy')}; items by number of correct samples "
+            f"{json.dumps(summary.get('correct_counts'))}; truncated samples {summary.get('truncation_rate')}"
+            f" (cut while thinking: {summary.get('truncated_thinking')}). Failing examples (all of them: "
+            "api.screen_results(filter='wrong' | 'unstable'); full outputs: api.screen_output(id, sample)):\n")
+    return head + json.dumps(summary.get("failing") or [], ensure_ascii=False)[:chars]
+
+
 def candidate_table(history, domains: list[str]) -> str:
     head = "| cid | thread | step | GiB | avg bits | KL | " + " | ".join(domains) + " | score | status |"
     lines = [head, "|" + "---|" * (head.count("|") - 1)]
@@ -174,15 +327,45 @@ def candidate_table(history, domains: list[str]) -> str:
     return "\n".join(lines)
 
 
-def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str = ""):
-    """Returns render_context(history, thread) -> str for rsicore.search.inner_search."""
+def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str = "", search: dict | None = None,
+                        history_tool: bool = False):
+    """Returns render_context(history, thread) -> str for rsicore.search.inner_search. search: search_settings
+    (2026-11-21; None = the old text); history_tool: the editor has the search_history chat tool."""
     n_examples = cfg["feedback"].get("examples", 2)
+    free = free_screens(search)
+    gflow = gate_flow(search)
+    one_step = bool(search) and int(search.get("steps", 0)) == 1
+    threads = int((search or {}).get("threads", 1))
+    steps = int((search or {}).get("steps", 1))
+    summary_cache = {}
+
+    def screen_summary() -> dict:
+        if "s" not in summary_cache:           # the incumbent's screen run is fixed for the whole search
+            try:
+                summary_cache["s"] = problem.screen_summary(examples=max(3, int(n_examples)))
+            except Exception as e:  # noqa: BLE001 - informative only
+                summary_cache["s"] = {"n_items": 0, "error": str(e)[:200]}
+        return summary_cache["s"]
 
     def render(history, thread: int) -> str:
         step = sum(1 for c in history if c.thread == thread)
-        parts = [f"[thread={thread} step={step} task={task} gen={problem.gen}]",
-                 f"Budget (fixed for every round): {problem.budget_gib:.3f} GiB packed. "
-                 f"Evaluates left this round: {problem.evals_left} (incl. api.evaluate calls)."]
+        budget = f"Budget (fixed for every round): {problem.budget_gib:.3f} GiB packed. "
+        if gflow:
+            budget += ("The config your program returns gets one gate evaluation (paired vs the incumbent); "
+                       f"this round: {threads} session(s) x {steps} step(s).")
+        elif free:
+            budget += ("The config your program returns is scored automatically at no cost. api.evaluate inside your "
+                       f"program draws on a separate pool: {problem.evals_left} left this round, "
+                       f"{_cap_text(search.get('per_program'))} (a config already evaluated this round is free).")
+        else:
+            budget += f"Evaluates left this round: {problem.evals_left} (incl. api.evaluate calls)."
+        parts = [f"[thread={thread} step={step} task={task} gen={problem.gen}]", budget]
+        if one_step and step == 0 and threads > 1:
+            src = "search_history and the archive of earlier rounds" if history_tool else "the archive of earlier rounds"
+            parts.append(f"You are session {thread + 1} of {threads} in this round. The other sessions work "
+                         "independently at the same time; you do not see their candidates and they do not see yours. "
+                         f"Use {src} to avoid repeating what earlier rounds already tried, and try something "
+                         "different from them.")
         if step == 0:
             info = problem.spec.summary()
             parts.append("Model: " + json.dumps({"num_layers": info["num_layers"], "layer_types": info["layer_types"],
@@ -190,7 +373,12 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
                                                  "params_by_group": info["params_by_group"],
                                                  "lm_head_tied": info["lm_head_tied"]}))
             inc = problem.incumbent
-            if inc:
+            if inc and gflow:
+                parts.append(f"Incumbent to beat (accepted in round {inc.get('gen')}, {inc.get('bytes_gib')} GiB, "
+                             f"linear avg bits {inc.get('linear_avg_bits')}); its gate accuracy: "
+                             + json.dumps(inc.get("gate_scores")) + "; config (compressed form): "
+                             + json.dumps(inc.get("config"))[:3000])
+            elif inc:
                 parts.append(f"Incumbent to beat (accepted in round {inc.get('gen')}, {inc.get('bytes_gib')} GiB, "
                              f"linear avg bits {inc.get('linear_avg_bits')}); its score on this round's items: "
                              + json.dumps(problem.incumbent_scores) + "; config (compressed form): "
@@ -204,7 +392,26 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
                 parts.append(f"Activation red flags (heavy outliers, {len(red)}): " + ", ".join(red[:30]))
             if archive:
                 parts.append("Archive of earlier generations:\n" + archive)
-        if history:
+        if gflow:
+            parts.append(screen_summary_text(screen_summary()))
+        if history and gflow:
+            parts.append("Candidates of this round so far, with their gate results (gain = paired accuracy gain over the "
+                         "incumbent on the gate set; broken / fixed = gate items the incumbent got right and the "
+                         "candidate wrong / the reverse; read_record(cid, 'feedback') has the ids):\n"
+                         + gate_table(history))
+            ok = [c for c in history if c.score is not None]
+            if ok:
+                best = max(ok, key=lambda c: c.score)
+                parts.append(f"Largest gate gain so far: {best.cid} ({best.score:+.4f}), config: "
+                             + json.dumps((best.artifact or {}).get("config"))[:2500])
+            mine = [c for c in history if c.thread == thread]
+            if mine:
+                last = mine[-1]
+                if last.error:
+                    parts.append(f"Your last program ({last.cid}) failed:\n{last.error[:2500]}")
+                else:
+                    parts.append(f"Gate result of your last candidate {last.cid}:\n" + json.dumps(_feedback(last))[:3500])
+        elif history:
             parts.append("All candidates so far (score = retention vs the incumbent - KL penalty; "
                          "(+/-delta vs the incumbent on the same items, * = significant)):\n"
                          + candidate_table(history, problem.domains))
@@ -225,8 +432,16 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
                     if regs:
                         parts.append("Items the incumbent got right and your candidate got wrong:\n"
                                      + json.dumps(regs, ensure_ascii=False)[:3000])
-        parts.append("Beat the incumbent: improve on the best candidate (yours or another thread's) or try a different idea. "
-                     "Return one ```python block with def main(api): ... return config.")
+        if gflow and history and steps > 1:
+            parts.append("Beat the incumbent: improve this thread's best config using the gate results above, borrow "
+                         "from other threads, or try a different idea. Return one ```python block with def main(api): "
+                         "... return config.")
+        elif not history and (free or one_step or gflow):    # nothing of this round is visible (2026-11-21)
+            parts.append("Beat the incumbent: try an idea that differs from what earlier rounds tried. "
+                         "Return one ```python block with def main(api): ... return config.")
+        else:
+            parts.append("Beat the incumbent: improve on the best candidate (yours or another thread's) or try a "
+                         "different idea. Return one ```python block with def main(api): ... return config.")
         return "\n\n".join(parts)
 
     return render
@@ -237,8 +452,17 @@ def archive_text(entries: list[dict]) -> str:
     Scores of different rounds are on different training items (compare within a round)."""
     lines = []
     for e in entries:
+        if e.get("reference_screen"):           # gate per candidate (2026-11-21): the incumbent's screen run instead
+            rs = e["reference_screen"]
+            ref = (f"incumbent on that round's screen items: accuracy {rs.get('accuracy')}, items by correct samples "
+                   f"{json.dumps(rs.get('correct_counts'))}, truncated {rs.get('truncation_rate')} "
+                   f"(screen_results(gen={e['gen']}))")
+        else:
+            ref = f"incumbent score on that round's items {e.get('incumbent_score')}"
         lines.append(f"- round {e['gen']}: new incumbent accepted={e.get('accepted')}; gate: {str(e.get('gate_reason'))[:300]}; "
-                     f"incumbent score on that round's items {e.get('incumbent_score')}")
+                     + ref)
         for c in e.get("top") or []:
-            lines.append(f"    {c['cid']}: score {c.get('score')}, {c.get('bytes_gib')} GiB, config {json.dumps(c.get('config'))[:600]}")
+            g = f", gate {gate_cell(c['gate'])}" if isinstance(c.get("gate"), dict) else ""
+            sc = "" if c.get("gate") else f"score {c.get('score')}, "
+            lines.append(f"    {c['cid']}: {sc}{c.get('bytes_gib')} GiB{g}, config {json.dumps(c.get('config'))[:600]}")
     return "\n".join(lines)
