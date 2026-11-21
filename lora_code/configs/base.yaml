@@ -214,6 +214,9 @@ nonllm:                     # 4th branch, same evaluate budget as the editor; wh
                             #   edit: random rule-based edits of the raw LoRA (scale / truncate / intruder / prune / regmean)
                             #   scratch: random gradient-free constructions (singular-direction scaling)
   evaluate: 32              # same evaluate budget as the editor
+  # (2026-11-21, read with these defaults, not written here so earlier locked run configs still resume):
+  #   enabled: true           # --set nonllm.enabled=false: never run the non-LLM branch (no E_t nonllm branch either)
+  #   skip_if_rejected: true  # skip it in a generation whose gate kept the current model (nothing to compare with)
   search_scales: [0.5, 0.75, 1.0, 1.25]   # edit: global scales the random edits draw from
 
 diagnostics:

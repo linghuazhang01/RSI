@@ -335,9 +335,8 @@ class QuantProblem:
 
     def _prepare_real(self):  # GPU path on the cluster; exercised on CPU by tests/test_quant.py
         import torch
-        from .diagnostics import activation_table_real, profile_table_real
+        from .diagnostics import activation_table_real, profile_rows, warn_slow_kernels
         from .quant.hessian import collect_stats, load_hf_model, tokenize_texts
-        from .quant.kl import reference
         dcfg, ccfg = self.cfg["diagnostics"], self.cfg["calibration"]
         dev = self._device()
         t0 = time.time()
@@ -349,18 +348,18 @@ class QuantProblem:
         batches = tokenize_texts(self.source_dir, texts, ccfg.get("max_len", 2048))
         stats = collect_stats(model, self.spec, batches, self.prep_dir / "hessians",
                               layers_per_pass=ccfg.get("layers_per_pass", 16), device=dev, log=self.log)
-        pb = tokenize_texts(self.source_dir, texts[: dcfg["profile_contexts"]], dcfg["profile_max_len"])
-        refs = reference(model, pb)
-        prof = profile_table_real(model, self.spec, pb, refs, bits_list=dcfg["profile_bits"],
-                                  group_size=dcfg["profile_group_size"], log=self.log)
+        warn_slow_kernels(self.log)
+        ptexts = texts[: dcfg["profile_contexts"]]
+        prof = profile_rows(model, self.source_dir, self.spec, ptexts, dcfg, rows_dir=self.prep_dir / "profile_rows",
+                            log=self.log)
         act = activation_table_real(self.spec, stats)
-        del model, refs
+        del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self.cache = self._open_cache()
         self.cache.warm(self.cfg["cache"].get("warm", []))
         free_cuda()
-        return prof, act, {"seconds": time.time() - t0, "contexts": len(batches), "profile_contexts": len(pb),
+        return prof, act, {"seconds": time.time() - t0, "contexts": len(batches), "profile_contexts": len(ptexts),
                            "cache_disk_gib": self.cache.disk_bytes() / 2 ** 30}
 
     def _prepare_real_parallel(self, texts: list[str], devs: list[str]):  # pragma: no cover - GPU path
@@ -368,61 +367,89 @@ class QuantProblem:
         GPU: (1) calibration Hessians, texts round-robin per worker, summed afterwards (H and the token count
         are sums over tokens, absmax a max: identical to one pass over all texts); (2) the profile table, group
         keys round-robin; (3) the cache warm-up, modules round-robin (the hessian table follows in prepare)."""
+        import multiprocessing as mp
         import torch
         from concurrent.futures import ThreadPoolExecutor
         from safetensors.torch import save_file
-        from .diagnostics import activation_table_real, profile_table_real
-        from .quant.hessian import (activation_summary, collect_stats, hessian_path, load_hessian, load_hf_model,
-                                    tokenize_texts)
-        from .quant.kl import reference
+        from .diagnostics import activation_table_real, profile_meta, profile_worker
+        from .quant.hessian import activation_summary, collect_stats, hessian_path, load_hessian, load_hf_model, \
+            tokenize_texts
         dcfg, ccfg = self.cfg["diagnostics"], self.cfg["calibration"]
         t0, k = time.time(), len(devs)
-        self.log(f"[prep:{self.tag}] {k} workers on {devs}: loading {self.source_dir}")
-        with ThreadPoolExecutor(max_workers=k) as ex:
-            models = list(ex.map(lambda d: load_hf_model(self.source_dir, d), devs))
-        parts = [texts[i::k] for i in range(k)]
-
-        def calib(i):
-            b = tokenize_texts(self.source_dir, parts[i], ccfg.get("max_len", 2048))
-            collect_stats(models[i], self.spec, b, self.prep_dir / "hessians_parts" / f"w{i}",
-                          layers_per_pass=ccfg.get("layers_per_pass", 16), device=devs[i], log=self.log)
-        with ThreadPoolExecutor(max_workers=k) as ex:
-            list(ex.map(calib, range(k)))
         stats, hdir = {}, self.prep_dir / "hessians"
         keys = sorted({(m.layer, m.input_key) for m in self.spec.modules})
-        for (layer, key) in keys:                  # sum the workers' Hessians
-            dst = hessian_path(hdir, layer, key)
-            if not dst.exists():
-                H = absmax = None
-                n = 0
-                for i in range(k):
-                    h, ni, a = load_hessian(self.prep_dir / "hessians_parts" / f"w{i}", layer, key)
-                    H = h if H is None else H + h
-                    absmax = a if absmax is None else torch.maximum(absmax, a)
-                    n += ni
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                save_file({"H": H.contiguous(), "absmax": absmax.contiguous(), "n": torch.tensor([n], dtype=torch.int64)},
-                          str(dst))
+        # (1) calibration, threads (one HF model per GPU). Skipped when every summed Hessian is already on disk
+        # (2026-11-21: a restarted prep no longer recomputes them).
+        if all(hessian_path(hdir, l, key).exists() for (l, key) in keys):
+            self.log(f"[prep:{self.tag}] calibration: all {len(keys)} Hessians already in {hdir}, skipped")
+        else:
+            self.log(f"[prep:{self.tag}] {k} workers on {devs}: loading {self.source_dir}")
+            with ThreadPoolExecutor(max_workers=k) as ex:
+                models = list(ex.map(lambda d: load_hf_model(self.source_dir, d), devs))
+            parts = [texts[i::k] for i in range(k)]
+
+            def calib(i):
+                b = tokenize_texts(self.source_dir, parts[i], ccfg.get("max_len", 2048))
+                collect_stats(models[i], self.spec, b, self.prep_dir / "hessians_parts" / f"w{i}",
+                              layers_per_pass=ccfg.get("layers_per_pass", 16), device=devs[i], log=self.log)
+            with ThreadPoolExecutor(max_workers=k) as ex:
+                list(ex.map(calib, range(k)))
+            del models, calib
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            for (layer, key) in keys:                  # sum the workers' Hessians
+                dst = hessian_path(hdir, layer, key)
+                if not dst.exists():
+                    H = absmax = None
+                    n = 0
+                    for i in range(k):
+                        h, ni, a = load_hessian(self.prep_dir / "hessians_parts" / f"w{i}", layer, key)
+                        H = h if H is None else H + h
+                        absmax = a if absmax is None else torch.maximum(absmax, a)
+                        n += ni
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    save_file({"H": H.contiguous(), "absmax": absmax.contiguous(),
+                               "n": torch.tensor([n], dtype=torch.int64)}, str(dst))
+            shutil.rmtree(self.prep_dir / "hessians_parts", ignore_errors=True)
+            self.log(f"[prep:{self.tag}] calibration done ({len(keys)} Hessians, {time.time() - t0:.0f}s)")
+        for (layer, key) in keys:
             H, n, absmax = load_hessian(hdir, layer, key)
             stats[f"{layer}.{key}"] = activation_summary(H, n, absmax)
-        shutil.rmtree(self.prep_dir / "hessians_parts", ignore_errors=True)
-        self.log(f"[prep:{self.tag}] calibration done ({len(keys)} Hessians, {time.time() - t0:.0f}s)")
+        # (2) profile table: one PROCESS per GPU (2026-11-21; the threads shared one GIL and the GPUs sat ~90% idle),
+        # group keys round-robin, contexts batched, each finished group saved to prep/profile_rows/<key>.json
         group_keys = self.spec.group_keys()
         share = [group_keys[i::k] for i in range(k)]
-
-        def prof(i):
-            pb = tokenize_texts(self.source_dir, texts[: dcfg["profile_contexts"]], dcfg["profile_max_len"])
-            refs = reference(models[i], pb)
-            rows = profile_table_real(models[i], self.spec, pb, refs, bits_list=dcfg["profile_bits"],
-                                      group_size=dcfg["profile_group_size"], log=self.log, groups=share[i])
-            del refs
-            return rows
-        with ThreadPoolExecutor(max_workers=k) as ex:
-            prow = [r for rows in ex.map(prof, range(k)) for r in rows]
+        ptexts = texts[: dcfg["profile_contexts"]]
+        rows_dir = self.prep_dir / "profile_rows"
+        rows_dir.mkdir(parents=True, exist_ok=True)
+        t1 = time.time()
+        ctx = mp.get_context("spawn")
+        procs = [ctx.Process(target=profile_worker, name=f"profile-w{i}",
+                             args=(str(self.source_dir), devs[i], str(self.prep_dir / "spec.json"), ptexts,
+                                   dict(dcfg), str(rows_dir), share[i], self.tag))
+                 for i in range(k)]
+        for pr in procs:
+            pr.start()
+        for pr in procs:
+            pr.join()
+        bad = [(pr.name, pr.exitcode) for pr in procs if pr.exitcode != 0]
+        if bad:
+            raise RuntimeError(f"profile workers failed: {bad} (finished groups are kept in {rows_dir}; rerun to resume)")
+        meta = profile_meta(ptexts, dcfg)
+        prow, missing = [], []
+        for key in group_keys:
+            rec = read_json(rows_dir / f"{key}.json") or {}
+            if rec.get("meta") != meta:
+                missing.append(key)
+            else:
+                prow += rec["rows"]
+        if missing:
+            raise RuntimeError(f"profile table incomplete: {len(missing)} groups missing, e.g. {missing[:3]}")
+        self.log(f"[prep:{self.tag}] profile table: {len(group_keys)} groups on {k} processes, {time.time() - t1:.0f}s")
         order = {g: i for i, g in enumerate(group_keys)}
         prof_rows = sorted(prow, key=lambda r: (order[r["key"]], r["bits"]))
         act = activation_table_real(self.spec, stats)
-        del models
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         mods = [m.name for m in self.spec.modules]

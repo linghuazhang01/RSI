@@ -262,7 +262,10 @@ def test_mock_run_scratch(tmp_path):
     for s in gate["submissions"]:
         assert cands[s["cid"]]["score"] > 0
         assert "paired_gain" in s["info"] and "paired_ci" in s["info"]
-    assert summ["nonllm"]["kind"] == "random_construct_search"
+    if summ["accepted"]["source"] == "keep":                          # 2026-11-21: nothing accepted -> control skipped
+        assert summ["nonllm"]["kind"] is None and "skip_if_rejected" in summ["nonllm"]["skipped"]
+    else:
+        assert summ["nonllm"]["kind"] == "random_construct_search"
     assert all(k in ("pure_construct", "construct+ops", "keep", "error", "none") for k in summ["search"]["strategies"])
     assert (run / "gen_00" / "parent_gate.json").exists()
     # E_t editor runs the tool loop too (run_python on the E task workspace's exploration api)
@@ -410,7 +413,10 @@ def test_mock_weights_mode(tmp_path):
     for g in ("0", "1"):
         s = summ[g]
         assert s["method"] == "weights" and s["accepted"]["source"] in ("llm", "keep")
-        assert s["nonllm"]["kind"] == "random_weight_search"
+        if s["accepted"]["source"] == "keep":                           # 2026-11-21: nothing accepted -> skipped
+            assert s["nonllm"]["kind"] is None and "skip_if_rejected" in s["nonllm"]["skipped"]
+        else:
+            assert s["nonllm"]["kind"] == "random_weight_search"
         assert all(k.startswith("weights") or k in ("keep", "error", "none") for k in s["search"]["strategies"]), \
             s["search"]["strategies"]
     msgs = [json.loads(x) for x in (run / "gen_00" / "editor" / "thread_0.jsonl").read_text().splitlines() if x.strip()]

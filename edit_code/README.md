@@ -165,6 +165,7 @@
 
 **用满所有卡（2026-11-20，`gpu_layout.*`，改造者有自己的卡时才生效）**：
 - `prep_all_gpus`：第 0 代准备分到所有卡上，每张卡一个 HF 模型：Hessian 按文本分给各卡后相加（结果和单卡一样）、敏感度表按组分、缓存预热和 Hessian 误差表按模块分。
+  - 敏感度表提速（2026-11-21）：每张卡一个**独立进程**（以前是同一进程里的线程，共用 GIL，GPU 利用率约 10%）；上下文右填充后成批前向（每批 ≤ `diagnostics.profile_batch_tokens` 个 token，默认 8192；各层都是因果的，填充不改变真实 token 的 logits，结果和逐段前向只差 bf16 舍入）；每算完一组写 `prep/profile_rows/<组>.json`，中断后同一条命令续跑只算缺的组；校准 Hessian 都在 `prep/hessians/` 时跳过校准。GPU 环境没有 `flash-linear-attention` / `causal-conv1d` 时，transformers 对线性注意力层用纯 torch 回退实现（慢几倍），日志里会有 WARNING：`pip install flash-linear-attention causal-conv1d`。
 - `m0_replicas`：M_0 的批量任务（第 0 代验收打分、留出评测、每代 KL 文本的回答）在所有卡上各起一份 M_0，按题目或任务分开跑（`rsicore.evaluate.score_split`、`run_heldout` 传多个地址）。
 - `editor_sleep`：搜索时改造者写完这一轮的程序就进入 vLLM 睡眠模式（`--enable-sleep-mode`，权重移到 CPU 内存约 52 GB，释放 KV cache），它的卡临时当一个候选槽（4 张卡：同时评测 4 个候选）；下一轮开始前收回并唤醒。搜索结束后改造者关闭，验收和导出用所有槽。
 - `parallel_heldout`：新 incumbent / Q_0 的留出评测在每组空闲卡上各起一份，任务分开跑。

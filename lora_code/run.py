@@ -862,10 +862,20 @@ class Run:
                 info = {"merged": True, **stat}
             st.mark(f"{P}/merge", info)
 
-        # ---- non-LLM branch
+        # ---- non-LLM branch (random-construction control). nonllm.enabled false = never run it;
+        # nonllm.skip_if_rejected (default true, 2026-11-21) = not run in a generation whose gate kept the current
+        # model (accepted.json source 'keep'): there is no accepted LoRA to compare it with. Absent keys = enabled
+        # true / skip_if_rejected true; base.yaml only documents them, so run configs locked earlier still resume.
+        nc = cfg.get("nonllm") or {}
+        skip = ("nonllm.enabled false" if not nc.get("enabled", True) else
+                "no candidate passed the gate (nonllm.skip_if_rejected)"
+                if nc.get("skip_if_rejected", True) and acc.get("source") == "keep" else None)
+        if skip and not st.done(f"{P}/nonllm"):
+            write_json(gd / "baselines" / "nonllm.json", {"kind": None, "name": None, "skipped": skip})
+            st.mark(f"{P}/nonllm", {"name": None, "skipped": skip})
+            print(f"[lora_code] gen {g}: non-LLM branch skipped: {skip}", flush=True)
         if not st.done(f"{P}/nonllm"):
             ev, ws = ctx_objects()
-            nc = cfg.get("nonllm", {})
             bws = self.workspace(gd, ev, store, self.hf(parent), tdata, {"evaluate": 1e9, "gpu_seconds": budget["gpu_seconds"]},
                                  f"g{g:02d}", stack=stack, ret_texts=kl_texts)
             out = {}
@@ -923,6 +933,15 @@ class Run:
                 st.mark(key, {"score": res["score"], "best_cid": res["best_cid"]})
 
         # ---- held-out evaluation of M_{g+1}
+        # (2026-11-21) gate kept the current model -> M_{g+1} = M_g, already evaluated (previous generation, or the
+        # baseline for generation 0): reuse that result instead of scoring the same model again.
+        prev_h = (self.gdir(g - 1) / "heldout.json") if g > 0 else (rc.run_dir / "baseline" / "heldout.json")
+        if (cfg.get("heldout", {}).get("enabled", True) and not st.done(f"{P}/heldout")
+                and acc.get("source") == "keep" and prev_h.exists()):
+            write_json(gd / "heldout.json", read_json(prev_h))
+            st.mark(f"{P}/heldout", {"tasks": len(read_json(prev_h) or {}), "reused_from": str(prev_h.relative_to(rc.run_dir))})
+            print(f"[lora_code] gen {g}: gate kept the current model; held-out reused from {prev_h.relative_to(rc.run_dir)}",
+                  flush=True)
         if cfg.get("heldout", {}).get("enabled", True) and not st.done(f"{P}/heldout"):
             from rsicore.heldout import heldout_domains, run_heldout
             if self.chain:   # M_{g+1} = M_0 + L_{g+1}: the same M_0 server, the adapter as the model
@@ -1189,7 +1208,7 @@ class Run:
                 "gate_submissions": [{"cid": s["cid"], "passed": s["passed"], "reasons": (s.get("info") or {}).get("reasons")}
                                      for s in gate.get("submissions", [])],
                 "nonllm": {"name": non.get("name"), "kind": non.get("kind"),
-                           "best": (non.get("random_search") or {}).get("best")},
+                           "best": (non.get("random_search") or {}).get("best"), "skipped": non.get("skipped")},
                 "raw": ({"name": raw.get("name"), "source": raw.get("source"), "gate": raw.get("gate"),
                          "n_train": (raw.get("train") or {}).get("n_train"),
                          "screen": (raw.get("points") or {}).get("screen")} if raw else None),

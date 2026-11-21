@@ -6,7 +6,7 @@
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20]
 #               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42] [--with-all] [--eval-overfit]
 #               [--eval-set humanevalplus,ifeval,...] [--simple] [--train-set X] [--gate-set X] [--eval-on X,Y]
-#               [--all-domains] [--set KEY=VALUE ...] [--dry-run] [--mock] [--skip-checks]
+#               [--all-domains] [--set KEY=VALUE ...] [--tag NAME] [--dry-run] [--mock] [--skip-checks]
 #
 #   --paper     A, B or both (default both)
 #   --domains   all = math,code,knowledge,instruction_following,tool_calling (default all)
@@ -51,11 +51,14 @@
 #               A train / gate other than the default adds _train-<x> / _gate-<x> to the run id.
 #   --all-domains  the original design (scope all): the other four domains are retention probes / KL texts,
 #               held-out on all five domains, Paper B E_t on. Run ids without _single.
+#   --tag NAME  append _NAME to every run id (letters, digits, - and _), e.g. --tag nosig ->
+#               B_math_s42_single_simple_nosig: a separate run (own locked config) next to the untagged one,
+#               for runs that change --set values of an existing run id. Not applied to A_all (--with-all).
 #   --dry-run   print the preflight result and the commands, start nothing
 #   --mock      laptop test: mock model server, no GPU (fake GPU ids), uses eval/.venv
 #   --skip-checks  skip the preflight checks
 #
-# Run ids: <A|B>_<domain>_s<seed>[_single][_evalfit[_<set>]] (A_all_s<seed> for --with-all), in experiment_records/.
+# Run ids: <A|B>_<domain>_s<seed>[_single][_simple][_<tag>][_evalfit[_<set>]] (A_all_s<seed> for --with-all), in experiment_records/.
 # --seed is the one experiment seed: per-generation draws, vLLM servers, editor sampling, training answers,
 # held-out sampling and bootstrap CIs all use it (the data / gate split keeps its fixed seed 20261118).
 # Logs and pids: experiment_records/_launch/<timestamp>/. Rerunning the same command resumes every run
@@ -82,7 +85,7 @@ cd "$ROOT"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$ROOT/launch.sh"; }
 
 PAPER=both; DOMAINS=all; GENS=5; GPUS=""; PER_RUN=""; MODEL=qwen3.8-27b; SEED=42; HW=b300
-WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; EVALFIT=0; EVAL_SETS=""; SIMPLE=0; TRAIN_SET=""; GATE_SET=""; EVAL_ON=""; SETS=()
+WITH_ALL=0; DRY=0; MOCK=0; SKIP=0; SINGLE=1; EVALFIT=0; EVAL_SETS=""; SIMPLE=0; TRAIN_SET=""; GATE_SET=""; EVAL_ON=""; TAG=""; SETS=()
 need() { [ $# -ge 2 ] || { echo "ERROR: $1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -94,6 +97,7 @@ while [ $# -gt 0 ]; do
     --per-run) need "$@"; PER_RUN="$2"; shift ;;
     --hw) need "$@"; HW="$2"; shift ;;
     --set) need "$@"; SETS+=(--set "$2"); shift ;;
+    --tag) need "$@"; TAG="$2"; shift ;;
     --model) need "$@"; MODEL="$2"; shift ;;
     --seed) need "$@"; SEED="$2"; shift ;;
     --with-all) WITH_ALL=1 ;;
@@ -134,6 +138,10 @@ if [ "$SIMPLE" -eq 1 ]; then
   [ "$WITH_ALL" -eq 1 ] && { echo "ERROR: --with-all (domain all) cannot use --simple" >&2; exit 2; }
   [ "$SINGLE" -eq 0 ] && { echo "ERROR: --simple needs scope single (drop --all-domains)" >&2; exit 2; }
   SETS=(--set objective=simple ${SETS[@]+"${SETS[@]}"}); SUFFIX="${SUFFIX}_simple"
+fi
+if [ -n "$TAG" ]; then
+  case "$TAG" in *[!A-Za-z0-9_-]*) echo "ERROR: --tag may only contain letters, digits, - and _" >&2; exit 2 ;; esac
+  SUFFIX="${SUFFIX}_${TAG}"
 fi
 
 # eval sets (objective eval_overfit; mirrors eval/configs/tasks.yaml eval_targets / eval_target_defaults)

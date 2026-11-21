@@ -274,6 +274,109 @@ class TestTinyModel(unittest.TestCase):
         self.assertTrue(torch.allclose(torch.log_softmax(lo, -1), refs[0].float(), atol=0.05))
 
 
+    def test_packed_kl_matches_unpacked(self):
+        """2026-11-21: right-padded batches give the same reference / KL as one context per forward pass."""
+        from edit_code.quant import quantizers as Q
+        from edit_code.quant.hessian import load_hf_model
+        from edit_code.quant.kl import kl_to_reference, kl_to_reference_packed, pack, reference, reference_packed
+        model = load_hf_model(self.src, "cpu")
+        g = torch.Generator().manual_seed(5)
+        bs = [torch.randint(1, 256, (1, n), generator=g) for n in (48, 17, 40, 30, 9, 33)]
+        packed = pack(bs, max_tokens=100, pad_id=0)
+        self.assertGreater(len(packed), 1)
+        self.assertTrue(all(ids.shape[0] * ids.shape[1] <= 100 or ids.shape[0] == 1 for ids, _ in packed))
+        self.assertEqual(sorted(n for _, lens in packed for n in lens), sorted(b.shape[-1] for b in bs))
+        refs_p = reference_packed(model, packed, chunk=16)
+        self.assertEqual(sum(r.shape[0] for r in refs_p), sum(b.shape[-1] - 1 for b in bs))
+        refs = reference(model, bs)
+        self_p = kl_to_reference_packed(model, packed, refs_p, chunk=16)["mean"]   # only the bf16 storage of refs
+        self_u = kl_to_reference(model, bs, refs)["mean"]
+        self.assertLess(self_p, 1e-3)
+        self.assertAlmostEqual(self_p, self_u, delta=0.2 * self_u + 1e-5)
+        m = next(x for x in self.spec.modules if x.proj == "down_proj")
+        p = model.get_parameter(m.name)
+        orig = p.data.clone()
+        with torch.no_grad():
+            p.data.copy_(Q.rtn(orig, 2, 32).dequant(p.dtype, device=p.device))
+        a = kl_to_reference(model, bs, refs)
+        b = kl_to_reference_packed(model, packed, refs_p, chunk=16)
+        with torch.no_grad():
+            p.data.copy_(orig)
+        self.assertEqual(a["tokens"], b["tokens"])
+        self.assertGreater(a["mean"], 0)
+        self.assertAlmostEqual(a["mean"], b["mean"], delta=0.05 * a["mean"] + 1e-6)
+        self.assertAlmostEqual(a["top1_agree"], b["top1_agree"], delta=0.02)
+
+    def test_profile_rows_resume(self):
+        """2026-11-21: each finished group is saved to rows_dir; a rerun with the same meta reads it back, another
+        meta recomputes."""
+        from edit_code.diagnostics import profile_table_real
+        from edit_code.quant.hessian import load_hf_model
+        from edit_code.quant.kl import kl_to_reference_packed, pack, reference_packed
+        model = load_hf_model(self.src, "cpu")
+        packed = pack(self.batches[:3], max_tokens=96)
+        refs = reference_packed(model, packed)
+        keys = self.spec.group_keys()[:3]
+        with tempfile.TemporaryDirectory() as td:
+            rd = Path(td)
+            kw = dict(bits_list=[2, 4], group_size=32, log=lambda *a: None, groups=keys, rows_dir=rd, meta={"v": 1})
+            rows = profile_table_real(model, self.spec, packed, refs, kl=kl_to_reference_packed, **kw)
+            self.assertEqual(len(rows), 6)
+            self.assertEqual(sorted(f.stem for f in rd.glob("*.json")), sorted(keys))
+
+            def boom(*a, **k):
+                raise AssertionError("recomputed a saved group")
+            again = profile_table_real(model, self.spec, packed, refs, kl=boom, **kw)
+            self.assertEqual(again, rows)
+            (rd / f"{keys[1]}.json").unlink()                        # one group lost -> only it is recomputed
+            calls = []
+
+            def count(*a, **k):
+                calls.append(1)
+                return kl_to_reference_packed(*a, **k)
+            third = profile_table_real(model, self.spec, packed, refs, kl=count, **kw)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([r["key"] for r in third], [r["key"] for r in rows])
+            for x, y in zip(third, rows):
+                self.assertAlmostEqual(x["dkl_mean"], y["dkl_mean"], places=6)
+            kw["meta"] = {"v": 2}                                    # other settings -> everything recomputed
+            calls.clear()
+            profile_table_real(model, self.spec, packed, refs, kl=count, **kw)
+            self.assertEqual(len(calls), 6)
+
+    def test_profile_worker_process(self):
+        """2026-11-21: the profile table runs in a separate spawned process per GPU (here: cpu) and writes
+        rows_dir/<key>.json; the parent only reads them."""
+        import multiprocessing as mp
+        import random
+        from edit_code.common import read_json, write_json
+        from edit_code.diagnostics import profile_meta, profile_worker
+        from edit_code.quant.hessian import tokenize_texts
+        save_tiny_tokenizer(self.src)
+        rng = random.Random(0)
+        texts = [" ".join(f"w{rng.randrange(1, 256)}" for _ in range(40)) for _ in range(4)]
+        if not tokenize_texts(self.src, texts[:1], 32):
+            self.skipTest(f"fixture tokenizer unusable with transformers {transformers.__version__}")
+        dcfg = {"profile_max_len": 32, "profile_bits": [2, 4], "profile_group_size": 32, "profile_batch_tokens": 64}
+        keys = self.spec.group_keys()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            write_json(td / "spec.json", self.spec.to_json())
+            ctx = mp.get_context("spawn")
+            procs = [ctx.Process(target=profile_worker, args=(str(self.src), "cpu", str(td / "spec.json"), texts, dcfg,
+                                                              str(td / "rows"), keys[i::2], "t")) for i in range(2)]
+            for pr in procs:
+                pr.start()
+            for pr in procs:
+                pr.join()
+            self.assertEqual([pr.exitcode for pr in procs], [0, 0])
+            meta = profile_meta(texts, dcfg)
+            for k in keys:
+                rec = read_json(td / "rows" / f"{k}.json")
+                self.assertEqual(rec["meta"], meta)
+                self.assertEqual([r["bits"] for r in rec["rows"]], [2, 4])
+
+
 def save_tiny_tokenizer(path: Path, vocab_size: int = 256):
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast

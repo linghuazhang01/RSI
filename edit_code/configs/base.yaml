@@ -143,6 +143,8 @@ diagnostics:                          # computed once from M_0 (prep/diagnostics
   profile_contexts: 64                # generation-0 KL texts used by the profile table (forward pass per group x
                                       # bits; ~350 groups x 3 bits; 2026-11-20: 64, was 32)
   profile_max_len: 512
+  # profile_batch_tokens: 8192      # (2026-11-21, read with this default, not written here so locked run configs
+                                    # still resume) contexts are right-padded into batches of at most this many tokens
   hessian_quantizers: [rtn, gptq, awq]   # hessian_table: Hessian-weighted error per (group, quantizer, bits),
   hessian_bits: null                  # from the cache + calibration Hessians, no forward pass (null = profile_bits)
 

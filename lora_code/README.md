@@ -125,9 +125,9 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 | `genXX/search` | `rsicore.search.inner_search`：4 线程 × 8 步、≤32 次 evaluate；改造者 = gpu0 上的 M_g（vLLM 多 LoRA），候选 LoRA 在 gpu1 上构建后热加载评测 | `candidates.jsonl`、`programs/`、`feedback/`、`loras/` |
 | `genXX/gate` | `submit_to_gate`（≤3 次）：只送在信号题上分数 > 0（赢了当前模型）的候选（2026-11-20）；目标对参照（edit 第 0 代：raw − ε；edit 之后和 scratch：在验收集上和当前模型逐题配对，平均提升 ≥ min_gain 且置信区间下界 > 0）；每个保留领域 ≥ 第 0 代 − max(δ, 噪声带)；已学目标 ≥ 学完时 − δ；沙箱检查。都不过 → edit 第 0 代兜底合并 raw LoRA（要能过验收）→ 否则保留 M_g | `gate.json`、`accepted.json`、`accepted_lora.*`、`parent_gate.json`（scratch） |
 | `genXX/merge` | LoRA 合并进权重 → M_{g+1}（mock：更新 registry 中 `m{g+1}` 的 quality）；`edit` 模式不合并，`model.json` 记录 M_{g+1} = M_0 + 哪个 LoRA | `model/`、`model.json` |
-| `genXX/nonllm` | 非 LLM 分支（同 evaluate 预算，按模式）：edit 随机编辑规则作用于 raw；scratch 随机无梯度构造 | `baselines/nonllm.json` |
+| `genXX/nonllm` | 非 LLM 分支（同 evaluate 预算，按模式）：edit 随机编辑规则作用于 raw；scratch 随机无梯度构造。2026-11-21：`--set nonllm.enabled=false` 完全不跑；`nonllm.skip_if_rejected`（默认 true）在验收保留当前模型（`accepted.json` source keep）的那一代跳过（没有被接受的 LoRA 可比）。两个键不写在 base.yaml 里（只在注释里），按默认读取，这样之前锁定的运行配置还能续跑；跳过时 `nonllm.json` 里有 `skipped` | `baselines/nonllm.json` |
 | `genXX/e_t/<branch>` | E_t：parent / llm / nonllm（edit 另加 raw）分支模型各开新会话，为 θ0 在 Seal-Tools 上写 LoRA（16 次 evaluate），在 Seal-Tools test + BFCL 上测；`--domain tool_calling` 时换成代码任务（TACO → LiveCodeBench） | `e_t/<branch>/result.json` |
-| `genXX/heldout` | M_{g+1} 五个领域留出评测 | `heldout.json` |
+| `genXX/heldout` | M_{g+1} 的留出评测（领域按 scope / data_roles.eval）。2026-11-21：验收保留当前模型时 M_{g+1} = M_g，直接复用上一代（第 0 代：baseline）的结果，不再重测（`state.json` 里记 `reused_from`） | `heldout.json` |
 | `genXX/summary` | 记录展示过的错例（`draw.py --mark-shown`）；汇总 ΔE_write、ΔE_nonLLM（按题配对 bootstrap） | `summary.json` |
 
 ## 文件
