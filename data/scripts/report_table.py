@@ -36,7 +36,7 @@ for name, c in rep["counts"].items():
     rev = rev[:12] if len(str(rev)) == 40 else rev
     repo = s.get("repo") or s.get("package")
     pools = rep["pools"].get(name, {})
-    extra = f" (+{pools['train_excluded']} train_excluded)" if "train_excluded" in pools else ""
+    extra = "".join(f" (+{pools[k]} {k})" for k in ("train_excluded", "train_duplicate") if k in pools)
     cells = [str(pools.get(p, "")) for p in ("pool", "gate", "test", "reserve")]
     ts = " / ".join(f"{k} {pools[k]}" for k in ("train", "search") if k in pools)
     cells.append(ts + extra)

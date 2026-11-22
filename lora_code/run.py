@@ -20,6 +20,7 @@ Every step is recorded in state.json (rsicore.state.RunState); rerunning the sam
 """
 from __future__ import annotations
 
+import json
 import queue
 import shutil
 import sys
@@ -31,8 +32,9 @@ from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / "eval")]
 
 from lora_code.common import (DOMAIN_DATASET, DOMAINS, deep_merge, gate_policy, gold_target,  # noqa: E402
-                              gpu_layout, load_records, main_groups, main_server_args, method_mode, prompt_text,
-                              read_json, render_messages, retention_domains, role_gpus, write_json)
+                              adapter_rank_budget, gpu_layout, load_records, main_groups, main_server_args,
+                              merge_mode, method_mode, prompt_text, read_json, render_messages, retention_domains,
+                              role_gpus, server_lora_rank, tools_on_replicas, write_json)
 
 
 # ============================================================================ servers
@@ -80,7 +82,8 @@ class Servers:
         else:
             extra = main_server_args(self.cfg) if slot == "main" else list(sc.get("theta0_args", []) or [])
         srvs = [VLLMServer(model_path, served, g, enable_lora=True, max_loras=int(sc.get("max_loras", 8)),
-                           max_lora_rank=int(self.cfg.get("lora", {}).get("rank_cap", 64)), extra_args=extra,
+                           max_lora_rank=(server_lora_rank(self.cfg) if slot == "main"
+                                          else int(self.cfg.get("lora", {}).get("rank_cap", 64))), extra_args=extra,
                            mock=self.rc.mock, mock_registry=self.rc.run_dir / "mock_registry.json", seed=self.rc.seed,
                            log_dir=self.rc.run_dir / "logs", sleep_mode=self.weights and slot == "main")
                 for g in groups]
@@ -266,6 +269,8 @@ class Run:
                               if d == self.target or d in self.retention_domains]
         self.mcfg = cfg.get("mock", {})
         self.mode = method_mode(cfg)
+        self.merge_mode = "adapter" if self.mode == "edit" else merge_mode(cfg)
+        self.budget_rank = adapter_rank_budget(cfg)
         self.gate_ref, self.gate_fallback = gate_policy(cfg)
         self._stores = {}
         self._hf = {}
@@ -277,13 +282,25 @@ class Run:
         M_g = M_0 + L_g served as an adapter on the M_0 server (no merge); candidates replace L_g."""
         return self.mode == "edit"
 
+    @property
+    def adapter(self) -> bool:
+        """scratch + merge.mode adapter (2026-11-22): M_g = M_0 + C_g, C_g the cumulative LoRA (every accepted delta
+        rank-concatenated), served as an adapter on the M_0 server; never merged. Candidates are deltas on M_g
+        (Evaluator.set_base composes them). Unlike chain, nothing is trained and candidates do not replace C_g."""
+        return self.mode == "scratch" and self.merge_mode == "adapter"
+
+    @property
+    def on_m0(self) -> bool:
+        """M_g is served as an adapter on the one M_0 server (mode=edit, or scratch + merge.mode adapter)."""
+        return self.chain or self.adapter
+
     def served(self, g: int) -> str:
-        return "m0" if self.chain else f"m{g}"
+        return "m0" if self.on_m0 else f"m{g}"
 
     def current_lora(self, g: int):
-        """mode=edit: (LoRA, name, file) of L_g (M_g = M_0 + L_g), from generation g-1's model.json; None if
-        g == 0 or no LoRA has been accepted yet."""
-        if not self.chain or g == 0:
+        """(LoRA, name, file) of the adapter that makes M_g on M_0, from generation g-1's model.json: mode=edit L_g,
+        merge.mode adapter the cumulative C_g. None if g == 0 or no LoRA has been accepted yet (M_g = M_0)."""
+        if not self.on_m0 or g == 0:
             return None
         info = read_json(self.gdir(g - 1) / "model.json") or {}
         if not info.get("lora_file"):
@@ -297,7 +314,7 @@ class Run:
         return cur[1] if cur else self.served(g)
 
     def model_path(self, g: int) -> Path:
-        if g == 0 or self.chain:
+        if g == 0 or self.on_m0:
             return Path(self.rc.model_path)
         info = read_json(self.gdir(g - 1) / "model.json")
         if info is None:
@@ -330,26 +347,30 @@ class Run:
         reg[name] = {k: round(float(v), 6) for k, v in q.items()} if isinstance(q, dict) else round(float(q), 6)
         write_json(self.registry, reg)
 
-    def store(self, path: Path):
+    def store(self, path: Path, device: str | None = None):
+        """Weight store of `path` on the train GPU, or (device, 2026-11-22: a main replica's GPU with
+        gpu_layout.tools_on_replicas) on that GPU; all share the run's SVD cache."""
         if self.rc.mock:
             from lora_code.mock import MockStore
             return self._stores.setdefault("mock", MockStore())
-        key = str(path)
+        key = str(path) if device is None else f"{path}@{device}"
         if key not in self._stores:
             from lora_code.primitives.weights import WeightStore
-            dev = self.train_device() if self.cfg.get("train", {}).get("store_on_gpu", True) else "cpu"
+            dev = device or (self.train_device() if self.cfg.get("train", {}).get("store_on_gpu", True) else "cpu")
             self._stores[key] = WeightStore(path, device=dev, cache_dir=self.rc.run_dir / "cache")
         return self._stores[key]
 
-    def hf(self, path: Path):
+    def hf(self, path: Path, device: str | None = None):
+        """HF model of `path` on the train GPU(s), or (device, 2026-11-22) a whole copy on that one GPU."""
         if self.rc.mock:
             return None
-        key = str(path)
+        key = str(path) if device is None else f"{path}@{device}"
         if key not in self._hf:
             from lora_code.primitives.train import HFModel
             tc = self.cfg.get("train", {})
-            self._hf[key] = HFModel(path, self.store(path), device=self.train_device(),
-                                    devices=[f"cuda:{g}" for g in role_gpus(self.rc, self.cfg, "train")],
+            self._hf[key] = HFModel(path, self.store(path, device), device=device or self.train_device(),
+                                    devices=([device] if device else
+                                             [f"cuda:{g}" for g in role_gpus(self.rc, self.cfg, "train")]),
                                     micro_batch=tc.get("micro_batch"),
                                     dtype=tc.get("dtype", "bfloat16"), max_len=int(tc.get("max_len", 4096)),
                                     seed=self.rc.seed)
@@ -360,10 +381,24 @@ class Run:
         """First GPU of the train role: weight store, diagnostics, merge, HF model inputs."""
         return f"cuda:{role_gpus(self.rc, self.cfg, 'train')[0]}"
 
-    def release_hf(self):
-        for h in self._hf.values():
-            h.release()
-        self._hf.clear()
+    def release_hf(self, devices_only: bool = False):
+        """Free the HF models (devices_only, 2026-11-22: only the copies on the main replicas' GPUs, keys
+        '<path>@<device>') and the replica GPUs' weight stores (their cached fp32 weights; a workspace still holding
+        one reloads from disk on use)."""
+        for k in [k for k in self._hf if not devices_only or "@" in k]:
+            self._hf.pop(k).release()
+        for k in [k for k in self._stores if "@" in k]:
+            st = self._stores.pop(k)
+            lock = getattr(st, "_lru_lock", None)
+            if lock is not None:
+                with lock:
+                    st._lru.clear()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
     def gdir(self, g: int) -> Path:
         from rsicore.records import gen_dir
@@ -510,18 +545,19 @@ class Run:
                          replicas=self.servers.replicas("main"),
                          ids=ids, target_dataset=self.tds, gate_dataset=self.gds, kl_texts=kl_texts, store=store,
                          mock=self.rc.mock,
-                         registry=self.registry, parent_quality=self.quality_value(served),
+                         registry=self.registry,
+                         parent_quality=self.quality_value(self.editor_name(g) if self.adapter else served),
                          max_loaded=int(self.cfg.get("server", {}).get("max_loras", 8)) - 2,
                          weights_scorer=self.wslots.score if (self.wslots is not None and not self.rc.mock) else None)
 
     def workspace(self, out_dir, ev, store, hf, train, budget, prefix, stack=(), diag=None, ret_texts=(),
-                  raw=None, raw_info=None):
+                  raw=None, raw_info=None, base_lora=None):
         from lora_code.primitives.train import TrainData
         from lora_code.tools import Workspace
         return Workspace(mock=self.rc.mock, store=store, train=TrainData(train), cfg=self.cfg, out_dir=out_dir,
                          evaluator=ev, hf=hf, stack=stack, retention_texts=ret_texts, budget=budget,
                          name_prefix=prefix, diagnostics=diag, seed=self.rc.seed, mode=self.mode, raw=raw,
-                         raw_info=raw_info, base_store=self.store(Path(self.rc.model_path)))
+                         raw_info=raw_info, base_store=self.store(Path(self.rc.model_path)), base_lora=base_lora)
 
     # ================================================================== baseline
     def baseline(self):
@@ -668,9 +704,14 @@ class Run:
         st.mark(f"{P}/draw", {"train": len(train_ids)}) if not st.done(f"{P}/draw") else None
         store = self.store(parent)
         stack = self.stack(g)
-        cur = self.current_lora(g)                        # mode=edit, g >= 1: (L_g, name, file) or None
+        cur = self.current_lora(g)                        # on M_0, g >= 1: (L_g / C_g, name, file) or None
         edit_later = self.chain and g > 0                 # mode=edit after generation 0: no training at all
-        diag_stack = [(g - 1, cur[0])] if cur else stack  # diagnostics show the current LoRA
+        # diagnostics show mode=edit's current LoRA; scratch (merged or adapter) the per-generation accepted deltas
+        diag_stack = [(g - 1, cur[0])] if (cur and self.chain) else stack
+        base = cur[0] if (cur and self.adapter) else None   # merge.mode adapter: C_g (current model = M_0 + C_g)
+        if base is not None and not rc.mock:              # W_g = W_0 + B_C A_C for the diagnostics (fp32 overlay)
+            from lora_code.primitives.weights import OverlayStore
+            store = OverlayStore(store, base)
 
         def main_srv():
             return self.servers.get("main", parent, served)
@@ -697,11 +738,13 @@ class Run:
             diag = D.load_or_compute(gd / "diagnostics.json", lambda: mock_diagnostics(store, diag_stack, rc.seed))
         else:
             def real_diag():
+                from contextlib import nullcontext
                 hf = self.hf(parent)
                 tt = ["\n\n".join(m["content"] for m in e["messages"]) for e in list(tdata.values())[:64] if e["messages"]]
-                return D.compute(store, diag_stack, base_store=self.store(Path(rc.model_path)), hf=hf, target_texts=tt,
-                                 retention_texts=kl_texts, svd_k=int(cfg.get("diagnostics", {}).get("svd_k", 8)),
-                                 device=self.train_device())
+                with (hf.applied(base) if base is not None else nullcontext()):   # adapter mode: HF model = M_g
+                    return D.compute(store, diag_stack, base_store=self.store(Path(rc.model_path)), hf=hf,
+                                     target_texts=tt, retention_texts=kl_texts,
+                                     svd_k=int(cfg.get("diagnostics", {}).get("svd_k", 8)), device=self.train_device())
             diag = D.load_or_compute(gd / "diagnostics.json", real_diag)
         st.mark(f"{P}/diagnostics", {"rows": diag["n_modules"]}) if not st.done(f"{P}/diagnostics") else None
 
@@ -715,8 +758,10 @@ class Run:
             if "ev" not in state:
                 srv = main_srv()
                 ev = self.evaluator(g, gd, srv, served, ids, kl_texts, store)
-                if cur:   # mode=edit: parent / editor = M_0 + L_g
+                if cur:   # parent / editor = M_0 + L_g (mode=edit) or M_0 + C_g (merge.mode adapter)
                     ev.set_parent(cur[0], cur[1])
+                if self.adapter:   # candidates are deltas on M_g: served as C_g (+) delta
+                    ev.set_base(base, self.budget_rank)
                 state.update(ev=ev, srv=srv)
             ev = state["ev"]
             info = read_json(gd / "baselines" / "raw.json")
@@ -740,8 +785,8 @@ class Run:
                     raise RuntimeError(f"{P}: mode=edit needs the raw LoRA (step {P}/raw) before the workspace")
                 raw = self.load_lora(self.raw_file(gd, rj))
                 raw_info = dict(rj["train"], source=rj.get("source", "trained"))
-            ws = self.workspace(gd, ev, store, self.hf(parent), tdata, budget, f"g{g:02d}", stack=stack, diag=diag,
-                                ret_texts=kl_texts, raw=raw, raw_info=raw_info)
+            ws = self.workspace(gd, ev, self.store(parent), self.hf(parent), tdata, budget, f"g{g:02d}", stack=stack,
+                                diag=diag, ret_texts=kl_texts, raw=raw, raw_info=raw_info, base_lora=base)
             ss = search_settings(cfg)
             ws.charge_screens = ss["charge_screens"]      # false: automatic screens are free (2026-11-21)
             ws.parallel_eval = self.mode != "weights" and self.eval_parallelism(ev) > 1
@@ -851,7 +896,35 @@ class Run:
             st.mark(f"{P}/gate", {"source": rec["source"], "cid": rec.get("cid")})
         acc = read_json(gd / "accepted.json")
 
+        # (2026-11-22) the search is over: free the HF copies on the main replicas' GPUs (tools_on_replicas) before
+        # the merge and the held-out evaluation restart the replicas with M_{g+1}
+        self.release_hf(devices_only=True)
+
         # ---- merge -> M_{g+1}
+        if self.adapter and not st.done(f"{P}/merge"):
+            # merge.mode adapter: nothing is merged. C_{g+1} = C_g (+) accepted delta, rebuilt by the same deterministic
+            # composition the evaluator served it with (Evaluator.compose: same fp32 inputs, same budget), i.e. the
+            # adapter the gate scored, kept under the accepted candidate's adapter name; rejected -> C_g stays.
+            lf = self.lora_file(gd / "accepted_lora")
+            if lf is not None:
+                from lora_code.primitives.lora import compose_cumulative
+                C = compose_cumulative(base, self.load_lora(lf), self.budget_rank)
+                self.save_lora(C, gd / "cumulative_lora")
+                info = {"path": str(parent), "merge_mode": "adapter", "lora": acc["name"],
+                        "lora_file": str(self.lora_file(gd / "cumulative_lora")), "source": "adapter (C_g + accepted)",
+                        "components": [k for k, _ in stack] + [g], "max_rank": int(C.max_rank()),
+                        "modules": len(C.modules()), "recompressed": C.meta.get("recompressed")}
+            elif cur:
+                info = {"path": str(parent), "merge_mode": "adapter", "lora": cur[1], "lora_file": str(cur[2]),
+                        "source": "keep (current adapter)", "components": [k for k, _ in stack]}
+            else:
+                info = {"path": str(parent), "merge_mode": "adapter", "lora": None, "lora_file": None,
+                        "source": "keep (original model)", "components": []}
+            if rc.mock:
+                info["quality"] = self.quality_value(info["lora"] or served)
+            write_json(gd / "model.json", info)
+            st.mark(f"{P}/merge", {"merged": False, "merge_mode": "adapter", "lora": info["lora"],
+                                   "source": info["source"]})
         if self.chain and not st.done(f"{P}/merge"):
             lf = self.lora_file(gd / "accepted_lora")
             if lf is not None:     # accepted: L_{g+1} = the accepted LoRA (it replaces L_g)
@@ -909,8 +982,9 @@ class Run:
             print(f"[lora_code] gen {g}: non-LLM branch skipped: {skip}", flush=True)
         if not st.done(f"{P}/nonllm"):
             ev, ws = ctx_objects()
-            bws = self.workspace(gd, ev, store, self.hf(parent), tdata, {"evaluate": 1e9, "gpu_seconds": budget["gpu_seconds"]},
-                                 f"g{g:02d}", stack=stack, ret_texts=kl_texts)
+            bws = self.workspace(gd, ev, self.store(parent), self.hf(parent), tdata,
+                                 {"evaluate": 1e9, "gpu_seconds": budget["gpu_seconds"]},
+                                 f"g{g:02d}", stack=stack, ret_texts=kl_texts, base_lora=base)
             out = {}
             n_ev = int(nc.get("evaluate", budget["evaluate"]))
             if self.mode == "edit":
@@ -955,7 +1029,7 @@ class Run:
                     continue
                 if lname is not None:
                     if b == "parent" and cur and not ev.known(lname):
-                        ev.register(cur[0], lname)
+                        ev.register(cur[0], lname, full=True)
                     if not ev.known(lname):   # resumed run: register the branch LoRA from disk
                         f = (self.raw_file(gd, raw) if b == "raw" else
                              self.lora_file(gd / {"llm": "accepted_lora", "nonllm": "baselines/nonllm_lora"}.get(b, "accepted_lora")))
@@ -977,12 +1051,12 @@ class Run:
                   flush=True)
         if cfg.get("heldout", {}).get("enabled", True) and not st.done(f"{P}/heldout"):
             from rsicore.heldout import heldout_domains, run_heldout
-            if self.chain:   # M_{g+1} = M_0 + L_{g+1}: the same M_0 server, the adapter as the model
+            if self.on_m0:   # M_{g+1} = M_0 + L_{g+1} / C_{g+1}: the same M_0 server, the adapter as the model
                 ev = get_ev()
                 nxt = self.current_lora(g + 1)
                 if nxt:
                     if not ev.known(nxt[1]):
-                        ev.register(nxt[0], nxt[1])
+                        ev.register(nxt[0], nxt[1], full=True)
                     ev.ensure_loaded(nxt[1])
                 h = run_heldout(ev.endpoints, served, gd / "heldout", lora=nxt[1] if nxt else None,
                                 domains=heldout_domains(cfg), mock=rc.mock,
@@ -1021,6 +1095,9 @@ class Run:
             from rsicore.records import update_summary
             update_summary(rc, g, info)
             st.mark(f"{P}/summary", {"accepted": info.get("accepted", {}).get("source")})
+        # (2026-11-22) the next generation works on M_{g+1}: free this generation's HF models (with E_t off they
+        # were never released, so each generation left one 52 GB model on the train GPU)
+        self.release_hf()
 
     def stall(self, g: int) -> int:
         """Consecutive generations up to g whose gate kept the current model (accepted.json source 'keep')."""
@@ -1064,6 +1141,16 @@ class Run:
                                      screen_tools_enabled, search_settings, tensor_compute_enabled)
         rc, cfg = self.rc, self.cfg
         ev, ws = ctx_objects()
+        if tools_on_replicas(cfg) and not ws.devs:
+            # (2026-11-22) only for the search: editor session k runs its tools on replica k mod n's GPU (an HF copy
+            # of the current model and a weight store there), in the order of the editor endpoints; the copies load
+            # now, one after another, outside any budget (gate / nonllm / a resumed generation never load them)
+            parent = self.model_path(g)
+            ws.set_devices([{"server": srv,
+                             "hf": None if rc.mock else self.hf(parent, device=f"cuda:{srv.gpu_ids[0]}"),
+                             "store": None if rc.mock else self.store(parent, device=f"cuda:{srv.gpu_ids[0]}")}
+                            for srv in ev.replicas])
+            ws.warm_devices()
         sc = cfg.get("search", {})
         ss = search_settings(cfg)
         # one step (objective simple: 8 sessions x 1 step): no session sees this generation's other candidates, so
@@ -1079,7 +1166,10 @@ class Run:
         ctx = ContextRenderer(task_text=task_text(gen=g, target=self.target, dataset=self.tds,
                                                   retention=self.retention_domains, n_train=len(ws.train.ids()),
                                                   raw_info=rawinfo, gate_dataset=self.gds),
-                              diag_text=D.render(diag), archive_text=self.archive(g) if sc.get("archive", True) else "",
+                              diag_text=D.render(diag, adapter=self.adapter),
+                              archive_text=(self.archive(g, read_tools=bool(hist_tool),
+                                                         max_chars=int(sc.get("archive_chars", 30000)))
+                                            if sc.get("archive", True) else ""),
                               budget_fn=lambda: ws.budget_status(), timeout_s=int(cfg.get("sandbox", {}).get("timeout_s", 1800)),
                               sessions=ss["threads"] if ss["steps"] == 1 and ss["threads"] > 1 else None,
                               history_tool=bool(hist_tool), gate_mode=ss["gate_every_candidate"])
@@ -1174,27 +1264,50 @@ class Run:
                             max_candidates=ss["max_candidates"], top_full=int(sc.get("top_full", 3)),
                             rerun_seeds=int(sc.get("rerun_seeds", 0)), parallel=parallel, phases=phases)
 
-    def archive(self, g: int) -> str:
-        """Experience channel: best programs and outcomes of earlier generations (RSI_LOOP_DESIGN §1.1)."""
+    def archive(self, g: int, *, read_tools: bool = True, max_chars: int = 30000) -> str:
+        """Experience channel (RSI_LOOP_DESIGN §1.1; structured 2026-11-22): per earlier generation a header (accepted,
+        best gains, the then-current model's own screen answers) and one row per candidate, failures included
+        (prompts.archive_row: what it is, gate result, error, note). read_tools (read_record / search_history reach
+        earlier generations): full programs are read on demand; else the best program of each generation is quoted
+        (3000 chars) as before. max_chars: the rows of the oldest generations are dropped first to fit."""
         if g == 0:
             return ""
+        from rsicore.chat_tools import _gate_outcomes
         from rsicore.search import load_candidates, ranked
-        parts = ["Archive of earlier generations:"]
+
+        from lora_code.prompts import ARCHIVE_HEAD, ARCHIVE_READ, archive_row
+        blocks = []
         for k in range(g):
             cs = ranked(load_candidates(self.rc, k).values())
             acc = read_json(self.gdir(k) / "accepted.json", {}) or {}
             gate_every = (read_json(self.gdir(k) / "gate.json", {}) or {}).get("rule", "").startswith("gate_every")
-            parts.append(f"- generation {k}: accepted={acc.get('source')} {acc.get('cid') or ''}; "
-                         f"{len(cs)} candidates; best " + ("paired gate gains " if gate_every else "scores ") +
-                         ", ".join(f"{c.cid}={c.score:.4f}" for c in cs[:3] if c.score is not None))
+            gates = _gate_outcomes(self.gdir(k))
+            head = [f"- generation {k}: accepted={acc.get('source')} {acc.get('cid') or ''}; "
+                    f"{len(cs)} candidates; best " + ("paired gate gains " if gate_every else "scores ") +
+                    ", ".join(f"{c.cid}={c.score:.4f}" for c in cs[:3] if c.score is not None)]
             rs = (read_json(self.gdir(k) / "reference_screen.json", {}) or {}).get("summary") or {}
             if rs.get("n_items"):                   # the then-current model's own screen answers (2026-11-21)
-                parts.append(f"  current model on that generation's screen: accuracy {rs.get('accuracy')} over "
-                             f"{rs['n_items']} items x {rs.get('samples_per_item')} samples, correct-count "
-                             f"distribution {rs.get('correct_counts')}, truncation {rs.get('truncation_rate')}")
-            if cs and cs[0].program:
-                parts.append(f"  best program of generation {k}:\n```python\n{cs[0].program[:3000]}```")
-        return "\n".join(parts)
+                head.append(f"  current model on that generation's screen: accuracy {rs.get('accuracy')} over "
+                            f"{rs['n_items']} items x {rs.get('samples_per_item')} samples, correct-count "
+                            f"distribution {rs.get('correct_counts')}, truncation {rs.get('truncation_rate')}")
+            rows = ["  " + json.dumps(archive_row(c, gates.get(c.cid)), ensure_ascii=False, default=str)
+                    for c in sorted(cs, key=lambda c: c.cid)]
+            if not read_tools and cs and cs[0].program:
+                rows.append(f"  best program of generation {k}:\n```python\n{cs[0].program[:3000]}```")
+            blocks.append((k, head, rows))
+        tail = [ARCHIVE_READ] if read_tools else []
+
+        def text(drop: int) -> str:
+            out = [ARCHIVE_HEAD]
+            for i, (k, head, rows) in enumerate(blocks):
+                out += head + (rows if i >= drop else
+                               [f"  ({len(rows)} rows omitted for length" +
+                                (f"; search_history(gen={k}) lists them)" if read_tools else ")")])
+            return "\n".join(out + tail)
+        drop = 0
+        while drop < len(blocks) - 1 and len(text(drop)) > max_chars:
+            drop += 1
+        return text(drop)
 
     # ------------------------------------------------------------------ reference screen (2026-11-21, objective simple)
     def reference_screen(self, gd, ev) -> dict:
@@ -1371,7 +1484,7 @@ class Run:
         non = read_json(gd / "baselines" / "nonllm.json", {}) or {}
         raw = read_json(gd / "baselines" / "raw.json", {}) or {}
         info = {"gen": g, "editor": self.editor_name(g), "successor": (read_json(gd / "model.json") or {}).get("lora")
-                if self.chain else self.served(g + 1), "method": self.mode,
+                if self.on_m0 else self.served(g + 1), "method": self.mode, "merge_mode": self.merge_mode,
                 "scope": self.cfg.get("scope", "all"), "retention_domains": list(self.retention_domains),
                 "data_roles": {"train": self.tds, "gate": self.gds},
                 "gate_reference": acc.get("gate_reference") or self.gate_ref,
@@ -1484,6 +1597,8 @@ def main(argv=None):
         print(f"[lora_code] {e}", flush=True)
         return 1
     mode, (gref, gfb) = method_mode(cfg), gate_policy(cfg)                      # fail fast: valid method / gate
+    mmode = "adapter" if mode == "edit" else merge_mode(cfg)                     # fail fast: valid merge.mode
+    lrank = server_lora_rank(cfg)                                                # fail fast: adapter rank <= 512
     if mode == "weights" and (cfg.get("e_t") or {}).get("enabled", True):
         print("[lora_code] method.mode weights does not support E_t (use scope single or --set e_t.enabled=false)",
               flush=True)
@@ -1495,7 +1610,7 @@ def main(argv=None):
         print(f"[lora_code] {short}", flush=True)
         return 1
     print(f"[lora_code] hardware={hw} scope={cfg.get('scope', 'all')} gpus={rc.gpus} roles {roles} method={mode} "
-          f"gate reference={gref} fallback={gfb}"
+          f"gate reference={gref} fallback={gfb} merge={mmode} max_lora_rank={lrank}"
           + (f" (UNUSED {unused}: tensor parallelism needs 1/2/4/8 GPUs per role)" if unused else ""), flush=True)
     try:
         Run(rc, cfg).run()

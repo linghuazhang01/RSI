@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import random
+import threading
 import time
 from contextlib import contextmanager
 
@@ -43,6 +44,9 @@ class TrainData:
         return ["\n\n".join(m["content"] for m in e["messages"]) for e in self.get(ids)]
 
 
+_LOAD_LOCK = threading.Lock()     # one from_pretrained at a time in this process (HFModel.model, 2026-11-22)
+
+
 class HFModel:
     def __init__(self, model_dir, store, *, device: str = "cuda:0", dtype: str = "bfloat16", max_len: int = 4096,
                  grad_checkpointing: bool = True, seed: int = 42, devices: list[str] | None = None,
@@ -67,31 +71,50 @@ class HFModel:
     # ------------------------------------------------------------------ loading
     @property
     def model(self):
-        if self._model is None:
+        """The loaded model. (2026-11-22) Loads are serialised process-wide (_LOAD_LOCK): transformers'
+        from_pretrained sets process-global state (the default dtype, the no-init flag) while it builds a model, and
+        several copies load at once with gpu_layout.tools_on_replicas. The model is published only once it is fully
+        moved and set up; a failed load frees what it built and raises (the next access retries)."""
+        if self._model is not None:
+            return self._model
+        with _LOAD_LOCK:
+            if self._model is not None:
+                return self._model
             import torch
             import transformers
 
             cfg = transformers.AutoConfig.from_pretrained(self.model_dir)
             arch = (getattr(cfg, "architectures", None) or ["AutoModelForCausalLM"])[0]
             cls = getattr(transformers, arch, None) or transformers.AutoModelForCausalLM
-            if len(self.devices) > 1 and all(d.startswith("cuda:") for d in self.devices):
-                ids = [int(d.split(":")[1]) for d in self.devices]
-                # first GPU also holds the inputs, logits (vocab ~248k) and activations: give it less weight
-                per = {i: torch.cuda.get_device_properties(i).total_memory for i in ids}
-                mm = {i: int(per[i] * (0.45 if k == 0 else 0.85)) for k, i in enumerate(ids)}
-                self._model = cls.from_pretrained(self.model_dir, dtype=getattr(torch, self.dtype_name),
-                                                  device_map="auto", max_memory=mm)
-                self.device = f"cuda:{ids[0]}"
-            else:
-                self._model = cls.from_pretrained(self.model_dir, dtype=getattr(torch, self.dtype_name))
-                self._model.to(self.device)
-            self._model.eval()
-            for p in self._model.parameters():
-                p.requires_grad_(False)
-            if self.grad_checkpointing and hasattr(self._model, "gradient_checkpointing_enable"):
-                self._model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            if hasattr(self._model.config, "use_cache"):
-                self._model.config.use_cache = False
+            m, dev = None, self.device
+            try:
+                if len(self.devices) > 1 and all(d.startswith("cuda:") for d in self.devices):
+                    ids = [int(d.split(":")[1]) for d in self.devices]
+                    # first GPU also holds the inputs, logits (vocab ~248k) and activations: give it less weight
+                    per = {i: torch.cuda.get_device_properties(i).total_memory for i in ids}
+                    mm = {i: int(per[i] * (0.45 if k == 0 else 0.85)) for k, i in enumerate(ids)}
+                    m = cls.from_pretrained(self.model_dir, dtype=getattr(torch, self.dtype_name),
+                                            device_map="auto", max_memory=mm)
+                    dev = f"cuda:{ids[0]}"
+                else:
+                    m = cls.from_pretrained(self.model_dir, dtype=getattr(torch, self.dtype_name))
+                    m.to(self.device)
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad_(False)
+                if self.grad_checkpointing and hasattr(m, "gradient_checkpointing_enable"):
+                    m.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                if hasattr(m.config, "use_cache"):
+                    m.config.use_cache = False
+            except BaseException:
+                del m
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise
+            self.device = dev
+            self._model = m
         return self._model
 
     @property

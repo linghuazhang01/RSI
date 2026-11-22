@@ -163,6 +163,46 @@ def check_lora(lora: LoRA, store, *, rank_cap: int, tau: float, allowed_leaves=N
     return not errors, {"errors": errors[:50], "n_errors": len(errors), "modules": mods}
 
 
+# ============================================================================ cumulative adapter (merge.mode adapter)
+def compose_cumulative(base, delta, budget: int | None = None, tol: float = 1e-6):
+    """merge.mode adapter (2026-11-22): the adapter that serves M_0 + C + ΔW, i.e. the rank-concatenation of the
+    cumulative LoRA C (None / empty = M_0) and the editor's delta ΔW. Exact (B_C A_C + B_Δ A_Δ, nothing rounded
+    into bf16 weights). When a module's concatenated rank exceeds `budget` it is re-factored by its exact thin SVD
+    (directions below tol·σ_max dropped) and, if still above the budget, truncated to the top `budget` singular
+    directions; meta["recompressed"] records the modules and the dropped relative energy. The result is the very
+    object that is registered on vLLM, gated, and (on accept) kept as the next C: gated = served.
+    Never mutates base or delta. MockLoRA inputs give a MockLoRA (mock.m_stack)."""
+    if getattr(delta, "kind", "lora") == "weights":
+        raise TypeError("a weight edit cannot be composed into an adapter")
+    if not hasattr(delta, "add"):               # MockLoRA (no factor tensors)
+        from ..mock import m_stack
+        return m_stack(base, delta, budget)
+    out = base.copy() if base is not None else LoRA()
+    for m in delta.modules():
+        A, B = delta.factors[m]
+        out.add(m, A, B)
+    rec = {}
+    if budget:
+        import torch
+        for m in out.modules():
+            if out.rank(m) <= int(budget):
+                continue
+            U, S, V = out.compact(m)
+            tot = float((S ** 2).sum())
+            keep = S > tol * S[0] if S.numel() else S.bool()
+            U, S, V = U[:, keep], S[keep], V[:, keep]
+            k = min(int(budget), int(S.numel()))
+            dropped = float((S[k:] ** 2).sum()) / max(tot, 1e-30)
+            r = torch.sqrt(S[:k])
+            out.factors[m] = ((V[:, :k] * r).T.contiguous(), (U[:, :k] * r).contiguous())
+            rec[m] = {"rank": k, "dropped_energy": dropped}
+    out.meta = {"cumulative": True, "components": list((base.meta if base is not None else {}).get("components", []))
+                + [delta.meta.get("name") or delta.digest()]}
+    if rec:
+        out.meta["recompressed"] = {"modules": len(rec), "max_dropped_energy": max(v["dropped_energy"] for v in rec.values())}
+    return out
+
+
 def padded_rank(r: int) -> int:
     for v in VLLM_RANKS:
         if v >= r:

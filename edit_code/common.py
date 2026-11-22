@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -38,6 +39,43 @@ def write_json(path: Path, obj) -> None:
     with os.fdopen(fd, "w") as f:
         json.dump(obj, f, indent=1, ensure_ascii=False, default=_json_default)
     os.replace(tmp, path)
+
+
+NOTE_CHARS = 600
+
+
+def cut_note(note, n: int = NOTE_CHARS) -> str:
+    """A program's "note" (2026-11-22, as Paper B's lora_code.tools.cut_note): whitespace collapsed, at most n
+    characters."""
+    t = " ".join(str(note).split())
+    return t if len(t) <= n else t[:n - 3].rstrip() + "..."
+
+
+# the automatic note api.solve_allocation puts on the config it returns (edit_code.allocation.solve)
+AUTO_NOTE = re.compile(r"^\s*solve_allocation: [\d.]+ GiB of [\d.]+; predicted weighted damage [-+\d.eE]+"
+                       r"(?: \(INFEASIBLE[^)]*\))?")
+
+
+def program_note(result) -> str | None:
+    """The editor's own note in a program's returned config (its "note" key), cut to NOTE_CHARS. The automatic text of
+    api.solve_allocation is removed (what the editor appended to it is kept); None when nothing of its own is left."""
+    note = result.get("note") if isinstance(result, dict) else None
+    if not isinstance(note, str):
+        return None
+    note = AUTO_NOTE.sub("", note, count=1).strip().lstrip(";,.:-|").strip()
+    return cut_note(note) if note else None
+
+
+def error_line(error, n: int = 200) -> str:
+    """One line of a candidate's error for the archive / gate.json (2026-11-22): the first line, joined with the next
+    ones while it ends with ':' (schema.ConfigError: "invalid quantization config:" + the problems below)."""
+    lines = [x.strip() for x in str(error or "").strip().splitlines() if x.strip()]
+    out = lines[0] if lines else ""
+    for x in lines[1:4]:
+        if not out.endswith(":"):
+            break
+        out += " " + x
+    return out[:n]
 
 
 def append_jsonl(path: Path, obj) -> None:

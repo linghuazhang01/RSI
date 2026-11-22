@@ -222,7 +222,25 @@ def test_render_gate_table_and_archive():
     assert "failed gain +0.0040 [-0.0100, +0.0200], broken 9 / fixed 11" in text
     assert "accuracy avg@4 0.6" in text and "screen_results(filter='wrong'" in text
     assert "improve this thread's best config" in text and "2 session(s) x 3 step(s)" in text
-    arch = archive_text([{"gen": 1, "accepted": False, "gate_reason": ["x"], "reference_screen":
-                          {"accuracy": 0.5, "correct_counts": {"0": 1}, "truncation_rate": 0.0},
-                          "top": [{"cid": "g01_t0_s00", "score": 0.004, "bytes_gib": 9.9, "config": {}, "gate": g}]}])
-    assert "screen_results(gen=1)" in arch and "gate failed gain +0.0040" in arch
+    from edit_code.prompts import ARCHIVE_HEAD, ARCHIVE_READ, archive_row
+    bad = Candidate(cid="g01_t1_s00", thread=1, step=0, program="", artifact=None, error="program failed: boom\nmore",
+                    screen=None, full=None, score=None)
+    c1 = Candidate(cid="g01_t0_s00", thread=0, step=0, program="", artifact={
+        "bytes_gib": 9.9, "linear_avg_bits": 4.1, "note": "8 bit down 0-3: largest herr",
+        "config": {"default": {"bits": 4, "group_size": 128, "quantizer": "gptq"},
+                   "groups": {"0.down": {"bits": 8}, "1.down": {"bits": 8}, "3.down": {"bits": 8}}}},
+        error=None, screen=None, full=None, score=0.004)
+    ent = {"gen": 1, "accepted": False, "gate_reason": ["x"], "n": 2, "gate_every": True, "best": [(c1.cid, 0.004)],
+           "reference_screen": {"accuracy": 0.5, "correct_counts": {"0": 1}, "truncation_rate": 0.0, "n_items": 500,
+                                "samples_per_item": 4},
+           "rows": [archive_row(c1, g), archive_row(bad, {"passed": False, "reason": "not evaluated: program failed"})],
+           "configs": [(c1.cid, c1.artifact["config"])]}
+    arch = archive_text([ent])
+    assert arch.startswith(ARCHIVE_HEAD) and arch.endswith(ARCHIVE_READ)
+    assert "screen_results(gen=1)" in arch and "over 500 items x 4 samples" in arch
+    assert '"gain": 0.004' in arch and '"ci": [-0.01, 0.02]' in arch and "8 bit down 0-3: largest herr" in arch
+    assert "down L0-1,3 x3" in arch                                    # config_brief with layer ranges
+    assert '"error": "program failed: boom"' in arch and "not evaluated" not in arch   # failures listed, one line
+    assert "full config of" not in arch and "full config of g01_t0_s00" in archive_text([ent], read_tools=False)
+    many = archive_text([dict(ent, gen=t) for t in (1, 2, 3)], max_chars=len(arch) + 400)
+    assert "rows omitted for length; search_history(gen=1)" in many and "round 3" in many

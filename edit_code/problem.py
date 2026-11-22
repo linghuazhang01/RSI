@@ -580,6 +580,49 @@ class QuantProblem:
         finally:
             self._pool.put(slot)
 
+    @contextmanager
+    def serve_all(self, art: dict, name: str):
+        """Serve one config on EVERY free slot of the pool at once (2026-11-22, like Paper B's parent screen over all
+        main replicas): blocks for the first slot, then takes every other slot that is free right now, so it never
+        waits on a running evaluation. Real mode: the checkpoint is written once (the incumbent's exported model when
+        it is there, else a shared copy under out_dir/ckpt/shared/, removed afterwards) and every slot serves it; the
+        servers start together. Yields the list of servers."""
+        from rsicore.servers import VLLMServer, start_all
+        slots = [self._pool.get()]
+        while True:
+            try:
+                slots.append(self._pool.get_nowait())
+            except queue.Empty:
+                break
+        tmp = None
+        try:
+            logs = Path(self.rc.run_dir) / "logs"
+            if self.mock:
+                M.register(self.registry, name, art["mock_quality"])
+                srvs = [VLLMServer("mock-" + name, name, self.slots[s], mock=True, mock_registry=self.registry,
+                                   seed=self.rc.seed, log_dir=logs) for s in slots]
+            else:  # pragma: no cover - GPU path
+                inc = self.incumbent or {}
+                ckpt = Path(inc["model_dir"]) if (inc.get("config_hash") == art["config_hash"] and inc.get("model_dir")
+                                                  and (Path(inc["model_dir"]) / "fake_quant.json").exists()) else None
+                if ckpt is None:
+                    tmp = self.out_dir / "ckpt" / "shared" / art["config_hash"]
+                    ckpt = self.materialize(art, dst=tmp, slot=slots[0])
+                srvs = [VLLMServer(ckpt, name, self.slots[s], seed=self.rc.seed, log_dir=logs,
+                                   extra_args=candidate_args(self.cfg)) for s in slots]
+            try:
+                start_all(srvs)
+                yield srvs
+            finally:
+                for s in srvs:
+                    s.stop()
+        finally:
+            for s in slots:
+                self._pool.put(s)
+            if tmp is not None:          # also the export's staging dir when it failed (quant.export: <dst>.partial)
+                shutil.rmtree(tmp, ignore_errors=True)
+                shutil.rmtree(tmp.with_name(tmp.name + ".partial"), ignore_errors=True)
+
     # ------------------------------------------------------------------ evaluation
     def stage_datasets(self, stage: str) -> list[str]:
         """Datasets scored at `stage`: the gate role for gate, the train role for screen / full."""
@@ -657,7 +700,7 @@ class QuantProblem:
 
     def _evaluate(self, art: dict, stage: str, cid: str, key: tuple, charged: bool, origin: str) -> dict:
         t0 = time.time()
-        from rsicore.evaluate import paired_delta, score
+        from rsicore.evaluate import paired_delta, score, score_split
         name = f"{self.rc.run_id}-{self.tag}-{art['config_hash']}"
         edir = self.out_dir / "evals" / f"{cid}" / stage
         probes, regressions, scored = {}, [], {}
@@ -675,7 +718,12 @@ class QuantProblem:
             if all(p.exists() for p in src.values()):
                 reuse = {ds: read_jsonl(p) for ds, p in src.items()}
         from contextlib import nullcontext
-        with (nullcontext() if reuse else self.serve(art, name)) as srv:
+        # (2026-11-22) the incumbent's screen / full run (once per generation, before the search; nothing else holds a
+        # slot then) is split over every free candidate slot, like Paper B's parent screen over all main replicas
+        split = origin == "incumbent" and stage != "gate" and not reuse
+        with (nullcontext() if reuse else self.serve_all(art, name) if split else self.serve(art, name)) as srv:
+            srvs = srv if isinstance(srv, list) else [srv]
+            srv = srvs[0]
             for ds in dsets:
                 ids = self._ids(ds, stage)
                 if reuse:
@@ -683,6 +731,9 @@ class QuantProblem:
                     (edir / f"{ds}.jsonl").write_text("".join(__import__("json").dumps(r, ensure_ascii=False) + "\n"
                                                               for r in reuse[ds]))
                     res = SimpleNamespace(records=reuse[ds])
+                elif len(srvs) > 1:
+                    res = score_split([s.endpoint for s in srvs], name, ds, pool="pool", ids=ids, out_dir=edir,
+                                      mock=self.mock, decoding=dec)
                 else:
                     res = score(srv.endpoint, name, ds, pool="pool", ids=ids, out_dir=edir, mock=self.mock,
                                 decoding=dec)
@@ -840,12 +891,16 @@ class QuantProblem:
 
     def compute_refs(self, endpoint: str, served_name: str) -> None:
         """M_0 (served as the editor) is only the KL reference: cache its prompt logprobs on the KL texts
-        (real mode). It is not scored on the signal items (candidates are compared with the incumbent)."""
-        if self.mock or float(self.cfg["search"].get("kl_weight", 0.0)) <= 0:   # no KL in the score: no reference
+        (real mode). It is not scored on the signal items (candidates are compared with the incumbent).
+        kl_ref.jsonl only when the score uses KL (search.kl_weight > 0); kl_ref_heldout.jsonl whenever there are
+        held-out KL texts (E_t's heldout_kl reads it whatever kl_weight is; 2026-11-22: objective simple has
+        kl_weight 0)."""
+        klw = float(self.cfg["search"].get("kl_weight", 0.0) or 0.0)
+        if self.mock or not ((self.kl_texts and klw > 0) or self.kl_heldout):
             return
         from rsicore.evaluate import reference_logprobs  # pragma: no cover - GPU path
         k = self.cfg["kl"]["top_k"]
-        if self.kl_texts:
+        if self.kl_texts and klw > 0:                     # no KL in the score: no reference
             reference_logprobs(endpoint, served_name, [t for _, t in self.kl_eval_texts()],
                                self.refs_dir / "kl_ref.jsonl", k)
         if self.kl_heldout:
@@ -926,12 +981,22 @@ class QuantProblem:
         else:
             from rsicore.records import gen_dir
             base = gen_dir(self.rc, int(gen))
+        # (2026-11-22) kept in memory once complete (the 8 sessions' screen_results / screen_output calls used to
+        # re-read the large jsonl files on every call; Paper B keeps one shared copy): a run's records never change
+        key = str(base)
+        cache = self.__dict__.setdefault("_screen_cache", {})
+        with self._lock:
+            if key in cache:
+                return dict(cache[key])
         out = {}
         for ds in self.datasets:
             p = base / "evals" / "incumbent" / "screen" / f"{ds}.jsonl"
             if p.exists():
                 out[ds] = read_jsonl(p)
-        return out
+        if out and len(out) == len(self.datasets):
+            with self._lock:
+                cache[key] = out
+        return dict(out)
 
     def screen_items(self, records_by_ds: dict) -> dict:
         """{dataset: {id: processed record}} for the ids in records_by_ds (prompt + gold; training-pool items)."""

@@ -67,6 +67,11 @@ def test_mode_tool_surface(tmp_path):
     art, err = program_build(ed, prog, "g00_t0_s00", timeout_s=120, mem_gb=4, workdir=tmp_path / "w1")
     assert err is None, err
     assert art["strategy"] == "raw+ops"
+    # (2026-11-22) the history's account of what changed: module types, per type layers / count / rank / rel norm
+    e = art["edit"]
+    assert e["types"] == ["mlp.down_proj"] and e["n"] == art["modules"]
+    assert e["groups"][0]["type"] == "mlp.down_proj" and e["groups"][0]["n"] == art["modules"]
+    assert e["groups"][0]["rank"] == "4" and "layers" in e["groups"][0] and "rel_norm" in e["groups"][0]
     assert ed.load_candidate(art["cid"]).damage < raw.damage
     bad = "def main(api):\n    return {'lora': api.sgd(steps=5, lr=1e-4)['lora']}\n"
     art, err = program_build(ed, bad, "g00_t1_s00", timeout_s=120, mem_gb=4, workdir=tmp_path / "w2")
@@ -200,7 +205,13 @@ def test_mock_program_through_sandbox(tmp_path):
     assert art is None and "PermissionError" in err
     keep = "def main(api):\n    return {'lora': None}\n"
     art, err = program_build(ws, keep, "g00_t2_s00", timeout_s=120, mem_gb=4, workdir=tmp_path / "w3")
-    assert err is None and art["keep"]
+    assert err is None and art["keep"] and "note" not in art
+    # (2026-11-22) a returned note is recorded in the artifact, whitespace collapsed and cut to 600 characters
+    noted = ("def main(api):\n    return {'lora': None, 'note': 'rejected: scale x1.1 (train_loss +0.03)\\n\\n'"
+             " + 'x' * 900}\n")
+    art, err = program_build(ws, noted, "g00_t3_s00", timeout_s=120, mem_gb=4, workdir=tmp_path / "w4")
+    assert err is None and art["keep"] and art["note"].startswith("rejected: scale x1.1 (train_loss +0.03) xxx")
+    assert len(art["note"]) == 600 and art["note"].endswith("...")
 
 
 def test_mock_run_end_to_end(tmp_path):
@@ -469,6 +480,49 @@ def test_mock_edit_chain_trains_once(tmp_path):
     assert len({json.loads((run / f"gen_{g:02d}" / "model.json").read_text())["path"] for g in range(3)}) == 1
 
 
+def test_mock_scratch_adapter(tmp_path):
+    """scratch + merge.mode adapter (2026-11-22): nothing is merged; M_g = M_0 + C_g on the one m0 server, C_{g+1} =
+    C_g (+) the accepted delta kept under the accepted candidate's adapter name (its registry quality = the gated
+    one), a rejected generation keeps C_g; nothing is trained; the editor of g >= 1 is C_g's adapter."""
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "3", "--mock",
+           "--runs-dir", str(tmp_path), "--run-id", "B_adapter", "--set", "method.mode=scratch",
+           "--set", "merge.mode=adapter", "--set", "gate.min_gain=0", "--set", "gate.require_significant=false"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    assert "merge=adapter max_lora_rank=256" in r.stdout
+    run = tmp_path / "B_adapter"
+    state = json.loads((run / "state.json").read_text())
+    summ = json.loads((run / "summary.json").read_text())["gens"]
+    reg = json.loads((run / "mock_registry.json").read_text())
+    assert not any(k.endswith("/raw") or k.endswith("/sft") for k in state)              # nothing trained
+    assert not any(k in reg for k in ("m1", "m2", "m3"))                                  # no merged successor
+    prev, accepted = None, 0
+    for g in range(3):
+        gd = run / f"gen_{g:02d}"
+        model = json.loads((gd / "model.json").read_text())
+        s = summ[str(g)]
+        assert not (gd / "model").exists() and model["merge_mode"] == "adapter"         # nothing merged
+        assert s["method"] == "scratch" and s["merge_mode"] == "adapter" and s["gate_reference"] == "parent"
+        assert s["editor"] == (prev or "m0") and s["successor"] == model["lora"]
+        assert state[f"gen{g:02d}/merge"]["merged"] is False
+        if s["accepted"]["source"] == "llm":
+            accepted += 1
+            assert model["lora"] == s["accepted"]["name"]
+            C = json.loads(Path(model["lora_file"]).read_text())
+            assert C["meta"]["cumulative"] and model["components"][-1] == g
+            dW = json.loads((gd / "accepted_lora.json").read_text())
+            for m, v in dW["modules"].items():                                            # the delta is inside C
+                assert C["modules"][m]["rank"] >= v["rank"]
+            assert reg[model["lora"]] == model["quality"]                                 # gated quality kept
+        else:
+            assert model["lora"] == prev                                                   # keep C_g
+        prev = model["lora"]
+    assert accepted >= 1, "no generation accepted a candidate; the adapter path was not exercised"
+    assert len({json.loads((run / f"gen_{g:02d}" / "model.json").read_text())["path"] for g in range(3)}) == 1
+
+
 def test_mock_data_sizes_and_fixed_noise(tmp_path):
     """data.* draw sizes, raw.n_train, baseline.noise_fixed (no re-runs) in one mock run."""
     py = REPO / "eval" / ".venv" / "bin" / "python"
@@ -611,10 +665,16 @@ def test_explore_api_surface_and_budgets(tmp_path):
     out, res = _explore(ws, "result = api.acts(module='layers.3.mlp.down_proj', ids=api.train_ids()[:4])['in_norm']",
                         tmp_path / "gpu", cfg=cfg)
     assert res["ok"] and res["result"] == 12.0, res
-    assert ws.api.spent["gpu_seconds"] == 0.0 and ws.gpu_measured == 0.0 and ws._xspent["gpu_seconds"] > 0
+    assert ws.api.spent["gpu_seconds"] == 0.0 and ws.gpu_measured == 0.0
+    assert ws._xbudgets["g00_t0_s00"][1]["gpu_seconds"] > 0
     out, res = _explore(ws, "for _ in range(20):\n    api.acts(module='layers.3.mlp.down_proj')\n", tmp_path / "gpu",
                         r=2, cfg=cfg)
     assert not res["ok"] and "BudgetExceeded" in res["error"] and ws.api.spent["gpu_seconds"] == 0.0
+    # (2026-11-22) the budget is per session: another candidate's session still has its full gpu_seconds
+    out, res = _explore(ws, "result = api.acts(module='layers.3.mlp.down_proj', ids=api.train_ids()[:4])['in_norm']",
+                        tmp_path / "gpu", cid="g00_t1_s00", cfg=cfg)
+    assert res["ok"], res
+    assert ws._xbudgets["g00_t1_s00"][0] == {"gpu_seconds": 10.0} and ws._xbudgets["g00_t1_s00"][1]["gpu_seconds"] < 10
     ws.api.call("acts", {"module": "layers.3.mlp.down_proj", "ids": ws.t_train_ids()[:4]})   # program budget intact
     assert ws.api.spent["gpu_seconds"] > 0
     assert editor_chat_tools(ws, {"editor": {"tool_rounds": 0}}) is None
@@ -712,7 +772,7 @@ def test_mock_tool_loop_scratch(tmp_path):
 
 def test_search_history_tool_scratch(tmp_path):
     """search_history (2026-11-21): generation 1's editor gets the tool; it lists generation 0's candidates with
-    Paper B's summary (strategy, modules, target gain, ...) and same_as by digest; read_record opens them."""
+    Paper B's summary (module types, modules, target gain, ...) and same_as by digest; read_record opens them."""
     from rsicore.chat_tools import ChatTools
     from rsicore.sandbox import ToolAPI
 
@@ -736,11 +796,279 @@ def test_search_history_tool_scratch(tmp_path):
         off = out.get("next_offset")
     assert len(rows) == len(g0) and all(x["gen"] == 0 for x in rows)
     ok = [x for x in rows if "error" not in x]
-    assert ok and all("strategy" in x and "modules" in x for x in ok)
+    assert ok and all("types" in x and "modules" in x and "strategy" not in x for x in ok if not x.get("keep"))
     digests = [(c.get("artifact") or {}).get("digest") for c in g0 if not c.get("error")]
     assert sum("same_as" in x for x in ok) == len(digests) - len(set(digests))
     rr = json.loads(t.call("read_record", {"cid": g0[0]["cid"], "part": "program"}, ctx, 1, 0)["content"])
     assert rr["ok"] and rr["text"] == (run / "gen_00" / "programs" / f"{g0[0]['cid']}.py").read_text()
+    # (2026-11-22) generation 1's first message carries the structured archive: one row per generation-0
+    # candidate, failures included, and full programs only through read_record (no quoted best program)
+    tr = [json.loads(x) for x in (run / "gen_01" / "editor" / "thread_0.jsonl").read_text().splitlines()]
+    first = next(x["content"] for x in tr if x.get("role") == "user")
+    assert "Archive of earlier generations: EVERY candidate" in first and "read_record(cid, 'program'" in first
+    assert "best program of generation 0" not in first
+    arows = [json.loads(x) for x in first.splitlines() if x.startswith('  {"cid": "g00_')]
+    assert sorted(x["cid"] for x in arows) == sorted(c["cid"] for c in g0)
+    assert all(("error" in x) == bool(c.get("error")) for x, c in zip(sorted(arows, key=lambda x: x["cid"]),
+                                                                       sorted(g0, key=lambda c: c["cid"])))
+
+
+def test_tool_devices(tmp_path):
+    """gpu_layout.tools_on_replicas (2026-11-22): session / candidate k uses tool device k mod n (its store / HF
+    model / replica) and that device's lock; sessions on different devices run their tools at once, sessions on
+    the same device one after the other; without devices the workspace lock and store as before."""
+    import threading
+    import time as _t
+
+    from lora_code.mock import MockStore
+    ws = _ws(tmp_path)
+    s0 = ws.store
+    assert ws.dev_index("g01_t3_s00") is None and ws._tool_lock() is ws._lock
+    stores = [MockStore(), MockStore()]
+    ws.set_devices([{"store": stores[0], "hf": None, "server": "R0"}, {"store": stores[1], "hf": None, "server": "R1"}])
+    assert [ws.dev_index(c) for c in ("g01_t0_s00", "g01_t1_s00", "g01_t2_s00~x", "g01_t3_s00~x01_0", "x")] == \
+        [0, 1, 0, 1, None]
+    ws.begin_program("g01_t3_s00")
+    assert ws.store is stores[1] and ws._tool_lock() is ws.devs[1]["lock"] and ws._loss_replica() == "R1"
+    ws.end_program("g01_t3_s00")
+    assert ws.store is s0 and ws._tool_lock() is ws._lock
+
+    inside, peak, lk = [0], [0], threading.Lock()
+
+    def slow(**kw):
+        with lk:
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+        _t.sleep(0.2)
+        with lk:
+            inside[0] -= 1
+        return {}
+    fn = ws._wrap("modules", slow)
+
+    def run(cid):
+        ws.begin_program(cid)
+        try:
+            fn()
+        finally:
+            ws.end_program(cid)
+    for cids, want in ((["g01_t0_s00", "g01_t1_s00"], 2), (["g01_t0_s00", "g01_t2_s00"], 1)):
+        peak[0] = 0
+        ts = [threading.Thread(target=run, args=(c,)) for c in cids]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert peak[0] == want, (cids, peak[0])
+
+
+def test_vllm_answer_nll():
+    """tools.vllm_answer_nll (2026-11-22): token-id prompts in batches, -logprob of each answer token (labels !=
+    -100) read from prompt_logprobs at its own position, mean over all answer tokens; missing logprobs raise."""
+    import math
+
+    import pytest
+
+    from lora_code.tools import vllm_answer_nll
+    enc = [([5, 6, 7, 8], [-100, -100, 7, 8]), ([9, 3], [-100, 3]), ([4, 4, 2], [-100, -100, 2])]
+    calls = []
+
+    def post(url, payload, timeout=None):
+        calls.append((url, payload))
+        assert payload["prompt_logprobs"] == 1 and payload["max_tokens"] == 1
+        chs = []
+        for k, ids in enumerate(payload["prompt"]):
+            plp = [None] + [{str(t): {"logprob": -0.1 * t, "rank": 1}, "99": {"logprob": -9.0, "rank": 2}}
+                            for t in ids[1:]]
+            chs.append({"index": k, "prompt_logprobs": plp})
+        return {"choices": list(reversed(chs))}
+    nll, secs = vllm_answer_nll("http://h:1/v1", "tl_x", enc, batch=2, post=post)
+    assert math.isclose(nll, 0.1 * (7 + 8 + 3 + 2) / 4) and secs >= 0
+    assert [c[0] for c in calls] == ["http://h:1/v1/completions"] * 2 and calls[0][1]["model"] == "tl_x"
+    assert calls[0][1]["prompt"] == [[5, 6, 7, 8], [9, 3]] and calls[1][1]["prompt"] == [[4, 4, 2]]
+
+    def bad(url, payload, timeout=None):
+        return {"choices": [{"index": 0, "prompt_logprobs": [None, {"1": {"logprob": -1.0}}]}]}
+    with pytest.raises(RuntimeError, match="no logprob for token 3"):
+        vllm_answer_nll("http://h:1/v1", "m", [([9, 3], [-100, 3])], post=bad)
+    import time as _t
+    with pytest.raises(RuntimeError, match="budget or wall-clock limit ran out"):
+        vllm_answer_nll("http://h:1/v1", "m", enc, post=post, deadline=_t.time() - 1)
+
+
+def test_vllm_loss_cleans_up(tmp_path, monkeypatch):
+    """Workspace._vllm_loss (2026-11-22): the adapter is unloaded and its directory deleted also when loading it on
+    the replica fails; the replica's load time is charged to the call."""
+    import pytest
+
+    import lora_code.primitives.lora as L
+
+    class Lo:
+        def modules(self):
+            return ["layers.1.mlp.down_proj"]
+
+        def max_rank(self):
+            return 4
+
+    class Srv:
+        endpoint, max_lora_rank = "http://h:1/v1", 64
+
+        def __init__(self):
+            self.unloaded = []
+
+        def load_lora(self, name, path):
+            assert Path(path).is_dir()
+            raise RuntimeError("load_lora failed: rank too large")
+
+        def unload_lora(self, name):
+            self.unloaded.append(name)
+
+    def fake_save(lo, path, store, **kw):
+        Path(path).mkdir(parents=True)
+        (Path(path) / "adapter_model.safetensors").write_text("x")
+    monkeypatch.setattr(L, "save_peft", fake_save)
+    ws = _ws(tmp_path)
+    srv = Srv()
+    ws.hf = type("H", (), {"encode": staticmethod(lambda e: ([1, 2, 3], [-100, 2, 3]))})()
+    ws.evaluator = type("E", (), {"served": "m0", "replicas": [srv]})()
+    ws.begin_program("g01_t0_s00")
+    with pytest.raises(RuntimeError, match="rank too large"):
+        ws._vllm_loss([{"messages": [], "target": "a"}], Lo())
+    ws.end_program("g01_t0_s00")
+    assert srv.unloaded == [f"tl_{ws.name_prefix}_1"]
+    assert not any((tmp_path / "train_loss_adapters").glob("*"))
+
+
+def test_warm_devices_raises_and_budget_shows_session_gpu(tmp_path):
+    """warm_devices (2026-11-22) raises the first HF load failure with the device named; api.budget inside
+    run_python reports the session's own exploration GPU seconds."""
+    import pytest
+
+    class Bad:
+        device = "cuda:3"
+
+        @property
+        def model(self):
+            raise MemoryError("CUDA out of memory")
+    ws = _ws(tmp_path)
+    ws.set_devices([{"hf": None, "store": None, "server": None}, {"hf": Bad(), "store": None, "server": None}])
+    with pytest.raises(RuntimeError, match=r"tool device 1 \(cuda:3\).*MemoryError"):
+        ws.warm_devices()
+    cfg = {"editor": {"explore": {"timeout_s": 60, "mem_gb": 4, "gpu_tools": True, "gpu_seconds": 10}}}
+    ws = _ws(tmp_path / "b")
+    out, res = _explore(ws, "api.acts(module='layers.3.mlp.down_proj', ids=api.train_ids()[:4])\nresult = api.budget()",
+                        tmp_path / "b", cfg=cfg)
+    assert res["ok"], res
+    assert 0 < res["result"]["explore_gpu_seconds_left"] < 10 and "explore_note" in res["result"]
+
+
+def test_train_loss_backend_choice(tmp_path):
+    """Workspace.loss_backend (2026-11-22): vllm only when tools.train_loss_backend is vllm, outside mock, with an
+    evaluator, a LoRA (not a weight edit) and no parent LoRA; hf otherwise."""
+    from lora_code.mock import MockLoRA, MockWeightEdit
+    ws = _ws(tmp_path)
+    lo = MockLoRA()
+    assert ws.loss_backend(lo, None) == "hf"
+    ws.cfg = {**ws.cfg, "tools": {"train_loss_backend": "vllm"}}
+    assert ws.loss_backend(lo, None) == "hf"                 # mock
+    srv = type("S", (), {"max_lora_rank": 64})()
+    ws.mock, ws.evaluator = False, type("E", (), {"replicas": [srv], "served": "m"})()
+    assert ws.loss_backend(lo, None) == "vllm"
+    assert ws.loss_backend(lo, MockLoRA()) == "hf"           # mode=edit: the parent is a LoRA
+    assert ws.loss_backend(MockWeightEdit(), None) == "hf"
+    big = MockLoRA({"layers.1.mlp.down_proj": {"rank": 65, "rel": 0.01}})
+    assert ws.loss_backend(big, None) == "hf"                # padded to 128 > the replica's --max-lora-rank 64
+    ws.evaluator = object()
+    assert ws.loss_backend(lo, None) == "hf"                 # no replica to score on
+
+
+def test_replica_memory():
+    """common.replica_memory (2026-11-22): with tools_on_replicas the main replicas get replica_vllm_gib (and a
+    scaled utilization fallback); unchanged without it or in mode=weights; the b300 profile turns it on."""
+    import yaml
+
+    from lora_code.common import replica_memory, tools_on_replicas
+    args = ["--rsi-gpu-memory-gib", "220", "--gpu-memory-utilization", "0.81", "--max-model-len", "131072"]
+    on = {"gpu_layout": {"tools_on_replicas": True, "replica_vllm_gib": 140}}
+    assert replica_memory(args, on) == ["--rsi-gpu-memory-gib", "140", "--gpu-memory-utilization", "0.515",
+                                        "--max-model-len", "131072"]
+    assert replica_memory(args, {"gpu_layout": {"replica_vllm_gib": 140}}) == args
+    assert not tools_on_replicas({**on, "method": {"mode": "weights"}})
+    base = yaml.safe_load((REPO / "lora_code" / "configs" / "base.yaml").read_text())
+    assert base["hardware_profiles"]["b300"]["gpu_layout"] == {"tools_on_replicas": True, "replica_vllm_gib": 140}
+    assert not base["gpu_layout"]["tools_on_replicas"]
+    assert not (base["hardware_profiles"]["h20"].get("gpu_layout") or {}).get("tools_on_replicas")
+
+
+def test_archive_row():
+    """prompts.archive_row (2026-11-22): what the candidate changed (module types; per type layers, count, rank,
+    rel norm, weight-edit ops), its gate result, error first line, kept, note."""
+    from types import SimpleNamespace as NS
+
+    from lora_code.prompts import archive_row
+    edit = {"n": 7, "types": ["mlp.down_proj", "self_attn.o_proj"], "groups": [
+        {"type": "mlp.down_proj", "n": 5, "layers": "10-14", "rank": "4", "rel_norm": "0.002-0.004"},
+        {"type": "self_attn.o_proj", "n": 2, "layers": "3,7", "rank": "1-2", "rel_norm": "0.001"}]}
+    ok = NS(cid="g00_t1_s00", error=None, score=0.0025, artifact={
+        "strategy": "svd", "modules": 7, "max_rank": 4, "tools_used": {"svd": 3}, "edit": edit,
+        "note": "down_proj 10-14: largest gradient norm on failed problems"})
+    r = archive_row(ok, {"passed": False, "gain": 0.00251, "ci": [-0.0105, 0.016], "reason": "gain not positive"})
+    assert r == {"cid": "g00_t1_s00", "types": ["mlp.down_proj", "self_attn.o_proj"],
+                 "modules": ["mlp.down_proj L10-14 x5 rank 4 rel 0.002-0.004",
+                             "self_attn.o_proj L3,7 x2 rank 1-2 rel 0.001"],
+                 "gate": {"passed": False, "gain": 0.0025, "ci": [-0.0105, 0.016], "reason": "gain not positive"},
+                 "note": "down_proj 10-14: largest gradient norm on failed problems"}
+    wed = NS(cid="g00_t4_s00", error=None, score=None, artifact={"kind": "weights", "edit": {
+        "n": 3, "types": ["mlp.up_proj"], "groups": [{"type": "mlp.up_proj", "n": 3, "layers": "20-22",
+                                                     "rel_norm": "0.01", "ops": "scale s=1.02"}]}})
+    assert archive_row(wed) == {"cid": "g00_t4_s00", "kind": "weights", "types": ["mlp.up_proj"],
+                                "modules": ["mlp.up_proj L20-22 x3 rel 0.01 [scale s=1.02]"]}
+    old = NS(cid="g00_t5_s00", error=None, score=None, artifact={"modules": 12, "max_rank": 4})
+    assert archive_row(old) == {"cid": "g00_t5_s00", "modules": 12, "rank": 4}
+    kept = NS(cid="g00_t2_s00", error=None, score=None, artifact={"keep": True, "note": "all 5 raised train_loss"})
+    assert archive_row(kept) == {"cid": "g00_t2_s00", "kept": True, "note": "all 5 raised train_loss"}
+    bad = NS(cid="g00_t3_s00", error="program failed: NameError: name 'x' is not defined\nTraceback ...",
+             score=None, artifact=None)
+    assert archive_row(bad) == {"cid": "g00_t3_s00", "error": "program failed: NameError: name 'x' is not defined"}
+
+
+def test_edit_summary():
+    """tools.edit_summary (2026-11-22): modules grouped by type (and by op setting for a weight edit) with layer
+    ranges, rank and rel-norm spans; non-layer tensors keep their name; at most EDIT_GROUPS groups."""
+    from types import SimpleNamespace as NS
+
+    from lora_code.tools import EDIT_GROUPS, edit_summary
+    rep = {"modules": {**{f"layers.{i}.mlp.down_proj": {"rank": 4, "rel_norm": 0.002 + 0.001 * (i - 10)}
+                          for i in (10, 11, 12, 14)},
+                       "layers.3.self_attn.o_proj": {"rank": 1, "rel_norm": 0.001},
+                       "layers.7.self_attn.o_proj": {"rank": 2, "rel_norm": 0.001}}}
+    s = edit_summary(NS(kind="lora"), rep)
+    assert s == {"n": 6, "types": ["mlp.down_proj", "self_attn.o_proj"], "groups": [
+        {"type": "mlp.down_proj", "n": 4, "layers": "10-12,14", "rank": "4", "rel_norm": "0.002-0.006"},
+        {"type": "self_attn.o_proj", "n": 2, "layers": "3,7", "rank": "1-2", "rel_norm": "0.001"}]}
+
+    class WE:
+        kind = "weights"
+
+        def summary(self):
+            return {"layers.2.mlp.up_proj": [{"op": "scale", "s": 1.02}],
+                    "layers.3.mlp.up_proj": [{"op": "scale", "s": 1.02}],
+                    "layers.4.mlp.up_proj": [{"op": "rows", "idx": [1, 2, 3], "f": 0.9}, {"op": "lowrank", "rank": 2}],
+                    "norm.weight": [{"op": "delta", "shape": [8], "norm": 0.1}]}
+    rep = {"modules": {m: {"rel_norm": 0.01} for m in WE().summary()}}
+    s = edit_summary(WE(), rep)
+    assert s["types"] == ["mlp.up_proj", "norm.weight"]
+    assert s["groups"][0] == {"type": "mlp.up_proj", "n": 2, "layers": "2-3", "rel_norm": "0.01", "ops": "scale s=1.02"}
+    assert {"type": "mlp.up_proj", "n": 1, "layers": "4", "rel_norm": "0.01",
+            "ops": "rows n=3 f=0.9; lowrank r=2"} in s["groups"]
+    assert {"type": "norm.weight", "n": 1, "rel_norm": "0.01", "ops": "delta"} in s["groups"]
+    many = {"modules": {f"layers.{i}.mlp.{leaf}": {"rank": 1, "rel_norm": 0.001}
+                        for i in range(2) for leaf in ("gate_proj", "up_proj", "down_proj")} |
+                       {f"layers.{i}.self_attn.{leaf}": {"rank": 1, "rel_norm": 0.001}
+                        for i in range(2) for leaf in ("q_proj", "k_proj", "v_proj", "o_proj")} |
+                       {f"layers.{i}.linear_attn.{leaf}": {"rank": 1, "rel_norm": 0.001}
+                        for i in range(2) for leaf in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")}}
+    s = edit_summary(NS(kind="lora"), many)
+    assert len(s["groups"]) == EDIT_GROUPS and s["more_groups"] == 12 - EDIT_GROUPS and len(s["types"]) == 12
 
 
 def test_prompt_gate_text_and_rules():

@@ -13,7 +13,11 @@
 # H20 (110 GB): replace --hw b300 with --hw h20.
 #
 # GPU roles: GPUs 0-6 = 7 replicas of the current model M_g (editor, screen / gate / test scoring, LoRA serving);
-#   GPU 7 = HF model for the tools (svd, acts, train_loss, merge)
+#   since 2026-11-22 (gpu_layout.tools_on_replicas, b300 profile) each of them also holds an HF copy of M_g and editor
+#   session k runs its tools (svd / acts / regmean_preserve) on GPU k mod 7, and train_loss on that replica's vLLM
+#   (tools.train_loss_backend vllm); vLLM there is planned at 140 GB instead of 220.
+#   GPU 7 = HF model for diagnostics, merge and the baselines
+#   Exploration GPU budget: editor.explore.gpu_seconds 600 per session (was one 600 s pool for all 8).
 # Data (simple_data/math/): gate = simple_math_eval (500 fixed, hidden: the editor sees only statistics of earlier
 #   candidates' gate results); test = simple_math_test (500 fixed, held-out report only); screen = 500 items drawn afresh
 #   each generation from the dapo_math pool minus gate and test; train = all remaining pool items (~13,200).
@@ -117,7 +121,7 @@ editor:
     timeout_s: 300
     mem_gb: 8
     gpu_tools: true
-    gpu_seconds: 600
+    gpu_seconds: 600          # per session (2026-11-22)
     persistent: true
 sandbox:
   timeout_s: 1800
@@ -136,6 +140,7 @@ tools:
   train_loss: true
   tensor_compute: true
   paper_tools: true
+  train_loss_backend: vllm
 tensor_compute:
   max_tensors: 4
   timeout_s: 300
@@ -237,7 +242,7 @@ server:
   max_loras: 8
   main_args:
   - --rsi-gpu-memory-gib
-  - '220'
+  - '220'                     # 140 on the main replicas with tools_on_replicas (gpu_layout.replica_vllm_gib)
   - --gpu-memory-utilization
   - '0.81'
   - --max-model-len
@@ -265,6 +270,8 @@ gpu_layout:
   main_replicas: true
   main_tp: 1
   train_gpus: 1
+  tools_on_replicas: true
+  replica_vllm_gib: 140
 hardware: b300
 data_roles:
   eval: eval:simple_math_test

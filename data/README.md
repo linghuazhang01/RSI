@@ -54,13 +54,13 @@ Paper B 设置 `retention.domains=[]`、`heldout.domains=math` 和 `e_t.enabled=
 
 benchmark 全部是**留出集**（`test` 池），每一代结束后评测、只用于报告。
 
-| 领域 | 训练集 | 池（去污染后） | 默认验收 `gate_n` | 留出集（主表） |
+| 领域 | 训练集 | 池（去污染、去重后） | 默认验收 `gate_n` | 留出集（主表） |
 |---|---|---|---|---|
-| 数学 | `dapo_math`（DAPO-Math-17K） | 16,314 | 1,000 | MATH-500（500）、GSM8K test（1,319）、AIME 2024+2025（60） |
-| 代码 | `taco_verified`（TACO-verified） | 10,806 | 1,000（按难度分层） | HumanEval+（164）、MBPP+（378）、LiveCodeBench（131） |
-| 通用推理 / 知识 | `triviaqa_train`（TriviaQA train） | 73,725 | 3,000 | GPQA-Diamond（198）、MMLU-Pro（2,000）、TriviaQA（2,000） |
-| 指令遵循 | `ifeval_train`（RLVR-IFeval） | 14,954 | 1,000（按约束类型分层） | IFEval（271）、IFBench（300，领域外） |
-| 工具调用 | `sealtool_train`（Seal-Tools train） | 12,019 | 1,000 | Seal-Tools test（1,354）、API-Bank test（584）、BFCL（4,696） |
+| 数学 | `dapo_math`（DAPO-Math-17K） | 14,738 | 1,000 | MATH-500（500）、GSM8K test（1,319）、AIME 2024+2025（60） |
+| 代码 | `taco_verified`（TACO-verified） | 10,791 | 1,000（按难度分层） | HumanEval+（164）、MBPP+（378）、LiveCodeBench（131） |
+| 通用推理 / 知识 | `triviaqa_train`（TriviaQA train） | 73,101 | 3,000 | GPQA-Diamond（198）、MMLU-Pro（2,000）、TriviaQA（2,000） |
+| 指令遵循 | `ifeval_train`（RLVR-IFeval） | 14,949 | 1,000（按约束类型分层） | IFEval（271）、IFBench（300，领域外） |
+| 工具调用 | `sealtool_train`（Seal-Tools train） | 12,015 | 1,000 | Seal-Tools test（1,354）、API-Bank test（584）、BFCL（4,696） |
 
 额外留出集（附录）：AMC23、OlympiadBench、FreebaseQA、MetaTool、T-Eval；MT-Bench、AlpacaEval 2 需要 LLM judge。
 不再使用（`reserve`）：GSM8K train、MATH train、ARC、GPQA Main、APPS、IFEval 的 270 个非测试题、Magicoder、Tulu-3 IF、API-Bank train。ToolACE 只作 Paper A 的 KL 文本。SQuAD 保留为 Paper B 的可选知识注入任务。
@@ -71,9 +71,9 @@ benchmark 全部是**留出集**（`test` 池），每一代结束后评测、�
 
 | dataset | category | source | revision | license | pool（抽样池） | gate（验收） | test（留出） | reserve | train / search | expected | actual |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| gsm8k_train（训练集） | math | [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) | `740312add88f` | MIT | 7221 | 250 |  |  |  (+2 train_excluded) | 7473 | 7473 |
-| math_train（训练集） | math | [EleutherAI/hendrycks_math](https://huggingface.co/datasets/EleutherAI/hendrycks_math) | `21a5633873b6` | MIT | 7116 | 350 |  |  |  (+34 train_excluded) | 7500 | 7500 |
-| dapo_math（训练集） | math | [BytedTsinghua-SIA/DAPO-Math-17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k) | `65877096c24f` | Apache-2.0 (per DAPO project) | 15929 | 400 |  |  |  (+1069 train_excluded) | 17398 | 17398 |
+| gsm8k_train（训练集） | math | [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) | `740312add88f` | MIT |  |  |  | 7471 |  (+2 train_excluded) | 7473 | 7473 |
+| math_train（训练集） | math | [EleutherAI/hendrycks_math](https://huggingface.co/datasets/EleutherAI/hendrycks_math) | `21a5633873b6` | MIT |  |  |  | 7261 |  (+228 train_excluded) (+11 train_duplicate) | 7500 | 7500 |
+| dapo_math（训练集） | math | [BytedTsinghua-SIA/DAPO-Math-17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k) | `65877096c24f` | Apache-2.0 (per DAPO project) | 14738 |  |  |  |  (+1541 train_excluded) (+1103 train_duplicate) | 17382 | 17382 |
 | math（留出集） | math | [EleutherAI/hendrycks_math](https://huggingface.co/datasets/EleutherAI/hendrycks_math) | `21a5633873b6` | MIT |  |  | 500 | 4500 |  | 5000 | 5000 |
 | gsm8k（留出集） | math | [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) | `740312add88f` | MIT |  |  | 1319 |  |  | 1319 | 1319 |
 | aime24（留出集） | math | [HuggingFaceH4/aime_2024](https://huggingface.co/datasets/HuggingFaceH4/aime_2024) | `2fe88a2f1091` | unspecified on HF (problems (c) MAA; used for research eval) |  |  | 30 |  |  | 30 | 30 |
@@ -81,33 +81,33 @@ benchmark 全部是**留出集**（`test` 池），每一代结束后评测、�
 | amc23（留出集） | math | [math-ai/amc23](https://huggingface.co/datasets/math-ai/amc23) | `80815d37005f` | unspecified on HF (problems (c) MAA) |  |  | 40 |  |  | 40 | 40 |
 | olympiadbench（留出集） | math | [Hothan/OlympiadBench](https://huggingface.co/datasets/Hothan/OlympiadBench) | `91184b52131e` | Apache-2.0 |  |  | 674 |  |  | 674 | 674 |
 | apps（训练集（不再使用）） | code | [codeparrot/apps](https://huggingface.co/datasets/codeparrot/apps) | `21e74ddf8de1` | MIT |  |  |  | 4449 |  | 4449 | 4449 |
-| taco_verified（训练集） | code | [likaixin/TACO-verified](https://huggingface.co/datasets/likaixin/TACO-verified) | `06dd53e0cfcf` | MIT tag on HF (upstream BAAI/TACO is Apache-2.0; card notes some content under CC-BY-4.0) | 9806 | 1000 |  |  |  | 10806 | 10806 |
+| taco_verified（训练集） | code | [likaixin/TACO-verified](https://huggingface.co/datasets/likaixin/TACO-verified) | `06dd53e0cfcf` | MIT tag on HF (upstream BAAI/TACO is Apache-2.0; card notes some content under CC-BY-4.0) | 10791 |  |  |  |  (+15 train_duplicate) | 10806 | 10806 |
 | magicoder_oss（训练集（不再使用）） | code | [ise-uiuc/Magicoder-OSS-Instruct-75K](https://huggingface.co/datasets/ise-uiuc/Magicoder-OSS-Instruct-75K) | `5f839b1f368a` | MIT |  |  |  | 75197 |  | 75197 | 75197 |
 | humanevalplus（留出集） | code | [evalplus/humanevalplus](https://huggingface.co/datasets/evalplus/humanevalplus) | `d32357cf319e` | Apache-2.0 |  |  | 164 |  |  | 164 | 164 |
 | mbppplus（留出集） | code | [evalplus/mbppplus](https://huggingface.co/datasets/evalplus/mbppplus) | `b2d74c91837c` | Apache-2.0 |  |  | 378 |  |  | 378 | 378 |
 | livecodebench（留出集） | code | [livecodebench/code_generation_lite](https://huggingface.co/datasets/livecodebench/code_generation_lite) | `0fe84c3912ea` | CC (per HF card; problems from LeetCode/AtCoder/Codeforces) |  |  | 131 |  |  | 131 | 131 |
 | arc（训练集） | knowledge | [allenai/ai2_arc](https://huggingface.co/datasets/allenai/ai2_arc) | `210d026faf99` | CC-BY-SA-4.0 | 2870 | 500 |  |  |  | 3370 | 3370 |
 | gpqa_main（训练集） | knowledge | [Idavidrein/gpqa](https://huggingface.co/datasets/Idavidrein/gpqa) | `83022cefff93` | CC-BY-4.0 (gated; requires accepting terms; do not redistribute publicly) |  | 250 |  |  |  | 250 | 250 |
-| triviaqa_train（训练集） | knowledge | [mandarjoshi/trivia_qa](https://huggingface.co/datasets/mandarjoshi/trivia_qa) | `0f7faf33a390` | Apache-2.0 (per TriviaQA GitHub; HF card says unknown) | 73225 | 500 |  |  |  (+2798 train_excluded) | 76523 | 76523 |
+| triviaqa_train（训练集） | knowledge | [mandarjoshi/trivia_qa](https://huggingface.co/datasets/mandarjoshi/trivia_qa) | `0f7faf33a390` | Apache-2.0 (per TriviaQA GitHub; HF card says unknown) | 73101 |  |  |  |  (+3185 train_excluded) (+237 train_duplicate) | 76523 | 76523 |
 | mmlu_pro（留出集） | knowledge | [TIGER-Lab/MMLU-Pro](https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro) | `b189ec765aa7` | MIT |  |  | 2000 | 10032 |  | 12032 | 12032 |
 | gpqa_diamond（留出集） | knowledge | [Idavidrein/gpqa](https://huggingface.co/datasets/Idavidrein/gpqa) | `83022cefff93` | CC-BY-4.0 (gated; requires accepting terms) |  |  | 198 |  |  | 198 | 198 |
 | triviaqa（留出集） | knowledge | [mandarjoshi/trivia_qa](https://huggingface.co/datasets/mandarjoshi/trivia_qa) | `0f7faf33a390` | Apache-2.0 (per TriviaQA GitHub; HF card says unknown) |  |  | 2000 | 7960 |  | 9960 | 9960 |
 | freebaseqa（留出集） | knowledge | [kelvin-jiang/FreebaseQA](https://github.com/kelvin-jiang/FreebaseQA) | `d16aae5149aa` | CC-BY-4.0 |  |  | 3996 |  |  | 3996 | 3996 |
-| ifeval_train（训练集） | instruction_following | [allenai/RLVR-IFeval](https://huggingface.co/datasets/allenai/RLVR-IFeval) | `47c03c73621c` | ODC-BY | 13954 | 1000 |  |  |  (+16 train_excluded) | 14970 | 14970 |
+| ifeval_train（训练集） | instruction_following | [allenai/RLVR-IFeval](https://huggingface.co/datasets/allenai/RLVR-IFeval) | `47c03c73621c` | ODC-BY | 14949 |  |  |  |  (+21 train_excluded) | 14970 | 14970 |
 | tulu3_if（训练集（不再使用）） | instruction_following | [allenai/tulu-3-sft-personas-instruction-following](https://huggingface.co/datasets/allenai/tulu-3-sft-personas-instruction-following) | `fe0c7d350c9b` | ODC-BY |  |  |  | 29980 |  | 29980 | 29980 |
 | ifeval（留出集） | instruction_following | [google/IFEval](https://huggingface.co/datasets/google/IFEval) | `966cd89545d6` | Apache-2.0 | 135 | 135 | 271 |  |  | 541 | 541 |
 | ifbench（留出集） | instruction_following | [allenai/IFBench_test](https://huggingface.co/datasets/allenai/IFBench_test) | `ed7c12452594` | ODC-BY (per allenai/IFBench repo README; HF card has no license tag) |  |  | 300 |  |  | 300 | 300 |
 | mt_bench（留出集） | instruction_following | [lm-sys/FastChat](https://github.com/lm-sys/FastChat/tree/main/fastchat/llm_judge) | `587d5cfa1609` | Apache-2.0 |  |  | 80 |  |  | 80 | 80 |
 | alpaca_eval（留出集） | instruction_following | [tatsu-lab/alpaca_eval](https://huggingface.co/datasets/tatsu-lab/alpaca_eval) | `2edc6fad8be6` | CC-BY-NC-4.0 |  |  | 805 |  |  | 805 | 805 |
-| sealtool_train（训练集） | tool_calling | [fairyshine/Seal-Tools](https://github.com/fairyshine/Seal-Tools) | `ce753ecd60ed` | Apache-2.0 (repo LICENSE) | 11019 | 1000 |  |  |  (+3 train_excluded) | 12022 | 12022 |
-| toolace（训练集） | tool_calling | [Team-ACE/ToolACE](https://huggingface.co/datasets/Team-ACE/ToolACE) | `6bda777c88d2` | Apache-2.0 |  |  |  |  | train 11300 | 11300 | 11300 |
+| sealtool_train（训练集） | tool_calling | [fairyshine/Seal-Tools](https://github.com/fairyshine/Seal-Tools) | `ce753ecd60ed` | Apache-2.0 (repo LICENSE) | 12015 |  |  |  |  (+5 train_excluded) (+2 train_duplicate) | 12022 | 12022 |
+| toolace（训练集） | tool_calling | [Team-ACE/ToolACE](https://huggingface.co/datasets/Team-ACE/ToolACE) | `6bda777c88d2` | Apache-2.0 |  |  |  |  | train 11165 (+135 train_duplicate) | 11300 | 11300 |
 | apibank_train（训练集（不再使用）） | tool_calling | [liminghao1630/API-Bank](https://huggingface.co/datasets/liminghao1630/API-Bank) | `12e8158b7628` | MIT |  |  |  | 10376 |  | 10376 | 10376 |
 | sealtool（留出集） | tool_calling | [fairyshine/Seal-Tools](https://github.com/fairyshine/Seal-Tools) | `ce753ecd60ed` | Apache-2.0 (repo LICENSE) |  |  | 1354 | 700 |  | 2054 | 2054 |
 | apibank（留出集） | tool_calling | [liminghao1630/API-Bank](https://huggingface.co/datasets/liminghao1630/API-Bank) | `12e8158b7628` | MIT |  |  | 584 |  |  | 584 | 584 |
 | bfcl（留出集） | tool_calling | [bfcl-eval](https://github.com/ShishirPatil/gorilla/tree/main/berkeley-function-call-leaderboard) | `bfcl-eval==2026.3.23` | Apache-2.0 |  |  | 4696 |  |  | 4696 | 4696 |
 | metatool（留出集） | tool_calling | [HowieHwong/MetaTool](https://github.com/HowieHwong/MetaTool) | `35e81bb75768` | MIT |  |  | 5327 |  |  | 5327 | 5327 |
 | teval（留出集） | tool_calling | [lovesnowbest/T-Eval](https://huggingface.co/datasets/lovesnowbest/T-Eval) | `af355ab2b62c` | Apache-2.0 |  |  | 4358 |  |  | 4358 | 4358 |
-| squad_train（训练集） | knowledge_injection | [rajpurkar/squad](https://huggingface.co/datasets/rajpurkar/squad) | `7b6d24c440a3` | CC-BY-SA-4.0 |  | 50 |  | 3887 | train 14904 / search 50 | 18891 | 18891 |
+| squad_train（训练集） | knowledge_injection | [rajpurkar/squad](https://huggingface.co/datasets/rajpurkar/squad) | `7b6d24c440a3` | CC-BY-SA-4.0 |  | 50 |  | 3887 | train 14899 / search 50 (+3 train_excluded) (+2 train_duplicate) | 18891 | 18891 |
 | squad_val（留出集） | knowledge_injection | [rajpurkar/squad](https://huggingface.co/datasets/rajpurkar/squad) | `7b6d24c440a3` | CC-BY-SA-4.0 |  |  | 200 | 1867 |  | 2067 | 2067 |
 
 BFCL 分类计数（全部与官方一致）：simple_python 400、simple_java 100、simple_javascript 50、multiple 200、parallel 200、parallel_multiple 200、live_simple 258、live_multiple 1053、live_parallel 16、live_parallel_multiple 24、irrelevance 240、live_irrelevance 884、live_relevance 16、multi_turn_{base,miss_func,miss_param,long_context} 各 200、memory 155、web_search 100。
@@ -134,7 +134,7 @@ MetaTool：Task1 1040、Task2-Subtask1 995、Subtask2 1800、Subtask3 995、Subt
 
 | 数据集 | pool（整体抽样池） | 固定验收集 | test（留出） | 其他 |
 |---|---|---|---|---|
-| dapo_math / taco_verified / triviaqa_train / ifeval_train / sealtool_train | 16,314 / 10,806 / 73,725 / 14,954 / 12,019 | 运行时由 `draw.py` 按 `gate_n` 动态切分 | — | 去污染移除的 → train_excluded |
+| dapo_math / taco_verified / triviaqa_train / ifeval_train / sealtool_train | 14,738 / 10,791 / 73,101 / 14,949 / 12,015 | 运行时由 `draw.py` 按 `gate_n` 动态切分 | — | 去污染移除的 → train_excluded；内部重复 → train_duplicate |
 | gsm8k_train / math_train / arc / gpqa_main / apps | — | — | — | 全部 reserve（2026-11-19 起不再使用） |
 | IFEval（541） | — | — | 271 | 其余 270 → reserve（按首个指令类型分层，测试集与之前相同） |
 | MATH test | — | — | 500（MATH-500） | 其余 4,500 → reserve |
@@ -197,23 +197,27 @@ $PY eval/run_eval.py --task gsm8k_train --pool pool --ids-file experiment_record
 
 ## 去污染
 
-`make_splits.py` 对每个训练集在**切分前**做两步过滤，命中的样本放进 `train_excluded`，不进入信号 / 验收 / train 任何一池：
-1. **精确匹配**：规范化后与任何评测样本（所有池，包括 reserve）题面相同；
-2. **13-gram 近似重复**：与同类别某一条**留出**样本共享的 13-gram 占任一方 13-gram 的 ≥50%（双向，能抓到"长训练题里包含一道留出题"的情况）。Seal-Tools 只比较 task_instruction 一行，跳过共用模板和 api_list。
+`make_splits.py` 对每个训练集在**切分前**做两步过滤，命中的样本放进 `train_excluded`，不进入信号 / 验收 / train 任何一池（2026-11-21 收紧）：
+1. **精确匹配**：与任何评测样本（所有池，包括 reserve）题面相同。两种规范化，任一命中即算：小写 + 合并空白；再去掉 LaTeX 标记（`\left`、`\frac`、`$` 等）、标点和空格（抓只差格式、引号、标点的同一道题）。
+2. **13-gram 近似重复**：与同类别某一条评测样本（所有池，包括 reserve；2026-11-21 前只比 test 池）共享的 13-gram 占任一方 13-gram 的 ≥50%（双向，能抓到"长训练题里包含一道留出题"的情况）。指令遵循和工具调用两类里，出现在 ≥5 条评测样本中的 13-gram 视为模板句（约束说明、调用格式说明），不计入。
+   Seal-Tools 只比较 task_instruction 一行（第 1 条的严格规范化也是），跳过共用模板和 api_list。
 
 移除数量（精确 / 近似）：
-- dapo_math：984 / 85
+- dapo_math：1,048 / 493
+- triviaqa_train：3,147 / 38
+- math_train：13 / 215（reserve，不使用）
+- ifeval_train：0 / 21（多为约束模板句造成：训练题只有 "hi"、"你好" 之类几个字加一句约束，约束句占了大半 13-gram）
+- sealtool_train：1 / 4（精确的一条是 `Tell me a joke`，与 BFCL 相同）
+- squad_train：0 / 3
 - gsm8k_train：0 / 2
-- math_train：1 / 33
-- sealtool_train：0 / 3
-- ifeval_train：0 / 16（全部是约束模板句与 IFEval/IFBench 短题面共用 13-gram 造成的，去掉约束句后的指令部分与 IFEval/IFBench 零精确重合、零 13-gram 重合）
-- triviaqa_train：2428 / 370
 - 其余训练集均为 0 / 0。
 
 要点：
-- **DAPO-Math-17K 含有大量 MATH test 原题**：精确匹配 984 条，其中 968 条是 MATH test 中 MATH-500 以外的题，4 条 MATH-500、5 条 AMC23、1 条 OlympiadBench；近似重复再移除 85 条。
-- 去污染后，按"留出样本被单条训练样本覆盖 ≥50% 的 13-gram"统计，所有主表留出集都是 0。
-- `check_data.py` 独立断言训练集的 search/gate/train 三池与评测集零精确重合；`--ngram` 给出任意 13-gram 重合的参考数字（已去掉在 ≥5 条评测样本中出现的模板性 n-gram），完整数字见 `splits/check_report.json`。任意一个 13-gram 重合大多是常见措辞（如 "find the remainder when ... is divided by 1000"）。
+- **DAPO-Math-17K 含有大量 MATH test 原题**，绝大多数是 MATH-500 以外的 4,500 道。2026-11-21 收紧规则后又多移除 473 条（470 条撞 MATH reserve，2 条撞 OlympiadBench，1 条撞 MATH-500），抽样池从 16,314 降到 15,841，再去掉内部重复 1,103 条后为 14,738。
+- **TriviaQA train 与 FreebaseQA、TriviaQA validation 有大量只差标点的同题**；收紧后又多移除 387 条（FreebaseQA 287、TriviaQA reserve 86、TriviaQA test 14），抽样池从 73,725 降到 73,338，再去掉内部重复 237 条后为 73,101。
+- **训练集内部去重**（2026-11-21）：去污染之后，同一训练集里按严格规范化（只比 Seal-Tools 的 task_instruction）题面相同的题只保留 id 最小的一条，其余放进 `train_duplicate`，不进入任何池。否则同一道题可能在 Paper B 的同一代里既当 `train` 又当 `signal`，或者同时进验收集和某一代的抽样。移除数量：dapo_math 1,103、triviaqa_train 237、toolace 135、taco_verified 15、math_train 11、sealtool_train 2、squad_train 2，其余为 0。`check_data.py` 断言 pool/gate/train 内没有重复题面。
+- 去污染后，按"评测样本被单条训练样本覆盖 ≥50% 的 13-gram"统计，所有评测集都是 0。
+- `check_data.py` 独立断言训练集的 search/gate/train 三池与评测集零精确重合（两种规范化）；`--ngram` 给出任意 13-gram 重合的参考数字（已去掉在 ≥5 条评测样本中出现的模板性 n-gram），完整数字见 `splits/check_report.json`。任意一个 13-gram 重合大多是常见措辞（如 "find the remainder when ... is divided by 1000"）。
 - 评测集之间的精确重合（不是错误，仅提示）：FreebaseQA 与 TriviaQA 有 308 道题面相同；BFCL 与 TriviaQA 有 1 道。
 
 ## 需要用户手动获取

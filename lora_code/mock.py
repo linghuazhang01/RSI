@@ -354,6 +354,23 @@ def m_combine(loras, weights):
     return out
 
 
+def m_stack(base, delta, budget=None):
+    """merge.mode adapter: the cumulative mock adapter C (+) dW (ranks add per module, capped at `budget`). Mock
+    quality is never computed from it: a candidate's quality is its delta's, relative to the current model."""
+    out = base.copy() if base is not None else MockLoRA()
+    out.gain += delta.gain
+    out.damage += delta.damage
+    for m, v in delta.modules_.items():
+        out.touch([m], v["rank"], v["rel"])
+    if budget:
+        for v in out.modules_.values():
+            v["rank"] = min(int(budget), v["rank"])
+    out.ops.append(["stack", delta.digest()])
+    out.meta = {"cumulative": True,
+                "components": list((base.meta if base is not None else {}).get("components", [])) + [delta.digest()]}
+    return out
+
+
 def m_ties(loras, weights, density):
     out = m_combine(loras, [w / max(len(loras), 1) for w in weights])
     out.gain *= 1.05

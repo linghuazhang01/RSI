@@ -23,6 +23,7 @@ from rsicore.chat_tools import ChatTools, with_mock_exploration  # noqa: E402
 from rsicore.editor import Editor, EditorReplyError  # noqa: E402
 
 CODE = "def main(api):\n    return 1\n"
+NEXT = "def main(api):\n    return 2\n"
 ANSWER = f"Plan: return one.\n```python\n{CODE}```"
 
 
@@ -548,7 +549,7 @@ def test_search_records_editor_reply_error(tmp_path, fake, monkeypatch):
 def test_mock_dict_replies_and_exploration(tmp_path):
     def inner(msgs):
         last = [m for m in msgs if m["role"] == "user"][-1]["content"]
-        return f"SEEN = {len(msgs)}  # {last}"
+        return f"def main(api):\n    return {len(msgs)}  # SEEN {last}\n"
     log = []
     tools = ChatTools(_api_factory(log), timeout_s=30, mem_gb=2)
     pol = with_mock_exploration(inner, 1, "result = api.double(x=4)")
@@ -568,7 +569,7 @@ def test_mock_dict_replies_and_exploration(tmp_path):
     pol3 = with_mock_exploration(inner, 3, "result = 1")
     ed3 = Editor("http://unused", "m", system_prompt="S", seed=1, transcript=tmp_path / "m3.jsonl", tools=tools,
                  mock_policy=pol3, tool_rounds=1)
-    assert ed3.propose("x", ctx={"cid": "z", "gen_dir": str(gd)}).startswith("SEEN")
+    assert "# SEEN" in ed3.propose("x", ctx={"cid": "z", "gen_dir": str(gd)})
     assert ed3.last_stats["stop"] == "forced:rounds"
 
 
@@ -657,18 +658,18 @@ def test_reply_timeout_forces_final_turn_without_retry(tmp_path, fake, monkeypat
     assert seen[-1] == ("none", 3600) and "timed out" in ed.last_stats["error"]
     # final turn times out without a fallback -> EditorReplyError (not a fatal RuntimeError), recorded as failed
     seen = _timeout_post(monkeypatch, [False, True])
-    srv = fake([tool_turn(), {"content": "```python\nNEXT = 1\n```"}])
+    srv = fake([tool_turn(), {"content": f"```python\n{NEXT}```"}])
     ed = mk(tmp_path, srv, FakeTools(), name="f.jsonl", tool_rounds=1)
     with pytest.raises(EditorReplyError, match="timed out"):
         ed.propose("m0", ctx={"cid": "s0"})
-    assert len(seen) == 2 and ed.propose("m1", ctx={"cid": "s1"}) == "NEXT = 1\n"
+    assert len(seen) == 2 and ed.propose("m1", ctx={"cid": "s1"}) == NEXT
     tr = lines(tmp_path / "f.jsonl")
     assert [(l["p"], bool(l.get("failed"))) for l in tr if l.get("final")] == [(0, True), (1, False)]
     assert [m["content"] for m in ed._prompt_history() if m["role"] == "user"] == ["m1"]
     ed2 = mk(tmp_path, fake([]), FakeTools(), name="f.jsonl", tool_rounds=1)     # restart: replays both
     with pytest.raises(EditorReplyError, match="timed out"):
         ed2.propose("m0", ctx={"cid": "s0"})
-    assert ed2.propose("m1", ctx={"cid": "s1"}) == "NEXT = 1\n" and ed2.n_calls == 0
+    assert ed2.propose("m1", ctx={"cid": "s1"}) == NEXT and ed2.n_calls == 0
 
 
 def test_final_turn_context_error_uses_fallback(tmp_path, fake):
@@ -801,3 +802,69 @@ def test_lora_editor_context_from_parent_card(tmp_path, fake):
                 tools=FakeTools(), context_tokens=131072)
     ed.propose("m")
     assert ed.context_tokens == 16000
+
+
+# ----------------------------------------------------------------------------- program check (2026-11-22)
+def test_check_program():
+    ok = editor.check_program
+    assert ok(CODE) is None
+    assert ok("def main(api):\n    '''doc'''\n    h = api.f(x=1)\n    return {'lora': h}\n") is None
+    assert ok("def main(api, n=3):\n    return n\n") is None
+    assert ok("import math\ndef build(api, m):\n    return math.pi\ndef main(api):\n"
+              "    try:\n        return build(api, 1)\n    except (ToolError, BudgetExceeded) as e:\n        return str(e)\n") is None
+    assert ok("def main(api):\n    f = lambda k: k + 1\n    return [f(i) for i in range(3)]\n") is None
+    assert ok("from x import *\ndef main(api):\n    return y\n") is None          # star import: names unknown
+    assert ok("def main(api)\n    return 1\n").startswith("SyntaxError on line 1")
+    assert ok("x = 1\n") == "there is no top-level def main(api)"
+    assert "exactly one parameter" in ok("def main(api, ws):\n    return 1\n")
+    assert "exactly one parameter" in ok("def main():\n    return 1\n")
+    assert "skeleton" in ok("def main(api):\n    # build the LoRA here\n    pass\n")
+    assert "skeleton" in ok("def main(api):\n    '''Plan: scale layer 12.'''\n    ...\n")
+    assert "skeleton" in ok("def main(api):\n    raise NotImplementedError\n")
+    assert "placeholders (line 3)" in ok("def main(api):\n    for m in api.modules():\n        ...\n    return {'lora': None}\n")
+    assert ok("def main(api):\n    api.f(x=1)\n") == "main never returns a value"
+    assert ok("def main(api):\n    def g():\n        return 1\n    g()\n") == "main never returns a value"
+    assert "never defined in the program: best_lora" in ok("def main(api):\n    return {'lora': best_lora}\n")
+    assert "read `api` as a global" in ok("def b(m):\n    return api.svd(module=m)\ndef main(api):\n    return b(1)\n")
+    # names=False: only the structural checks
+    assert ok("def main(api):\n    return {'lora': best_lora}\n", names=False) is None
+
+
+SKELETON = "Plan.\n```python\ndef main(api):\n    # TODO\n    pass\n```"
+PROG = "def main(api):\n    h = api.new(k=1)\n    return {'lora': h}\n"
+
+
+def test_final_program_gets_one_repair_turn(tmp_path, fake):
+    srv = fake([{"content": SKELETON}, {"content": ANSWER}])
+    ed = mk(tmp_path, srv, FakeTools())
+    assert ed.propose("m") == CODE
+    st = ed.last_stats
+    assert st["stop"] == "answer" and st["repairs"] == 1 and st["check"] is None and st["model_calls"] == 2
+    last = srv.requests[-1]["messages"]
+    assert last[-1]["role"] == "user" and last[-1]["content"].startswith("Your program cannot run as written: main is only")
+    ev = [l for l in lines(tmp_path / "t.jsonl") if l["role"] == "event"]
+    assert [e["kind"] for e in ev] == ["check"] and "skeleton" in ev[0]["detail"]["problem"]
+    # still broken after the one repair turn and nothing better: submitted as is, the problem recorded
+    srv = fake([{"content": SKELETON}, {"content": SKELETON}])
+    ed = mk(tmp_path, srv, FakeTools(), name="b.jsonl")
+    assert "pass" in ed.propose("m") and ed.last_stats["stop"] == "answer" and "skeleton" in ed.last_stats["check"]
+    assert len(srv.requests) == 2
+
+
+def test_fallback_takes_checked_program_from_run_python(tmp_path, fake):
+    # final reply still a skeleton after the repair turn -> the complete program of a run_python call wins
+    srv = fake([tool_turn(code=PROG, content="```python\nDRAFT = 1\n```"), {"content": SKELETON}, {"content": SKELETON}])
+    ed = mk(tmp_path, srv, FakeTools())
+    assert ed.propose("m") == PROG and ed.last_stats["stop"] == "fallback" and ed.last_stats["check"] is None
+    # forced final turn cut at max_tokens twice (no code at all) -> the run_python program, not the older block
+    srv = fake([tool_turn(content="```python\nDRAFT = 1\n```"), tool_turn(code=PROG),
+                {"content": "", "finish": "length"}, {"content": "", "finish": "length"}])
+    ed = mk(tmp_path, srv, FakeTools(), name="f.jsonl", tool_rounds=2)
+    assert ed.propose("m") == PROG and ed.last_stats["stop"] == "fallback"
+    # a run_python program that leans on the session's globals is no fallback: the last block is used
+    srv = fake([tool_turn(content="```python\nDRAFT = 1\n```"),
+                tool_turn(code="def main(api):\n    return {'lora': built}\n"),
+                {"content": "", "finish": "length"}, {"content": "", "finish": "length"}])
+    ed = mk(tmp_path, srv, FakeTools(), name="g.jsonl", tool_rounds=2)
+    assert ed.propose("m") == "DRAFT = 1\n" and ed.last_stats["stop"] == "fallback"
+    assert ed.last_stats["check"] == "there is no top-level def main(api)"

@@ -13,7 +13,8 @@
 # H20 (110 GB): replace --hw b300 with --hw h20.
 #
 # GPU roles: GPU 0 = editor (M_0, vLLM; sleeps while candidates are evaluated and lends its GPU); GPUs 1-7 = 7 candidate
-#   servers (each candidate's gate evaluation and the incumbent's screen / gate / test runs are spread over them)
+#   servers (each candidate's gate evaluation and the incumbent's screen / gate / test runs are spread over them; since
+#   2026-11-22 the incumbent's 500 x 4 screen is split over all free candidate GPUs at once, QuantProblem.serve_all)
 # Data (simple_data/math/): gate = simple_math_eval (500 fixed, hidden: the editor sees only statistics of earlier
 #   candidates' gate results); test = simple_math_test (500 fixed, held-out report only); screen = 500 items drawn afresh
 #   each generation from the dapo_math pool minus gate and test; train = all remaining pool items (~13,200).
@@ -69,7 +70,7 @@ budget:
     lm_head: 8
 loop:
   editor: frozen
-  patience: 2
+  patience: 3                 # 2026-11-22: simple profile, as Paper B
 action_space:
   bits:
   - 2
@@ -105,7 +106,7 @@ search:
   gate_every_candidate: true
   top_full: 0
   rerun_seeds: 0
-  kl_weight: 0.5
+  kl_weight: 0.0               # 2026-11-22: simple profile; no per-generation KL work (Runner.kl_used)
 gate:
   min_delta: 0.0
   require_significant: true
@@ -233,8 +234,9 @@ sandbox:
   timeout_s: 1800
   mem_gb: 16
 archive:
-  enabled: true
+  enabled: true                 # 2026-11-22: every earlier candidate one row (config, size, gate, error, note)
   top_candidates: 3
+  max_chars: 30000
 heldout:
   domains: math
   limit: null

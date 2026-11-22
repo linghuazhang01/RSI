@@ -545,11 +545,14 @@ class TestEditorConfig(unittest.TestCase):
         prob = types.SimpleNamespace(space={"bits": [2, 3, 4, 8, 16], "group_sizes": [32, 64, 128],
                                             "quantizers": ["rtn", "gptq", "awq"]})
         base = P.SYSTEM_PROMPT.format(tools="DOC", bits=prob.space["bits"], group_sizes=prob.space["group_sizes"],
-                                      quantizers=prob.space["quantizers"], acceptance=P.acceptance_text({"gate": {"min_delta": 0.005}}))
+                                      quantizers=prob.space["quantizers"], timeout_s=1800,
+                                      acceptance=P.acceptance_text({"gate": {"min_delta": 0.005}}))
         cfg = {"gate": {"min_delta": 0.005}}
         self.assertEqual(P.system_prompt(prob, "DOC", dict(cfg, editor={"tool_rounds": 0})), base)
         t = P.system_prompt(prob, "DOC", dict(cfg, editor={"tool_rounds": 12}))
         self.assertIn("for up to 12 rounds", t)
+        self.assertIn("at most 100 calls in all", t)                                  # editor.max_tool_calls default
+        self.assertIn("killed after 1800 s", base)                                     # sandbox.timeout_s default
         self.assertIn("api.evaluate is NOT available there", t)
         self.assertIn("group_error there only accepts settings already cached", t)
         self.assertNotIn(P.FINAL_RULE, t)

@@ -54,6 +54,12 @@ Rules
 - Robust code: tool results can be empty (e.g. api.diagnostics for a module without a row) and one uncaught
   error fails the whole candidate. Check lengths before indexing and the structure before unpacking; wrap
   optional steps in try/except and fall back to what you already built.
+- note (optional, at most 600 characters, plain text): which modules this candidate changes and WHY those (the
+  evidence that picked them: a diagnostic, an activation or gradient statistic, a probe result), then what you tried
+  and rejected, with the numbers that decided it (e.g. "down_proj layers 10-14, rank 4: largest gradient norm on the
+  failed problems; rejected: o_proj layers 20-24, train_loss +0.03 at scale 0.5 and +0.01 at -0.5"). The history
+  table already lists the modules and parameters; the note is for the reasons. Every later session sees it, so a
+  good note keeps them from repeating your failed ideas.
 - {strategies}
 
 Tools
@@ -69,7 +75,7 @@ DATA_ACCESS_SCREEN = """- Data access: activation tools accept the ids returned 
 
 _LORA_TEXT = dict(
     what="a low-rank weight update dW = B A per linear module",
-    return_line='return {"lora": handle}      # or {"lora": None} to leave the model unchanged',
+    return_line='return {"lora": handle, "note": "..."}      # or {"lora": None, "note": "..."} to leave the model unchanged',
     objects="LoRAs, SVDs and activation statistics",
     limits="Limits checked on every LoRA: rank <= {rank_cap} per module, ||dW||_F / ||W0||_F <= {tau} per module,\n"
            "  finite values, existing modules only.",
@@ -105,7 +111,7 @@ MODE_TEXT = {
         what="an ordered list of operations on the dense weight matrices W [out, in] of the linear modules: "
              "channel / module scaling, dense additions of LoRA-built updates, moves toward the original weights"
              "{tensor_what}",
-        return_line='return {"edit": handle}      # or {"edit": None} to leave the model unchanged',
+        return_line='return {"edit": handle, "note": "..."}      # or {"edit": None, "note": "..."} to leave the model unchanged',
         objects="Weight edits, LoRAs, SVDs and activation statistics",
         limits="Limits checked on every edit: ||W'-W||_F / ||W||_F <= {tau_w} per module (W = your current weights,\n"
                "  W' = after the edit){max_modules_text}, finite values, existing modules only. There is no rank limit."
@@ -250,6 +256,11 @@ def system_prompt(cfg: dict, *, budget: dict, e_task: bool = False, mode: str = 
                           "if it passes a fixed gate, and the merged model becomes the next editor")
     whose = ("The model you edit is the original base model, not yourself." if e_task else
              "You are editing yourself.")
+    if mode == "scratch" and not e_task and str((cfg.get("merge") or {}).get("mode") or "merge") == "adapter":
+        # merge.mode adapter (2026-11-22): accepted LoRAs are kept as one cumulative adapter, never merged
+        who = ("the model being edited: you are the original weights plus every LoRA accepted so far, kept as one "
+               "adapter and never merged; the LoRA you write is added on top of YOU (limits apply to your LoRA, not "
+               "the accumulated adapter) if it passes a fixed gate, and that model becomes the next editor")
     if mode == "weights" and e_task:
         who = "an AI model asked to edit the weights of a FIXED base model on a tool-calling / coding task"
     elif mode == "weights":
@@ -352,7 +363,7 @@ PERSIST_SESSION = ("Your run_python calls share ONE Python session for this cand
                    "program runs separately: it must build what it returns{saved}.")
 HISTORY_READ = " or of any earlier candidate that search_history lists"
 HISTORY_LINE = ("\n- search_history(gen, sort, offset) lists every candidate already tried (this generation's and the "
-                "earlier generations') with what it is (strategy, modules, rank, tools used), its target gain, worst "
+                "earlier generations') with what it changed (module types; per type the layers, rank and ||dW||/||W0||, or the weight-edit ops), its note, its target gain, worst "
                 "retention change, KL, score and gate outcome; same_as marks a result identical to an earlier one. "
                 "Check it before you write a program, so you do not spend an evaluation repeating an idea that was "
                 "already tried.")
@@ -365,14 +376,74 @@ def history_row(rec: dict) -> dict:
     c = SimpleNamespace(**{k: rec.get(k) for k in ("cid", "thread", "step", "artifact", "screen", "full", "error")})
     row = summarize_candidate(c)
     art = rec.get("artifact") or {}
-    tools = art.get("tools_used") if isinstance(art.get("tools_used"), dict) else {}
-    top = sorted(tools.items(), key=lambda kv: -kv[1])[:6]
-    out = {k: row.get(k) for k in ("strategy", "target_gain", "vs_raw", "worst_retention_delta", "kl")}
+    out = {k: row.get(k) for k in ("target_gain", "vs_raw", "worst_retention_delta", "kl")}
     out.update({"kind": art.get("kind") if art.get("kind") not in (None, "lora") else None,
-                "modules": art.get("modules"), "max_rank": art.get("max_rank"),
-                "keep": True if art.get("keep") else None,
-                "tools": ", ".join(f"{k} x{v}" for k, v in top) or None})
+                "keep": True if art.get("keep") else None, **change_fields(art),
+                "note": art.get("note") or None})
     return out
+
+
+def change_fields(art: dict) -> dict:
+    """What a candidate changed, for the history rows (2026-11-22): types = the module types it touched, modules = one
+    line per type (per op setting for a weight edit): '<type> L<layers> x<count> rank <r> rel <||dW||/||W0||>
+    [<ops>]'. Artifacts without the edit summary (before 2026-11-22) give the module count and largest rank."""
+    ed = art.get("edit")
+    if not isinstance(ed, dict) or not isinstance(ed.get("groups"), list):
+        return {k: v for k, v in (("modules", art.get("modules")), ("rank", art.get("max_rank"))) if v}
+    lines = []
+    for g in ed["groups"]:
+        parts = [str(g.get("type"))]
+        if g.get("layers"):
+            parts.append(f"L{g['layers']}")
+        parts.append(f"x{g.get('n')}")
+        if g.get("rank"):
+            parts.append(f"rank {g['rank']}")
+        if g.get("rel_norm"):
+            parts.append(f"rel {g['rel_norm']}")
+        if g.get("ops"):
+            parts.append(f"[{g['ops']}]")
+        lines.append(" ".join(parts))
+    if ed.get("more_groups"):
+        lines.append(f"+{ed['more_groups']} more groups ({ed.get('n')} modules in all)")
+    return {"types": ed.get("types") or None, "modules": lines or None}
+
+
+ARCHIVE_HEAD = ("Archive of earlier generations: EVERY candidate tried, one row each, failures included. types = the "
+                "module types it changed, modules = one line per type: layers (L), module count (x), LoRA rank, "
+                "rel = ||dW||/||W0|| (and the ops of a weight edit), kept = it returned None (no change), gate = its gate result (gain = paired gain in gate accuracy vs that "
+                "generation's current model, ci = its 95% interval), note = its own account of what it tried.")
+ARCHIVE_READ = ("Full program or feedback of any candidate above: read_record(cid, 'program' | 'feedback'); "
+                "search_history lists them with more statistics. Do not repeat what failed: try something different "
+                "or fix the reason it failed.")
+
+
+def archive_row(c, gate: dict | None = None) -> dict:
+    """One archive row of an earlier generation's candidate (2026-11-22): what it changed, its gate result (gate =
+    rsicore.chat_tools._gate_outcomes row) or score, the first line of its error, its note."""
+    art = c.artifact or {}
+    row = {"cid": c.cid}
+    if c.error:
+        row["error"] = (c.error.strip().splitlines() or [""])[0][:200]
+    elif art.get("keep"):
+        row["kept"] = True
+    else:
+        if art.get("kind") not in (None, "lora"):
+            row["kind"] = art["kind"]
+        row.update({k: v for k, v in change_fields(art).items() if v is not None})
+    if gate:
+        g = {"passed": bool(gate.get("passed"))}
+        if gate.get("gain") is not None:
+            g["gain"] = _num(gate["gain"])
+        if isinstance(gate.get("ci"), (list, tuple)):
+            g["ci"] = [_num(x) for x in gate["ci"]]
+        if not g["passed"] and gate.get("reason"):
+            g["reason"] = str(gate["reason"])[:120]
+        row["gate"] = g
+    elif c.score is not None:
+        row["score"] = _num(c.score)
+    if art.get("note"):
+        row["note"] = art["note"]
+    return row
 
 
 def _with_tool_protocol(text: str, cfg: dict, *, mode: str, retention: bool) -> str:
@@ -390,7 +461,7 @@ def _with_tool_protocol(text: str, cfg: dict, *, mode: str, retention: bool) -> 
     miss = (", ".join(f"api.{n}" for n in missing) or "(none)") + \
         (" (the handle 'RAW' still works)" if "raw_lora" in missing else "")
     note = (f" (the GPU tools there have their own exploration budget of {float(s['explore'].get('gpu_seconds') or 0):.0f}"
-            " GPU-seconds)") if gpu else ""
+            " GPU-seconds per session)") if gpu else ""
     hist = bool(s.get("history_tool", True))
     from .tools import explore_persistent
     if explore_persistent(cfg):              # editor.explore.persistent (2026-11-21)
@@ -423,7 +494,7 @@ def summarize_candidate(c) -> dict:
             "vs_raw": _num((tgt.get("vs_raw") or {}).get("delta")),
             "worst_retention_delta": _num(min(drops)) if drops else None, "kl": _num(fb.get("kl_vs_parent")),
             **({"gate": _gate_row(fb["gate"])} if isinstance(fb.get("gate"), dict) else {}),
-            "error": (c.error or "")[:160] or None}
+            "error": (c.error or "")[:160] or None, **({"note": art["note"]} if art.get("note") else {})}
 
 
 def _gate_row(gt: dict) -> dict:

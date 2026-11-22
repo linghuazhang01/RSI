@@ -52,7 +52,8 @@ def test_refusals(tmp_path):
 
 @pytest.mark.parametrize("paper", ["A", "B"])
 def test_shipped_run_configs_equal_the_set_command(paper):
-    sets = ["--set", "objective=simple", "--set", "editor.tool_rounds=30", "--set", "gate.require_significant=false"]
+    sets = ["--set", "objective=simple", "--set", "editor.tool_rounds=30", "--set", "gate.require_significant=false",
+            "--set", "editor.turn_max_tokens=16384"]          # 49a5fe4: the run configs cap every round at 16k
     if paper == "B":
         sets += ["--set", "nonllm.enabled=false"]
     for hw in ("b300", "h20"):

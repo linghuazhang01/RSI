@@ -95,6 +95,14 @@ def norm(s):
     return " ".join(str(s).lower().split())
 
 
+def norm_strict(s):
+    """Same as make_splits.norm_strict: also strip LaTeX markup, punctuation and spaces."""
+    s = str(s).lower()
+    s = re.sub(r"\\(left|right|displaystyle|text|mathrm|mathbf|operatorname|dfrac|tfrac|frac)", "", s)
+    s = s.replace("\\$", "").replace("$", "")
+    return re.sub(r"[\W_]+", "", s)
+
+
 def ngrams(s, n=13):
     toks = re.findall(r"\w+", s.lower())
     return {" ".join(toks[i:i + n]) for i in range(len(toks) - n + 1)}
@@ -195,24 +203,38 @@ def main():
         got = sum(manifest.get("gate_sizes", {}).get(ds, 0) for ds in g["datasets"])
         check(got == int(g["size"]), f"gate domain {dom}: {got} gate items != configured {g['size']}")
         print(f"  gate domain {dom:22s} size={got}")
-    print("== 3. train/eval decontamination (exact match on normalized prompt)")
+    print("== 3. train/eval decontamination (exact match on normalized prompt, whitespace and strict)")
     is_train = lambda n: cfg["datasets"][n].get("role") == "train" or cfg["datasets"][n].get("all") == "train"
     eval_names = [n for n in data if not is_train(n)]
-    eval_txt = defaultdict(set)
+    eval_txt, eval_strict = defaultdict(set), set()
     for n in eval_names:
         for r in data[n]:
             eval_txt[norm(text_of(r))].add(n)
+            eval_strict.add(norm_strict(text_of(r)))
     eval_txt.pop("", None)
+    eval_strict.discard("")
     # every item of a training set the loop can see (signal / gate / train) must be decontaminated
     train_items = [(n, r) for n in data if is_train(n) for r in data[n]
                    if r["split_pool"] in ("train", "search", "gate", "pool")]
     hits = defaultdict(int)
     for n, r in train_items:
-        if norm(text_of(r)) in eval_txt:
+        if norm(text_of(r)) in eval_txt or norm_strict(text_of(r)) in eval_strict:
             hits[n] += 1
     for n in sorted({n for n, _ in train_items}):
         check(hits[n] == 0, f"{n}: {hits[n]} train items exactly match eval items")
         print(f"  {n:16s} pool+gate+train={sum(1 for m, _ in train_items if m == n):6d} exact-match hits={hits[n]}")
+    # no internal duplicates among the items the loop can draw (make_splits.py moves them to train_duplicate)
+    dups = Counter()
+    seen_txt = defaultdict(set)
+    for n, r in train_items:
+        k = norm_strict(text_of(r))
+        if k in seen_txt[n]:
+            dups[n] += 1
+        seen_txt[n].add(k)
+    for n in sorted({n for n, _ in train_items}):
+        check(dups[n] == 0, f"{n}: {dups[n]} internal duplicates among pool+gate+train")
+    print(f"  internal duplicates among pool+gate+train: {dict(dups) or 0}")
+    report["internal_duplicates"] = dict(dups)
     # also: squad_train search/gate passages must not equal any eval passage
     report["decontam"] = {"exact_match_hits": dict(hits), "removed_at_split_time": manifest.get("decontamination")}
     # cross-eval overlap (informational, not an error): same question in two eval sets

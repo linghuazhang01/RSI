@@ -20,6 +20,24 @@
 --set method.mode=edit         # 训练一次 raw LoRA 再编辑（保留的旧方式）
 ```
 
+### scratch 模式接受后怎么变成下一代：`merge.mode`（2026-11-22）
+
+| `merge.mode` | 接受后 | 下一代怎么服务 | 精度 |
+|---|---|---|---|
+| `merge`（**默认**） | W' = W + B A，fp32 累加后转回 bf16，写成 `gen_XX/model` | 新 checkpoint，main 上的 vLLM 重启成 `m{g+1}` | bf16 舍入会吞掉小的 ΔW（‖ΔW‖/‖W‖ ≲ 3e-3 时明显），gate 测的（基座 + adapter）和合并后的后继不完全一样；`model.json` 的 `max_realised_rel_err` 记录误差 |
+| `adapter` | **不合并**：C_{g+1} = C_g ⊕ ΔW（秩拼接，fp32 存在 `gen_XX/cumulative_lora`） | 整个 run 只有一个 M_0 服务（`m0`），M_g = M_0 + C_g 作为一个 adapter，名字 = 被接受候选的 adapter 名 | 候选按 C_g ⊕ ΔW 注册并过 gate，接受的就是这个 adapter 本身：gate 测的 = 下一代 |
+
+adapter 模式的细节：
+- 改造者写的仍然是相对当前模型的增量 ΔW（`rank_cap`、`norm_cap_tau` 只约束 ΔW，τ 的分母是当前权重 ‖W_0 + B_C A_C‖）。组合只在 `Evaluator.register` 一处做；C_g、C_{g+1} 这类完整 adapter 用 `full=True` 注册，不会重复组合。
+- 工具看到的是当前模型：`Workspace.store` 是 `OverlayStore`（读取时 fp32 计算 W_0 + B_C A_C，SVD 缓存按模块因子的 digest 分开），`acts` / `regmean_preserve` / `train_loss` / 诊断的 HF 前向都在 `hf.applied(C_g)` 下跑；`tensor_compute` 拿到的也是叠加后的张量。
+- 秩预算：`merge.adapter_rank_budget`（默认 256）。拼接后某模块秩超过预算时，**在注册之前**用精确 SVD 重分解并截断，所以 gate 测的仍然就是保留下来的 C_{g+1}（`model.json` 的 `recompressed` 记录丢掉的能量）。main 服务的 `--max-lora-rank` = padded(max(预算, `lora.rank_cap`))，默认 256（vLLM 最大 512）。vLLM 按 `max_loras` × 这个秩预留显存，H20 上要核对显存或调小 `server.max_loras`；走 adapter 解码也比合并后的基座慢。
+- `edit` 模式本来就是 adapter（忽略 `merge.mode`）；`weights` 模式不支持 adapter（启动时报错）。`merge.mode` 不写进 base.yaml 的实际配置（paper_cfg 被锁定，旧 run 照常续跑），默认值在代码里。
+
+```bash
+--set merge.mode=adapter                                   # scratch：不合并，累积 adapter
+--set merge.mode=adapter --set merge.adapter_rank_budget=128   # 更小的秩预算（server --max-lora-rank 128）
+```
+
 raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 个 epoch、batch 4，除 `in_proj_a/b` 外的全部投影层；`raw.n_train` 空 = 第 0 代全部 train 题）：
 
 ```bash
@@ -133,7 +151,7 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 | `genXX/raw` | 仅 `edit`：第 0 代按 `raw` 配方训练 raw LoRA（整个运行唯一的训练），screen / full / gate 评测；之后各代记录改造者出发的 LoRA = 当前 LoRA，不训练 | `baselines/raw.json`、`baselines/raw_lora.*` |
 | `genXX/search` | `rsicore.search.inner_search`：4 线程 × 8 步、≤32 次 evaluate；改造者 = gpu0 上的 M_g（vLLM 多 LoRA），候选 LoRA 在 gpu1 上构建后热加载评测 | `candidates.jsonl`、`programs/`、`feedback/`、`loras/` |
 | `genXX/gate` | `submit_to_gate`（≤3 次）：只送在信号题上分数 > 0（赢了当前模型）的候选（2026-11-20）；目标对参照（edit 第 0 代：raw − ε；edit 之后和 scratch：在验收集上和当前模型逐题配对，平均提升 ≥ min_gain 且置信区间下界 > 0）；每个保留领域 ≥ 第 0 代 − max(δ, 噪声带)；已学目标 ≥ 学完时 − δ；沙箱检查。都不过 → edit 第 0 代兜底合并 raw LoRA（要能过验收）→ 否则保留 M_g | `gate.json`、`accepted.json`、`accepted_lora.*`、`parent_gate.json`（scratch） |
-| `genXX/merge` | LoRA 合并进权重 → M_{g+1}（mock：更新 registry 中 `m{g+1}` 的 quality）；`edit` 模式不合并，`model.json` 记录 M_{g+1} = M_0 + 哪个 LoRA | `model/`、`model.json` |
+| `genXX/merge` | LoRA 合并进权重 → M_{g+1}（mock：更新 registry 中 `m{g+1}` 的 quality）；`edit` 模式和 `merge.mode adapter` 不合并，`model.json` 记录 M_{g+1} = M_0 + 哪个 adapter（adapter 模式另存 `cumulative_lora`） | `model/`、`model.json`、`cumulative_lora` |
 | `genXX/nonllm` | 非 LLM 分支（同 evaluate 预算，按模式）：edit 随机编辑规则作用于 raw；scratch 随机无梯度构造。2026-11-21：`--set nonllm.enabled=false` 完全不跑；`nonllm.skip_if_rejected`（默认 true）在验收保留当前模型（`accepted.json` source keep）的那一代跳过（没有被接受的 LoRA 可比）。两个键不写在 base.yaml 里（只在注释里），按默认读取，这样之前锁定的运行配置还能续跑；跳过时 `nonllm.json` 里有 `skipped` | `baselines/nonllm.json` |
 | `genXX/e_t/<branch>` | E_t：parent / llm / nonllm（edit 另加 raw）分支模型各开新会话，为 θ0 在 Seal-Tools 上写 LoRA（16 次 evaluate），在 Seal-Tools test + BFCL 上测；`--domain tool_calling` 时换成代码任务（TACO → LiveCodeBench） | `e_t/<branch>/result.json` |
 | `genXX/heldout` | M_{g+1} 的留出评测（领域按 scope / data_roles.eval）。2026-11-21：验收保留当前模型时 M_{g+1} = M_g，直接复用上一代（第 0 代：baseline）的结果，不再重测（`state.json` 里记 `reused_from`） | `heldout.json` |

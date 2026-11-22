@@ -3,6 +3,9 @@ string handles, registered on an rsicore.sandbox.ToolAPI so programs call `api.<
 
 Handles: L* = LoRA, W* = weight edit (mode=weights), S* = SVD of a weight, A* = activation statistics,
 H<g> = adapter accepted in generation g (the stack), C:<cid> = an earlier candidate of this generation.
+merge.mode adapter (scratch, 2026-11-22): the current model is M_0 + the cumulative adapter C_g (base_lora, never
+merged); store reads W_0 + B_C A_C (OverlayStore), HF passes (acts / grams / train_loss) run with C_g applied, and
+evaluator.register serves a candidate (a delta on M_g) as C_g (+) delta.
 Vector references (for rank1 / from_direction): "S3.u0", "S3.v1", "A2.in_mean", "A2.out_mean", "A2.pc0", and
 "T5.<name>" (a vector returned by tensor_compute).
 
@@ -44,6 +47,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -197,6 +201,9 @@ def tools_for_mode(mode: str, retention: bool = True, cfg: dict | None = None) -
         out.pop("regmean_preserve", None)
     if mode != "edit":
         out.pop("raw_lora", None)
+    if mode == "scratch" and str(((cfg or {}).get("merge") or {}).get("mode") or "merge") == "adapter" and "stack" in out:
+        out["stack"] = ("stack() -> list of {handle, gen, modules, max_rank} (adapters accepted in earlier generations, "
+                        "kept as one cumulative adapter, not merged; already part of the current model)")
     ss = search_settings(cfg or {})
     if not ss["evaluate_tool"]:                # program_evaluate_calls 0 with uncharged screens (2026-11-21)
         out.pop("evaluate", None)
@@ -323,8 +330,19 @@ class Workspace:
     def __init__(self, *, mock: bool, store, train, cfg: dict, out_dir: Path, evaluator=None, hf=None,
                  stack=None, retention_texts=None, budget: dict | None = None, name_prefix: str = "c",
                  diagnostics: dict | None = None, seed: int = 42, mode: str = "scratch", raw=None,
-                 raw_info: dict | None = None, base_store=None):
+                 raw_info: dict | None = None, base_store=None, base_lora=None):
         self.mock = mock
+        # merge.mode adapter: the cumulative LoRA C_g (current model = M_0 + C_g); None = the store / HF model is
+        # the current model itself
+        self.base_lora = base_lora if (base_lora is not None and base_lora.modules()) else None
+        self._overlays: dict = {}
+        # (2026-11-22, gpu_layout.tools_on_replicas) one tool device per main replica: [{"hf", "store", "lock",
+        # "server"}]; a session (cid ..._t<k>_...) uses device k mod n, the same replica its editor runs on. Empty =
+        # every tool on the train GPU's model under the workspace lock (as before).
+        self.devs: list[dict] = []
+        self._local = threading.local()
+        self._xbudgets: dict[str, tuple[dict, dict]] = {}   # exploration GPU budget per session (cid)
+        self._tl_n = 0
         self.mode = mode                        # method.mode: which tools are registered (tools_for_mode)
         self.raw = raw                          # mode=edit: the raw LoRA (handle "RAW")
         self.raw_info = dict(raw_info or {})
@@ -349,7 +367,6 @@ class Workspace:
         self._owner: dict[str, str] = {}
         self._n = 0
         self._lock = threading.RLock()
-        self._local = threading.local()
         self._evaluated: dict[str, tuple] = {}
         self._prog_evals: dict[str, int] = {}     # cid -> new api.evaluate calls made by that program
         # (2026-11-21, set by run.py for the main search) charge_screens false: screen_candidate is free and the
@@ -389,10 +406,85 @@ class Workspace:
     def left(self, kind: str) -> float:
         return self.budget.get(kind, math.inf) - self.api.spent.get(kind, 0)
 
+    # ------------------------------------------------------------------ tool devices (2026-11-22)
+    @property
+    def store(self):
+        """The weight store of the calling session's device (tools_on_replicas), else the workspace's."""
+        d = self._dev()
+        return self._overlay(d["store"] if d is not None and d.get("store") is not None else self._store0)
+
+    def _overlay(self, s):
+        """merge.mode adapter: the device's store seen through C_g (W_0 + B_C A_C, fp32); else the store itself."""
+        if self.base_lora is None or self.mock or s is None:
+            return s
+        o = self._overlays.get(id(s))
+        if o is None:
+            from .primitives.weights import OverlayStore
+            o = self._overlays.setdefault(id(s), OverlayStore(s, self.base_lora))
+        return o
+
+    def _hf_current(self):
+        """Context in which the HF model computes the CURRENT model: merge.mode adapter applies C_g (forward hooks,
+        entered before a tool's own statistic hooks so they see its output); otherwise nothing to do."""
+        from contextlib import nullcontext
+        if self.base_lora is None or self.mock or self.hf is None:
+            return nullcontext()
+        return self.hf.applied(self.base_lora)
+
+    @store.setter
+    def store(self, v):
+        self._store0 = v
+
+    @property
+    def hf(self):
+        """The HF model of the calling session's device (tools_on_replicas), else the workspace's (train GPU)."""
+        d = self._dev()
+        return d["hf"] if d is not None and d.get("hf") is not None else self._hf0
+
+    @hf.setter
+    def hf(self, v):
+        self._hf0 = v
+
+    def set_devices(self, devs: list[dict]) -> None:
+        """One tool device per main replica, in the order of the editor endpoints (thread k -> replica k mod n):
+        {"hf": HFModel on that replica's GPU | None, "store": WeightStore there | None, "server": the replica}."""
+        self.devs = [dict(d, lock=d.get("lock") or threading.RLock()) for d in devs]
+
+    def dev_index(self, cid) -> int | None:
+        """Device of a session / candidate id (g01_t3_s00, g01_t3_s00~x...): thread mod the number of devices."""
+        if not self.devs or not cid:
+            return None
+        m = re.search(r"_t(\d+)_", str(cid))
+        return int(m.group(1)) % len(self.devs) if m else None
+
+    def _dev(self) -> dict | None:
+        i = getattr(self._local, "dev", None)
+        return self.devs[i] if i is not None and i < len(self.devs) else None
+
+    def _tool_lock(self):
+        """Lock of a tool call: the session's device lock with tool devices (sessions on different replicas run
+        their tools at once; shared bookkeeping keeps the workspace lock), else the workspace lock."""
+        d = self._dev()
+        return d["lock"] if d is not None else self._lock
+
+    def warm_devices(self) -> None:
+        """Load every device's HF model before the search (not charged to any budget). The loads run one after
+        another (HFModel.model serialises from_pretrained process-wide); the first failure is raised, so a search
+        never starts with a replica whose tools cannot run."""
+        for i, d in enumerate(self.devs):
+            if d.get("hf") is not None:
+                try:
+                    d["hf"].model
+                except Exception as e:  # noqa: BLE001 - re-raised with the device named
+                    raise RuntimeError(f"tool device {i} ({getattr(d['hf'], 'device', '?')}): HF copy failed to "
+                                       f"load: {type(e).__name__}: {e}") from e
+
     def begin_program(self, cid: str, timeout_s: float | None = None) -> None:
         """timeout_s (2026-11-21): the program's wall clock (default sandbox.timeout_s); tools that start their own
         subprocess (tensor_compute) never run past it."""
         self._local.cid = cid
+        self._local.dev = self.dev_index(cid)
+        self._local.gpu = 0.0
         self._local.t0 = time.time()
         self._local.deadline = self._local.t0 + float(timeout_s if timeout_s is not None else self.program_timeout_s)
         self.tool_log[cid] = []
@@ -403,6 +495,7 @@ class Workspace:
                 self._h.pop(h, None)
                 self._owner.pop(h, None)
         self._local.cid = None
+        self._local.dev = None
         self._local.t0 = None
         self._local.deadline = None
 
@@ -514,17 +607,25 @@ class Workspace:
         lst = self.tool_log.setdefault(self._cid(), [])
         lst.append(name)
 
-    def _gpu(self, fn, est_seconds: float):
+    def _xbudget(self) -> tuple[dict, dict]:
+        """(budget, spent) of the calling session's exploration GPU budget (editor.explore.gpu_seconds per session)."""
+        return self._xbudgets.get(getattr(self._local, "xkey", None) or "", ({}, {}))
+
+    def _gpu(self, fn, est_seconds: float, self_timed: bool = False):
         """Run fn and record its gpu seconds (mock: the estimate) for the tool's cost_fn. Inside explore_api the
-        exploration budget is checked instead of the generation's."""
+        session's exploration budget is checked instead of the generation's. self_timed (2026-11-22): fn adds its
+        own seconds to self._local.gpu (train_loss on a vLLM replica: the replica's request time only)."""
         if getattr(self._local, "explore", False):
-            xb, xs = getattr(self, "_xbudget", None) or {}, getattr(self, "_xspent", None) or {}
+            xb, xs = self._xbudget()
             if xs.get("gpu_seconds", 0.0) >= xb.get("gpu_seconds", 0.0) - 1e-9:
-                raise _budget_exc()("exploration gpu_seconds budget exhausted (editor.explore.gpu_seconds)")
+                raise _budget_exc()("exploration gpu_seconds budget of this session exhausted "
+                                    "(editor.explore.gpu_seconds)")
         elif self.left("gpu_seconds") <= 0:
             raise _budget_exc()("gpu_seconds budget exhausted")
         if self.mock:
             self._local.gpu = getattr(self._local, "gpu", 0.0) + est_seconds
+            return fn()
+        if self_timed:
             return fn()
         t0 = self.hf.gpu_seconds
         try:
@@ -533,11 +634,16 @@ class Workspace:
             self._local.gpu = getattr(self._local, "gpu", 0.0) + (self.hf.gpu_seconds - t0)
 
     def _gpu_cost(self, kwargs, result) -> dict:
-        """cost_fn of the GPU tools: seconds measured by _gpu during this call, capped at the remaining budget."""
+        """cost_fn of the GPU tools: seconds measured by _gpu during this call, capped at the remaining budget.
+        (2026-11-22) The cap and the charge happen in one step under the ToolAPI lock: programs on several tool
+        devices finish GPU calls at once, and a cap read before another call's charge landed would push spent past
+        the budget and throw away a finished result."""
         used = float(getattr(self._local, "gpu", 0.0))
         self._local.gpu = 0.0
-        self.gpu_measured += used
-        return {"gpu_seconds": min(used, max(self.left("gpu_seconds"), 0.0))}
+        with self.api._lock:
+            self.gpu_measured += used
+            self.api.charge("gpu_seconds", min(used, max(self.left("gpu_seconds"), 0.0)))
+        return {}
 
     def _eval_obj(self, kwargs):
         """The object an evaluate / train_loss call refers to: kwargs edit (a weight edit) or lora (a LoRA; in
@@ -612,7 +718,8 @@ class Workspace:
         without evaluate / raw_lora (the handle 'RAW' still works) and, unless gpu_tools, without the GPU tools
         (acts / regmean_preserve / train_loss). It never charges the generation's budgets (ws.api.spent,
         gpu_measured): with gpu_tools the GPU tools are charged to a separate exploration budget of gpu_seconds per
-        workspace (shared by all threads; their gram / parent-loss caches are shared with the programs). Runs under
+        session (2026-11-22: each proposal / cid has its own; their gram / parent-loss caches are shared with the
+        programs). Runs under
         begin_program(tag) in the calling thread (the sandbox serves tool calls in it), so the handles made here
         are freed by cleanup() and the tool log lives under the '~x' tag, which classify() never reads.
         persistent (2026-11-21, editor.explore.persistent): -> (api, cleanup, before_call) for ONE api per proposal
@@ -620,19 +727,19 @@ class Workspace:
         proposal); before_call(timeout_s) starts each run_python call's wall clock (the tensor_compute deadline), and
         every tool call binds this tag's thread-local state first, so it works in whichever thread serves it."""
         from rsicore.sandbox import ToolAPI
+        xkey = str(tag).split("~")[0]
         with self._lock:
-            if getattr(self, "_xbudget", None) is None:
-                self._xbudget = {"gpu_seconds": float(gpu_seconds)}
-                self._xspent = {"gpu_seconds": 0.0}
+            xb = self._xbudgets.setdefault(xkey, ({"gpu_seconds": float(gpu_seconds)}, {"gpu_seconds": 0.0}))
         api = ToolAPI({})
         if gpu_tools:
-            api.budget, api.spent = self._xbudget, self._xspent   # shared by every exploration call of this workspace
+            api.budget, api.spent = xb          # this session's own budget (every run_python call of the proposal)
         docs = tools_for_mode(self.mode, retention=bool(self.retention_texts), cfg=self.cfg)
         clock = {"t0": time.time(), "deadline": time.time() + _explore_timeout(self.cfg)}
 
         def bind():
             """This tag's thread-local state in the calling thread (persistent: before every tool call)."""
             self._local.cid, self._local.t0, self._local.deadline = tag, clock["t0"], clock["deadline"]
+            self._local.dev, self._local.xkey = self.dev_index(tag), xkey
             self._local.explore = True
 
         def bound(fn):
@@ -651,10 +758,12 @@ class Workspace:
                 api.register(name, fn, doc=docs[name])
         self.begin_program(tag, timeout_s=_explore_timeout(self.cfg))
         self._local.explore = True
+        self._local.xkey = xkey
         self._local.gpu = 0.0
 
         def cleanup():
             self._local.explore = False
+            self._local.xkey = None
             self._local.gpu = 0.0
             self.end_program(tag)
         if not persistent:
@@ -673,7 +782,8 @@ class Workspace:
         with self._lock:
             used = float(getattr(self._local, "gpu", 0.0))
             self._local.gpu = 0.0
-            self._xspent["gpu_seconds"] = self._xspent.get("gpu_seconds", 0.0) + used
+            xs = self._xbudget()[1]
+            xs["gpu_seconds"] = xs.get("gpu_seconds", 0.0) + used
         return {}
 
     UNLOCKED_TOOLS = ("evaluate",)   # mode=weights: lock only their own bookkeeping (concurrent evaluations)
@@ -686,7 +796,7 @@ class Workspace:
                 with self._lock:
                     self._log(name, kwargs)
                 return fn(**kwargs)
-            with self._lock:
+            with self._tool_lock():
                 self._log(name, kwargs)
                 return fn(**kwargs)
         call.__name__ = name
@@ -750,6 +860,13 @@ class Workspace:
                 if not self.charge_screens:             # the generation's pool can be the tighter limit
                     left = int(max(0, min(left, self.left("evaluate"))))
                 out["program_evaluate_calls_left"] = left
+        if getattr(self._local, "explore", False):      # (2026-11-22) run_python: the session's own GPU budget
+            xb, xs = self._xbudget()
+            if xb:
+                out["explore_gpu_seconds_left"] = round(max(0.0, xb.get("gpu_seconds", 0.0)
+                                                            - xs.get("gpu_seconds", 0.0)), 1)
+                out["explore_note"] = ("GPU tools in run_python spend explore_gpu_seconds_left (this session only); "
+                                       "'spent' / 'left' are your final program's budgets")
         if not self.charge_screens and self._registered and "evaluate" not in self.api.names():
             out["note"] = ("no api.evaluate in this run: every returned candidate gets one gate evaluation "
                            "automatically (shown to later steps / generations)")
@@ -815,7 +932,10 @@ class Workspace:
                     "pc_var": st["pc_var"], "tokens": (800 if source == "own" else 200) * n}
         if texts is None:
             texts = self.train.texts(ids)
-        st = self._gpu(lambda: self.hf.acts(texts, [module], k=int(k))[module], est_seconds=0)
+        def run_acts():
+            with self._hf_current():
+                return self.hf.acts(texts, [module], k=int(k))[module]
+        st = self._gpu(run_acts, est_seconds=0)
         st["module"] = module
         return {"handle": self._new("A", st), "in_norm": st["in_norm"], "out_norm": st["out_norm"],
                 "pc_var": st["pc_var"], "tokens": st["tokens"]}
@@ -969,16 +1089,30 @@ class Workspace:
             self._gpu(lambda: None, est_seconds=20)
             return {"lora": self._new("L", M.m_regmean(lo, float(alpha)))}
         mods = [m for m in (self._mods(modules) if modules else lo.modules()) if m in lo.factors]
-        need = [m for m in mods if m not in self._gram_t]
-        if need:
-            n = int(self.cfg.get("tools", {}).get("gram_items", 64))
-            tt = self.train.texts(self.train.ids()[:n])
-            rt = self.retention_texts[:n]
-            if not rt:
-                raise ValueError("no retention contexts available for regmean_preserve")
-            self._gram_t.update(self._gpu(lambda: self.hf.grams(tt, need), est_seconds=0))
-            self._gram_r.update(self._gpu(lambda: self.hf.grams(rt, need), est_seconds=0))
-        out = ops.regmean_preserve(lo, self._gram_t, self._gram_r, float(alpha), modules=mods)
+        # (2026-11-22) sessions on several tool devices share the gram caches: one gram lock around check, compute
+        # and publish, so nobody reads a module whose target grams are in and retention grams are not yet
+        with self.__dict__.setdefault("_gram_lock", threading.Lock()):
+            need = [m for m in mods if m not in self._gram_t or m not in self._gram_r]
+            if need:
+                n = int(self.cfg.get("tools", {}).get("gram_items", 64))
+                tt = self.train.texts(self.train.ids()[:n])
+                rt = self.retention_texts[:n]
+                if not rt:
+                    raise ValueError("no retention contexts available for regmean_preserve")
+                def grams(texts):
+                    with self._hf_current():
+                        return self.hf.grams(texts, need)
+                gt = self._gpu(lambda: grams(tt), est_seconds=0)
+                gr = self._gpu(lambda: grams(rt), est_seconds=0)
+                self._gram_t.update(gt)
+                self._gram_r.update(gr)
+            gt = {m: self._gram_t[m] for m in mods if m in self._gram_t}
+            gr = {m: self._gram_r[m] for m in mods if m in self._gram_r}
+        miss = [m for m in mods if m not in gt or m not in gr]
+        if miss:
+            raise RuntimeError(f"regmean_preserve: no activation statistics for {miss[:4]} (their forward hooks "
+                               "never fired)")
+        out = ops.regmean_preserve(lo, gt, gr, float(alpha), modules=mods)
         return {"lora": self._new("L", out)}
 
     def t_orthogonalize(self, lora, against="stack"):
@@ -1192,6 +1326,10 @@ class Workspace:
                     if base_ed.needs_base(en):
                         wb = (self.base_store.weight(en) if self.base_store.has(en) else self.base_store.tensor(en))
                     cur[n] = base_ed.apply(en, self._tc_current(n), wb).contiguous()
+        if not self.mock and hasattr(self.store, "is_overlaid"):   # merge.mode adapter: W_0 + B_C A_C, not the disk W_0
+            for n in canon:
+                if n not in cur and self.store.is_overlaid(n):
+                    cur[n] = self._tc_current(n).contiguous()
         left = self._time_left()
         timeout = float(tc["timeout_s"]) if left is None else min(float(tc["timeout_s"]), left - 5.0)
         if timeout < 5:
@@ -1527,7 +1665,10 @@ class Workspace:
         run.py (Run.reference_screen) before the search; RuntimeError when this session has none."""
         sd = getattr(self, "screen", None)
         if callable(sd):
-            sd = self.screen = sd()
+            with self._lock:            # sessions on several tool devices may ask at once (2026-11-22)
+                sd = self.screen
+                if callable(sd):
+                    sd = self.screen = sd()
         if not sd or not sd.get("records"):
             raise RuntimeError("no screen results of the current model in this session")
         return sd
@@ -1760,17 +1901,115 @@ class Workspace:
 
     def _parent_lora_for_loss(self):
         """The LoRA that makes the current model in the HF model: mode=edit after generation 0 the current LoRA
-        (RAW, source 'current') on M_0; otherwise none (the HF model is the current model itself)."""
+        (RAW, source 'current') on M_0; merge.mode adapter (real) the cumulative LoRA C_g on M_0 (a candidate is then
+        scored as C_g (+) delta, _loss_lora); otherwise none (the HF model is the current model itself)."""
+        if self.base_lora is not None and not self.mock:
+            return self.base_lora
         return self.raw if (self.raw is not None and self.raw_info.get("source") == "current") else None
+
+    def _loss_lora(self, lo):
+        """The adapter whose loss is the candidate's: merge.mode adapter = the composed C_g (+) lo that the evaluator
+        serves (same composition, same rank budget); else lo (mode=edit: a replacement of the current LoRA)."""
+        if self.base_lora is None or self.mock or self.is_edit_obj(lo) or not lo.modules():
+            return lo
+        if self.evaluator is not None:
+            return self.evaluator.compose(lo)
+        from .primitives.lora import compose_cumulative
+        return compose_cumulative(self.base_lora, lo)
+
+    def loss_backend(self, lo, ref) -> str:
+        """'vllm' (tools.train_loss_backend vllm, 2026-11-22): the LoRA is hot-loaded on the session's own main
+        replica and the answer NLL read from vLLM's prompt logprobs; 'hf': the HF model (weight edits, a parent LoRA
+        in mode=edit, mock, or the backend set to hf)."""
+        b = str((self.cfg.get("tools") or {}).get("train_loss_backend") or "hf")
+        if (b != "vllm" or self.mock or (ref is not None and ref is not self.base_lora) or self.evaluator is None
+                or self.is_edit_obj(lo)):
+            return "hf"
+        try:
+            srv = self._loss_replica()
+        except Exception:  # noqa: BLE001 - no replica to score on
+            return "hf"
+        # an adapter above the replica's --max-lora-rank (after vLLM's rank padding) cannot be loaded there: ranks
+        # can pass lora.rank_cap through rank1 / from_direction / scale_singular / project_out (no recompress)
+        from .primitives.lora import padded_rank
+        cap = int(getattr(srv, "max_lora_rank", None) or self.rank_cap)
+        lo = self._loss_lora(lo) if lo is not None else lo     # adapter mode: the composed rank counts
+        if lo is not None and lo.modules() and padded_rank(max(1, int(lo.max_rank()))) > cap:
+            return "hf"
+        return "vllm"
+
+    def _loss_replica(self):
+        """The calling session's main replica: its tool device's server, else replica (thread mod n) of the
+        evaluator, the same replica its editor runs on."""
+        d = self._dev()
+        if d is not None and d.get("server") is not None:
+            return d["server"]
+        reps = list(getattr(self.evaluator, "replicas", None) or [self.evaluator.server])
+        m = re.search(r"_t(\d+)_", str(self._cid()))
+        return reps[int(m.group(1)) % len(reps)] if m else reps[0]
+
+    def _loss_seconds_left(self) -> float:
+        """Seconds a vLLM train_loss may still use: the session's exploration budget (run_python) or the
+        generation's gpu_seconds, minus what this tool call already used, and the program's / run_python call's
+        wall clock."""
+        used = float(getattr(self._local, "gpu", 0.0))
+        if getattr(self._local, "explore", False):
+            xb, xs = self._xbudget()
+            lim = [xb.get("gpu_seconds", 0.0) - xs.get("gpu_seconds", 0.0) - used]
+        else:
+            lim = [self.left("gpu_seconds") - used]
+        dl = getattr(self._local, "deadline", None)
+        if dl:
+            lim.append(dl - time.time())
+        return max(1.0, min(lim))
+
+    def _vllm_loss(self, ex, lo) -> float:
+        """Mean answer-token NLL of ex under the current model (lo None / empty) or the current model + lo, on the
+        session's own replica (lo saved as a PEFT adapter, loaded there under a unique name, unloaded and deleted
+        after, also on errors). Charged: the adapter load and the requests' time (not the disk writes or retry
+        waits), and the requests stop at the budget / wall-clock limit (_loss_seconds_left)."""
+        import shutil
+        srv = self._loss_replica()
+        deadline = time.time() + self._loss_seconds_left()
+        enc = [self.hf.encode(e) for e in ex]       # the HF tokenizer and chat template of HFModel.loss
+        name, path = None, None
+        try:
+            if lo is not None and lo.modules():
+                from .primitives.lora import save_peft
+                with self._lock:
+                    self._tl_n += 1
+                    name = f"tl_{self.name_prefix}_{self._tl_n}"
+                path = self.out_dir / "train_loss_adapters" / name
+                save_peft(lo, path, self.store, base_model=str(getattr(self.store, "model_dir", "")),
+                          dtype=self.lcfg.get("save_dtype", "bfloat16"))
+                t0 = time.time()
+                try:
+                    srv.load_lora(name, path)
+                finally:
+                    self._local.gpu = getattr(self._local, "gpu", 0.0) + (time.time() - t0)
+            parent = getattr(self.evaluator, "parent_lora", None) or self.evaluator.served   # M_g: C_g's adapter
+            nll, secs = vllm_answer_nll(srv.endpoint, name or parent, enc, deadline=deadline)
+            self._local.gpu = getattr(self._local, "gpu", 0.0) + secs
+            return nll
+        finally:
+            if name is not None:
+                try:
+                    srv.unload_lora(name)       # tolerates an adapter that never got loaded
+                except Exception:  # noqa: BLE001 - a stale adapter only takes a CPU slot
+                    pass
+            if path is not None:
+                shutil.rmtree(path, ignore_errors=True)
 
     def t_train_loss(self, lora=None, ids=None, n=64, edit=None):
         """Mean answer NLL on train items with and without the LoRA / weight edit (forward only). Real mode with an
-        edit: HFModel.loss(ex, lora=<WeightEdit>) applies the edit."""
+        edit: HFModel.loss(ex, lora=<WeightEdit>) applies the edit. tools.train_loss_backend vllm (2026-11-22): a LoRA
+        is scored on the session's own vLLM replica (loss_backend)."""
         lo = self._eval_obj({"lora": lora, "edit": edit})
         ids = self._ids(ids, default_n=int(n))
         ex = self._examples(ids)
         ref = self._parent_lora_for_loss()
-        key = tuple(sorted(ids))
+        backend = self.loss_backend(lo, ref)
+        key = tuple(sorted(ids)) if backend == "hf" else ("vllm",) + tuple(sorted(ids))
         cache = self.__dict__.setdefault("_parent_loss", {})
         if self.mock:
             def mloss(x):
@@ -1778,8 +2017,12 @@ class Workspace:
             loss = self._gpu(lambda: mloss(lo if lo.modules() else ref), est_seconds=1 + 0.05 * len(ex))
             if key not in cache:
                 cache[key] = mloss(ref)
+        elif backend == "vllm":
+            loss = self._gpu(lambda: self._vllm_loss(ex, self._loss_lora(lo)), est_seconds=0, self_timed=True)
+            if key not in cache:
+                cache[key] = self._gpu(lambda: self._vllm_loss(ex, None), est_seconds=0, self_timed=True)
         else:
-            loss = self._gpu(lambda: self.hf.loss(ex, lora=lo if lo.modules() else ref), est_seconds=0)
+            loss = self._gpu(lambda: self.hf.loss(ex, lora=self._loss_lora(lo) if lo.modules() else ref), est_seconds=0)
             if key not in cache:
                 cache[key] = self._gpu(lambda: self.hf.loss(ex, lora=ref), est_seconds=0)
         p = cache[key]
@@ -2036,6 +2279,155 @@ def _overlap(lo, others) -> float | None:
     return round(sum(vals) / len(vals), 4) if vals else None
 
 
+NOTE_CHARS = 600
+
+
+def vllm_answer_nll(endpoint: str, model: str, encoded, *, batch: int = 16, timeout: float = 1800,
+                    deadline: float | None = None, post=None) -> tuple[float, float]:
+    """(mean answer-token NLL, seconds spent in requests) (2026-11-22, tools.train_loss_backend vllm) of encoded =
+    [(input_ids, labels)] (HFModel.encode: labels -100 on the prompt) from vLLM's /v1/completions prompt_logprobs:
+    position j of a token-id prompt holds log p(ids[j] | ids[:j]) (the prompt token itself is always included), so
+    the answer NLL is the mean of -logprob over the positions with labels[j] != -100, over all items' answer tokens.
+    deadline (time.time() value): no request runs past it (timeouts shortened, no retry after it)."""
+    from rsicore import _net
+    post = post or _net.post_json
+    url = endpoint.rstrip("/") + "/completions"
+    tot, n, secs = 0.0, 0, 0.0
+    for i in range(0, len(encoded), max(1, int(batch))):
+        chunk = encoded[i:i + max(1, int(batch))]
+        payload = {"model": model, "prompt": [[int(t) for t in ids] for ids, _ in chunk], "max_tokens": 1,
+                   "temperature": 0.0, "prompt_logprobs": 1}
+        last = None
+        for attempt in range(4):
+            left = timeout if deadline is None else min(timeout, deadline - time.time())
+            if left <= 0:
+                raise RuntimeError("train_loss stopped: its GPU budget or wall-clock limit ran out"
+                                   + (f" (last error: {last})" if last else ""))
+            t0 = time.time()
+            try:
+                resp = post(url, payload, timeout=left)
+                secs += time.time() - t0
+                break
+            except (_net.HTTPError, OSError) as e:
+                secs += time.time() - t0
+                last = e
+                if isinstance(e, _net.HTTPError) and e.status < 500:
+                    raise
+                if deadline is not None and time.time() + 2 ** attempt >= deadline:
+                    raise RuntimeError(f"train_loss stopped at its GPU budget / wall-clock limit: {e}") from None
+                time.sleep(2 ** attempt)
+        else:
+            raise RuntimeError(f"train_loss prompt_logprobs request failed: {last}")
+        chs = sorted(resp.get("choices") or [], key=lambda c: c.get("index", 0))
+        if len(chs) != len(chunk):
+            raise RuntimeError(f"train_loss: {len(chs)} choices for {len(chunk)} prompts")
+        for (ids, lab), ch in zip(chunk, chs):
+            plp = ch.get("prompt_logprobs")
+            if plp is None:
+                raise RuntimeError("server returned no prompt_logprobs (vLLM >= 0.6 needed)")
+            for j in range(1, min(len(ids), len(lab))):
+                if lab[j] == -100:
+                    continue
+                pos = plp[j] if j < len(plp) else None
+                v = (pos or {}).get(str(int(ids[j])))
+                if v is None:
+                    raise RuntimeError(f"train_loss: no logprob for token {ids[j]} at position {j}")
+                tot -= float(v["logprob"] if isinstance(v, dict) else v)
+                n += 1
+    return tot / max(n, 1), secs
+
+
+def cut_note(note: str, n: int = NOTE_CHARS) -> str:
+    """A program's returned "note" (2026-11-22), whitespace collapsed, at most n characters."""
+    t = " ".join(str(note).split())
+    return t if len(t) <= n else t[:n - 3].rstrip() + "..."
+
+
+EDIT_GROUPS = 8
+
+
+def _layer_ranges(xs) -> str:
+    """[1, 2, 3, 5] -> '1-3,5'."""
+    xs = sorted(set(xs))
+    out, i = [], 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+            j += 1
+        out.append(str(xs[i]) if i == j else f"{xs[i]}-{xs[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def _span(vals, fmt=lambda v: f"{v:.3g}"):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    lo, hi = min(vals), max(vals)
+    return fmt(lo) if fmt(lo) == fmt(hi) else f"{fmt(lo)}-{fmt(hi)}"
+
+
+def _op_sig(op: dict) -> str:
+    """A weight-edit op's settings without tensors: 'scale s=1.05', 'rows n=3 f=1.1', 'lowrank r=4', 'delta'."""
+    k = op.get("op")
+    if k == "scale":
+        return f"scale s={op.get('s'):.4g}"
+    if k == "toward_base":
+        return f"toward_base alpha={op.get('alpha'):.4g}"
+    if k in ("rows", "cols"):
+        f = op.get("f")
+        idx = op.get("idx")
+        return (f"{k} n={'all' if idx is None else len(idx)} "
+                f"f={f'{f:.4g}' if isinstance(f, (int, float)) else 'vector'}")
+    if k == "lowrank":
+        return f"lowrank r={op.get('rank')}"
+    return str(k)
+
+
+def edit_summary(lo, rep: dict) -> dict:
+    """What a candidate changed (2026-11-22), for the history table: the module types it touched and, per type (and
+    per op setting for a weight edit), the layers and the parameters (LoRA rank, ||dW||/||W0||, weight-edit ops).
+    rep = the sandbox check report (its 'modules' has rank / rel_norm per module)."""
+    from .primitives.naming import tensor_layer
+    mods = rep.get("modules") or {}
+    ops = {}
+    if getattr(lo, "kind", "lora") == "weights" and callable(getattr(lo, "summary", None)):
+        try:
+            s = lo.summary()
+            ops = s if isinstance(s, dict) else {}
+        except Exception:                    # noqa: BLE001 - the summary is for the history only
+            ops = {}
+    groups = {}
+    for m, d in mods.items():
+        layer = tensor_layer(m)
+        typ = m.split(".", 2)[2] if layer is not None else m
+        lst = ops.get(m)
+        sig = "; ".join(_op_sig(op) for op in lst if isinstance(op, dict)) if isinstance(lst, list) else None
+        g = groups.setdefault((typ, sig), {"layers": [], "rank": [], "rel": []})
+        if layer is not None:
+            g["layers"].append(layer)
+        g["rank"].append(d.get("rank"))
+        g["rel"].append(d.get("rel_norm"))
+    out = []
+    for (typ, sig), g in sorted(groups.items(), key=lambda kv: (-len(kv[1]["rel"]), kv[0][0], kv[0][1] or "")):
+        row = {"type": typ, "n": len(g["rel"])}
+        if g["layers"]:
+            row["layers"] = _layer_ranges(g["layers"])
+        r = _span(g["rank"], fmt=lambda v: str(int(v)))
+        if r and r != "0":
+            row["rank"] = r
+        rel = _span(g["rel"])
+        if rel:
+            row["rel_norm"] = rel
+        if sig:
+            row["ops"] = sig[:160]
+        out.append(row)
+    res = {"n": len(mods), "types": sorted({t for t, _ in groups}), "groups": out[:EDIT_GROUPS]}
+    if len(out) > EDIT_GROUPS:
+        res["more_groups"] = len(out) - EDIT_GROUPS
+    return res
+
+
 def program_build(ws: Workspace, program: str, cid: str, *, timeout_s: int, mem_gb: int, workdir: Path):
     """build_fn for rsicore.search.inner_search: run the program in the sandbox, resolve and check the LoRA,
     save it. Returns (artifact | None, error | None)."""
@@ -2063,6 +2455,13 @@ def program_build(ws: Workspace, program: str, cid: str, *, timeout_s: int, mem_
                "max_rank": lo.max_rank(), "digest": lo.digest(), "kind": getattr(lo, "kind", "lora"),
                "tools_used": _count(tools),
                "strategy": classify(tools), "stdout": (res.stdout or "")[-1000:], "seconds": round(time.time() - t0, 1)}
+        try:                        # (2026-11-22) modules, module types, parameters, for the history
+            art["edit"] = edit_summary(lo, rep)
+        except Exception as e:      # noqa: BLE001 - never fail a built candidate over its description
+            art["edit"] = {"error": f"{type(e).__name__}: {e}"[:200]}
+        note = res.result.get("note") if isinstance(res.result, dict) else None
+        if isinstance(note, str) and note.strip():   # (2026-11-22) the candidate's own account, for the history
+            art["note"] = cut_note(note)
         return art, None
     finally:
         ws.end_program(cid)
@@ -2121,8 +2520,8 @@ def explore_doc(ws: Workspace, gpu_tools: bool = False, gpu_seconds: float = 300
     if "raw_lora" in missing:
         out += " The raw LoRA is still usable as the handle 'RAW'."
     if gpu_tools:
-        out += (f" The GPU tools here use a separate exploration budget ({gpu_seconds:.0f} GPU-seconds for the whole "
-                "search), not your program budget.")
+        out += (f" The GPU tools here use a separate exploration budget ({gpu_seconds:.0f} GPU-seconds for this "
+                "session), not your program budget.")
     if explore_persistent(ws.cfg):            # one Python session per proposal (2026-11-21)
         out += (" Variables, imports and handles persist across your run_python calls for this candidate (one Python "
                 "session; a timeout or crash restarts it and loses them).")

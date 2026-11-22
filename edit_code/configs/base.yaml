@@ -95,8 +95,13 @@ objective_profiles:
     decoding:
       screen: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
       gate: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
+    # kl_weight 0 (2026-11-22): acceptance is the paired gate gain alone, so no per-generation KL work (M_0's
+    # self-generated KL texts, reference logprobs, the incumbent's KL), as in Paper B; generation 0 still builds the
+    # calibration texts with M_0's responses
     search: {threads: 8, steps: 1, max_candidates: 8, charge_screens: false, program_evaluate_calls: 0,
-             program_evaluate_total: 0, top_full: 0, screen_candidates: false, gate_every_candidate: true}
+             program_evaluate_total: 0, top_full: 0, screen_candidates: false, gate_every_candidate: true,
+             kl_weight: 0.0}
+    loop: {patience: 3}               # (2026-11-22) as Paper B: stop after 3 generations without a new incumbent
     vllm: {candidate_max_model_len: 32768}
     editor: {tool_rounds: 20, explore: {persistent: true}}
 
@@ -275,8 +280,11 @@ sandbox:
   mem_gb: 16
 
 archive:
-  enabled: true                       # experience channel: earlier rounds' incumbents + top candidates in context
-  top_candidates: 3
+  enabled: true                       # experience channel: earlier rounds in context (2026-11-22, as Paper B): EVERY
+                                      # candidate one row (config in one line, size, gate result, error, note)
+  top_candidates: 3                   # full configs quoted per round, only when the editor has no search_history /
+                                      # read_record (editor.tool_rounds 0 or history_tool false)
+  max_chars: 30000                    # cap of the archive text: the oldest rounds' rows are dropped first
 
 heldout:
   domains: all                        # all | run (= the run's --domain; scope=single) | a domain list
@@ -387,3 +395,7 @@ mock_overrides:                       # applied in --mock runs only (fast local 
 mock_objective_overrides:             # --mock runs of that objective, applied after mock_overrides (2026-11-21):
   simple:                             # the simple layout (k threads x 1 step, gate per candidate, no evaluate), small
     search: {threads: 3, steps: 1, max_candidates: 3, top_full: 0, program_evaluate_calls: 0}
+    # (2026-11-22) the real simple gate rule and no baselines (as Paper B's mock), so a mock simple run follows the
+    # real flow (mock_overrides would otherwise set min_delta 0.002 and run the uniform / kl_greedy baselines)
+    gate: {min_delta: 0.0}
+    baselines: {methods: []}

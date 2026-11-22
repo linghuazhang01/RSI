@@ -110,6 +110,11 @@ class Evaluator:
         # M_0 server); candidates are full replacement LoRAs on M_0. None = the served model itself.
         self.parent_lora: str | None = None
         self.pinned: set = set()            # adapters never unloaded (the parent / editor LoRA)
+        # merge.mode adapter (scratch, 2026-11-22): the current model is M_0 + the cumulative LoRA C_g (parent_lora
+        # is its adapter); a candidate is a DELTA on M_g and is served as compose_cumulative(C_g, delta) (the one
+        # place where deltas are composed; full adapters are registered with full=True). None = no composition.
+        self.base_lora = None
+        self.base_budget: int | None = None
         self.shown: dict[str, set] = {}
         self._loaded: OrderedDict = OrderedDict()
         self._paths: dict[str, Path] = {}
@@ -124,15 +129,38 @@ class Evaluator:
         self.mark_shown_examples = bool(ec.get("mark_shown", True))
 
     # ------------------------------------------------------------------ adapters
-    def register(self, lora, name: str) -> Path:
-        """Save `lora` (PEFT dir, or mock JSON spec) and make it servable under `name`."""
+    def set_base(self, lora, budget: int | None = None) -> None:
+        """merge.mode adapter: candidates registered from now on are deltas on M_0 + `lora` (composed at register)."""
+        self.base_lora = lora if (lora is not None and lora.modules()) else None
+        self.base_budget = budget
+
+    def compose(self, lora):
+        """What a delta is served as: compose_cumulative(C_g, lora, budget) in adapter mode (also with C_g empty when
+        the delta alone is above the budget), else lora itself. Deterministic: run.py rebuilds the accepted C_{g+1}
+        with the same call instead of keeping every composite in memory."""
+        if getattr(lora, "kind", "lora") == "weights" or not lora.modules():
+            return lora
+        if self.base_lora is None and not (self.base_budget and lora.max_rank() > int(self.base_budget)):
+            return lora
+        from .primitives.lora import compose_cumulative
+        return compose_cumulative(self.base_lora, lora, self.base_budget)
+
+    def register(self, lora, name: str, *, full: bool = False) -> Path:
+        """Save `lora` (PEFT dir, or mock JSON spec) and make it servable under `name`. Adapter mode: a delta is
+        saved as C_g (+) delta (full=False); full=True registers a complete adapter on M_0 as is (C_g itself, the
+        next C, an E_t parent). Mock quality is always the delta's, relative to parent_quality (= the current model);
+        a full adapter whose quality is already in the registry keeps it."""
         weights = getattr(lora, "kind", "lora") == "weights"
+        serve = lora if full else self.compose(lora)
         with self._lock:
             if weights:
                 self._kinds[name] = "weights"
             if self.mock:
                 path = self.out_dir / "adapters" / f"{name}.json"
-                write_json(path, lora.to_json())
+                write_json(path, serve.to_json())
+                if full and name in (read_json(self.registry, {}) or {}):
+                    self._paths[name] = path
+                    return path
                 # per-domain mock quality: the target domain gains, retention domains take the damage
                 # (train and gate datasets differ: the gain goes to the domain, so both of them see it)
                 tkey = DATASET_DOMAIN.get(self.target, self.target) if self.gate_target == self.target \
@@ -151,7 +179,7 @@ class Evaluator:
                 from .primitives.lora import save_peft
                 path = self.out_dir / "adapters" / name
                 if not (path / "adapter_model.safetensors").exists():
-                    save_peft(lora, path, self.store, base_model=str(getattr(self.store, "model_dir", "")),
+                    save_peft(serve, path, self.store, base_model=str(getattr(self.store, "model_dir", "")),
                               dtype=self.cfg.get("lora", {}).get("save_dtype", "bfloat16"))
             self._paths[name] = path
             return path
@@ -160,9 +188,10 @@ class Evaluator:
         return name in self._paths
 
     def set_parent(self, lora, name: str) -> None:
-        """mode=edit: the parent / editor model is M_0 + `lora` (registered and pinned as `name`)."""
+        """The parent / editor model is M_0 + `lora` (registered as a full adapter and pinned as `name`): mode=edit's
+        current LoRA, or merge.mode adapter's cumulative LoRA C_g."""
         if not self.known(name):
-            self.register(lora, name)
+            self.register(lora, name, full=True)
         self.parent_lora = name
         self.pinned.add(name)
         self.ensure_loaded(name)

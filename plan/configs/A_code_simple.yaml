@@ -59,7 +59,7 @@ budget:
     lm_head: 8
 loop:
   editor: frozen
-  patience: 2
+  patience: 3                 # 2026-11-22: simple profile, as Paper B
 action_space:
   bits:
   - 2
@@ -95,7 +95,7 @@ search:
   gate_every_candidate: true
   top_full: 0
   rerun_seeds: 0
-  kl_weight: 0.5
+  kl_weight: 0.0               # 2026-11-22: simple profile; no per-generation KL work
 gate:
   min_delta: 0.0
   require_significant: true
@@ -225,6 +225,7 @@ sandbox:
 archive:
   enabled: true
   top_candidates: 3
+  max_chars: 30000
 heldout:
   domains: code
   limit: null

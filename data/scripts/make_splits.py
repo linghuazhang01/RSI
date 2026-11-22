@@ -2,6 +2,8 @@
 
 * Reads data/processed/<dataset>.jsonl (written by normalize.py).
 * Writes data/splits/<dataset>/<pool>.json  (sorted JSON list of item ids)
+* Training sets: eval-overlapping items -> train_excluded, internal duplicates -> train_duplicate (both
+  before splitting, so no loop-visible pool contains them).
 * Rewrites data/processed/<dataset>.jsonl with split_pool filled in.
 * Writes data/splits/MANIFEST.json with sha256 of every split file (+ config + processed files).
 
@@ -198,7 +200,19 @@ def norm_text(s):
     return " ".join(str(s).lower().split())
 
 
+def norm_strict(s):
+    """Also strip LaTeX markup, punctuation and spaces: catches formatting variants of the same item
+    (e.g. `Who wrote the book `A Brief History Of Time`?` vs the same question without backticks)."""
+    s = str(s).lower()
+    s = re.sub(r"\\(left|right|displaystyle|text|mathrm|mathbf|operatorname|dfrac|tfrac|frac)", "", s)
+    s = s.replace("\\$", "").replace("$", "")
+    return re.sub(r"[\W_]+", "", s)
+
+
 NGRAM, NEAR_THR = 13, 0.5
+# 13-grams found in >= TEMPLATE_DF eval items of these categories are template text (IF constraint
+# sentences, tool-call format instructions) and do not count as shared in the near-duplicate check
+TEMPLATE_DF, TEMPLATE_CATEGORIES = 5, {"instruction_following", "tool_calling"}
 
 
 def near_text(r):
@@ -264,27 +278,32 @@ def main():
     # Exact-match decontamination set: normalized text of EVERY item of every evaluation dataset
     # (all pools incl. reserve). SQuAD: passages of squad_val (+ squad_train search/gate are
     # handled by title-disjoint construction).
-    eval_texts = set()
+    # Two normalizations (2026-11-21): whitespace/case on the full text, and strict (also LaTeX markup,
+    # punctuation, spaces) on near_text, so a Seal-Tools task_instruction is compared on its own.
+    eval_texts, eval_strict = set(), set()
     for n, c in present.items():
         if not is_train_dataset(c):
-            eval_texts.update(norm_text(text_of(r)) for r in load(n))
+            for r in load(n):
+                eval_texts.add(norm_text(text_of(r)))
+                eval_strict.add(norm_strict(near_text(r)))
     eval_texts.discard("")
-    # Near-duplicate index: 13-grams of every HELD-OUT (test-pool) item, per category. A training item
-    # is dropped if its shared 13-grams with a single held-out item of the same category cover >= 50%
-    # of either item's 13-grams.
+    eval_strict.discard("")
+    # Near-duplicate index: 13-grams of EVERY eval item (all pools incl. reserve, since 2026-11-21; was test
+    # only), per category. A training item is dropped if its shared 13-grams with a single eval item of the
+    # same category cover >= 50% of either item's 13-grams. Template 13-grams of TEMPLATE_CATEGORIES are
+    # left out of the index.
     near_idx = defaultdict(lambda: defaultdict(set))
     near_len = {}
     for n, c in present.items():
         if is_train_dataset(c):
             continue
-        rows_n = load(n)
-        test_ids = set(split_dataset(n, rows_n, c).get("test", []))
-        for r in rows_n:
-            if r["id"] in test_ids:
-                G = grams(near_text(r))
-                near_len[r["id"]] = len(G)
-                for g in G:
-                    near_idx[r["category"]][g].add(r["id"])
+        for r in load(n):
+            G = grams(near_text(r))
+            near_len[r["id"]] = len(G)
+            for g in G:
+                near_idx[r["category"]][g].add(r["id"])
+    for cat in TEMPLATE_CATEGORIES & set(near_idx):
+        near_idx[cat] = {g: s for g, s in near_idx[cat].items() if len(s) < TEMPLATE_DF}
 
     def near_dup(r):
         G = grams(near_text(r))
@@ -308,17 +327,34 @@ def main():
         if is_train_dataset(c):
             # training sets: drop items whose text exactly matches ANY held-out item BEFORE splitting,
             # so the signal / gate / train pools are all decontaminated
-            exact = sorted(r["id"] for r in rows if norm_text(text_of(r)) in eval_texts)
+            exact = sorted(r["id"] for r in rows
+                           if norm_text(text_of(r)) in eval_texts or norm_strict(near_text(r)) in eval_strict)
             exact_set = set(exact)
             near = {r["id"]: m for r in rows if r["id"] not in exact_set and (m := near_dup(r))}
             bad_set = exact_set | set(near)
-            pools = split_dataset(name, [r for r in rows if r["id"] not in bad_set], c)
+            # internal duplicates (2026-11-21): same text under norm_strict(near_text) as an earlier id of the
+            # same training set -> train_duplicate, keeping the smallest id. Otherwise one problem could be
+            # drawn as both `train` and `signal` (Paper B) or into both the gate and a generation's draw.
+            seen, dup = {}, {}
+            for r in sorted(rows, key=lambda r: r["id"]):
+                if r["id"] in bad_set:
+                    continue
+                k = norm_strict(near_text(r))
+                if k in seen:
+                    dup[r["id"]] = seen[k]
+                else:
+                    seen[k] = r["id"]
+            pools = split_dataset(name, [r for r in rows if r["id"] not in bad_set and r["id"] not in dup], c)
             if bad_set:
                 pools["train_excluded"] = sorted(bad_set)
+            if dup:
+                pools["train_duplicate"] = sorted(dup)
             manifest["decontamination"][name] = {
                 "exact_match_removed": len(exact), "exact_examples": exact[:20],
                 "near_dup_13gram_removed": len(near),
-                "near_dup_examples": [[k, near[k]] for k in sorted(near)[:20]]}
+                "near_dup_examples": [[k, near[k]] for k in sorted(near)[:20]],
+                "internal_duplicates_removed": len(dup),
+                "internal_duplicate_examples": [[k, dup[k]] for k in sorted(dup)[:20]]}
         else:
             pools = split_dataset(name, rows, c)
         for old, new in (c.get("relabel") or {}).items():  # e.g. ifeval: pool/gate -> reserve

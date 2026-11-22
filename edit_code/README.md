@@ -6,7 +6,7 @@
 - 改造者：原始 BF16 模型 M_0（`loop.editor: frozen`）；消融 `loop.editor: current` 让当前最好的量化模型来写。
 - 每个候选都从 **M_0 的原始权重**出发量化，所有代用**同一个体积**（默认 = 统一 4 bit GPTQ g128（2026-11-20 起；原为 3 bit）、词嵌入和输出层 8 bit 那份配置的打包大小，它也是起点 Q_0）。
 - 第 g 代的目标是超过当前最好的量化 Q_{g-1}（incumbent）：在固定验收集上逐题配对比较，平均提升 ≥ `gate.min_delta`，至少一个领域显著变好、没有领域显著变差，才换成新的 incumbent；否则保留。连续 `loop.patience` 代没有新的 incumbent 就停。
-- 改造者能看到：incumbent 的配置和它在本代题目上的分数、往代每代最好的几个候选（经验通道）、诊断表。
+- 改造者能看到：incumbent 的配置和它在本代题目上的分数、往代**每个**候选一行（经验通道，2026-11-22 起与 Paper B 一致）、诊断表。
 
 ## 单领域实验（`scope`）
 
@@ -70,7 +70,19 @@
 - **最终流程（2026-11-21）**：每代先让**最新模型（incumbent）**回答本代的快速筛题一次（n 4，所有线程 / 步共用）；**候选不跑快速筛**（`search.screen_candidates: false`）。改造者在每步上下文里看到 incumbent 快速筛的摘要（avg@4、每题答对次数分布、截断率、几道失败题的题目 / 标准答案 / 抽取答案），并可以用程序和 run_python 里的只读工具 `api.screen_results(ids, filter='all'|'wrong'|'unstable'|'right', limit, offset, gen)`、`api.screen_output(id, sample, offset, gen)`（整段输出，含 thinking，分页）看全部数据。**没有 `api.evaluate`**（`program_evaluate_calls: 0`：工具、文档和提示词里都去掉；`compare` 也不注册）。每个候选建好后做**一次验收评测**（`search.gate_every_candidate: true`，500 题 × 4 次，和 incumbent 的验收记录逐题配对、同一种子；超出预算的配置不评测直接拒绝），结果按候选写进 `gen_XX/gate.json`（submissions 列表，每个候选一条：准确率、配对增益、CI、是否通过 / 原因、broken / fixed 个数和题号，不含题目内容），后面的步和后面的代都能看到（候选表、自己的反馈、`search_history`、`read_record`、存档；存档里还有往期 incumbent 的快速筛摘要，`screen_results(gen=k)` 可读往期数据）。一代结束时，在通过验收规则（尺寸、`gate.min_delta`、`require_significant` 时的 CI）的候选里接受**增益最大**的那个（平分时 cid 靠前者）；都不通过就保持。然后新 incumbent 跑测试集（500 × 4，唯一无偏的数字）。代价：每代 线程 × 步 × 500 × 4 个 thinking 采样花在验收集上。
 - **搜索**：8 个线程 × 1 步（`search.threads` / `search.steps` 都可配置，提示词用配置的数字）：1 步时提示"你是本轮 N 个会话中的第 k 个、彼此独立"，并让它用 `search_history` / 存档避开往期思路；多步时保留"改进本线程最好的配置"。
 - 改造者每个候选最多 `editor.tool_rounds` 轮工具调用（simple 为 20，可配置，提示词里的轮数跟着配置走；上下文 `editor.context_tokens` 131072）；`editor.explore.persistent: true`：run_python 每个提案一个持久会话，变量跨轮保留（超时则重启、变量丢失；最终程序仍须自包含）。五个领域都可以用；运行名带 `_simple`。profile 改了，旧的 `*_simple` 运行不能续跑，要换 `--run-id` / `--tag`。各领域合并后的配置见 `plan/configs/A_<领域>_simple.yaml`（由协调方更新）。服务器上需要先有 `simple_data/<领域>/` 的 `eval.jsonl`、`test.jsonl`、`pool_ids.json` 和 `data/processed/` 里对应的训练集。
-- mock：`mock_overrides` 优先于 profile；`mock_objective_overrides.simple` 再把 mock 的 simple 运行改回"3 线程 × 1 步、候选不筛、每个候选一次验收、没有 api.evaluate"的布局；快速筛题数用 `--set simple.screen_n=20` 缩小。
+- mock：`mock_overrides` 优先于 profile；`mock_objective_overrides.simple` 再把 mock 的 simple 运行改回"3 线程 × 1 步、候选不筛、每个候选一次验收、没有 api.evaluate"的布局，并用真实 simple 的验收规则（`gate.min_delta: 0.0`）、不跑 baselines（2026-11-22）；快速筛题数用 `--set simple.screen_n=20` 缩小。
+
+## 与 Paper B 的流程对齐（2026-11-22，`objective: simple`）
+
+每代流程和 Paper B 相同：从训练池抽 500 道 → 当前模型（incumbent）在这 500 道上采样（n 4，thinking）→ 8 个会话共享这批题分析、各写一个配置 → 每个配置在验收集上评测一次（与 incumbent 逐题配对）→ 通过且增益最大的成为新 incumbent，再跑测试集。这次改的是和 B 不一致的细节：
+- **incumbent 的快速筛分到所有空闲的候选 GPU 上**（`QuantProblem.serve_all` + `score_split`；原来只用一张卡），和 B 用所有副本采样一样。检查点只写一次（有导出的 incumbent 模型就直接用）。候选的验收仍是一张卡一个。
+- **不再做每代的 KL 工作**：simple 的 `search.kl_weight: 0.0`，验收只看配对增益，所以每代不再让 M_0 生成 KL 文本的回答、不再算 M_0 的参考 logprob 和 incumbent 的 KL（`Runner.kl_used`；E_t 或 baselines 打开时照旧；E_t 的留出 KL 参考在 `kl_weight: 0` 时也照常计算）。第 0 代的校准文本（含 M_0 回答，用于 Hessian）不变。
+- **候选的 note**：程序在返回的配置里写 `"note"`（最多 600 字：改了哪些组、为什么、试过什么被否了及数字），存进候选记录，`search_history` 和存档里都显示（`{"config": ..., "note": ...}` 也接受；`solve_allocation` 自动写的那段去掉，编辑者在后面追加的保留）。
+- **存档列出往代每个候选**（含失败的），每行：配置一行描述（覆盖按设置分组，带层号范围，如 `8b/g128/gptq: down L0-3 x4`）、GiB、平均位数、验收结果（增益、CI、未通过原因）、报错第一行、note；`archive.max_chars`（默认 30000）超长时先删最老几代的行；有 `search_history` / `read_record` 时不再贴完整配置（`archive.top_candidates` 只在没有这两个工具时用）。
+- **和 incumbent 完全相同的配置不再评测验收**：直接记为增益 0、不通过（B 的空 LoRA 同样处理），省一次 500 × 4 的验收，也不会给后面的会话显示一个噪声造成的"通过"。
+- `loop.patience: 3`（simple，和 B 一样：连续 3 代没有新 incumbent 才停）；系统提示写明程序时限（`sandbox.timeout_s`）和工具调用总数上限（`editor.max_tool_calls`）。
+- simple profile 改了，旧的 `*_simple` 运行不能续跑（锁定的配置不同），要换 `--run-id` / `--tag`。
+- 没有照搬的：B 每代重测当前模型的验收（A 的 incumbent 就是那份配置本身，同一种子重测只会复现原记录）；B 的改造者跑在多个副本上（A 的 8 个会话共用编辑 GPU 上的一个 M_0 服务）。
 
 ## 打分解码与搜索预算（2026-11-21）
 

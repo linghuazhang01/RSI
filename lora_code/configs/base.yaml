@@ -31,7 +31,7 @@ max_tokens:
 # training or gradient tools (no sgd / grad / from_grad) in any mode.
 #   scratch (default) : write a LoRA from zero with SVD / activation statistics / constructions; candidates are
 #             hot-loaded on the main replicas. Gate reference = the current model (paired, + gate.min_gain);
-#             fallback = keep; an accepted LoRA is merged into the weights.
+#             fallback = keep; an accepted LoRA becomes part of the model as merge.mode says (below).
 #   weights : edit the weights directly with structured, any-rank operations (row / column / module scaling,
 #             dense low-rank additions built with the LoRA tools, moving modules toward the original weights;
 #             per-module ||W'-W||/||W|| <= weights.norm_cap_tau). A candidate is exported (only edited shards
@@ -122,11 +122,13 @@ objective_profiles:
     search: {threads: 8, steps: 1, max_candidates: 8, charge_screens: false, program_evaluate_calls: 0,
              program_evaluate_total: 0, top_full: 0, parallel_builds: true, screen_candidates: false,
              gate_every_candidate: true}
-    tools: {tensor_compute: true, paper_tools: true}   # screen_results / screen_output: on (screen_candidates false)
+    # train_loss_backend vllm (2026-11-22): train_loss of a LoRA runs on the session's own main replica
+    tools: {tensor_compute: true, paper_tools: true, train_loss_backend: vllm}   # screen_results / screen_output: on
     nonllm: {evaluate: 8}     # the same candidate count as the editor
     e_t: {enabled: false}
     # tool_rounds: tool rounds per candidate (configurable; the prompt states it); explore.persistent: one Python
-    # session per candidate for run_python (rsicore.chat_tools); gpu_tools: acts (also on own outputs) while exploring
+    # session per candidate for run_python (rsicore.chat_tools); gpu_tools: acts (also on own outputs) while exploring,
+    # gpu_seconds 600 PER SESSION (2026-11-22; was one 600 s pool for all sessions of a generation)
     editor: {tool_rounds: 20, explore: {persistent: true, gpu_tools: true, gpu_seconds: 600}}
 
 raw:                        # mode=edit only: recipe of the raw LoRA (trained once, generation 0; the only training)
@@ -141,7 +143,7 @@ raw:                        # mode=edit only: recipe of the raw LoRA (trained on
   gpu_seconds: null         # null = budget.gpu_seconds
 
 lora:
-  rank_cap: 64              # [pilot] max rank per module (vLLM --max-lora-rank)
+  rank_cap: 64              # [pilot] max rank per module of a candidate (vLLM --max-lora-rank; merge.mode adapter: see merge)
   norm_cap_tau: 0.1         # [pilot] per-module ||dW||_F / ||W0||_F cap
   allowed_leaves: null      # null = every vLLM-LoRA-capable Qwen3.5 projection (see primitives/naming.py)
   save_dtype: bfloat16      # adapter_model.safetensors dtype
@@ -156,7 +158,8 @@ search:
   max_evaluate: 32          # evaluate calls per generation (every candidate costs 1, while charge_screens is true)
   top_full: 3               # top screened candidates re-scored on the full signal draw
   rerun_seeds: 0
-  archive: true             # experience channel: show earlier generations' best programs
+  archive: true             # experience channel: every earlier candidate, one row each (what, gate, error, note;
+                            # 2026-11-22); full programs via read_record. archive_chars (code default 30000) caps it
   # program_evaluate_calls: 2   # (2026-11-21, code default 2; null = no cap) NEW api.evaluate calls one program may
                                 # make; the automatic evaluation of the returned candidate is not counted
   # (2026-11-21, read with these code defaults, set by objective simple; not written here so earlier locked run
@@ -210,7 +213,7 @@ editor:
     timeout_s: 300
     mem_gb: 8
     gpu_tools: false        # true: acts / train_loss / regmean_preserve allowed while exploring, charged to
-    gpu_seconds: 300        # this separate budget (per search; never the generation's gpu_seconds)
+    gpu_seconds: 300        # this separate budget (2026-11-22: per session / candidate; never the generation's)
     # persistent: false     # (2026-11-21, code default; objective simple: true) one Python session per candidate:
     #                       # variables / handles persist across run_python calls (rsicore.chat_tools)
 
@@ -234,6 +237,9 @@ loop:
 tools:                      # editor tools that can be switched off (ablations)
   compare: true             # item-level comparison with the current model (ids / statistics only)
   train_loss: true          # mean answer NLL on train items under a LoRA (forward only, costs gpu_seconds)
+  train_loss_backend: hf    # (2026-11-22) hf = the HF model (the session's tool device or the train GPU); vllm = the
+                            # LoRA hot-loaded on the session's own main replica, NLL from prompt logprobs (charged by
+                            # wall clock). Weight edits, a parent LoRA (mode=edit) and mock always use hf
   # tensor_compute: (2026-11-21) absent = on for objective simple only; true / false forces it (with api.tensors)
   # paper_tools: (2026-11-21) absent = on for objective simple only: save_edit / load_edit / list_edits / drop_edit,
   #   output_matrices, unit, direction, project_out, acts(source='own'), tensor_compute(vectors=...)
@@ -345,6 +351,21 @@ baseline:
 
 merge:
   gpu: true                 # accumulate W + dW on gpu1 (else CPU)
+  # (2026-11-22, method.mode scratch) How an accepted LoRA becomes the next model. Code defaults, no live keys here
+  # (paper_cfg is locked, so runs started earlier resume unchanged); set them with --set or a run config:
+  #   mode: merge             merge (default) = W' = W + B A in fp32, cast to bf16, written as gen_XX/model and served
+  #                           as m{g+1} after a vLLM restart (bf16 rounding can swallow small dW: the gated adapter
+  #                           and the merged successor differ; model.json max_realised_rel_err).
+  #                           adapter = never merged: M_g = M_0 + C_g, C_g = every accepted LoRA rank-concatenated
+  #                           (gen_XX/cumulative_lora, fp32), served as ONE adapter on the M_0 server for the whole
+  #                           run (no restart, no checkpoint). A candidate is served as C_g (+) its delta, so the gate
+  #                           scores exactly the next model; HF / weight tools see W_0 + B_C A_C (fp32 overlay).
+  #                           mode=edit is adapter-only (ignored there); mode=weights refuses adapter.
+  #   adapter_rank_budget: 256  adapter: max rank per module of C_g; a composite above it is re-factored by exact SVD
+  #                           and truncated BEFORE it is registered (gated = kept). The main servers start with
+  #                           --max-lora-rank padded(max(budget, lora.rank_cap)) (default 256; vLLM max 512): vLLM
+  #                           reserves max_loras x that rank of LoRA buffers, so check the KV / memory budget (or
+  #                           lower server.max_loras) on H20; decoding through the adapter is also slower.
 
 server:
   max_loras: 8
@@ -365,6 +386,11 @@ gpu_layout:
   main_tp: 1                # GPUs per main replica (tensor parallelism inside a replica)
   train_gpus: 1             # GPUs of the train role (HF model: SVD / acts / train_loss / merge / edit's raw LoRA)
                             # 4 GPUs, single domain: main [0, 1, 2] (3 replicas) | train [3]
+  tools_on_replicas: false  # (2026-11-22) true: every main replica's GPU also holds an HF copy of the current model and
+                            # a weight store; editor session k runs its tools there (replica k mod n, the one its
+                            # editor uses), so sessions on different replicas do not queue on the train GPU. The
+                            # train GPU keeps diagnostics, merge and the baselines. Not in mode=weights.
+  replica_vllm_gib: null    # with tools_on_replicas: the main replicas' --rsi-gpu-memory-gib (room for the HF copy)
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
 # cards; the b300 profile plans them at 220 GB (2026-11-21). rsicore.config merges the profile over base/domain
@@ -381,6 +407,9 @@ hardware_profiles:
       theta0_args: ["--rsi-gpu-memory-gib", "100", "--gpu-memory-utilization", "0.37", "--max-model-len", "20480",
                     "--max-num-seqs", "128", "--max-logprobs", "20"]
     editor: {context_tokens: 131072}   # main replicas --max-model-len 131072
+    # (2026-11-22) tools on the replicas: vLLM 140 GB (52 GB weights + ~80 GB KV) + the HF copy (52 GB) + tool
+    # activations (~30 GB: acts / grams forward with ~248k-vocab logits) ~ 222 GB of the ~270 GB visible
+    gpu_layout: {tools_on_replicas: true, replica_vllm_gib: 140}
   h20:                      # H20 cards (~140 GB) PLANNED AT 110 GB each (2026-11-20); Qwen3.8-27B BF16 ~52 GB
     gpu_layout: {theta0_own_gpu: true}   # theta0 vLLM (52 GB + KV) and the training model (52 GB + activations)
                                          # do not fit on one 110 GB card: own card when E_t is on (scope all)

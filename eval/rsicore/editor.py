@@ -14,8 +14,14 @@ One Editor per thread (its own history). One proposal = one call of propose():
     calls), then one forced final turn with tool_choice "none" (a notice is appended to the last tool message,
     never a new user message). The proposal ends with a reply WITHOUT tool calls that holds a ```python block.
     Empty / cut-at-length / unparsed "<tool_call>" replies get up to 2 nudges during the tool rounds and one
-    more on the forced final turn (still tool_choice "none"); without any final block the last block seen in
-    the loop is used (stop "fallback"). Guards that force the final turn: rounds >= tool_rounds, tool calls >=
+    more on the forced final turn (still tool_choice "none"). A final program that check_program rejects
+    (2026-11-22: syntax error, no def main(api), skeleton / `...` placeholders, no return value, names bound
+    nowhere in the program, helpers reading `api` as a global) gets ONE repair turn (CHECK_NUDGE with the
+    problem; same budgets); stats["check"] records what is still wrong with the submitted program (None = ok).
+    Without any final block, or with a final block that is still structurally broken after the repair turn,
+    the latest program from the loop that passes check_program is used -- a ```python block of a tool turn or
+    the code of a run_python call that defines main -- else the last block seen in the loop (stop
+    "fallback"). Guards that force the final turn: rounds >= tool_rounds, tool calls >=
     max_tool_calls, completion tokens >= proposal_tokens, wall clock >= proposal_wall_s, too little room left
     in context_tokens, a tool-round reply that timed out. Per-turn max_tokens = min(turn_max_tokens, or
     max_tokens on the final turn, context_tokens - estimated prompt - 512). The live message list is compacted
@@ -39,7 +45,7 @@ Transcript (jsonl, format 2): a system line {"role": "system", ..., "format": 2}
   {p, r, role: assistant, content, reasoning, tool_calls: [{id, name, arguments}], usage, finish_reason}
   {p, r, role: tool, tool_call_id, name, args, content (as sent), full_chars, ok, seconds}
   {p, r, role: assistant, content, reasoning, usage, finish_reason, nudge}  +  {p, role: user, content, nudge: true}
-  {p, role: event, kind: compact | nudge | forced_final | http400 | timeout, detail}
+  {p, role: event, kind: compact | nudge | check | forced_final | http400 | timeout, detail}
   {p, role: assistant, final: true, content, reasoning, code, usage, finish_reason, stats}
   {p, role: assistant, final: true, failed: true, code: "", error}  (EditorReplyError: not in the history)
 On construction the transcript is reloaded. propose() with the same user message as the next COMPLETE recorded
@@ -55,6 +61,8 @@ none) or a dict {"content", "tool_calls": [{"name", "arguments"}], "reasoning"};
 It sees the full per-proposal messages; ids are synthesised as call_{p}_{r}_{i}; guards and the forced final
 turn apply as for the real model.
 """
+import ast
+import builtins
 import json
 import os
 import re
@@ -98,6 +106,130 @@ FORCED_WHY = {"rounds": "tool-round limit reached", "tool_calls": "tool-call lim
               "context": "context nearly full", "http400": "context full", "timeout": "model reply timed out"}
 STOP_TEXT = {"length": "final reply cut at max_tokens while thinking", "no_code": "final reply had no code block",
              "fallback": "used the last code block written during the tool rounds"}
+# (2026-11-22) the one repair turn after a final program that check_program rejects
+CHECK_NUDGE = ("Your program cannot run as written: {problem}. Reply with a short plan and the COMPLETE program in "
+               "exactly one ```python block: def main(api) with every helper and import it uses (variables and "
+               "functions defined in run_python do not carry over into the program).")
+# globals the sandbox child gives every program besides the builtins (rsicore._sandbox_child.main)
+PROGRAM_GLOBALS = frozenset({"BudgetExceeded", "ToolError", "__file__", "__name__"})
+
+
+# ------------------------------------------------------------------------------------- program check
+def _is_placeholder(stmt) -> bool:
+    """pass / ... / a bare string / raise NotImplementedError: a statement that does nothing."""
+    if isinstance(stmt, ast.Pass):
+        return True
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and \
+            (stmt.value.value is Ellipsis or isinstance(stmt.value.value, str)):
+        return True
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+        e = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+        return isinstance(e, ast.Name) and e.id == "NotImplementedError"
+    return False
+
+
+def _own_nodes(fn):
+    """The nodes of a function body, without the bodies of nested functions / lambdas / classes."""
+    todo = list(fn.body)
+    while todo:
+        n = todo.pop()
+        yield n
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            todo.extend(ast.iter_child_nodes(n))
+
+
+def _undefined_names(tree) -> list[str]:
+    """Names read somewhere in the program but bound nowhere in it (scope-insensitive, so it only catches names
+    that exist in no scope at all, e.g. a helper or variable from a run_python session). [] with a star import."""
+    if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree)):
+        return []
+    bound, loads = set(PROGRAM_GLOBALS) | set(dir(builtins)), {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            if isinstance(n.ctx, ast.Load):
+                loads.setdefault(n.id, n.lineno)
+            else:
+                bound.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(n.name)
+        elif isinstance(n, ast.arg):
+            bound.add(n.arg)
+        elif isinstance(n, ast.alias):
+            bound.add((n.asname or n.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            bound.update(n.names)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            bound.add(n.rest)
+    return sorted((k for k in loads if k not in bound), key=loads.get)
+
+
+def _global_api_helpers(tree) -> list[str]:
+    """Top-level functions other than main that read `api` although it is neither their parameter nor bound
+    in them nor a module global (in a program `api` exists only as main's argument)."""
+    top = {t.id for s in tree.body if isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+           for t in ast.walk(s) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)}
+    if "api" in top:
+        return []
+    out = []
+    for s in tree.body:
+        if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) or s.name == "main":
+            continue
+        names = list(ast.walk(s))
+        if any(isinstance(n, ast.arg) and n.arg == "api" for n in names):
+            continue
+        if any(isinstance(n, ast.Name) and n.id == "api" and not isinstance(n.ctx, ast.Load) for n in names):
+            continue
+        if any(isinstance(n, ast.Name) and n.id == "api" for n in names):
+            out.append(s.name)
+    return out
+
+
+def check_program(code: str, *, names: bool = True) -> str | None:
+    """Static check of a final program before it is submitted (2026-11-22): None if it looks runnable, else a
+    short description of what is wrong. Checks: it parses; a top-level def main(api) with exactly one
+    positional parameter; main is not a skeleton (only pass / ... / docstring / raise NotImplementedError, or a
+    `...` placeholder statement anywhere in it); main returns a value; names=True also: no name that is bound
+    nowhere in the program and no top-level helper that reads `api` as a global. names=False = only the
+    structural checks (used to decide whether a fallback is clearly better)."""
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as e:
+        return f"SyntaxError on line {e.lineno}: {e.msg}"
+    mains = [s for s in tree.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == "main"]
+    if not mains:
+        return "there is no top-level def main(api)"
+    fn = mains[-1]
+    if isinstance(fn, ast.AsyncFunctionDef):
+        return "main must be a plain def, not async def"
+    a = fn.args
+    pos = a.posonlyargs + a.args
+    required_kw = [k.arg for k, d in zip(a.kwonlyargs, a.kw_defaults) if d is None]
+    if len(pos) - len(a.defaults) > 1 or not pos or required_kw:
+        return f"main must take exactly one parameter (api), not ({ast.unparse(a)})"
+    problems = []
+    body = fn.body[1:] if (fn.body and isinstance(fn.body[0], ast.Expr) and isinstance(fn.body[0].value, ast.Constant)
+                           and isinstance(fn.body[0].value.value, str)) else fn.body
+    own = list(_own_nodes(fn))
+    if not body or all(_is_placeholder(s) for s in body):
+        return "main is only a skeleton (its body does nothing): write the full program"
+    holes = sorted(n.lineno for n in own if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                   and n.value.value is Ellipsis)
+    if holes:
+        problems.append(f"main still has `...` placeholders (line {', '.join(map(str, holes[:5]))})")
+    if not any(isinstance(n, ast.Return) and n.value is not None for n in own):
+        problems.append("main never returns a value")
+    if names and not problems:
+        und = _undefined_names(tree)
+        if und:
+            problems.append(f"name(s) used but never defined in the program: {', '.join(und[:8])}")
+        helpers = _global_api_helpers(tree)
+        if helpers:
+            problems.append(f"helper(s) {', '.join(helpers[:5])} read `api` as a global; pass it as an argument")
+    return "; ".join(problems) or None
 
 
 class EditorReplyError(RuntimeError):
@@ -125,6 +257,16 @@ def extract_python(text: str) -> str:
         text = text.split("</think>", 1)[1]
     blocks = _BLOCK.findall(text)
     return blocks[-1].strip("\n") + "\n" if blocks else ""
+
+
+def _call_code(arguments) -> str:
+    """The `code` argument of a tool call (JSON string or dict), "" if none."""
+    try:
+        a = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except (TypeError, ValueError):
+        return ""
+    c = a.get("code") if isinstance(a, dict) else None
+    return c if isinstance(c, str) else ""
 
 
 def describe_stop(stats: dict | None) -> str:
@@ -569,6 +711,8 @@ class Editor:
         code = extract_python(r.content)
         stats = self._stats0(stop="answer" if code else ("length" if r.finish == "length" else "no_code"), usage=r.usage)
         stats.update(finish_reason=r.finish, wall_s=round(self.clock() - t0, 2))
+        if code:
+            stats["check"] = check_program(code)   # recorded only: one call, no repair turn
         return {"content": r.content, "reasoning": r.reasoning, "code": code, "usage": r.usage,
                 "finish_reason": r.finish}, stats
 
@@ -585,6 +729,10 @@ class Editor:
               "wall_s": 0.0, "stop": None, "model_calls": 0, "nudges": 0, "compactions": 0,
               "finish_reason": None, "forced_by": None}
         loop, fallback, forced_by, aggressive, noticed, final_nudged = [], "", None, False, False, False
+        # (2026-11-22) good_fallback = the latest program written during the tool rounds (a ```python block of a
+        # tool turn, or the code of a run_python call) that passes check_program; repaired = the one repair turn
+        # after a final program that check_program rejects was used
+        good_fallback, repaired = "", False
 
         def elapsed():
             return self.clock() - t0
@@ -601,11 +749,12 @@ class Editor:
 
         def give_up(why: str):
             """The final turn failed (context / timeout): the fallback block if any, else EditorReplyError."""
-            if not fallback:
+            fb = good_fallback or fallback
+            if not fb:
                 raise EditorReplyError(why)
             st.update(stop="fallback", finish_reason=None, forced_by=forced_by, wall_s=round(elapsed(), 2),
-                      error=why[:1000])
-            return {"content": "", "reasoning": None, "code": fallback, "usage": {}, "finish_reason": None}, st
+                      error=why[:1000], check=check_program(fb))
+            return {"content": "", "reasoning": None, "code": fb, "usage": {}, "finish_reason": None}, st
 
         while True:
             if forced_by is None:
@@ -686,6 +835,12 @@ class Editor:
                 blk = extract_python(r.content)
                 if blk:
                     fallback = blk
+                    if check_program(blk) is None:
+                        good_fallback = blk
+                for tc in r.tool_calls:             # a run_python call that holds a complete program
+                    c = _call_code(tc.get("arguments"))
+                    if c and "def main" in c and check_program(c) is None:
+                        good_fallback = c if c.endswith("\n") else c + "\n"
                 loop.append({"t": "asst", "r": rr, "content": r.content, "reasoning": r.reasoning,
                              "tool_calls": r.tool_calls, "drop_reasoning": False, "elided_args": set()})
                 emit({"p": p, "r": rr, "role": "assistant", "content": r.content, "reasoning": r.reasoning,
@@ -729,13 +884,30 @@ class Editor:
                     emit({"p": p, "role": "event", "kind": "nudge", "detail": {"reason": reason, "final": final}})
                     emit({"p": p, "role": "user", "content": text, "nudge": True})
                     continue
+            problem = check_program(code) if code else None
+            if problem and not repaired:            # one repair turn, inside the same budgets
+                repaired = True
+                st["repairs"] = st.get("repairs", 0) + 1
+                text = CHECK_NUDGE.format(problem=problem)
+                loop += [{"t": "nasst", "content": r.content},
+                         {"t": "nuser", "content": text, "notice": ""}]
+                emit({"p": p, "r": st["rounds"], "role": "assistant", "content": r.content, "reasoning": r.reasoning,
+                      "usage": r.usage, "finish_reason": r.finish, "nudge": "check"})
+                emit({"p": p, "role": "event", "kind": "check", "detail": {"problem": problem, "final": final}})
+                emit({"p": p, "role": "user", "content": text, "nudge": True})
+                continue
             break
-        if code:
+        problem = check_program(code) if code else None
+        if code and problem and good_fallback and check_program(code, names=False):
+            code, stop = good_fallback, "fallback"  # still structurally broken after the repair turn
+        elif code:
             stop = f"forced:{forced_by}" if final else "answer"
-        elif fallback:
-            code, stop = fallback, "fallback"
+        elif good_fallback or fallback:
+            code, stop = good_fallback or fallback, "fallback"
         else:
             stop = "length" if r.finish == "length" else "no_code"
+        if code:
+            st["check"] = check_program(code)       # what is still wrong with the submitted program (None = ok)
         st.update(stop=stop, finish_reason=r.finish, forced_by=forced_by, wall_s=round(elapsed(), 2))
         return {"content": r.content, "reasoning": r.reasoning, "code": code, "usage": r.usage,
                 "finish_reason": r.finish}, st

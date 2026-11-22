@@ -1,7 +1,7 @@
 """Fixed diagnostics table (METHOD_DESIGN §3.2, RSI_LOOP_DESIGN §3.2), identical program in every generation.
 
 One row per (layer, module) of the CURRENT model:
-  w_norm, w_sigma (top singular values of W), and for every adapter already merged into the model
+  w_norm, w_sigma (top singular values of W), and for every adapter already part of the model (merged, or in the cumulative adapter)
   (the stack, one entry per earlier generation): norm, rel_norm (||ΔW||/||W0||, W0 = base θ0), sv (singular
   values of ΔW), eff_rank (exp of the entropy of σ²), intruder (mean max-alignment of ΔW's singular
   directions with θ0's top-k left singular subspace; low = intruder), relchange_q (quantiles of
@@ -110,10 +110,12 @@ def layer_summary(diag: dict) -> list[dict]:
     return out
 
 
-def render(diag: dict, max_modules: int = 12) -> str:
-    """Compact text table for the editor prompt (layer summary + most-changed modules)."""
-    lines = [f"Diagnostics: {diag['n_modules']} editable modules; adapters already merged from generations "
-             f"{diag.get('stack_gens') or 'none'}.",
+def render(diag: dict, max_modules: int = 12, adapter: bool = False) -> str:
+    """Compact text table for the editor prompt (layer summary + most-changed modules). adapter (merge.mode adapter,
+    2026-11-22): the accepted adapters are in the cumulative adapter, not merged."""
+    held = ("adapters accepted in generations {} (kept as one cumulative adapter, part of the current model)"
+            if adapter else "adapters already merged from generations {}")
+    lines = [f"Diagnostics: {diag['n_modules']} editable modules; " + held.format(diag.get('stack_gens') or 'none') + ".",
              "layer | type | sigma1(attn) | sigma1(mlp) | stack ||dW||/||W0|| | stack intruder | act ratio tgt/ret"]
     for s in diag.get("summary", []):
         lines.append(f"{s['layer']:>3} | {('full' if s['layer_type'] == 'full_attention' else 'gdn'):4} | "

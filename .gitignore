@@ -40,3 +40,6 @@ experiment_records/*/
 
 # full clean pools of simple_data (~210 MB), rebuilt by data/scripts/make_simple_data.py
 simple_data/*/pool.jsonl
+
+# Paper sources live in their own repo (paper/.git)
+paper/

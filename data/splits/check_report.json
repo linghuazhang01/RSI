@@ -209,27 +209,113 @@
    "apibank_train": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [
+     [
+      "apibank_train/lv2/1953",
+      "apibank_train/lv2/1891"
+     ],
+     [
+      "apibank_train/lv2/4534",
+      "apibank_train/lv2/3135"
+     ],
+     [
+      "apibank_train/lv2/4814",
+      "apibank_train/lv2/3557"
+     ],
+     [
+      "apibank_train/lv2/4966",
+      "apibank_train/lv2/3557"
+     ],
+     [
+      "apibank_train/lv3/366",
+      "apibank_train/lv3/209"
+     ],
+     [
+      "apibank_train/lv3/367",
+      "apibank_train/lv3/210"
+     ],
+     [
+      "apibank_train/lv3/368",
+      "apibank_train/lv3/211"
+     ],
+     [
+      "apibank_train/lv3/369",
+      "apibank_train/lv3/212"
+     ],
+     [
+      "apibank_train/lv3/457",
+      "apibank_train/lv3/358"
+     ],
+     [
+      "apibank_train/lv3/479",
+      "apibank_train/lv3/209"
+     ],
+     [
+      "apibank_train/lv3/480",
+      "apibank_train/lv3/210"
+     ],
+     [
+      "apibank_train/lv3/481",
+      "apibank_train/lv3/211"
+     ],
+     [
+      "apibank_train/lv3/482",
+      "apibank_train/lv3/212"
+     ],
+     [
+      "apibank_train/lv3/483",
+      "apibank_train/lv3/316"
+     ],
+     [
+      "apibank_train/lv3/663",
+      "apibank_train/lv3/651"
+     ],
+     [
+      "apibank_train/lv3/681",
+      "apibank_train/lv3/209"
+     ],
+     [
+      "apibank_train/lv3/682",
+      "apibank_train/lv3/210"
+     ],
+     [
+      "apibank_train/lv3/683",
+      "apibank_train/lv3/211"
+     ]
+    ],
+    "internal_duplicates_removed": 18,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    },
    "apps": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [],
+    "internal_duplicates_removed": 0,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    },
    "arc": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [
+     [
+      "arc/ARC-Challenge/MEA_2012_5_8",
+      "arc/ARC-Challenge/MEA_2011_8_8"
+     ]
+    ],
+    "internal_duplicates_removed": 1,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    },
    "dapo_math": {
     "exact_examples": [
      "dapo/009ddb1d-ab00-4672-8a1a-5ab38e0d2034",
+     "dapo/016f4d91-1064-4e94-9378-22c36c0657cd",
      "dapo/021af04e-6625-4efd-8343-913dfca529ed",
      "dapo/02c8f190-4a6c-49fd-99bd-b6936a506dd1",
      "dapo/0332021f-0487-4b0a-8022-08a8071c902a",
+     "dapo/03397ac4-f821-471c-b44f-bc26cce8123f",
      "dapo/033e90c9-4c3e-49b4-9458-1d53d893b40e",
      "dapo/0359299e-2264-4d38-b41e-3c852d9eb50a",
      "dapo/03630476-2366-4556-9a26-00de066ce926",
@@ -241,106 +327,191 @@
      "dapo/045e3f2f-a22f-4e90-95cf-3dde19a63ddc",
      "dapo/0484efff-629b-42f8-b095-bb627378c424",
      "dapo/04ae351f-21c5-402a-94b0-01ad0bb2dc57",
+     "dapo/04bb4db3-6d00-4631-b59a-96abe66c73e0",
      "dapo/05d3d17d-15d8-4f34-a7c0-0563f85bba40",
-     "dapo/061571e3-7269-4e34-b870-f3588646151b",
-     "dapo/066df148-1c72-4467-9fa7-bf84d094a5e4",
-     "dapo/06865281-0468-468f-9f37-b45f411fbbdf",
-     "dapo/071d2258-f634-4b2d-9f4d-1de31c1bfcb5"
+     "dapo/061571e3-7269-4e34-b870-f3588646151b"
     ],
-    "exact_match_removed": 983,
-    "near_dup_13gram_removed": 85,
+    "exact_match_removed": 1048,
+    "internal_duplicate_examples": [
+     [
+      "dapo/08453bb0-7f86-4155-b941-224096ca96c9",
+      "dapo/03eca081-5a68-4f3e-a5aa-ad59e6ddbe33"
+     ],
+     [
+      "dapo/0c0ba3eb-7570-4973-81d7-dafd92837353",
+      "dapo/0b3b1875-ffea-4d7a-aba2-3ef3ea4cf39b"
+     ],
+     [
+      "dapo/0f5af1b7-4b10-4800-8cf5-8bb4119228f4",
+      "dapo/06a5bea6-7b0a-4eb3-a2ed-d66492b8060b"
+     ],
+     [
+      "dapo/0fff1ab1-924d-4d05-9fe8-74695a683dd2",
+      "dapo/07953739-d94b-4e8f-8264-fe05053f15d4"
+     ],
+     [
+      "dapo/1013f3e0-56f3-48b9-b1f2-28b812c38ada",
+      "dapo/007c391f-5314-4c76-a45d-61d5005270a1"
+     ],
+     [
+      "dapo/12bc4ede-ce4a-4b52-8c24-01da62067e9a",
+      "dapo/0425cabc-35a9-4b9d-ba0c-f9c594403376"
+     ],
+     [
+      "dapo/13eaaf18-1ede-41b3-a5c2-3cb592101c68",
+      "dapo/092632f8-f844-40e5-9b86-d02725696475"
+     ],
+     [
+      "dapo/13f8d769-dddb-49d2-8b59-f234b8df4111",
+      "dapo/10454080-3cd6-4f74-9afe-fffe2fb06979"
+     ],
+     [
+      "dapo/16b804ab-bdb1-4511-8e0b-9941a9777e43",
+      "dapo/0406f867-30f1-4904-a732-4f0f7890ab09"
+     ],
+     [
+      "dapo/1701f783-be6d-418c-83c9-fae501fae45d",
+      "dapo/1243a2eb-d23a-459f-9705-843d2dbc9751"
+     ],
+     [
+      "dapo/18393e20-91e7-4192-b986-7d6be98acbe6",
+      "dapo/0ebb6172-edd4-49bd-9043-14cb4456a65d"
+     ],
+     [
+      "dapo/1ba83374-3e63-46aa-bc13-d4653814f087",
+      "dapo/18be8cf2-06bc-4f76-8a5e-0bf5ed1d7921"
+     ],
+     [
+      "dapo/1d8d1200-3b68-4679-b272-3616a40a14df",
+      "dapo/13c001aa-44ed-4002-8873-129799bcf541"
+     ],
+     [
+      "dapo/1d98a7c5-b94a-4336-8f48-3d00d1f0f17a",
+      "dapo/1a50dbc6-b949-423b-9cb9-270201900d48"
+     ],
+     [
+      "dapo/1ede56b9-ff32-4c03-a5ef-e27a17dc41d3",
+      "dapo/1d35d78e-447d-4a1a-ad40-2ba922da4037"
+     ],
+     [
+      "dapo/1f74207e-7e30-46a3-a1a5-5fecd76e64bb",
+      "dapo/0cdee9b9-17ff-4385-867e-4ea63aabc524"
+     ],
+     [
+      "dapo/235ee805-727e-4923-81f1-e14ad69a242b",
+      "dapo/229a96c8-7ed4-4a99-8134-0f7b09cfc825"
+     ],
+     [
+      "dapo/23ca632c-99bf-4724-a819-be40b4710aa9",
+      "dapo/09b60a8d-64cc-46c9-a3f6-c933053c1d47"
+     ],
+     [
+      "dapo/2410cef2-e0a2-451f-9bcd-b53c5e109ea4",
+      "dapo/06110a8b-a70a-4af6-8093-ac120db93a95"
+     ],
+     [
+      "dapo/27052512-00f4-4b2b-b2e1-99b1d3cbb7f2",
+      "dapo/10b631bd-285b-469d-9809-da7a741608c0"
+     ]
+    ],
+    "internal_duplicates_removed": 1103,
+    "near_dup_13gram_removed": 493,
     "near_dup_examples": [
+     [
+      "dapo/00c832b3-0c6d-4108-9f22-fe84c650982e",
+      "math/test/precalculus/26"
+     ],
+     [
+      "dapo/00dddd76-c56f-444e-b75d-3c151aa796b6",
+      "math/test/counting_and_probability/260"
+     ],
+     [
+      "dapo/00ef419b-5219-4a6e-8440-e503fd73d3e4",
+      "math/test/geometry/314"
+     ],
+     [
+      "dapo/0121d6bf-8704-40bb-bab9-dc6e58d05209",
+      "math/test/precalculus/59"
+     ],
      [
       "dapo/0152710e-c10b-4dba-a44b-ad5fba93a867",
       "math/test/geometry/449"
      ],
      [
-      "dapo/03397ac4-f821-471c-b44f-bc26cce8123f",
-      "amc23/10"
+      "dapo/02aed10d-d4a2-493e-a813-c3c1604a0ecf",
+      "math/test/precalculus/523"
      ],
      [
-      "dapo/06390219-477f-4848-8e3d-df373fb51e8d",
-      "amc23/16"
+      "dapo/03480ad7-01eb-4853-9ac5-ba57a7bdf281",
+      "math/test/counting_and_probability/159"
+     ],
+     [
+      "dapo/0434d6f9-30c3-4834-972c-6d385a388d09",
+      "math/test/precalculus/373"
+     ],
+     [
+      "dapo/059c042d-685e-40b2-a9d1-7b25bfc0b563",
+      "math/test/intermediate_algebra/42"
+     ],
+     [
+      "dapo/065f7fa5-1e47-4d06-a25f-8098b25500b1",
+      "math/test/counting_and_probability/355"
+     ],
+     [
+      "dapo/066ed339-dbb9-4ae2-8f62-0547fa340c2d",
+      "math/test/geometry/66"
+     ],
+     [
+      "dapo/069e310a-1beb-42f7-931d-b84cc799b3b6",
+      "math/test/precalculus/49"
+     ],
+     [
+      "dapo/0808daf1-95ba-483c-8275-509934eb19e0",
+      "math/test/precalculus/495"
+     ],
+     [
+      "dapo/0906a189-c3fd-46ae-a7ab-afaa55b131b0",
+      "math/test/algebra/469"
+     ],
+     [
+      "dapo/0a8248f8-f788-4c11-bde7-d894d7ff07ca",
+      "math/test/prealgebra/329"
+     ],
+     [
+      "dapo/0b67c967-7493-4452-a349-3eebe54dbb5f",
+      "math/test/prealgebra/231"
      ],
      [
       "dapo/0b7033f6-56ad-43c6-9cad-e728e3e38155",
       "amc23/44"
      ],
      [
+      "dapo/0b9df9e2-1b81-4e57-8bcb-0cbceabf89a7",
+      "math/test/counting_and_probability/213"
+     ],
+     [
       "dapo/0c69905c-ed03-4dbf-804c-e5d06218d1b0",
       "amc23/26"
      ],
      [
-      "dapo/0cac63d3-2050-4255-8574-9e8b77fa5e36",
-      "olympiadbench/1798"
-     ],
-     [
-      "dapo/0f64e9ec-bc40-4ca8-b80f-3ae2b0dd8d41",
-      "math/test/precalculus/524"
-     ],
-     [
-      "dapo/146bc3eb-f75b-4015-9a51-86f9ea624864",
-      "olympiadbench/1873"
-     ],
-     [
-      "dapo/149719c5-b6ad-46b8-8968-6285a1563889",
-      "olympiadbench/1662"
-     ],
-     [
-      "dapo/15a38198-d5e7-4a3d-88e1-6d045c831da8",
-      "amc23/28"
-     ],
-     [
-      "dapo/1b8f4f92-227d-4471-8309-cb1b09ffb4ea",
-      "olympiadbench/1807"
-     ],
-     [
-      "dapo/1fa53fc5-6c25-443f-900f-49a01399fb17",
-      "amc23/13"
-     ],
-     [
-      "dapo/25f28d8f-466c-48a1-9eec-6f34287c3047",
-      "olympiadbench/2064"
-     ],
-     [
-      "dapo/273daed8-850f-48d5-bc3e-132bcc548d8f",
-      "amc23/4"
-     ],
-     [
-      "dapo/281d4d68-6b5b-444b-84b1-b170dd3472d8",
-      "olympiadbench/1945"
-     ],
-     [
-      "dapo/28899bd8-d432-414d-bc00-f2dbc9e63ec8",
-      "olympiadbench/2022"
-     ],
-     [
-      "dapo/29267fa5-4acc-4983-80d3-7620d96135ee",
-      "olympiadbench/1887"
-     ],
-     [
-      "dapo/2cc4ea28-50fc-4642-be16-d76aab93b525",
-      "olympiadbench/1641"
-     ],
-     [
-      "dapo/2ebec39f-4dea-48c9-9616-f1bde006a0ae",
-      "amc23/8"
-     ],
-     [
-      "dapo/3223a825-9e51-4352-a749-11a54b4e37dc",
-      "olympiadbench/1612"
+      "dapo/0d2c211d-9244-435f-b3d7-ec8c0d30aa9a",
+      "math/test/counting_and_probability/59"
      ]
     ]
    },
    "gpqa_main": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [],
+    "internal_duplicates_removed": 0,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    },
    "gsm8k_train": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [],
+    "internal_duplicates_removed": 0,
     "near_dup_13gram_removed": 2,
     "near_dup_examples": [
      [
@@ -356,8 +527,14 @@
    "ifeval_train": {
     "exact_examples": [],
     "exact_match_removed": 0,
-    "near_dup_13gram_removed": 16,
+    "internal_duplicate_examples": [],
+    "internal_duplicates_removed": 0,
+    "near_dup_13gram_removed": 21,
     "near_dup_examples": [
+     [
+      "rlvr_ifeval/10085",
+      "ifeval/2383"
+     ],
      [
       "rlvr_ifeval/10720",
       "ifeval/2216"
@@ -365,6 +542,10 @@
      [
       "rlvr_ifeval/11662",
       "ifeval/2216"
+     ],
+     [
+      "rlvr_ifeval/12619",
+      "ifeval/2383"
      ],
      [
       "rlvr_ifeval/12709",
@@ -377,6 +558,10 @@
      [
       "rlvr_ifeval/1999",
       "ifeval/2216"
+     ],
+     [
+      "rlvr_ifeval/2388",
+      "ifeval/2383"
      ],
      [
       "rlvr_ifeval/2708",
@@ -399,6 +584,10 @@
       "ifeval/2216"
      ],
      [
+      "rlvr_ifeval/4966",
+      "ifeval/2383"
+     ],
+     [
       "rlvr_ifeval/6475",
       "ifeval/2216"
      ],
@@ -415,11 +604,11 @@
       "ifeval/2216"
      ],
      [
-      "rlvr_ifeval/9757",
-      "ifeval/2216"
+      "rlvr_ifeval/8130",
+      "ifeval/2383"
      ],
      [
-      "rlvr_ifeval/9885",
+      "rlvr_ifeval/9757",
       "ifeval/2216"
      ]
     ]
@@ -427,19 +616,141 @@
    "magicoder_oss": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [
+     [
+      "magicoder/46397",
+      "magicoder/40445"
+     ],
+     [
+      "magicoder/72187",
+      "magicoder/5841"
+     ]
+    ],
+    "internal_duplicates_removed": 2,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    },
    "math_train": {
     "exact_examples": [
-     "math/train/geometry/433"
+     "math/train/algebra/1414",
+     "math/train/algebra/1598",
+     "math/train/algebra/750",
+     "math/train/geometry/350",
+     "math/train/geometry/433",
+     "math/train/geometry/637",
+     "math/train/intermediate_algebra/1102",
+     "math/train/intermediate_algebra/263",
+     "math/train/intermediate_algebra/461",
+     "math/train/intermediate_algebra/561",
+     "math/train/intermediate_algebra/58",
+     "math/train/precalculus/409",
+     "math/train/precalculus/702"
     ],
-    "exact_match_removed": 1,
-    "near_dup_13gram_removed": 33,
+    "exact_match_removed": 13,
+    "internal_duplicate_examples": [
+     [
+      "math/train/algebra/1227",
+      "math/train/algebra/1168"
+     ],
+     [
+      "math/train/algebra/167",
+      "math/train/algebra/142"
+     ],
+     [
+      "math/train/algebra/959",
+      "math/train/algebra/925"
+     ],
+     [
+      "math/train/geometry/684",
+      "math/train/geometry/102"
+     ],
+     [
+      "math/train/intermediate_algebra/491",
+      "math/train/intermediate_algebra/34"
+     ],
+     [
+      "math/train/intermediate_algebra/496",
+      "math/train/algebra/1158"
+     ],
+     [
+      "math/train/intermediate_algebra/664",
+      "math/train/algebra/59"
+     ],
+     [
+      "math/train/intermediate_algebra/937",
+      "math/train/intermediate_algebra/108"
+     ],
+     [
+      "math/train/prealgebra/945",
+      "math/train/prealgebra/873"
+     ],
+     [
+      "math/train/precalculus/404",
+      "math/train/precalculus/294"
+     ],
+     [
+      "math/train/precalculus/624",
+      "math/train/precalculus/138"
+     ]
+    ],
+    "internal_duplicates_removed": 11,
+    "near_dup_13gram_removed": 215,
     "near_dup_examples": [
+     [
+      "math/train/algebra/10",
+      "math/test/algebra/934"
+     ],
+     [
+      "math/train/algebra/1050",
+      "math/test/algebra/469"
+     ],
+     [
+      "math/train/algebra/1107",
+      "math/test/algebra/1101"
+     ],
+     [
+      "math/train/algebra/1151",
+      "math/test/algebra/898"
+     ],
+     [
+      "math/train/algebra/1157",
+      "math/test/algebra/16"
+     ],
+     [
+      "math/train/algebra/116",
+      "math/test/algebra/180"
+     ],
+     [
+      "math/train/algebra/118",
+      "math/test/algebra/958"
+     ],
      [
       "math/train/algebra/1256",
       "math/test/geometry/159"
+     ],
+     [
+      "math/train/algebra/1258",
+      "math/test/algebra/830"
+     ],
+     [
+      "math/train/algebra/1274",
+      "math/test/algebra/889"
+     ],
+     [
+      "math/train/algebra/1276",
+      "math/test/algebra/892"
+     ],
+     [
+      "math/train/algebra/1305",
+      "math/test/algebra/958"
+     ],
+     [
+      "math/train/algebra/1306",
+      "math/test/algebra/469"
+     ],
+     [
+      "math/train/algebra/1322",
+      "math/test/algebra/469"
      ],
      [
       "math/train/algebra/1324",
@@ -450,79 +761,40 @@
       "math/test/algebra/684"
      ],
      [
-      "math/train/algebra/173",
-      "math/test/algebra/1033"
+      "math/train/algebra/1409",
+      "math/test/algebra/958"
      ],
      [
-      "math/train/counting_and_probability/243",
-      "math/test/counting_and_probability/115"
+      "math/train/algebra/143",
+      "math/test/algebra/364"
      ],
      [
-      "math/train/counting_and_probability/759",
-      "math/test/counting_and_probability/344"
+      "math/train/algebra/1438",
+      "math/test/algebra/924"
      ],
      [
-      "math/train/geometry/1",
-      "math/test/geometry/449"
-     ],
-     [
-      "math/train/geometry/123",
-      "math/test/geometry/159"
-     ],
-     [
-      "math/train/geometry/697",
-      "math/test/geometry/320"
-     ],
-     [
-      "math/train/geometry/799",
-      "math/test/geometry/340"
-     ],
-     [
-      "math/train/intermediate_algebra/214",
-      "math/test/intermediate_algebra/837"
-     ],
-     [
-      "math/train/intermediate_algebra/460",
-      "math/test/intermediate_algebra/837"
-     ],
-     [
-      "math/train/intermediate_algebra/58",
-      "olympiadbench/2890"
-     ],
-     [
-      "math/train/intermediate_algebra/896",
-      "math/test/intermediate_algebra/591"
-     ],
-     [
-      "math/train/number_theory/865",
-      "math/test/prealgebra/185"
-     ],
-     [
-      "math/train/number_theory/868",
-      "math/test/number_theory/301"
-     ],
-     [
-      "math/train/prealgebra/1149",
-      "math/test/prealgebra/652"
-     ],
-     [
-      "math/train/prealgebra/40",
-      "math/test/prealgebra/3"
-     ],
-     [
-      "math/train/prealgebra/703",
-      "math/test/prealgebra/185"
-     ],
-     [
-      "math/train/prealgebra/752",
-      "math/test/prealgebra/185"
+      "math/train/algebra/1452",
+      "math/test/algebra/835"
      ]
     ]
    },
    "sealtool_train": {
-    "exact_examples": [],
-    "exact_match_removed": 0,
-    "near_dup_13gram_removed": 3,
+    "exact_examples": [
+     "sealtool/train-easy-3046"
+    ],
+    "exact_match_removed": 1,
+    "internal_duplicate_examples": [
+     [
+      "sealtool/train-easy-2034",
+      "sealtool/train-easy-2033"
+     ],
+     [
+      "sealtool/train-easy-532",
+      "sealtool/train-easy-1578"
+     ]
+    ],
+    "internal_duplicates_removed": 2,
+    "near_dup_13gram_removed": 4,
     "near_dup_examples": [
      [
       "sealtool/train-difficult-8003",
@@ -535,24 +807,198 @@
      [
       "sealtool/train-easy-3320",
       "sealtool/test_out_domain-difficult-610"
+     ],
+     [
+      "sealtool/train-easy-432",
+      "sealtool/dev-difficult-696"
      ]
     ]
    },
    "squad_train": {
     "exact_examples": [],
     "exact_match_removed": 0,
-    "near_dup_13gram_removed": 0,
-    "near_dup_examples": []
+    "internal_duplicate_examples": [
+     [
+      "squad/34f7618891403a70",
+      "squad/0bbf19f943156c2d"
+     ],
+     [
+      "squad/e93b1a0ff8fd8cba",
+      "squad/ba2098afa3212fe0"
+     ]
+    ],
+    "internal_duplicates_removed": 2,
+    "near_dup_13gram_removed": 3,
+    "near_dup_examples": [
+     [
+      "squad/70b17f86269e114c",
+      "squad/88ebefee76460e60"
+     ],
+     [
+      "squad/b929bdb476398ea7",
+      "squad/32756d0f25725e1a"
+     ],
+     [
+      "squad/f00f0bda0b501800",
+      "squad/d28ae44a1bd65936"
+     ]
+    ]
    },
    "taco_verified": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [
+     [
+      "taco/15094",
+      "taco/12267"
+     ],
+     [
+      "taco/16455",
+      "taco/14142"
+     ],
+     [
+      "taco/24138",
+      "taco/19546"
+     ],
+     [
+      "taco/24814",
+      "taco/13301"
+     ],
+     [
+      "taco/2968",
+      "taco/12577"
+     ],
+     [
+      "taco/4269",
+      "taco/406"
+     ],
+     [
+      "taco/4905",
+      "taco/23340"
+     ],
+     [
+      "taco/5438",
+      "taco/23014"
+     ],
+     [
+      "taco/5489",
+      "taco/23391"
+     ],
+     [
+      "taco/5558",
+      "taco/22043"
+     ],
+     [
+      "taco/5624",
+      "taco/19163"
+     ],
+     [
+      "taco/6819",
+      "taco/12904"
+     ],
+     [
+      "taco/7400",
+      "taco/15949"
+     ],
+     [
+      "taco/8598",
+      "taco/7512"
+     ],
+     [
+      "taco/9048",
+      "taco/10957"
+     ]
+    ],
+    "internal_duplicates_removed": 15,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    },
    "toolace": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [
+     [
+      "toolace/11179",
+      "toolace/1070"
+     ],
+     [
+      "toolace/1190",
+      "toolace/11140"
+     ],
+     [
+      "toolace/1876",
+      "toolace/1004"
+     ],
+     [
+      "toolace/2261",
+      "toolace/220"
+     ],
+     [
+      "toolace/2338",
+      "toolace/1157"
+     ],
+     [
+      "toolace/241",
+      "toolace/2088"
+     ],
+     [
+      "toolace/2482",
+      "toolace/1573"
+     ],
+     [
+      "toolace/2538",
+      "toolace/197"
+     ],
+     [
+      "toolace/2609",
+      "toolace/1257"
+     ],
+     [
+      "toolace/2639",
+      "toolace/1810"
+     ],
+     [
+      "toolace/304",
+      "toolace/1116"
+     ],
+     [
+      "toolace/3124",
+      "toolace/10435"
+     ],
+     [
+      "toolace/3225",
+      "toolace/1023"
+     ],
+     [
+      "toolace/3232",
+      "toolace/1723"
+     ],
+     [
+      "toolace/3233",
+      "toolace/1604"
+     ],
+     [
+      "toolace/3291",
+      "toolace/10449"
+     ],
+     [
+      "toolace/331",
+      "toolace/2312"
+     ],
+     [
+      "toolace/3578",
+      "toolace/224"
+     ],
+     [
+      "toolace/3624",
+      "toolace/3215"
+     ],
+     [
+      "toolace/3645",
+      "toolace/1244"
+     ]
+    ],
+    "internal_duplicates_removed": 135,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    },
@@ -568,6 +1014,7 @@
      "triviaqa/bb_1386",
      "triviaqa/bb_1446",
      "triviaqa/bb_1476",
+     "triviaqa/bb_1509",
      "triviaqa/bb_151",
      "triviaqa/bb_1604",
      "triviaqa/bb_1651",
@@ -576,97 +1023,254 @@
      "triviaqa/bb_1722",
      "triviaqa/bb_1746",
      "triviaqa/bb_1762",
-     "triviaqa/bb_1775",
-     "triviaqa/bb_179"
+     "triviaqa/bb_1775"
     ],
-    "exact_match_removed": 2428,
-    "near_dup_13gram_removed": 370,
+    "exact_match_removed": 3147,
+    "internal_duplicate_examples": [
+     [
+      "triviaqa/bt_1610",
+      "triviaqa/bb_8361"
+     ],
+     [
+      "triviaqa/bt_2234",
+      "triviaqa/bb_2546"
+     ],
+     [
+      "triviaqa/bt_2288",
+      "triviaqa/bb_688"
+     ],
+     [
+      "triviaqa/bt_2382",
+      "triviaqa/bb_511"
+     ],
+     [
+      "triviaqa/bt_2610",
+      "triviaqa/bb_1743"
+     ],
+     [
+      "triviaqa/bt_2836",
+      "triviaqa/bb_8086"
+     ],
+     [
+      "triviaqa/bt_3395",
+      "triviaqa/bb_7582"
+     ],
+     [
+      "triviaqa/bt_3546",
+      "triviaqa/bb_9035"
+     ],
+     [
+      "triviaqa/bt_3969",
+      "triviaqa/bt_3933"
+     ],
+     [
+      "triviaqa/bt_672",
+      "triviaqa/bb_5212"
+     ],
+     [
+      "triviaqa/bt_727",
+      "triviaqa/bb_3425"
+     ],
+     [
+      "triviaqa/dpql_2099",
+      "triviaqa/bb_7934"
+     ],
+     [
+      "triviaqa/dpql_2835",
+      "triviaqa/bt_422"
+     ],
+     [
+      "triviaqa/dpql_3129",
+      "triviaqa/bt_2469"
+     ],
+     [
+      "triviaqa/dpql_3357",
+      "triviaqa/bt_2511"
+     ],
+     [
+      "triviaqa/dpql_4188",
+      "triviaqa/bt_2363"
+     ],
+     [
+      "triviaqa/dpql_4207",
+      "triviaqa/bt_1203"
+     ],
+     [
+      "triviaqa/dpql_911",
+      "triviaqa/bt_437"
+     ],
+     [
+      "triviaqa/jp_2473",
+      "triviaqa/bt_1147"
+     ],
+     [
+      "triviaqa/jp_582",
+      "triviaqa/bt_3857"
+     ]
+    ],
+    "internal_duplicates_removed": 237,
+    "near_dup_13gram_removed": 38,
     "near_dup_examples": [
      [
-      "triviaqa/bb_1509",
-      "triviaqa/bt_3155"
+      "triviaqa/bb_7591",
+      "triviaqa/sfq_2754"
      ],
      [
-      "triviaqa/bb_2605",
-      "FreebaseQA-eval-3359"
+      "triviaqa/bt_560",
+      "triviaqa/tb_1113"
      ],
      [
-      "triviaqa/bb_2913",
-      "FreebaseQA-eval-3324"
+      "triviaqa/odql_10436",
+      "triviaqa/odql_10461"
      ],
      [
-      "triviaqa/bb_5956",
-      "FreebaseQA-eval-3728"
+      "triviaqa/odql_11042",
+      "FreebaseQA-eval-1908"
      ],
      [
-      "triviaqa/bb_9312",
-      "FreebaseQA-eval-3716"
+      "triviaqa/odql_14736",
+      "FreebaseQA-eval-1908"
      ],
      [
-      "triviaqa/bt_1070",
-      "FreebaseQA-eval-3968"
+      "triviaqa/odql_1478",
+      "triviaqa/odql_13189"
      ],
      [
-      "triviaqa/bt_1306",
-      "FreebaseQA-eval-939"
+      "triviaqa/odql_2140",
+      "FreebaseQA-eval-1516"
      ],
      [
-      "triviaqa/bt_1581",
-      "FreebaseQA-eval-3703"
+      "triviaqa/odql_252",
+      "triviaqa/odql_249"
      ],
      [
-      "triviaqa/bt_1853",
-      "FreebaseQA-eval-3652"
+      "triviaqa/odql_72",
+      "triviaqa/odql_6909"
      ],
      [
-      "triviaqa/bt_2224",
-      "FreebaseQA-eval-190"
+      "triviaqa/odql_7355",
+      "triviaqa/odql_309"
      ],
      [
-      "triviaqa/bt_2354",
-      "FreebaseQA-eval-1504"
+      "triviaqa/odql_9338",
+      "triviaqa/odql_14742"
      ],
      [
-      "triviaqa/bt_2369",
-      "FreebaseQA-eval-1696"
+      "triviaqa/odql_9931",
+      "FreebaseQA-eval-3672"
      ],
      [
-      "triviaqa/bt_272",
-      "FreebaseQA-eval-1111"
+      "triviaqa/odql_9961",
+      "triviaqa/odql_9955"
      ],
      [
-      "triviaqa/bt_273",
-      "FreebaseQA-eval-423"
+      "triviaqa/qb_2411",
+      "triviaqa/qb_2869"
      ],
      [
-      "triviaqa/bt_2924",
-      "FreebaseQA-eval-2018"
+      "triviaqa/qb_3375",
+      "triviaqa/qb_2869"
      ],
      [
-      "triviaqa/bt_2999",
-      "FreebaseQA-eval-2757"
+      "triviaqa/qb_568",
+      "triviaqa/sfq_13"
      ],
      [
-      "triviaqa/bt_3048",
-      "FreebaseQA-eval-434"
+      "triviaqa/qg_1708",
+      "triviaqa/odql_12839"
      ],
      [
-      "triviaqa/bt_3177",
-      "FreebaseQA-eval-2320"
+      "triviaqa/qg_1827",
+      "triviaqa/qg_1847"
      ],
      [
-      "triviaqa/bt_3298",
-      "triviaqa/qz_6596"
+      "triviaqa/qg_2838",
+      "triviaqa/qg_2781"
      ],
      [
-      "triviaqa/bt_3313",
-      "FreebaseQA-eval-3642"
+      "triviaqa/qg_88",
+      "triviaqa/qg_550"
      ]
     ]
    },
    "tulu3_if": {
     "exact_examples": [],
     "exact_match_removed": 0,
+    "internal_duplicate_examples": [
+     [
+      "personas_IF_4ae13omuyn7f6c0btd93mpd8",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_5724w8csrwub38xuvyg7cmau",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_88qi516we95weq7b2dc6gr58",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_969q0xs63pnn1vam4bd8s3nk",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_9g3y2zbettas7dhzfes6nnm5",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_hvqhb5ptyipbmyfcvtj716h2",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_lvg3yw01bg4pksonl26a54s0",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_mtdlbabjvmzdi5dpl983sd9d",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_muaambtvgka89mjsl2f47skb",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_nadl6nukgi377wx44dsnsryf",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_oihtijle9rn8t3dqh9cc6wvw",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_oispu7xk9dg3p5hav5ox4wnk",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_sjqdvycp5vs3s3u26jmaekiz",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_swzxvp6m169yb1567xzawk4w",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_u8mc9cpoq8izqtz75aw4y8z3",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_vno3t8dldu7bvvlys05gsvss",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_wvzxpcuukobgw3pibpfzbvnh",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ],
+     [
+      "personas_IF_y1cb8010kzazw8qk2g7sbeib",
+      "personas_IF_3wce9jt63czxy7i0ece0wkn9"
+     ]
+    ],
+    "internal_duplicates_removed": 18,
     "near_dup_13gram_removed": 0,
     "near_dup_examples": []
    }
@@ -711,7 +1315,139 @@
    "test": 25
   }
  },
- "ngram13": {},
+ "internal_duplicates": {},
+ "ngram13": {
+  "arc->gpqa_diamond": {
+   "eval_items_touched": 0,
+   "eval_total": 198,
+   "train_items_with_overlap": 0
+  },
+  "arc->mmlu_pro": {
+   "eval_items_touched": 0,
+   "eval_total": 12032,
+   "train_items_with_overlap": 0
+  },
+  "dapo_math->aime24": {
+   "eval_items_touched": 8,
+   "eval_total": 30,
+   "train_items_with_overlap": 312
+  },
+  "dapo_math->aime25": {
+   "eval_items_touched": 10,
+   "eval_total": 30,
+   "train_items_with_overlap": 310
+  },
+  "dapo_math->amc23": {
+   "eval_items_touched": 10,
+   "eval_total": 40,
+   "train_items_with_overlap": 26
+  },
+  "dapo_math->math": {
+   "eval_items_touched": 214,
+   "eval_total": 5000,
+   "train_items_with_overlap": 499
+  },
+  "dapo_math->olympiadbench": {
+   "eval_items_touched": 35,
+   "eval_total": 674,
+   "train_items_with_overlap": 43
+  },
+  "gpqa_main->gpqa_diamond": {
+   "eval_items_touched": 0,
+   "eval_total": 198,
+   "train_items_with_overlap": 0
+  },
+  "gsm8k_train->gsm8k": {
+   "eval_items_touched": 0,
+   "eval_total": 1319,
+   "train_items_with_overlap": 0
+  },
+  "ifeval_train->ifbench": {
+   "eval_items_touched": 2,
+   "eval_total": 300,
+   "train_items_with_overlap": 803
+  },
+  "ifeval_train->ifeval": {
+   "eval_items_touched": 11,
+   "eval_total": 541,
+   "train_items_with_overlap": 2562
+  },
+  "math_train->aime24": {
+   "eval_items_touched": 0,
+   "eval_total": 30,
+   "train_items_with_overlap": 0
+  },
+  "math_train->aime25": {
+   "eval_items_touched": 0,
+   "eval_total": 30,
+   "train_items_with_overlap": 0
+  },
+  "math_train->amc23": {
+   "eval_items_touched": 0,
+   "eval_total": 40,
+   "train_items_with_overlap": 0
+  },
+  "math_train->math": {
+   "eval_items_touched": 0,
+   "eval_total": 5000,
+   "train_items_with_overlap": 0
+  },
+  "math_train->olympiadbench": {
+   "eval_items_touched": 0,
+   "eval_total": 674,
+   "train_items_with_overlap": 0
+  },
+  "sealtool_train->apibank": {
+   "eval_items_touched": 0,
+   "eval_total": 584,
+   "train_items_with_overlap": 0
+  },
+  "sealtool_train->bfcl": {
+   "eval_items_touched": 1,
+   "eval_total": 4696,
+   "train_items_with_overlap": 1
+  },
+  "sealtool_train->sealtool": {
+   "eval_items_touched": 1993,
+   "eval_total": 2054,
+   "train_items_with_overlap": 12011
+  },
+  "taco_verified->humanevalplus": {
+   "eval_items_touched": 1,
+   "eval_total": 164,
+   "train_items_with_overlap": 2
+  },
+  "taco_verified->livecodebench": {
+   "eval_items_touched": 62,
+   "eval_total": 131,
+   "train_items_with_overlap": 446
+  },
+  "taco_verified->mbppplus": {
+   "eval_items_touched": 0,
+   "eval_total": 378,
+   "train_items_with_overlap": 0
+  },
+  "toolace->apibank": {
+   "eval_items_touched": 0,
+   "eval_total": 584,
+   "train_items_with_overlap": 0
+  },
+  "toolace->bfcl": {
+   "eval_items_touched": 4,
+   "eval_total": 4696,
+   "train_items_with_overlap": 4
+  },
+  "toolace->metatool": {
+   "eval_items_touched": 0,
+   "eval_total": 5327,
+   "train_items_with_overlap": 0
+  },
+  "triviaqa_train->triviaqa": {
+   "eval_items_touched": 33,
+   "eval_total": 9960,
+   "train_items_with_overlap": 44
+  }
+ },
  "pools": {
   "aime24": {
    "test": 30
@@ -729,20 +1465,23 @@
    "test": 584
   },
   "apibank_train": {
-   "reserve": 10376
+   "reserve": 10358,
+   "train_duplicate": 18
   },
   "apps": {
    "reserve": 4449
   },
   "arc": {
-   "reserve": 3370
+   "reserve": 3369,
+   "train_duplicate": 1
   },
   "bfcl": {
    "test": 4696
   },
   "dapo_math": {
-   "pool": 16314,
-   "train_excluded": 1068
+   "pool": 14738,
+   "train_duplicate": 1103,
+   "train_excluded": 1541
   },
   "freebaseqa": {
    "test": 3996
@@ -771,22 +1510,24 @@
    "test": 271
   },
   "ifeval_train": {
-   "pool": 14954,
-   "train_excluded": 16
+   "pool": 14949,
+   "train_excluded": 21
   },
   "livecodebench": {
    "test": 131
   },
   "magicoder_oss": {
-   "reserve": 75197
+   "reserve": 75195,
+   "train_duplicate": 2
   },
   "math": {
    "reserve": 4500,
    "test": 500
   },
   "math_train": {
-   "reserve": 7466,
-   "train_excluded": 34
+   "reserve": 7261,
+   "train_duplicate": 11,
+   "train_excluded": 228
   },
   "mbppplus": {
    "test": 378
@@ -809,38 +1550,45 @@
    "test": 1354
   },
   "sealtool_train": {
-   "pool": 12019,
-   "train_excluded": 3
+   "pool": 12015,
+   "train_duplicate": 2,
+   "train_excluded": 5
   },
   "squad_train": {
    "gate": 50,
    "reserve": 3887,
    "search": 50,
-   "train": 14904
+   "train": 14899,
+   "train_duplicate": 2,
+   "train_excluded": 3
   },
   "squad_val": {
    "reserve": 1867,
    "test": 200
   },
   "taco_verified": {
-   "pool": 10806
+   "pool": 10791,
+   "train_duplicate": 15
   },
   "teval": {
    "test": 4358
   },
   "toolace": {
-   "train": 11300
+   "train": 11165,
+   "train_duplicate": 135
   },
   "triviaqa": {
    "reserve": 7960,
    "test": 2000
   },
   "triviaqa_train": {
-   "pool": 73725,
-   "train_excluded": 2798
+   "pool": 73101,
+   "train_duplicate": 237,
+   "train_excluded": 3185
   },
   "tulu3_if": {
-   "reserve": 29980
+   "reserve": 29962,
+   "train_duplicate": 18
   }
  }
 }

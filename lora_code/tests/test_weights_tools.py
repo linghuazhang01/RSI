@@ -329,11 +329,11 @@ def test_system_prompt_modes():
     pe = system_prompt(cfg, budget=b, mode="edit", e_task=True)
     assert "w_scale_rows" in pw and '{"edit"' in pw and "- new_edit(" in pw and "0.03 per module" in pw
     assert "- raw_lora(" not in pw and "dW = B A per linear module" not in pw
-    assert "w_scale_rows" not in ps and '{"edit"' not in ps and '{"lora": handle}' in ps
+    assert "w_scale_rows" not in ps and '{"edit"' not in ps and '{"lora": handle, "note"' in ps
     assert "dW = B A per linear module" in ps and "rank <= 64" in ps
     assert "w_scale" not in pe and '{"lora"' in pe
     assert "{" not in system_prompt(cfg, budget=b, mode="weights", e_task=True).split("Tools")[0].replace(
-        '{"edit": handle}', "").replace('{"edit": None}', "")
+        '{"edit": handle, "note": "..."}', "").replace('{"edit": None, "note": "..."}', "")
 
 
 def test_summarize_candidate_edit():

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 
+from .common import error_line
 from .diagnostics import summarize_profile
 
 SYSTEM_PROMPT = """You are quantizing a large language model to a fixed memory budget. The model being quantized is a copy of YOURSELF: every config is applied to the original BF16 weights. The budget is the same in every round; each round tries to beat the best quantization accepted so far (the incumbent), which you can see together with the experience of earlier rounds.
@@ -38,7 +39,8 @@ Config schema (JSON object):
   "rules": [{{"layers": "56-63", "groups": ["down", "gate_up"], "bits": 8}}],  # optional, applied in order
   "groups": {{"17.down": {{"bits": 3}}, "gdn_ba": {{"bits": 16}}}},             # optional, applied last
   "embed": "bf16",      # "bf16" | 8 | 4
-  "lm_head": 8          # "bf16" | 8 | 4
+  "lm_head": 8,         # "bf16" | 8 | 4
+  "note": "..."         # optional: why these groups, what you tried and rejected (see below)
 }}
 - bits in {bits} (16 = keep BF16); group_size in {group_sizes}; quantizer in {quantizers}.
 - Module groups per layer. Full-attention layers: qk (q_proj+k_proj), v, o. Linear-attention (Gated DeltaNet) layers: gdn_qkv (in_proj_qkv), gdn_z (in_proj_z), gdn_ba (in_proj_b+in_proj_a, tiny gates), gdn_out (out_proj). Every layer: gate_up (gate_proj+up_proj), down (down_proj). Group keys look like "17.down".
@@ -49,6 +51,8 @@ Config schema (JSON object):
 - Each program's returned config is evaluated on held-back training items and compared with the INCUMBENT on the same items (retention = your accuracy / the incumbent's; paired delta; KL vs the original BF16 model); you then see the feedback and may improve. api.evaluate(config) inside a program spends the same per-round evaluate budget.
 - {acceptance}
 - In your program `api` exists only as the argument of main(api) (it is not a global there): pass it to helper functions explicitly, e.g. def pick(api, budget): ...
+- Time: your program is killed after {timeout_s} s of wall clock, every tool call included (group_error / hessian_table on settings that are not cached yet quantize on the GPU and take real time). A killed program is a lost candidate.
+- note (optional, at most 600 characters, plain text, the "note" key of the returned config): which groups you changed and WHY those (the evidence that picked them: a profile_table / hessian_table / group_error number, the incumbent's failures), then what you tried and rejected, with the numbers that decided it (e.g. "8 bit for down 0-3 and v 40-47: largest gptq 4-bit herr_rel in hessian_table; paid for with gate_up 20-35 at 3 bit; rejected: awq on gdn_qkv, group_error total +9% vs gptq"). The history already lists the config; the note is for the reasons. Every later session sees it, so a good note keeps them from repeating your failed ideas.
 
 Answer with a short plan, then exactly one ```python code block containing the full program."""
 
@@ -62,27 +66,28 @@ PERSIST_SESSION = ("Variables, imports and functions persist between your run_py
 FINAL_RULE = "Answer with a short plan, then exactly one ```python code block containing the full program."
 
 # editor.tool_rounds > 0 (2026-11-21): the editor may call chat tools before answering; replaces FINAL_RULE
-TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds:
+TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds (one round = one reply with function calls; at most {calls} calls in all):
 - run_python(code) runs exploratory code in the same sandbox with the same `api` (keyword arguments as above), so you can inspect and filter the tables and check configs before you commit to a program.{no_eval}{group_error}. print() what you need or set `result = ...`; output is cut to a few thousand characters, so filter big tables in the code.
 - read_record(cid, part) shows the full program ("program") or the full feedback ("feedback", with the full config) of a candidate in the table{history_read}.{history}
 {persist}
 When you are done, reply WITHOUT a function call: a short plan, then exactly one ```python code block containing the full program."""
 
 
-def _tool_rounds(cfg: dict) -> tuple[int, bool, bool]:
-    """(editor.tool_rounds, editor.explore.gpu_tools, editor.explore.persistent) with the rsicore.editor defaults
-    (the round count is always the configured one, e.g. 20 in the simple profile)."""
+def _tool_rounds(cfg: dict) -> tuple[int, bool, bool, int]:
+    """(editor.tool_rounds, editor.explore.gpu_tools, editor.explore.persistent, editor.max_tool_calls) with the
+    rsicore.editor defaults (the round count is always the configured one, e.g. 20 in the simple profile)."""
     try:
         from rsicore.editor import editor_settings
         s = editor_settings(cfg)
         ex = s.get("explore") or {}
     except ImportError:                      # pragma: no cover - rsicore not on sys.path
         s = cfg.get("editor") or {}
-        s = {"tool_rounds": s.get("tool_rounds", 50)}
+        s = {"tool_rounds": s.get("tool_rounds", 50), "max_tool_calls": s.get("max_tool_calls", 100)}
         ex = (cfg.get("editor") or {}).get("explore") or {}
     if "persistent" not in ex:               # rsicore.editor_settings may not know the key yet
         ex = dict(ex, persistent=((cfg.get("editor") or {}).get("explore") or {}).get("persistent", False))
-    return int(s["tool_rounds"] or 0), bool(ex.get("gpu_tools")), bool(ex.get("persistent"))
+    return (int(s["tool_rounds"] or 0), bool(ex.get("gpu_tools")), bool(ex.get("persistent")),
+            int(s.get("max_tool_calls") or 0))
 
 
 def acceptance_text(cfg: dict, gate_every: bool = False) -> str:
@@ -175,7 +180,7 @@ def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False, sear
     gflow = gate_flow(search)
     no_eval = bool(search) and not search.get("evaluate_tool", True)
     text = SYSTEM_PROMPT.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
-                                quantizers=sp["quantizers"],
+                                quantizers=sp["quantizers"], timeout_s=int((cfg.get("sandbox") or {}).get("timeout_s", 1800)),
                                 acceptance=acceptance_text(cfg, gate_every=bool(search and search.get("gate_every_candidate"))))
     if no_eval:                              # program_evaluate_calls 0: no evaluate tool anywhere (2026-11-21)
         text = (text.replace(", `api.evaluate(config=cfg)`)", ")")
@@ -191,7 +196,7 @@ def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False, sear
                                                                      cap=_cap_text(search.get("per_program"))))
     if search and int(search.get("steps", 0)) == 1:   # one program per session and round: no feedback this round
         text = text.replace(FEEDBACK_SENTENCE, ONE_STEP_FEEDBACK)
-    rounds, gpu_tools, persistent = _tool_rounds(cfg)
+    rounds, gpu_tools, persistent, calls = _tool_rounds(cfg)
     if rounds > 0:                           # tool_rounds 0: byte-identical to the single-call prompt
         ge = ("" if gpu_tools or not (cfg.get("tools") or {}).get("group_error", True)
               else "; group_error there only accepts settings already cached (those of hessian_table)")
@@ -200,7 +205,7 @@ def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False, sear
         hl = HISTORY_LINE
         if free_screens(search) or no_eval:
             hl = hl.replace("so you do not spend an evaluation on a config", "so you do not repeat a config")
-        text += TOOL_PROTOCOL.format(rounds=rounds, group_error=ge, history_read=HISTORY_READ if history else "",
+        text += TOOL_PROTOCOL.format(rounds=rounds, calls=calls, group_error=ge, history_read=HISTORY_READ if history else "",
                                      history=hl if history else "", no_eval="" if no_eval else NO_EVAL_EXPLORE,
                                      persist=PERSIST_SESSION if persistent else PERSIST_NONE)
     return text
@@ -229,19 +234,41 @@ def _setting(x: dict) -> str:
     return out
 
 
+def _layer_ranges(xs, chars: int = 40) -> str:
+    """[1, 2, 3, 5] -> '1-3,5' (cut to about `chars` characters with '...')."""
+    xs = sorted(set(xs))
+    out, i = [], 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+            j += 1
+        out.append(str(xs[i]) if i == j else f"{xs[i]}-{xs[j]}")
+        i = j + 1
+    t = ",".join(out)
+    return t if len(t) <= chars else t[:chars].rsplit(",", 1)[0] + ",..."
+
+
 def config_brief(config: dict | None) -> str | None:
-    """One line describing a (compressed) config: the default setting and the overrides grouped by setting,
-    with the module kinds they hit, e.g. "default 4b/g128/gptq; 16b: gdn_ba x12; 8b/g128/gptq: v x8, gdn_ba x6"."""
+    """One line describing a (compressed) config: the default setting and the overrides grouped by setting, with
+    the module kinds they hit and (2026-11-22, as Paper B's history rows) their layers, e.g.
+    "default 4b/g128/gptq; 16b: gdn_ba L0-11 x12; 8b/g128/gptq: v L40-47 x8, gdn_ba L0-5 x6"."""
     if not isinstance(config, dict):
         return None
-    from collections import Counter, defaultdict
-    by = defaultdict(Counter)
+    from collections import defaultdict
+    by = defaultdict(lambda: defaultdict(list))
     for k, v in (config.get("groups") or {}).items():
-        by[_setting(v or {})][str(k).split(".", 1)[-1]] += 1
+        layer, _, kind = str(k).partition(".")
+        if not kind:
+            layer, kind = "", layer
+        by[_setting(v or {})][kind].append(int(layer) if layer.lstrip("-").isdigit() else None)
     parts = ["default " + _setting(config.get("default") or {})]
-    for st, kinds in sorted(by.items(), key=lambda kv: -sum(kv[1].values())):
-        parts.append(f"{st}: " + ", ".join(f"{m} x{n}" for m, n in kinds.most_common(4))
-                     + (f" (+{len(kinds) - 4} kinds)" if len(kinds) > 4 else ""))
+    for st, kinds in sorted(by.items(), key=lambda kv: -sum(len(x) for x in kv[1].values())):
+        top = sorted(kinds.items(), key=lambda kv: -len(kv[1]))[:4]
+        cells = []
+        for m, ls in top:
+            lay = [x for x in ls if x is not None]
+            cells.append(f"{m} " + (f"L{_layer_ranges(lay)} " if lay else "") + f"x{len(ls)}")
+        parts.append(f"{st}: " + ", ".join(cells) + (f" (+{len(kinds) - 4} kinds)" if len(kinds) > 4 else ""))
     for k in ("embed", "lm_head"):
         v = config.get(k)
         if isinstance(v, dict) and v:
@@ -264,7 +291,8 @@ def history_row(rec: dict) -> dict:
     kl = (fb.get("kl") or {}).get("overall") if isinstance(fb.get("kl"), dict) else None
     return {"config": config_brief(art.get("config")), "GiB": art.get("bytes_gib"),
             "avg_bits": None if art.get("linear_avg_bits") is None else round(float(art["linear_avg_bits"]), 2),
-            "kl": None if kl is None else round(float(kl), 4), "vs_incumbent": deltas or None}
+            "kl": None if kl is None else round(float(kl), 4), "vs_incumbent": deltas or None,
+            "note": art.get("note") or None}
 
 
 def gate_cell(g: dict | None) -> str:
@@ -390,8 +418,8 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
             red = [f"{r['layer']}.{r['module']}" for r in problem.tables["activation"] if r.get("red_flag")]
             if red:
                 parts.append(f"Activation red flags (heavy outliers, {len(red)}): " + ", ".join(red[:30]))
-            if archive:
-                parts.append("Archive of earlier generations:\n" + archive)
+            if archive:                     # archive_text starts with its own header (ARCHIVE_HEAD)
+                parts.append(archive)
         if gflow:
             parts.append(screen_summary_text(screen_summary()))
         if history and gflow:
@@ -447,22 +475,92 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
     return render
 
 
-def archive_text(entries: list[dict]) -> str:
-    """entries: one per earlier round {gen, accepted, gate_reason, incumbent_score, top: [{cid, score, config}]}.
-    Scores of different rounds are on different training items (compare within a round)."""
-    lines = []
+ARCHIVE_HEAD = ("Archive of earlier rounds: EVERY candidate tried, one row each, failures included (2026-11-22, as in "
+                "Paper B). config = the config in one line (default setting; overrides grouped by setting: module kind, "
+                "layers L, count x), GiB / avg_bits = its size, gate = its gate result (gain = paired gain in gate accuracy "
+                "vs that round's incumbent, ci = its 95% interval, reason when it failed), error = why it was not built, "
+                "note = its own account of what it tried and why.")
+ARCHIVE_READ = ("Full program or feedback (with the full config) of any candidate above: read_record(cid, 'program' | "
+                "'feedback'); search_history lists them with more statistics. Do not repeat what failed: try something "
+                "different or fix the reason it failed.")
+
+
+def _num(x, nd: int = 4):
+    try:
+        return None if x is None else round(float(x), nd)
+    except (TypeError, ValueError):
+        return None
+
+
+def archive_row(c, gate: dict | None = None) -> dict:
+    """One archive row of an earlier round's candidate (rsicore.search.Candidate; 2026-11-22): what the config is,
+    its size, its gate result (gate = run.gate_outcomes row) or score, the first line of its error, its note."""
+    art = c.artifact or {}
+    row = {"cid": c.cid}
+    if c.error:
+        row["error"] = error_line(c.error)
+    elif art:
+        row["config"] = config_brief(art.get("config"))
+        row["GiB"] = art.get("bytes_gib")
+        if art.get("linear_avg_bits") is not None:
+            row["avg_bits"] = round(float(art["linear_avg_bits"]), 2)
+    if isinstance(gate, dict):
+        g = {"passed": bool(gate.get("passed"))}
+        if gate.get("gain") is not None:
+            g["gain"] = _num(gate["gain"])
+        ci = gate.get("ci")
+        if isinstance(ci, (list, tuple)):
+            g["ci"] = [_num(x) for x in ci]
+        elif isinstance(ci, dict):           # several gate datasets: {dataset: [lo, hi]}
+            g["ci"] = {ds: [_num(x) for x in v] for ds, v in ci.items() if isinstance(v, (list, tuple))}
+        if not g["passed"] and gate.get("reason") and not c.error:
+            g["reason"] = str(gate["reason"])[:120]
+        row["gate"] = g
+    elif c.score is not None:
+        row["score"] = _num(c.score)
+    if art.get("note"):
+        row["note"] = art["note"]
+    return row
+
+
+def archive_text(entries: list[dict], *, read_tools: bool = True, max_chars: int = 30000) -> str:
+    """The experience channel (2026-11-22, structured as Paper B's archive). entries: one per earlier round {gen,
+    accepted, cid, gate_reason, n, best: [(cid, gain or score)], gate_every, reference_screen (flat summary),
+    incumbent_score, rows: [archive_row], configs: [(cid, full config)] (quoted only without read_tools)}.
+    max_chars: the rows of the oldest rounds are dropped first to fit. Scores of different rounds are on different
+    training items (compare within a round); gate gains are all on the same fixed gate set."""
+    blocks = []
     for e in entries:
-        if e.get("reference_screen"):           # gate per candidate (2026-11-21): the incumbent's screen run instead
-            rs = e["reference_screen"]
-            ref = (f"incumbent on that round's screen items: accuracy {rs.get('accuracy')}, items by correct samples "
-                   f"{json.dumps(rs.get('correct_counts'))}, truncated {rs.get('truncation_rate')} "
-                   f"(screen_results(gen={e['gen']}))")
-        else:
-            ref = f"incumbent score on that round's items {e.get('incumbent_score')}"
-        lines.append(f"- round {e['gen']}: new incumbent accepted={e.get('accepted')}; gate: {str(e.get('gate_reason'))[:300]}; "
-                     + ref)
-        for c in e.get("top") or []:
-            g = f", gate {gate_cell(c['gate'])}" if isinstance(c.get("gate"), dict) else ""
-            sc = "" if c.get("gate") else f"score {c.get('score')}, "
-            lines.append(f"    {c['cid']}: {sc}{c.get('bytes_gib')} GiB{g}, config {json.dumps(c.get('config'))[:600]}")
-    return "\n".join(lines)
+        acc = f"new incumbent {e.get('cid')}" if e.get("accepted") else \
+            f"incumbent kept (gate: {str(e.get('gate_reason'))[:300]})"
+        best = ", ".join(f"{cid}={v:+.4f}" if e.get("gate_every") else f"{cid}={v:.4f}"
+                         for cid, v in (e.get("best") or []) if v is not None)
+        head = [f"- round {e['gen']}: {acc}; {e.get('n', 0)} candidates"
+                + (f"; largest {'paired gate gains' if e.get('gate_every') else 'scores'} {best}" if best else "")]
+        rs = e.get("reference_screen")
+        if rs and (rs.get("n_items") or rs.get("accuracy") is not None):
+            size = (f" over {rs['n_items']} items x {rs.get('samples_per_item')} samples" if rs.get("n_items") else "")
+            head.append(f"  incumbent on that round's screen items: accuracy {rs.get('accuracy')}{size}, items by correct "
+                        f"samples {json.dumps(rs.get('correct_counts'))}, truncated {rs.get('truncation_rate')} "
+                        f"(screen_results(gen={e['gen']}))")
+        elif e.get("incumbent_score"):
+            head.append(f"  incumbent score on that round's items {e.get('incumbent_score')}")
+        rows = ["  " + json.dumps(r, ensure_ascii=False, default=str) for r in e.get("rows") or []]
+        if not read_tools:
+            rows += [f"  full config of {cid}: {json.dumps(cfg)[:2500]}" for cid, cfg in e.get("configs") or []]
+        blocks.append((e["gen"], head, rows))
+    if not blocks:
+        return ""
+    tail = [ARCHIVE_READ] if read_tools else []
+
+    def text(drop: int) -> str:
+        out = [ARCHIVE_HEAD]
+        for i, (gen, head, rows) in enumerate(blocks):
+            out += head + (rows if i >= drop else
+                           [f"  ({len(rows)} rows omitted for length" +
+                            (f"; search_history(gen={gen}) lists them)" if read_tools else ")")])
+        return "\n".join(out + tail)
+    drop = 0
+    while drop < len(blocks) - 1 and len(text(drop)) > max_chars:
+        drop += 1
+    return text(drop)

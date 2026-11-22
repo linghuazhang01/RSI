@@ -211,28 +211,99 @@ class WeightStore:
     def svd(self, short: str, k: int = 16):
         """Top-k singular triplets of W (U [out,k], S [k], V [in,k]); exact for small matrices,
         randomized (torch.svd_lowrank, 6 power iterations) otherwise; cached on disk per model."""
-        import torch
+        cache = None if self.cache_dir is None else self.cache_dir / f"svd_{self.fingerprint}" / f"{short}.k{k}.pt"
+        if cache is not None and cache.exists():
+            return _top_svd(None, k, cache)
+        return _top_svd(self.weight(short), k, cache)
 
-        cache = None
-        if self.cache_dir is not None:
-            cache = self.cache_dir / f"svd_{self.fingerprint}" / f"{short}.k{k}.pt"
-            if cache.exists():
-                d = torch.load(cache, map_location="cpu", weights_only=True)
-                return d["U"], d["S"], d["V"]
-        w = self.weight(short)
-        m = min(w.shape)
-        if m <= 2048 or k >= m // 4:
-            U, S, Vh = torch.linalg.svd(w, full_matrices=False)
-            U, S, V = U[:, :k], S[:k], Vh[:k].T
-        else:
-            torch.manual_seed(0)
-            U, S, V = torch.svd_lowrank(w, q=min(m, k + 16), niter=6)
-            U, S, V = U[:, :k], S[:k], V[:, :k]
-        U, S, V = U.float().cpu().contiguous(), S.float().cpu().contiguous(), V.float().cpu().contiguous()
-        if cache is not None:
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"U": U, "S": S, "V": V}, cache)
-        return U, S, V
+
+class OverlayStore:
+    """merge.mode adapter (2026-11-22): the CURRENT weights W_g = W_0 + B_C A_C of a model served as M_0 + the
+    cumulative adapter C, computed in fp32 on read (nothing is written or rounded to bf16). Duck-types WeightStore:
+    weight / tensor / norm / svd of a module C touches see W_0 + ΔW_C; every other tensor and all metadata
+    (model_dir, prefix, shapes, tensor_source) come from the base store. tensor_source of an overlaid tensor still
+    points at W_0 on disk: readers outside the process (tensor_compute) must take is_overlaid() tensors from tensor().
+    SVDs of overlaid modules are cached per module factor digest (cache_dir/svd_<base fp>_<digest>/)."""
+
+    def __init__(self, base: "WeightStore", lora):
+        self.base = base
+        self.lora = lora
+        self._norms = {}                         # W_g is not cached (the base store caches W_0); its norms are
+        self._mdig = {}
+        self.fingerprint = f"{base.fingerprint}+{lora.digest()}"
+
+    def __getattr__(self, name):                 # metadata and untouched tensors: the base store
+        if name in ("base", "lora", "__setstate__", "__getstate__"):
+            raise AttributeError(name)
+        return getattr(self.base, name)
+
+    def is_overlaid(self, name: str) -> bool:
+        short = linear_short(self.base._canon(name))
+        return short in self.lora.factors
+
+    def _digest(self, m: str) -> str:
+        if m not in self._mdig:
+            A, B = self.lora.factors[m]
+            h = hashlib.sha256()
+            h.update(A.contiguous().float().cpu().numpy().tobytes())
+            h.update(B.contiguous().float().cpu().numpy().tobytes())
+            self._mdig[m] = h.hexdigest()[:16]
+        return self._mdig[m]
+
+    def weight(self, short: str, *, device=None, dtype=None):
+        import torch
+        if short not in self.lora.factors:
+            return self.base.weight(short, device=device, dtype=dtype)
+        device = device or self.base.device
+        w0 = self.base.weight(short, device=device, dtype=torch.float32)
+        A, B = self.lora.factors[short]
+        return (w0 + B.to(device=device, dtype=torch.float32) @ A.to(device=device, dtype=torch.float32)).to(
+            dtype or torch.float32)
+
+    def tensor(self, name: str, *, device="cpu", dtype=None):
+        short = linear_short(self.base._canon(name))
+        if short in self.lora.factors:
+            return self.weight(short, device=device, dtype=dtype).clone()
+        return self.base.tensor(name, device=device, dtype=dtype)
+
+    def norm(self, short: str) -> float:
+        if short not in self.lora.factors:
+            return self.base.norm(short)
+        if short not in self._norms:             # check_lora reads it for every module of every candidate
+            self._norms[short] = float(self.weight(short).norm())
+        return self._norms[short]
+
+    def svd(self, short: str, k: int = 16):
+        if short not in self.lora.factors:
+            return self.base.svd(short, k)
+        return _top_svd(self.weight(short), k, None if self.base.cache_dir is None else
+                        self.base.cache_dir / f"svd_{self.base.fingerprint}_{self._digest(short)}" / f"{short}.k{k}.pt")
+
+
+def _top_svd(w, k: int, cache):
+    """Top-k singular triplets (U [out,k], S [k], V [in,k]) of w, cached at `cache` (a .pt path) when given."""
+    import torch
+    if cache is not None and cache.exists():
+        d = torch.load(cache, map_location="cpu", weights_only=True)
+        return d["U"], d["S"], d["V"]
+    m = min(w.shape)
+    if m <= 2048 or k >= m // 4:
+        U, S, Vh = torch.linalg.svd(w, full_matrices=False)
+        U, S, V = U[:, :k], S[:k], Vh[:k].T
+    else:
+        torch.manual_seed(0)
+        U, S, V = torch.svd_lowrank(w, q=min(m, k + 16), niter=6)
+        U, S, V = U[:, :k], S[:k], V[:, :k]
+    U, S, V = U.float().cpu().contiguous(), S.float().cpu().contiguous(), V.float().cpu().contiguous()
+    if cache is not None:
+        # several tool devices share this cache (2026-11-22): write a private file, then rename it into place
+        import os
+        import uuid
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_name(f".{cache.name}.{uuid.uuid4().hex}")
+        torch.save({"U": U, "S": S, "V": V}, tmp)
+        os.replace(tmp, cache)
+    return U, S, V
 
 
 _DTYPES = {"BF16": "bfloat16", "F16": "float16", "F32": "float32", "F64": "float64", "I64": "int64", "I32": "int32",

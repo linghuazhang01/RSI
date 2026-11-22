@@ -156,6 +156,42 @@ def method_mode(cfg: dict) -> str:
     return m
 
 
+MERGE_MODES = ("merge", "adapter")
+
+
+def merge_mode(cfg: dict) -> str:
+    """How an accepted LoRA becomes the next model (method.mode scratch; 2026-11-22). merge (code default) = merged
+    into the bf16 weights (a new checkpoint gen_XX/model, served as m{g+1}); adapter = never merged: M_g = M_0 + C_g,
+    C_g the rank-concatenation of every accepted LoRA (SVD re-compressed above merge.adapter_rank_budget), served as
+    one adapter on the M_0 server for the whole run. mode=edit is adapter-only (merge.mode ignored); mode=weights
+    cannot be an adapter. The key has no live default in base.yaml (paper_cfg is locked: older runs resume)."""
+    m = str((cfg.get("merge") or {}).get("mode") or "merge")
+    if m not in MERGE_MODES:
+        raise SystemExit(f"merge.mode must be one of {MERGE_MODES}, got {m!r}")
+    if m == "adapter" and method_mode(cfg) == "weights":
+        raise SystemExit("merge.mode adapter needs LoRA candidates: method.mode weights writes dense edits")
+    return m
+
+
+def adapter_rank_budget(cfg: dict) -> int:
+    """merge.mode adapter: max rank per module of the cumulative LoRA C_g (default 256)."""
+    return int((cfg.get("merge") or {}).get("adapter_rank_budget") or 256)
+
+
+def server_lora_rank(cfg: dict) -> int:
+    """--max-lora-rank of the main servers: lora.rank_cap; scratch + merge.mode adapter: padded(max(budget, rank_cap)),
+    since a candidate is served as C_g (+) delta truncated to the budget (compose_cumulative); vLLM tops out at 512."""
+    from lora_code.primitives.lora import padded_rank
+    cap = int((cfg.get("lora") or {}).get("rank_cap", 64))
+    if method_mode(cfg) == "scratch" and merge_mode(cfg) == "adapter":
+        need = max(adapter_rank_budget(cfg), cap)
+        r = padded_rank(need)
+        if r > 512:
+            raise SystemExit(f"merge.adapter_rank_budget / lora.rank_cap = {need} > 512 (vLLM's largest --max-lora-rank)")
+        return r
+    return cap
+
+
 def gate_policy(cfg: dict) -> tuple[str, str]:
     """(reference, fallback) of the gate: 'auto' resolves by method.mode (edit: raw / raw, scratch and weights:
     parent / keep)."""
@@ -248,4 +284,31 @@ def main_server_args(cfg: dict) -> list[str]:
     context length; it overrides a --max-model-len written in main_args; null keeps main_args as written).
     theta0_args are never changed."""
     from rsicore.editor import apply_context_tokens
-    return apply_context_tokens(list((cfg.get("server") or {}).get("main_args", []) or []), cfg)
+    args = apply_context_tokens(list((cfg.get("server") or {}).get("main_args", []) or []), cfg)
+    return replica_memory(args, cfg)
+
+
+def tools_on_replicas(cfg: dict) -> bool:
+    """gpu_layout.tools_on_replicas (2026-11-22): every main replica's GPU also holds an HF copy of the current model
+    and its own weight store, and editor session k runs its tools (svd / acts / regmean_preserve / train_loss on
+    HF) there, on the replica its editor talks to (k mod n), instead of all sessions queueing on the train GPU.
+    Never in method.mode weights (the main GPUs are candidate slots there)."""
+    return bool((cfg.get("gpu_layout") or {}).get("tools_on_replicas")) and method_mode(cfg) != "weights"
+
+
+def replica_memory(args: list, cfg: dict) -> list[str]:
+    """Main-replica vLLM args with --rsi-gpu-memory-gib = gpu_layout.replica_vllm_gib when tools_on_replicas (room
+    for the HF copy on the same card); the --gpu-memory-utilization fallback (used without nvidia-smi) is scaled by
+    the same ratio. Unchanged otherwise."""
+    from rsicore.servers import MEM_FLAG
+    args = [str(a) for a in args]
+    gib = (cfg.get("gpu_layout") or {}).get("replica_vllm_gib")
+    if not tools_on_replicas(cfg) or not gib or MEM_FLAG not in args:
+        return args
+    i = args.index(MEM_FLAG)
+    old = float(args[i + 1])
+    args[i + 1] = f"{float(gib):g}"
+    if "--gpu-memory-utilization" in args and old > 0:
+        j = args.index("--gpu-memory-utilization")
+        args[j + 1] = str(round(float(args[j + 1]) * float(gib) / old, 3))
+    return args
