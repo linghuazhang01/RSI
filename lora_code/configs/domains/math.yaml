@@ -1,2 +1,2 @@
-# Target: DAPO-Math-17K (dapo_math). Held-out: MATH-500, GSM8K test, AIME 24/25.
-# Sizes (n, gate_n, retention_n, ...) come from data/draw/paper_b.yaml; override here only what differs.
+# Domain math: train pool simple_math_pool (from DAPO-Math-17K), gate simple_math_eval, held-out simple_math_test.
+# Override here only what differs from base.yaml.

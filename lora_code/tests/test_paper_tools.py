@@ -21,7 +21,7 @@ MISSING = [m for m in ("torch", "safetensors", "yaml") if importlib.util.find_sp
 pytestmark = pytest.mark.skipif(bool(MISSING), reason=f"missing {MISSING}")
 
 DS = "simple_math_pool"
-SIMPLE = {"objective": "simple", "lora": {"rank_cap": 64, "norm_cap_tau": 0.1}, "weights": {"norm_cap_tau": 0.05},
+SIMPLE = {"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}, "weights": {"norm_cap_tau": 0.05},
           "search": {"threads": 8, "steps": 1, "charge_screens": False, "program_evaluate_calls": 0,
                      "screen_candidates": False, "gate_every_candidate": True, "top_full": 0},
           "tools": {"tensor_compute": True}, "editor": {"tool_rounds": 20, "explore": {"persistent": True}}}
@@ -61,13 +61,11 @@ def _call(ws, tool, **kw):
 
 
 def test_settings_and_tool_surface():
-    """The simple profile of base.yaml resolves to the FINAL flow; other objectives keep their tool surface."""
+    """base.yaml (the simple flow, folded 2026-11-22) resolves to the FINAL flow; the code defaults of the search
+    knobs (screen_candidates true, gate_every_candidate false) keep the screen / submit tool surface."""
     import yaml
-    from lora_code.common import deep_merge
     from lora_code.tools import search_settings, tools_for_mode
-    base = yaml.safe_load(open(REPO / "lora_code" / "configs" / "base.yaml"))
-    simple = deep_merge(base, base["objective_profiles"]["simple"])
-    simple["objective"] = "simple"
+    simple = yaml.safe_load(open(REPO / "lora_code" / "configs" / "base.yaml"))
     ss = search_settings(simple)
     assert (ss["threads"], ss["steps"], ss["max_candidates"]) == (8, 1, 8)
     assert not ss["screen_candidates"] and ss["gate_every_candidate"] and not ss["evaluate_tool"] and ss["pool"] == 0
@@ -79,11 +77,10 @@ def test_settings_and_tool_surface():
         t = tools_for_mode(mode, cfg=simple)
         assert new <= set(t) and "evaluate" not in t and "source='own'" in t["acts"]
         assert "vectors=None" in t["tensor_compute"] and "level='gate'" in t["compare"]
-    tg = deep_merge(base, base["objective_profiles"]["train_gate"])
-    tg["objective"] = "train_gate"
-    old = search_settings(tg)
+    knobs = dict(simple, search={}, tools={"paper_tools": False})        # code defaults of the search knobs
+    old = search_settings(knobs)
     assert old["screen_candidates"] and not old["gate_every_candidate"] and old["evaluate_tool"]
-    t = tools_for_mode("scratch", cfg=tg)
+    t = tools_for_mode("scratch", cfg=knobs)
     assert not new & set(t) and "evaluate" in t and "source=" not in t["acts"]
     off = tools_for_mode("scratch", cfg=dict(simple, tools={"paper_tools": False, "screen_results": False}))
     assert not new & set(off)
@@ -253,15 +250,14 @@ def test_prompts_gate_mode_and_context():
     cfg = json.loads(json.dumps(SIMPLE))
     cfg["decoding"] = {"screen": {"n": 4, "thinking": True}, "gate": {"n": 4, "thinking": True}}
     cfg["gate"] = {"min_gain": 0.01, "require_significant": True}
-    sysmsg = system_prompt(cfg, budget={"evaluate": 0, "gpu_seconds": 300}, mode="scratch", retention=False,
-                           gate_n=500)
+    sysmsg = system_prompt(cfg, budget={"evaluate": 0, "gpu_seconds": 300}, mode="scratch", gate_n=500)
     assert "there is no api.evaluate" in sysmsg and "evaluated ONCE on a fixed hidden set of 500 items" in sysmsg
     assert "LARGEST gain" in sysmsg and "- evaluate(" not in sysmsg and "api.evaluate draws" not in sysmsg
     assert "source='own'" in sysmsg and "api.project_out" in sysmsg and "api.load_edit(name='best')['lora']" in sysmsg
     assert "answered by YOU (the current model) 4 time(s)" in sysmsg and "this generation's screen ids" in sysmsg
     assert "up to 20 rounds" in sysmsg and "share ONE Python session" in sysmsg
     cfg["editor"]["tool_rounds"] = 7                      # the round count is configurable (prompt follows it)
-    assert "up to 7 rounds" in system_prompt(cfg, budget={"evaluate": 0, "gpu_seconds": 300}, retention=False)
+    assert "up to 7 rounds" in system_prompt(cfg, budget={"evaluate": 0, "gpu_seconds": 300})
     summ = {"n_items": 4, "samples_per_item": 4, "accuracy": 0.375, "correct_counts": {"0": 2, "2": 1, "4": 1},
             "truncation_rate": 0.0625, "truncated_thinking": 0, "failing": [{"id": "s/0", "gold": "0"}]}
     txt = screen_text(summ)

@@ -40,7 +40,7 @@ class _Ev:
         lo = self.reg.get(name)
         g, d = (lo.gain, lo.damage) if lo is not None else (0.0, 0.0)
         sc = round(g - d, 6)
-        return sc, {"score": sc, "target": {"vs_parent": {"delta": round(g, 6)}}, "retention": {},
+        return sc, {"score": sc, "target": {"vs_parent": {"delta": round(g, 6)}},
                     "lora_stats": lora_report, "cost": cost}
 
     def cached(self, name, level):
@@ -78,17 +78,17 @@ def test_tool_surface_per_mode(tmp_path):
         assert not (W_TOOLS & set(t))
         assert ("raw_lora" in t) == (mode == "edit")
         assert "edit=" not in t["evaluate"]
-    off = tools_for_mode("weights", retention=False, cfg={"tools": {"w_toward_original": False, "train_loss": False}})
+    off = tools_for_mode("weights", cfg={"tools": {"w_toward_original": False, "train_loss": False}})
     assert "w_toward_original" not in off and "train_loss" not in off and "regmean_preserve" not in off
     ws = _ws(tmp_path)
     names = set(ws.api.names())
     assert W_TOOLS <= names and "raw_lora" not in names
     sc = _ws(tmp_path / "s", mode="scratch")
     assert not (W_TOOLS & set(sc.api.names()))
-    # tensor tools (2026-11-21): every mode when enabled (objective simple by default), not a WEIGHT_TOOL; the
+    # tensor tools (2026-11-21): every mode when enabled (absent key: on, 2026-11-22), not a WEIGHT_TOOL; the
     # weights doc documents writes / caps / the edit arg
-    assert not {"tensors", "tensor_compute"} & names                   # this workspace's cfg has no objective
-    on = {"objective": "simple"}
+    assert {"tensors", "tensor_compute"} <= names                      # this workspace's cfg has no tools block
+    on = {"tools": {"tensor_compute": True}}
     w = tools_for_mode("weights", cfg=on)
     assert {"tensors", "tensor_compute"} <= set(w) and {"tensors", "tensor_compute"} <= set(tools_for_mode("scratch", cfg=on))
     assert "writes" in w["tensor_compute"] and "edit=None" in w["tensor_compute"] and "vector_cap_tau" in w["tensor_compute"]
@@ -326,14 +326,15 @@ def test_system_prompt_modes():
     b = {"evaluate": 4, "gpu_seconds": 10}
     pw = system_prompt(cfg, budget=b, mode="weights")
     ps = system_prompt(cfg, budget=b, mode="scratch")
-    pe = system_prompt(cfg, budget=b, mode="edit", e_task=True)
+    pe = system_prompt(cfg, budget=b, mode="edit")
     assert "w_scale_rows" in pw and '{"edit"' in pw and "- new_edit(" in pw and "0.03 per module" in pw
     assert "- raw_lora(" not in pw and "dW = B A per linear module" not in pw
     assert "w_scale_rows" not in ps and '{"edit"' not in ps and '{"lora": handle, "note"' in ps
     assert "dW = B A per linear module" in ps and "rank <= 64" in ps
-    assert "w_scale" not in pe and '{"lora"' in pe
-    assert "{" not in system_prompt(cfg, budget=b, mode="weights", e_task=True).split("Tools")[0].replace(
-        '{"edit": handle, "note": "..."}', "").replace('{"edit": None, "note": "..."}', "")
+    assert "w_scale" not in pe and '{"lora"' in pe and "- raw_lora(" in pe
+    plain = system_prompt(dict(cfg, tools={"paper_tools": False, "tensor_compute": False}), budget=b, mode="weights")
+    assert "{" not in plain.split("Tools")[0].replace('{"edit": handle, "note": "..."}', "").replace(
+        '{"edit": None, "note": "..."}', "")                          # no unfilled placeholder
 
 
 def test_summarize_candidate_edit():

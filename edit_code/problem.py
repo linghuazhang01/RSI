@@ -40,7 +40,7 @@ from .quant.spec import ModelSpec, spec_from_checkpoint, synthetic_spec
 
 DATASET_DOMAIN = {"dapo_math": "math", "taco_verified": "code", "triviaqa_train": "knowledge",
                   "ifeval_train": "instruction_following", "sealtool_train": "tool_calling"}
-# objective simple (2026-11-21): simple_<domain>_{train,pool,eval,test} belong to their domain
+# simple_<domain>_{train,pool,eval,test} (the run's data, 2026-11-21) belong to their domain
 DATASET_DOMAIN.update({f"simple_{d}_{r}": d for d in ("math", "code", "knowledge", "instruction_following",
                                                        "tool_calling") for r in ("train", "pool", "eval", "test")})
 
@@ -63,8 +63,7 @@ def _mean_per_id(records: list[dict]) -> tuple[float | None, dict, int]:
 class QuantProblem:
     def __init__(self, rc, cfg: dict, *, tag: str, gen: int, out_dir: Path, prep_dir: Path,
                  source_dir: Path | None, source_state: dict | None, budget_gib: float,
-                 datasets: list[str], data: dict, kl_texts: list[tuple[str, str]], kl_heldout: list[tuple[str, str]] = (),
-                 refs_dir: Path, noise: dict | None = None, gate_baseline: dict | None = None,
+                 datasets: list[str], data: dict, kl_texts: list[tuple[str, str]], refs_dir: Path, noise: dict | None = None, gate_baseline: dict | None = None,
                  eval_budget: int = 24, show_examples: int = 2, incumbent: dict | None = None, log=print,
                  prep_gpus: list[int] | None = None, gate_datasets: list[str] | None = None):
         from rsicore import evaluate as _ev  # noqa: F401  (fail early if rsicore is missing)
@@ -75,20 +74,19 @@ class QuantProblem:
         self.source_dir = Path(source_dir) if source_dir else None
         self.source_state = source_state
         self.budget_gib = float(budget_gib)
-        # data roles (2026-11-21, rsicore.draws.roles): datasets = the train role (screen / full items, feedback,
-        # compare), gate_datasets = the gate role (gate stage; default: the same datasets)
+        # data roles (rsicore.draws): datasets = the train role simple_<d>_pool (screen / full items, feedback,
+        # compare), gate_datasets = the gate role simple_<d>_eval (gate stage; default: the same datasets)
         self.datasets = list(datasets)
         self.gate_datasets = list(gate_datasets) if gate_datasets else list(self.datasets)
         self.data = data                                  # {dataset: {"screen": ids, "signal": ids}}
         self.kl_texts = list(kl_texts)                    # [(domain, text)]
-        self.kl_heldout = list(kl_heldout)
         self.noise = noise or {}
         self.gate_baseline = gate_baseline or {}
         # incumbent = best accepted quantization so far: {"gen", "cid", "config", "gate": {ds: {"score", "records"}}}
         self.incumbent = incumbent
         self.incumbent_scores: dict = {}                  # {"screen": x, "full": y} on this problem's items
         self.eval_budget = int(eval_budget)
-        # search.screen_candidates false (2026-11-21, objective simple): candidates are not screened; the editor sees
+        # search.screen_candidates false (2026-11-21, the base.yaml default): candidates are not screened; the editor sees
         # the incumbent's screen run through screen_results / screen_output (tools.make_tool_api) instead of compare
         self.screen_tools = not bool((cfg.get("search") or {}).get("screen_candidates", True))
         self.show_examples = int(show_examples)
@@ -107,8 +105,8 @@ class QuantProblem:
         self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
         self.prep_gpus = list(prep_gpus) if prep_gpus else None   # generation-0 prep on these GPUs (one worker each)
         from rsicore.draws import is_eval_set
-        # an eval-set train role (objective eval_overfit, or data_roles.train = an eval set): the editor may see
-        # every item, so feedback examples also show the reference answer
+        # an eval-set train role (simple_<d>_pool is one): the editor may see every item, so feedback examples
+        # also show the reference answer
         self._eval_mode = any(is_eval_set(ds) for ds in self.datasets)
         self._pool: queue.Queue = queue.Queue()
         for i in range(len(self.slots)):
@@ -568,7 +566,8 @@ class QuantProblem:
             logs = Path(self.rc.run_dir) / "logs"
             if self.mock:
                 M.register(self.registry, name, art["mock_quality"])
-                # no --tasks: candidates are also scored on held-out tasks (E_t); the index is cached
+                # no --tasks: the mock server's default index (the training sets; simple_* prompts resolve to
+                # them); the index is cached
                 with VLLMServer("mock-" + name, name, gpus, mock=True, mock_registry=self.registry,
                                 seed=self.rc.seed, log_dir=logs) as srv:
                     yield srv
@@ -643,8 +642,8 @@ class QuantProblem:
         step = len(self.kl_texts) / int(n)
         return [self.kl_texts[int(i * step)] for i in range(int(n))]
 
-    def _kl(self, srv, art: dict, stage: str, heldout: bool = False) -> dict | None:
-        texts = self.kl_heldout if heldout else self.kl_eval_texts()
+    def _kl(self, srv, art: dict, stage: str) -> dict | None:
+        texts = self.kl_eval_texts()
         if not texts:
             return None
         if self.mock:
@@ -658,7 +657,7 @@ class QuantProblem:
                                for i, (d, _) in enumerate(texts)]
             return out
         from rsicore.evaluate import token_kl  # pragma: no cover - GPU path
-        ref = self.refs_dir / ("kl_ref_heldout.jsonl" if heldout else "kl_ref.jsonl")
+        ref = self.refs_dir / "kl_ref.jsonl"
         r = token_kl(ref, srv.endpoint, srv.served_name, [t for _, t in texts], top_k=self.cfg["kl"]["top_k"])
         out = {"overall": round(r["mean"], 5), "token_mean": round(r["token_mean"], 5),
                "per_text": [None if v is None else round(v, 6) for v in r["per_text"]]}
@@ -704,9 +703,9 @@ class QuantProblem:
         name = f"{self.rc.run_id}-{self.tag}-{art['config_hash']}"
         edir = self.out_dir / "evals" / f"{cid}" / stage
         probes, regressions, scored = {}, [], {}
-        # the same datasets AND items as an existing screen evaluation of this config (objective eval_overfit: every
-        # stage is the whole eval set; objective simple: full = screen): reuse its records instead of scoring them
-        # again. A gate on another dataset than the train role (data_roles) is always scored, and so is a stage with
+        # the same datasets AND items as an existing screen evaluation of this config (full = screen): reuse its
+        # records instead of scoring them again. The gate (simple_<d>_eval, another dataset than the train role) is
+        # always scored, and so is a stage with
         # another decoding than the screen's (2026-11-21: e.g. a gate with n 4 never reuses n 1 screen records).
         dsets = self.stage_datasets(stage)
         dec = self.decoding.get(stage)
@@ -778,7 +777,7 @@ class QuantProblem:
             klw = float(self.cfg["search"].get("kl_weight", 0.0))
             if reuse:
                 kl = (scr.get("feedback") or {}).get("kl") if stage in ("screen", "full") else None
-            else:   # kl_weight 0 (objective eval_overfit): the score does not use KL, so it is not computed
+            else:   # kl_weight 0 (the default): the score does not use KL, so it is not computed
                 kl = self._kl(srv, art, stage) if (stage in ("screen", "full") and klw > 0) else None
         if kl and "per_text" in kl:                # kept on disk, not in the editor's feedback
             kl = dict(kl)
@@ -891,21 +890,14 @@ class QuantProblem:
 
     def compute_refs(self, endpoint: str, served_name: str) -> None:
         """M_0 (served as the editor) is only the KL reference: cache its prompt logprobs on the KL texts
-        (real mode). It is not scored on the signal items (candidates are compared with the incumbent).
-        kl_ref.jsonl only when the score uses KL (search.kl_weight > 0); kl_ref_heldout.jsonl whenever there are
-        held-out KL texts (E_t's heldout_kl reads it whatever kl_weight is; 2026-11-22: objective simple has
-        kl_weight 0)."""
+        (real mode), kl_ref.jsonl, only when the score uses KL (search.kl_weight > 0). It is not scored on the
+        signal items (candidates are compared with the incumbent)."""
         klw = float(self.cfg["search"].get("kl_weight", 0.0) or 0.0)
-        if self.mock or not ((self.kl_texts and klw > 0) or self.kl_heldout):
+        if self.mock or not (self.kl_texts and klw > 0):  # no KL in the score: no reference
             return
         from rsicore.evaluate import reference_logprobs  # pragma: no cover - GPU path
-        k = self.cfg["kl"]["top_k"]
-        if self.kl_texts and klw > 0:                     # no KL in the score: no reference
-            reference_logprobs(endpoint, served_name, [t for _, t in self.kl_eval_texts()],
-                               self.refs_dir / "kl_ref.jsonl", k)
-        if self.kl_heldout:
-            reference_logprobs(endpoint, served_name, [t for _, t in self.kl_heldout],
-                               self.refs_dir / "kl_ref_heldout.jsonl", k)
+        reference_logprobs(endpoint, served_name, [t for _, t in self.kl_eval_texts()],
+                           self.refs_dir / "kl_ref.jsonl", self.cfg["kl"]["top_k"])
 
     def evaluate_incumbent(self, stages=("screen", "full")) -> dict:
         """Score the incumbent on this problem's items (uncharged; cid 'incumbent'): the reference of every
@@ -1040,12 +1032,6 @@ class QuantProblem:
                 "ci": (next(iter(cis.values())) if len(cis) == 1 else cis) or None,
                 "broken": len(broken), "fixed": len(fixed), "broken_ids": broken[:50], "fixed_ids": fixed[:50],
                 "bytes_gib": art.get("bytes_gib")}
-
-    def heldout_kl(self, art: dict) -> dict | None:
-        if not self.kl_heldout:
-            return None
-        with self.serve(art, f"{self.rc.run_id}-{self.tag}-{art['config_hash']}-hk") as srv:
-            return self._kl(srv, art, "full", heldout=True)
 
 
 # ---------------------------------------------------------------------------------- data helpers

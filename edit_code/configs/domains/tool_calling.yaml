@@ -1,4 +1,3 @@
-# Paper A, single domain: signal, screen and gate use only this domain's training set
-# (rsicore.draws.DOMAIN_TRAIN["tool_calling"]); held-out evaluation still covers all five domains.
-# KL / calibration texts come from all five domains (kl.domains: all) unless overridden here.
+# Paper A, one domain: screen / KL texts from simple_tool_calling_pool, gate simple_tool_calling_eval, held-out simple_tool_calling_test
+# (rsicore.draws, rsicore.heldout).
 domain: tool_calling

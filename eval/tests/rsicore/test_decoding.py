@@ -61,7 +61,9 @@ class DecodingUnitTest(unittest.TestCase):
                   "heldout.decoding.thinking=true", "heldout.decoding.max_tokens=16384")
         self.assertEqual(rc.paper_cfg["decoding"]["gate"]["seed"], 9)
         self.assertEqual(config.stage_decoding(rc.paper_cfg, "gate", rc.seed)["n"], 4)
-        self.assertIsNone(config.stage_decoding(rc.paper_cfg, "screen", rc.seed))
+        # (2026-11-22) the simple decoding is base.yaml's own now: screen keeps it, its null seed becomes --seed
+        self.assertEqual(config.stage_decoding(rc.paper_cfg, "screen", rc.seed)["seed"], 9)
+        self.assertIsNone(config.stage_decoding(load("decoding.screen=null").paper_cfg, "screen", 9))
         self.assertEqual(rc.paper_cfg["heldout"]["decoding"]["seed"], 9)
         for bad in ("decoding.final={n: 2}", "decoding.gate={min_p: 0.1}", "heldout.decoding.foo=1"):
             with self.assertRaises(SystemExit, msg=bad):

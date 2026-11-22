@@ -320,7 +320,7 @@ def main(api):
 """
 
 
-def mock_program(thread: int, step: int, task: str = "main", gen: int = 0) -> str:
+def mock_program(thread: int, step: int, gen: int = 0) -> str:
     """Varies with (thread, step, gen) so later rounds try configs earlier rounds did not."""
     strategies = ["refine", "solver", "refine", "greedy"]
     strategy = strategies[(thread + gen) % len(strategies)]
@@ -336,7 +336,7 @@ def mock_program(thread: int, step: int, task: str = "main", gen: int = 0) -> st
         maybe_eval = ('if "evaluate" in tools:\n        fb = api.evaluate(config=cfg_of(choice))\n'
                       '        print("probe evaluate:", fb.get("score"))')
     elif strategy == "greedy" and step == 0 and thread >= 2:
-        # 2026-11-21: the k x 1 layout (objective simple; never reached by the 2-thread mocks): evaluate, the same
+        # 2026-11-21: the k x 1 layout with api.evaluate (never reached by the default mock): evaluate, the same
         # config again (free with free screens: cached) and a second config (over a per-program cap of 1)
         maybe_eval = PROBE_EVAL
     return PROGRAM_TEMPLATE.format(strategy=strategy, margin=margin, protect=protect, quantizer=quantizer,
@@ -353,9 +353,8 @@ def mock_policy(history: list[dict]) -> str:
             break
     mt = _MARK.search(last)
     thread, step = (int(mt.group(1)), int(mt.group(2))) if mt else (0, 0)
-    task = (mt.group(3) if mt and mt.group(3) else "main")
     gen = int(mt.group(4)) if mt and mt.group(4) else 0
-    return mock_program(thread, step, task, gen)
+    return mock_program(thread, step, gen)
 
 
 def save_state(path: Path, state: dict) -> None:

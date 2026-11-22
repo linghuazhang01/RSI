@@ -60,7 +60,7 @@ train / eval / test 文件的 `split_pool` 改写为 `train` / `eval` / `test`�
   与前几代可以重叠）；train = pool − eval − test − 本代 screen；kl = train 中用种子 `<seed>:simple_kl:<domain>:<g>` 抽 400 道。
   写在运行目录的 `draws/gen_XX/ids/simple_<domain>_pool.<role>.json`。
 - `simple_<domain>_eval`：gate，每代都是全部 500 道。
-- `simple_<domain>_test`：held-out 报告（`data_roles.eval: test`）。
+- `simple_<domain>_test`：held-out 报告（固定，`rsicore.heldout.heldout_domains`；`data_roles` 已于 2026-11-22 删除）。
 - `simple_<domain>_train`：仍然注册（兼容旧运行），新的 simple 配置不用它。
 
 ## 各领域数量

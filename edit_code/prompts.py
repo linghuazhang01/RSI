@@ -13,7 +13,7 @@ session k of N working independently this round and should use search_history / 
 different from earlier rounds; the "improve on the best candidate" line is dropped while nothing of this round is
 visible. With the old settings (charged screens, several steps) the text is unchanged.
 
-Gate per candidate (2026-11-21, objective simple: search.screen_candidates false, gate_every_candidate true,
+Gate per candidate (2026-11-21, the base.yaml defaults: search.screen_candidates false, gate_every_candidate true,
 program_evaluate_calls 0): no api.evaluate anywhere (tool, docs and prompt text removed); the editor sees the
 incumbent's (latest model's) answers to this round's screen items (summary in the context, full data through
 screen_results / screen_output); every returned config gets ONE gate evaluation and later steps / rounds see its gate
@@ -129,7 +129,7 @@ def _cap_text(per_program) -> str:
 
 
 def gate_flow(search: dict | None) -> bool:
-    """search_settings with one gate evaluation per candidate and no candidate screen (objective simple)."""
+    """search_settings with one gate evaluation per candidate and no candidate screen (the base.yaml default)."""
     return bool(search) and bool(search.get("gate_every_candidate")) and not search.get("screen_candidates", True)
 
 
@@ -355,7 +355,7 @@ def candidate_table(history, domains: list[str]) -> str:
     return "\n".join(lines)
 
 
-def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str = "", search: dict | None = None,
+def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict | None = None,
                         history_tool: bool = False):
     """Returns render_context(history, thread) -> str for rsicore.search.inner_search. search: search_settings
     (2026-11-21; None = the old text); history_tool: the editor has the search_history chat tool."""
@@ -387,7 +387,7 @@ def make_render_context(problem, cfg: dict, *, task: str = "main", archive: str 
                        f"{_cap_text(search.get('per_program'))} (a config already evaluated this round is free).")
         else:
             budget += f"Evaluates left this round: {problem.evals_left} (incl. api.evaluate calls)."
-        parts = [f"[thread={thread} step={step} task={task} gen={problem.gen}]", budget]
+        parts = [f"[thread={thread} step={step} task=main gen={problem.gen}]", budget]   # (marker parsed by mock._MARK)
         if one_step and step == 0 and threads > 1:
             src = "search_history and the archive of earlier rounds" if history_tool else "the archive of earlier rounds"
             parts.append(f"You are session {thread + 1} of {threads} in this round. The other sessions work "

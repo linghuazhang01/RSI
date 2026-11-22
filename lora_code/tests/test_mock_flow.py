@@ -6,12 +6,10 @@
   run through rsicore.sandbox.run_program, checks).
 - test_mode_tool_surface / test_raw_recipe: method.mode (scratch default / weights / edit) tool sets, the raw LoRA handle,
   no training / gradient tool in any mode (2026-11-20), and the raw recipe (size) resolution.
-- test_mock_run_end_to_end: lora_code/run.py --mock (default mode=edit) for 1 generation (reduced branches)
-  in a temp runs dir, then a second invocation of the same run-id must skip everything.
-- test_mock_run_scratch: mode=scratch for 1 generation (gate vs the parent, fallback keep, nothing trained,
-  no sampled training answers).
-- test_mock_data_roles_*: data_roles (2026-11-21): a gate dataset different from the train dataset (eval-set gate
-  next to dapo_math draws; eval-set train next to dapo_math's gate split).
+- test_mock_run_end_to_end: lora_code/run.py --mock (mode=edit) for 1 generation in a temp runs dir (only the
+  run's domain: simple_math_pool / simple_math_eval / simple_math_test; screen size, raw size, fixed noise band),
+  then a second invocation of the same run-id must skip everything.
+- test_mock_simple_flow: the default (simple) flow on 4 GPUs, scratch; weights / edit chain / merge.mode adapter runs.
 - editor tool loop (2026-11-21): test_explore_api_surface_and_budgets (Workspace.explore_api: no evaluate / raw_lora /
   GPU tools, no generation budget spent, handles freed, gpu_tools budget), test_editor_context_tokens_sets_main_max_model_len
   (editor.context_tokens -> main servers' --max-model-len), test_mock_tool_loop_scratch (one run_python round per
@@ -146,7 +144,7 @@ def test_compare_and_train_loss_tools(tmp_path):
     r = ws.api.call("train_loss", {"lora": h, "n": 8})
     assert r["n"] == 8 and r["parent_loss"] == 1.2 and abs(r["delta"] - (r["loss"] - 1.2)) < 1e-9
     assert ws.spent["gpu_seconds"] > 0
-    off = tools_for_mode("scratch", retention=False, cfg={"tools": {"compare": False, "train_loss": False}})
+    off = tools_for_mode("scratch", cfg={"tools": {"compare": False, "train_loss": False}})
     assert "compare" not in off and "train_loss" not in off
 
 
@@ -215,30 +213,55 @@ def test_mock_program_through_sandbox(tmp_path):
 
 
 def test_mock_run_end_to_end(tmp_path):
+    """mode=edit, 1 generation, the one (simple) flow: the raw LoRA is trained in generation 0 (raw.n_train), every
+    candidate is gated during the search (reference = the current model, so the summary says 'parent'), only the
+    run's domain is drawn / scored (simple.screen_n screen items, the simple_math_eval gate, the simple_math_test
+    held-out), baseline.noise_fixed is used as is; no E_t / theta0 / retention anywhere; a rerun skips everything."""
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--runs-dir", str(tmp_path), "--run-id", "B_test_mock", "--set", "scope=all",
-           "--set", "e_t.branches=[parent,llm]", "--set", "method.mode=edit"]
+           "--runs-dir", str(tmp_path), "--run-id", "B_test_mock", "--set", "method.mode=edit",
+           "--set", "simple.screen_n=30", "--set", "raw.n_train=40", "--set", "baseline.noise_fixed=0.05",
+           "--set", "heldout.limit=4"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    assert "roles {'main': [0], 'train': [1]}" in r.stdout and "theta0" not in r.stdout
     run = tmp_path / "B_test_mock"
     state = json.loads((run / "state.json").read_text())
-    for k in ("baseline/gate", "baseline/heldout", "e_ref", "gen00/raw", "gen00/search", "gen00/gate",
-              "gen00/merge", "gen00/nonllm", "gen00/e_t/parent", "gen00/e_t/raw", "gen00/heldout", "gen00/summary"):
+    for k in ("baseline/gate", "baseline/heldout", "gen00/raw", "gen00/search", "gen00/gate",
+              "gen00/merge", "gen00/nonllm", "gen00/heldout", "gen00/summary"):
         assert k in state, k
-    assert not any(k.endswith("/sft") or "/e_t/sft" in k for k in state)   # no SFT baseline anywhere
+    assert not any(k == "e_ref" or "/e_t/" in k or k.endswith("/sft") for k in state)
+    assert not (run / "e_ref").exists() and not (run / "gen_00" / "e_t").exists()
+    assert state["gen00/raw"]["n_train"] == 40
+    assert len(json.loads((run / "draws" / "gen_00" / "ids" / "simple_math_pool.screen.json").read_text())) == 30
+    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
+    assert list(gate) == ["simple_math_eval"] and gate["simple_math_eval"]["n"] == 30          # gate_limit 30 (mock)
+    assert gate["simple_math_eval"]["noise_band"] == 0.05 and gate["simple_math_eval"]["noise_source"].startswith("fixed")
+    assert not (run / "baseline" / "noise").exists()
     summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
     assert summ["search"]["candidates"] >= 1 and summ["accepted"]["source"] in ("llm", "raw_fallback", "keep")
-    assert summ["method"] == "edit" and summ["gate_reference"] == "raw" and summ["raw"]["source"] == "trained"
-    assert {"parent", "raw"} <= set(summ["E"]) and summ["E_ref"]["raw_ref"] is not None
-    assert summ["dE_reference_branch"] == "raw" and "sft" not in summ and "dE_train" not in summ
+    assert summ["method"] == "edit" and summ["gate_reference"] == "parent" and summ["raw"]["source"] == "trained"
+    assert summ["data_roles"] == {"train": "simple_math_pool", "gate": "simple_math_eval"}
+    for gone in ("E", "E_ref", "dE_write", "dE_nonLLM", "dE_reference_branch", "scope", "retention_domains", "sft"):
+        assert gone not in summ, gone
+    assert set(summ["heldout"]) == {"simple_math_test"}
+    assert set(summ["accepted"].get("gate_scores") or {"simple_math_eval": 0}) == {"simple_math_eval"}
+    evals = {p.name for p in (run / "gen_00" / "evals").glob("*/*/*.json")}
+    assert evals <= {"simple_math_pool.json", "simple_math_eval.json"}, evals
+    raw = json.loads((run / "gen_00" / "baselines" / "raw.json").read_text())
+    assert not {"worst_retention_delta", "kl"} & set(raw["points"]["screen"])
+    non = json.loads((run / "gen_00" / "baselines" / "nonllm.json").read_text())
+    for p in (non.get("random_search") or {}).get("points") or []:
+        assert "regmean" not in p and "worst_retention_delta" not in p
     assert not (run / "gen_00" / "baselines" / "sft.json").exists()
-    assert "frontiers" not in json.loads((run / "gen_00" / "baselines" / "nonllm.json").read_text())
     assert (run / "gen_00" / "model.json").exists() and (run / "gen_00" / "diagnostics.json").exists()
     reg = json.loads((run / "mock_registry.json").read_text())
     model = json.loads((run / "gen_00" / "model.json").read_text())   # mode=edit: M_1 = M_0 + a LoRA, no merge
-    assert "m0" in reg and (model["lora"] is None or model["lora"] in reg) and "m1" not in reg
+    assert "m0" in reg and "theta0" not in reg and (model["lora"] is None or model["lora"] in reg) and "m1" not in reg
+    prompt = (run / "gen_00" / "editor" / "thread_0.jsonl").read_text()
+    assert "Single-domain run" in prompt and "- regmean_preserve(" not in prompt
+    assert "The gate accepts a candidate on simple_math_eval" in prompt
     n_cand = len((run / "gen_00" / "candidates.jsonl").read_text().splitlines())
     t0 = time.time()
     r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -246,113 +269,6 @@ def test_mock_run_end_to_end(tmp_path):
     assert json.loads((run / "state.json").read_text()).keys() == state.keys()
     assert len((run / "gen_00" / "candidates.jsonl").read_text().splitlines()) == n_cand
     assert time.time() - t0 < 60          # resumed run: everything skipped, no server started
-
-
-def test_mock_run_scratch(tmp_path):
-    py = REPO / "eval" / ".venv" / "bin" / "python"
-    py = str(py) if py.exists() else sys.executable
-    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--runs-dir", str(tmp_path), "--run-id", "B_test_scratch", "--set", "method.mode=scratch",
-           "--set", "scope=all", "--set", "e_t.branches=[parent,llm]"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
-    run = tmp_path / "B_test_scratch"
-    state = json.loads((run / "state.json").read_text())
-    assert "gen00/raw" not in state and "gen00/gate" in state
-    assert not any(k.endswith("/sft") or "/e_t/sft" in k or "/e_t/raw" in k for k in state)
-    assert not (run / "gen_00" / "train_samples").exists()
-    assert not (run / "gen_00" / "baselines" / "sft.json").exists()
-    assert "raw" not in json.loads((run / "e_ref" / "result.json").read_text())   # E task: nothing trained
-    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
-    assert summ["method"] == "scratch" and summ["gate_reference"] == "parent"
-    assert summ["accepted"]["source"] in ("llm", "keep")          # never a raw fallback
-    assert summ["dE_reference_branch"] == "parent"
-    # only candidates that beat the current model on the signal items reach the gate; paired-CI gate
-    cands = {c["cid"]: c for c in (json.loads(x) for x in (run / "gen_00" / "candidates.jsonl").read_text().splitlines())}
-    gate = json.loads((run / "gen_00" / "gate.json").read_text())
-    for s in gate["submissions"]:
-        assert cands[s["cid"]]["score"] > 0
-        assert "paired_gain" in s["info"] and "paired_ci" in s["info"]
-    if summ["accepted"]["source"] == "keep":                          # 2026-11-21: nothing accepted -> control skipped
-        assert summ["nonllm"]["kind"] is None and "skip_if_rejected" in summ["nonllm"]["skipped"]
-    else:
-        assert summ["nonllm"]["kind"] == "random_construct_search"
-    assert all(k in ("pure_construct", "construct+ops", "keep", "error", "none") for k in summ["search"]["strategies"])
-    assert (run / "gen_00" / "parent_gate.json").exists()
-    # E_t editor runs the tool loop too (run_python on the E task workspace's exploration api)
-    for b in ("parent", "llm"):
-        tr = run / "gen_00" / "e_t" / b / "editor" / "thread_0.jsonl"
-        if tr.exists():
-            lines = [json.loads(x) for x in tr.read_text().splitlines() if x.strip()]
-            assert [x for x in lines if x.get("role") == "tool" and x.get("ok")], b
-            assert list((run / "gen_00" / "e_t" / b / "explore").glob("*/r01_0/stdout.txt")), b
-    assert (run / "gen_00" / "e_t" / "parent" / "editor" / "thread_0.jsonl").exists()
-
-
-def test_mock_run_single_domain(tmp_path):
-    """scope=single: only the target dataset is evaluated / gated, held-out only on the target domain."""
-    py = REPO / "eval" / ".venv" / "bin" / "python"
-    py = str(py) if py.exists() else sys.executable
-    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--runs-dir", str(tmp_path), "--run-id", "B_test_single"]   # scope single is the default
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
-    run = tmp_path / "B_test_single"
-    state = json.loads((run / "state.json").read_text())
-    assert "e_ref" not in state and not any("/e_t/" in k for k in state)
-    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
-    assert list(gate) == ["dapo_math"]
-    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
-    assert summ["scope"] == "single" and summ["retention_domains"] == []
-    assert set(summ["heldout"]) <= {"math500", "gsm8k", "aime24", "aime25"} and summ["heldout"]
-    assert set((summ["accepted"].get("gate_scores") or {"dapo_math": 0})) == {"dapo_math"}
-    evals = {p.name for p in (run / "gen_00" / "evals").glob("*/*/*.json")}
-    assert evals <= {"dapo_math.json"}, evals
-    prompt = (run / "gen_00" / "editor" / "thread_0.jsonl").read_text()
-    assert "Single-domain run" in prompt and "- regmean_preserve(" not in prompt
-
-
-def test_mock_scratch_four_gpus(tmp_path):
-    """4 GPUs (2026-11-20): main = 3 replicas + train 1; every scoring job split over the replicas, held-out tasks
-    in parallel, gate submissions at once."""
-    py = REPO / "eval" / ".venv" / "bin" / "python"
-    py = str(py) if py.exists() else sys.executable
-    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--gpus", "0,1,2,3", "--runs-dir", str(tmp_path), "--run-id", "B_4gpu", "--set", "method.mode=scratch",
-           "--set", "hardware=h20"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
-    assert "roles {'main': [0, 1, 2], 'train': [3]}" in r.stdout
-    run = tmp_path / "B_4gpu"
-    assert len(list((run / "baseline" / "gate" / "dapo_math").glob("_part*"))) == 3
-    assert len(list((run / "gen_00" / "evals" / "__parent__" / "screen" / "dapo_math_raw").glob("_part*"))) == 3
-    # held-out tasks in parallel: gen 0's own run, or (gate kept the model, 2026-11-21: gen 0 reuses the baseline's
-    # held-out) the baseline's
-    acc = json.loads((run / "gen_00" / "accepted.json").read_text())
-    hd = run / ("baseline" if acc.get("source") == "keep" else "gen_00") / "heldout" / "_par"
-    assert {p.name for p in hd.iterdir()} == {"math500", "gsm8k", "aime24", "aime25"}
-    assert json.loads((run / "summary.json").read_text())["gens"]["0"]["search"]["candidates"] >= 1
-
-
-def test_mock_eval_overfit_scratch(tmp_path):
-    """objective eval_overfit + scratch: target = math_eval (MATH-500 + GSM8K test); train / signal / gate are all of
-    it (gold answers visible to the editor's tools); no draws; run id _evalfit."""
-    py = REPO / "eval" / ".venv" / "bin" / "python"
-    py = str(py) if py.exists() else sys.executable
-    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--runs-dir", str(tmp_path), "--set", "method.mode=scratch", "--set", "objective=eval_overfit",
-           "--set", "heldout.limit=2"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
-    run = tmp_path / "B_math_s42_single_evalfit_mock"
-    assert run.exists() and not (run / "draws").exists()
-    td = json.loads((run / "gen_00" / "train_data.json").read_text())
-    assert len(td) == 1819 and all(v["target"] for v in td.values())                 # every eval item, gold visible
-    assert list(json.loads((run / "baseline" / "gate_scores.json").read_text())) == ["math_eval"]
-    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
-    assert summ["accepted"]["source"] in ("llm", "keep")
-    assert set(json.loads((run / "baseline" / "heldout.json").read_text())) == {"math_eval"}   # same 1819 items
-    assert set(summ["heldout"]) == {"math_eval"}
 
 
 def _run_b(tmp_path, *sets):
@@ -365,50 +281,6 @@ def _run_b(tmp_path, *sets):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     return r
-
-
-def test_mock_data_roles_eval_set_gate(tmp_path):
-    """data_roles (2026-11-21): train = dapo_math draws, gate = all of math500_eval, held-out = math500 alone."""
-    _run_b(tmp_path, "method.mode=scratch", "data_roles.gate=math500", "data_roles.eval=math500")
-    run = tmp_path / "B_math_s42_single_gate-math500_mock"
-    assert run.exists() and (run / "draws" / "gen_00" / "ids" / "dapo_math.train.json").exists()
-    train_ids = json.loads((run / "draws" / "gen_00" / "ids" / "dapo_math.train.json").read_text())
-    td = json.loads((run / "gen_00" / "train_data.json").read_text())
-    assert sorted(td) == sorted(train_ids)                                        # the editor works on dapo_math
-    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
-    assert list(gate) == ["math500_eval"] and gate["math500_eval"]["n"] == 30     # gate_limit 30 in mock
-    assert set(json.loads((run / "baseline" / "heldout.json").read_text())) == {"math500"}
-    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
-    assert summ["data_roles"] == {"train": "dapo_math", "gate": "math500_eval"}
-    assert set(summ["heldout"]) == {"math500"} and summ["accepted"]["source"] in ("llm", "keep")
-    assert set(summ["accepted"].get("gate_scores") or {"math500_eval": 0}) == {"math500_eval"}
-    assert set(json.loads((run / "gen_00" / "parent_gate.json").read_text())) == {"math500_eval"}
-    evals = run / "gen_00" / "evals"
-    assert {p.name for p in evals.glob("*/screen/*.json")} <= {"dapo_math.json"}
-    assert {p.name for p in evals.glob("*/gate/*.json")} <= {"math500_eval.json"}
-    for s in json.loads((run / "gen_00" / "gate.json").read_text())["submissions"]:
-        assert set(s["info"]["scores"]) == {"math500_eval"} and "paired_gain" in s["info"]
-    prompt = (run / "gen_00" / "editor" / "thread_0.jsonl").read_text()
-    assert "The gate accepts a candidate on math500_eval" in prompt
-
-
-def test_mock_data_roles_eval_set_train(tmp_path):
-    """data_roles: train = all 500 items of math500_eval (visible to the editor), gate = dapo_math's fixed split."""
-    _run_b(tmp_path, "method.mode=scratch", "data_roles.train=math500", "data_roles.gate=dapo_math")
-    run = tmp_path / "B_math_s42_single_train-math500_mock"
-    td = json.loads((run / "gen_00" / "train_data.json").read_text())
-    pool = json.loads((REPO / "data" / "splits" / "math500_eval" / "pool.json").read_text())
-    assert len(td) == 500 and sorted(td) == sorted(pool) and all(v["target"] for v in td.values())
-    assert json.loads((run / "state.json").read_text())["gen00/draw"]["train"] == 500
-    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
-    assert list(gate) == ["dapo_math"]
-    assert (run / "draws" / "gate" / "dapo_math.gate.json").exists()
-    summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
-    assert summ["data_roles"] == {"train": "math500_eval", "gate": "dapo_math"}
-    assert set(summ["accepted"].get("gate_scores") or {"dapo_math": 0}) == {"dapo_math"}
-    evals = run / "gen_00" / "evals"
-    assert {p.name for p in evals.glob("*/screen/*.json")} <= {"math500_eval.json"}
-    assert {p.name for p in evals.glob("*/gate/*.json")} <= {"dapo_math.json"}
 
 
 def test_mock_weights_mode(tmp_path):
@@ -465,7 +337,8 @@ def test_mock_edit_chain_trains_once(tmp_path):
         s = summ[str(g)]
         assert not (gd / "model").exists()                                          # nothing merged
         if g == 0:
-            assert raw["source"] == "trained" and s["editor"] == "m0" and s["gate_reference"] == "raw"
+            # gate per candidate (the simple flow): every candidate is gated against the current model
+            assert raw["source"] == "trained" and s["editor"] == "m0" and s["gate_reference"] == "parent"
         else:
             assert not (gd / "baselines" / "raw_lora.json").exists()                 # no training after gen 0
             assert not (gd / "train_samples").exists()
@@ -523,29 +396,8 @@ def test_mock_scratch_adapter(tmp_path):
     assert len({json.loads((run / f"gen_{g:02d}" / "model.json").read_text())["path"] for g in range(3)}) == 1
 
 
-def test_mock_data_sizes_and_fixed_noise(tmp_path):
-    """data.* draw sizes, raw.n_train, baseline.noise_fixed (no re-runs) in one mock run."""
-    py = REPO / "eval" / ".venv" / "bin" / "python"
-    py = str(py) if py.exists() else sys.executable
-    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--runs-dir", str(tmp_path), "--run-id", "B_sizes", "--set", "data.n=200", "--set", "data.gate_n=100",
-           "--set", "data.screen_n=30", "--set", "raw.n_train=40",
-           "--set", "baseline.noise_fixed=0.05", "--set", "method.mode=edit"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
-    run = tmp_path / "B_sizes"
-    ids = run / "draws" / "gen_00" / "ids"
-    assert len(json.loads((ids / "dapo_math.train.json").read_text())) == 100      # 200 x 0.5 (2026-11-20; was 0.8)
-    assert len(json.loads((ids / "dapo_math.screen.json").read_text())) == 30
-    assert len(json.loads((run / "draws" / "gate" / "dapo_math.gate.json").read_text())) == 100
-    assert json.loads((run / "gen_00" / "baselines" / "raw.json").read_text())["train"]["n_train"] == 40
-    gate = json.loads((run / "baseline" / "gate_scores.json").read_text())["dapo_math"]
-    assert gate["noise_band"] == 0.05 and gate["noise_source"].startswith("fixed")
-    assert not (run / "baseline" / "noise").exists()
-
-
-def test_mock_simple_objective(tmp_path):
-    """objective simple v2, FINAL flow (2026-11-21), 4 GPUs (3 main replicas): a fresh 500-item screen of the clean
+def test_mock_simple_flow(tmp_path):
+    """The simple flow v2 (2026-11-21; the only flow since 2026-11-22), 4 GPUs (3 main replicas): a fresh 500-item screen of the clean
     pool per generation (draws/gen_XX), train = the rest of the pool, gate = simple_math_eval, held-out =
     simple_math_test (avg@4). The CURRENT model answers the screen once (n 4, thinking text kept: reference_screen.json,
     api.screen_results); candidates are NOT screened; each of the k x 1 candidates gets ONE gate evaluation paired vs
@@ -555,12 +407,14 @@ def test_mock_simple_objective(tmp_path):
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--gpus", "0,1,2,3", "--runs-dir", str(tmp_path), "--set", "objective=simple", "--set", "hardware=h20",
+           "--gpus", "0,1,2,3", "--runs-dir", str(tmp_path), "--set", "hardware=h20",
            "--set", "simple.screen_n=20", "--set", "heldout.limit=4"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     assert "roles {'main': [0, 1, 2], 'train': [3]}" in r.stdout
-    run = next(p for p in tmp_path.iterdir() if p.name.startswith("B_math_s42_single_simple"))
+    run = tmp_path / "B_math_s42_single_simple_mock"                             # the default run id
+    # every scoring job is split over the 3 replicas
+    assert len(list((run / "baseline" / "gate" / "simple_math_eval").glob("_part*"))) == 3
     ids = run / "draws" / "gen_00" / "ids"
     screen = json.loads((ids / "simple_math_pool.screen.json").read_text())
     gate = json.loads((REPO / "data" / "splits" / "simple_math_eval" / "pool.json").read_text())
@@ -577,6 +431,7 @@ def test_mock_simple_objective(tmp_path):
     assert pg["decoding"]["n"] == 4 and pg["decoding"]["thinking"] and all(x["ns"] == 4 for x in pg["records"])
     ps = json.loads((gd / "evals" / "__parent__" / scr[0] / "simple_math_pool.json").read_text())
     assert ps["decoding"]["n"] == 4 and ps["n"] == 20
+    assert len(list((gd / "evals" / "__parent__" / scr[0] / "simple_math_pool_raw").glob("_part*"))) == 3
     rs = json.loads((gd / "reference_screen.json").read_text())["summary"]
     assert rs["n_items"] == 20 and rs["samples_per_item"] == 4 and sum(rs["correct_counts"].values()) == 20
     # candidates: k x 1, never screened (only gate@ caches), one gate result each, recorded in gate.json
@@ -682,8 +537,8 @@ def test_explore_api_surface_and_budgets(tmp_path):
 
 def test_editor_context_tokens_sets_main_max_model_len(tmp_path, monkeypatch):
     """editor.context_tokens is the one context knob: --max-model-len of every server started from server.main_args
-    (main replicas / weights slots; overrides main_args), the Editor's context_tokens; theta0_args unchanged;
-    hardware profiles b300 / h20 131072, h20_80 49152."""
+    (main replicas / weights slots; overrides main_args), the Editor's context_tokens; hardware profiles b300 / h20
+    131072, h20_80 49152. 'main' is the only server slot (no theta0 since 2026-11-22)."""
     import types
 
     import rsicore.servers as S
@@ -697,9 +552,9 @@ def test_editor_context_tokens_sets_main_max_model_len(tmp_path, monkeypatch):
         cfg = deep_merge(base, base["hardware_profiles"][hw] or {})
         args = main_server_args(cfg)
         assert max_model_len(args) == n and args.count("--max-model-len") == 1, (hw, args)
-        assert cfg["server"]["theta0_args"] == (base["hardware_profiles"][hw].get("server") or base["server"])["theta0_args"]
+        assert "theta0_args" not in cfg["server"]
         assert editor_kwargs(cfg, server_args=args)["context_tokens"] == n
-        assert editor_kwargs(cfg)["max_tokens"] == 16384 and editor_kwargs(cfg)["tool_rounds"] == 50
+        assert editor_kwargs(cfg)["max_tokens"] == 16384 and editor_kwargs(cfg)["tool_rounds"] == 20
         assert editor_kwargs(cfg)["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
     cfg = {"server": {"main_args": ["--max-model-len", "20480", "--max-logprobs", "20"]},
            "editor": {"context_tokens": 65536}}
@@ -707,7 +562,7 @@ def test_editor_context_tokens_sets_main_max_model_len(tmp_path, monkeypatch):
     cfg["editor"]["context_tokens"] = None                                   # null: main_args as written
     assert main_server_args(cfg) == ["--max-model-len", "20480", "--max-logprobs", "20"]
     assert editor_kwargs(cfg, server_args=main_server_args(cfg))["context_tokens"] == 20480
-    # the main replicas get it (real path, servers stubbed), the theta0 server does not
+    # the main replicas get it (real path, servers stubbed)
     made = []
 
     class FakeServer:
@@ -724,11 +579,10 @@ def test_editor_context_tokens_sets_main_max_model_len(tmp_path, monkeypatch):
     rc = types.SimpleNamespace(gpus=[0, 1, 2, 3], mock=False, run_dir=tmp_path, seed=42)
     srv = Servers(rc, cfg)
     srv.replicas("main", "/m", "m0")
-    srv.replicas("theta0", "/m", "theta0")
     main = [a for s, a in made if s == "m0"]
-    th0 = [a for s, a in made if s == "theta0"]
-    assert main and all(max_model_len(a) == 98304 for a in main)
-    assert th0 and all(max_model_len(a) == 20480 for a in th0)
+    assert len(main) == 3 and all(max_model_len(a) == 98304 for a in main)      # 4 GPUs: 3 replicas | train
+    with pytest.raises(ValueError):
+        srv.replicas("theta0", "/m", "theta0")
 
 
 def _transcript(path):
@@ -739,7 +593,9 @@ def test_mock_tool_loop_scratch(tmp_path):
     """Default editor = thinking + tool loop: one mock run_python round per proposal on the exploration api
     (transcript format 2, editor_rounds in the candidate costs, explore output on disk); the same programs, scores
     and evaluations as with editor.tool_rounds=0 (one call per candidate, no tool lines)."""
-    _run_b(tmp_path / "loop", "method.mode=scratch")
+    # history_tool off in the loop run: with one step per generation the sessions line names search_history when the
+    # tool is on, and the mock editor's choices depend on the message length (tool_rounds 0 has no history tool)
+    _run_b(tmp_path / "loop", "method.mode=scratch", "editor.history_tool=false")
     _run_b(tmp_path / "single", "method.mode=scratch", "editor.tool_rounds=0")
     runs = {k: next((tmp_path / k).iterdir()) for k in ("loop", "single")}
     for k in ("loop", "single"):
@@ -747,13 +603,13 @@ def test_mock_tool_loop_scratch(tmp_path):
     gl, gs = runs["loop"] / "gen_00", runs["single"] / "gen_00"
     tr = _transcript(gl / "editor" / "thread_0.jsonl")
     assert tr[0]["role"] == "system" and tr[0].get("format") == 2
-    assert "Before answering you may call functions for up to 50 rounds" in tr[0]["content"]
+    assert "Before answering you may call functions for up to 20 rounds" in tr[0]["content"]
     tools = [l for l in tr if l.get("role") == "tool"]
     finals = [l for l in tr if l.get("final")]
     assert tools and all(l["name"] == "run_python" and l["ok"] for l in tools), tools[:1]
     assert len(tools) == len(finals) and all(f["stats"]["rounds"] == 1 and f["stats"]["stop"] == "answer" for f in finals)
     assert "'spent'" in json.loads(tools[0]["content"])["stdout"]
-    assert list((gl / "explore").glob("*/r01_0/stdout.txt"))
+    assert list((gl / "explore").glob("*/session/r01_0/*"))         # persistent session per candidate (base.yaml)
     tr0 = _transcript(gs / "editor" / "thread_0.jsonl")
     assert "Before answering" not in tr0[0]["content"] and "Each turn, reply with a short plan" in tr0[0]["content"]
     assert not [l for l in tr0 if l.get("role") == "tool"] and all(l["stats"]["rounds"] == 0 for l in tr0 if l.get("final"))
@@ -1075,36 +931,33 @@ def test_prompt_gate_text_and_rules():
     """System prompt (2026-11-21): the gate rule follows the config (min_gain, require_significant, raw reference,
     gate item count), the per-program evaluate cap, the api-scope / module-name / vector-side / robust-code rules;
     the budget text by search.charge_screens (true: candidates cost one evaluate; false: free screens + a separate
-    api.evaluate pool, never for the E task); the tensor-tool rules only when the tool is on."""
+    api.evaluate pool); the tensor-tool rules only when the tool is on (absent key: on, 2026-11-22)."""
     from lora_code.prompts import gate_text, system_prompt
     base = {"gate": {"min_gain": 0.01, "require_significant": True}}
-    sig = gate_text(base, kind="parent", gate_n=500, retention=False)
+    sig = gate_text(base, kind="parent", gate_n=500)
     assert "statistically significant" in sig and "about 5 more correct items out of 500" in sig
-    nosig = gate_text({"gate": {"min_gain": 0.01, "require_significant": False}}, kind="parent", gate_n=500,
-                      retention=False)
+    nosig = gate_text({"gate": {"min_gain": 0.01, "require_significant": False}}, kind="parent", gate_n=500)
     assert "no significance test" in nosig and "95% CI" not in nosig and "Retention" not in nosig
     assert "raw LoRA" in gate_text({"gate": {"epsilon": 0.01}}, kind="raw")
-    cfg = {"gate": {"min_gain": 0.01, "require_significant": False}, "sandbox": {"timeout_s": 1800}}
-    sp = system_prompt(cfg, budget={"evaluate": 32, "gpu_seconds": 7200}, mode="scratch", retention=False,
-                       gate_kind="parent", gate_n=500)
+    cfg = {"gate": {"min_gain": 0.01, "require_significant": False}, "sandbox": {"timeout_s": 1800},
+           "tools": {"tensor_compute": False}}
+    sp = system_prompt(cfg, budget={"evaluate": 32, "gpu_seconds": 7200}, mode="scratch", gate_kind="parent",
+                       gate_n=500)
     assert "no significance test" in sp and "95% CI" not in sp
     assert "at most 2 per program" in sp and "1800 s of wall clock" in sp
     assert "NOT a global there" in sp and "api.modules()" in sp and "OUTPUT-side" in sp and "try/except" in sp
-    sp0 = system_prompt(dict(cfg, search={"program_evaluate_calls": None}), budget={"evaluate": 32}, mode="scratch",
-                        retention=False)
+    sp0 = system_prompt(dict(cfg, search={"program_evaluate_calls": None}), budget={"evaluate": 32}, mode="scratch")
     assert "per program" not in sp0.split("Tools")[0].split("Budgets")[1].split("GPU-seconds")[0]
-    assert "hidden items of the target task" in system_prompt(cfg, budget={}, e_task=True, mode="scratch")
+    assert "retention domains must not get worse" not in sp and "Retention domains" not in sp
     assert "costs one" in sp and "scored automatically on the feedback items" not in sp
-    assert "api.tensors()" not in sp and "T5.name" not in sp and "tensor_compute" not in sp   # tool off by default
-    free = dict(cfg, search={"charge_screens": False, "program_evaluate_calls": 2}, objective="simple")
-    fp = system_prompt(free, budget={"evaluate": 16, "gpu_seconds": 7200}, mode="scratch", retention=False,
-                       gate_kind="parent", gate_n=500)
+    assert "api.tensors()" not in sp and "T5.name" not in sp and "tensor_compute" not in sp   # tool switched off
+    free = dict(cfg, search={"charge_screens": False, "program_evaluate_calls": 2}, tools={})   # absent key: on
+    fp = system_prompt(free, budget={"evaluate": 16, "gpu_seconds": 7200}, mode="scratch", gate_kind="parent",
+                       gate_n=500)
     assert "scored automatically on the feedback items at\n  no cost" in fp and "separate pool of 16 calls" in fp
     assert "at most 2 new ones per program" in fp and "costs one" not in fp and "already scored is free" in fp
     assert "api.tensors()" in fp and "T5.name" in fp and "lora = {module: (A [r, in], B [out, r])}" in fp
     assert "at most ~300 s" in fp and "writes = " not in fp
-    ep = system_prompt(free, budget={"evaluate": 16}, e_task=True, mode="scratch")
-    assert "costs one" in ep and "separate pool" not in ep                        # the E task keeps charged screens
     wp = system_prompt(dict(free, weights={"vector_cap_tau": 0.25}), budget={"evaluate": 16}, mode="weights")
     assert "rms(W'-W) <= 0.25 * max(rms(W), 1)" in wp and "zero-centred" in wp and "use w_scale" in wp
     assert "dense additions computed by api.tensor_compute" in wp and "writes = {tensor: new full tensor}" in wp
@@ -1148,7 +1001,7 @@ def _ws_ev(tmp_path, budget, charge_screens=True):
 def test_program_evaluate_cap_and_budget(tmp_path):
     """search.program_evaluate_calls (default 2): a program's own NEW api.evaluate calls are capped (BudgetExceeded),
     the automatic screen (no program running) is not; api.budget() shows the program's time and calls left.
-    charge_screens true (default): the automatic screen costs one evaluate; false (2026-11-21, objective simple): it is
+    charge_screens true (code default): the automatic screen costs one evaluate; false (2026-11-21, base.yaml): it is
     free, `evaluate` is the programs' pool, and an api.evaluate of an already screened LoRA is free (no new scoring,
     no per-program count) even when the pool is used up."""
     ws = _ws(tmp_path, {"evaluate": 32, "gpu_seconds": 100})

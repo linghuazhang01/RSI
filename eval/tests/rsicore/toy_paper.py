@@ -2,12 +2,12 @@
 
   eval/.venv/bin/python -I eval/tests/rsicore/toy_paper.py --runs-dir /tmp/toy_runs --gens 2 --limit 40
 
-Per generation g (Paper-B-like: candidates are LoRA-style JSON artifacts hot-swapped on the server):
-  draw (target math) -> mock server serving M_g -> [g=0: baseline on the gate] -> inner_search with a
-  mock editor whose programs call sandboxed tools -> builders register each candidate's quality in the
-  mock registry -> screen (screen ids) / full (signal ids) via run_eval -> submit_to_gate (gate ids,
-  relative to the baseline) -> mark shown items -> token KL of the accepted candidate vs M_g ->
-  held-out (math, --limit) of M_{g+1} -> summary. The accepted candidate's quality becomes M_{g+1}.
+Per generation g (Paper-B-like: candidates are LoRA-style JSON artifacts hot-swapped on the server; the simple
+flow): draw of simple_math_pool -> mock server serving M_g -> M_g on the gate (simple_math_eval) -> inner_search
+with a mock editor whose programs call sandboxed tools -> builders register each candidate's quality in the mock
+registry -> gate per candidate (screen_fn = the paired gate gain over M_g) -> accept the largest positive gain ->
+token KL of the accepted candidate vs M_g -> held-out (simple_math_test, --limit) of M_{g+1} -> summary. The
+accepted candidate's quality becomes M_{g+1}.
 A second run with the same arguments must skip every step (prints "ALL STEPS SKIPPED").
 """
 import argparse
@@ -18,9 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "eval"))
 
-from rsicore import config, draws, editor, evaluate, gate, heldout, records, sandbox, search, servers, state  # noqa: E402
+from rsicore import config, draws, editor, evaluate, heldout, records, sandbox, search, servers, state  # noqa: E402
 
-DS = "dapo_math"
 SYSTEM = "You write programs `def main(api)` that choose an edit strength in [0, 1]. Reply with one ```python block."
 
 
@@ -50,11 +49,12 @@ def main():
     if not a.paper_dir:
         pdir = Path(a.runs_dir) / "_toy_paper_dir"
         (pdir / "configs" / "domains").mkdir(parents=True, exist_ok=True)
-        (pdir / "configs" / "base.yaml").write_text("search: {threads: 2, steps: 2, max_candidates: 4, top_full: 2}\n"
-                                                    "gate: {ratio: 1.0, max_submissions: 3}\nbase_quality: 0.55\n")
+        (pdir / "configs" / "base.yaml").write_text("search: {threads: 2, steps: 2, max_candidates: 4}\n"
+                                                    "simple: {screen_n: 40}\nbase_quality: 0.55\n")
         (pdir / "configs" / "domains" / "math.yaml").write_text("target: math\n")
         a.paper_dir = str(pdir)
     rc = config.load_run_config("B", a)
+    gds = draws.gate_dataset(rc)                  # simple_math_eval (the train role simple_math_pool is drawn)
     st = state.RunState(rc.run_dir)
     reg = rc.run_dir / "mock_registry.json"
     S, L = rc.paper_cfg["search"], a.limit
@@ -78,21 +78,16 @@ def main():
         gd = records.gen_dir(rc, g)
         with run(f"gen{g:02d}/draw") as todo:
             if todo:
-                draws.draw_gen(rc, g, target="math")
+                draws.draw_gen(rc, g, target="math")      # (the screen is unused: candidates are gated directly)
         served = f"toy-m{g:02d}"
         regd = records.read_json(reg, {})
         regd[served] = cur_q
         records.write_json(reg, regd)
         with servers.VLLMServer(rc.model_path, served, rc.gpus, enable_lora=True, mock=True, mock_registry=reg,
                                 seed=rc.seed, log_dir=rc.run_dir / "logs") as srv:
-            gate_ids = draws.gate_ids(rc, DS)
-            with run("baseline") as todo:
-                if todo:
-                    b = evaluate.score(srv.endpoint, served, DS, pool="pool", ids=gate_ids,
-                                       out_dir=rc.run_dir / "baseline" / "gate", extra=["--limit", str(L)], mock=True)
-                    st.mark("baseline", {"gate_acc": b.accuracy})
-            base_acc = st.get("baseline")["gate_acc"]
-            screen_ids, signal_ids = draws.ids(rc, g, DS, "screen"), draws.ids(rc, g, DS, "signal")
+            gate_ids = draws.gate_ids(rc, gds)
+            ref = evaluate.score(srv.endpoint, served, gds, pool="pool", ids=gate_ids, out_dir=gd / "eval" / "ref",
+                                 extra=["--limit", str(L)], mock=True)       # M_g on the gate
 
             def build_fn(program, cid):
                 api = sandbox.ToolAPI({"estimate": 3})
@@ -115,12 +110,12 @@ def main():
                 records.write_json(reg, r)
                 return art, None
 
-            def evaluate_on(art, cid, ids, stage):
+            def gate_candidate(art, cid):            # gate per candidate: the paired gain over M_g on the gate
                 srv.load_lora(art["name"], art["path"])
-                e = evaluate.score(srv.endpoint, served, DS, pool="pool", ids=ids, out_dir=gd / "eval" / stage / cid,
+                e = evaluate.score(srv.endpoint, served, gds, pool="pool", ids=gate_ids, out_dir=gd / "eval" / "gate" / cid,
                                    lora=art["name"], extra=["--limit", str(L)], mock=True)
-                wrong = [x["id"] for x in e.records if x["score"] == 0][:3]
-                return e.accuracy, {"accuracy": e.accuracy, "n": e.summary["n"], "wrong_examples": wrong}
+                d = evaluate.paired_delta(ref.records, e.records)
+                return d["delta"], {"accuracy": e.accuracy, "n": e.summary["n"], "gain": d["delta"], "ci": d["ci"]}
 
             def render(history, thread):
                 lines = [f"{c.cid}: score={c.score} error={(c.error or '')[:80]!r}" for c in history]
@@ -133,25 +128,16 @@ def main():
                         editor_factory=lambda th: editor.Editor(srv.endpoint, served, system_prompt=SYSTEM,
                                                                 seed=rc.seed + th, mock_policy=mock_policy(th),
                                                                 transcript=gd / "editor" / f"thread_{th}.jsonl"),
-                        screen_fn=lambda art, cid: evaluate_on(art, cid, screen_ids, "screen"),
-                        full_fn=lambda art, cid: evaluate_on(art, cid, signal_ids, "full"),
-                        threads=S["threads"], steps=S["steps"], max_candidates=S["max_candidates"],
-                        top_full=S["top_full"])
+                        screen_fn=gate_candidate, full_fn=None, threads=S["threads"], steps=S["steps"],
+                        max_candidates=S["max_candidates"], top_full=0)
                     st.mark(f"gen{g:02d}/search", {"n": len(ranked), "best": ranked[0].cid})
 
-            def gate_fn(c):
-                r = evaluate_on(c.artifact, c.cid, gate_ids, "gate")[0]
-                passed = gate.relative_pass(r, base_acc, rc.paper_cfg["gate"]["ratio"])
-                return passed, {"gate_acc": r, "baseline": base_acc}
-
-            with run(f"gen{g:02d}/gate") as todo:
+            with run(f"gen{g:02d}/accept") as todo:      # the largest positive paired gate gain
                 if todo:
                     ranked = search.ranked(search.load_candidates(rc, g).values())
-                    acc = search.submit_to_gate(rc, g, ranked, gate_fn, rc.paper_cfg["gate"]["max_submissions"])
+                    acc = next((c for c in ranked if c.artifact and c.score is not None and c.score > 0), None)
                     records.write_json(gd / "accepted.json", acc.to_record() if acc else
-                                       {"accepted": None, "reason": "no candidate passed the gate"})
-                    shown = {DS: sorted({i for c in ranked if c.screen for i in c.screen["feedback"]["wrong_examples"]})}
-                    draws.mark_shown(rc, g, shown)
+                                       {"accepted": None, "reason": "no candidate with a positive gate gain"})
             accepted = records.read_json(gd / "accepted.json")
             nxt = accepted.get("artifact") if accepted.get("cid") else None
             with run(f"gen{g:02d}/kl") as todo:
@@ -165,7 +151,8 @@ def main():
                 if todo:
                     if nxt:
                         srv.load_lora(nxt["name"], nxt["path"])
-                    h = heldout.run_heldout(srv.endpoint, served, gd / "heldout", domains="math",
+                    h = heldout.run_heldout(srv.endpoint, served, gd / "heldout",
+                                            domains=heldout.heldout_domains(rc.paper_cfg, rc.domain),
                                             lora=nxt["name"] if nxt else None, mock=True, limit=5)
                     st.mark(f"gen{g:02d}/heldout", {"acc": {k: v["accuracy"] for k, v in h.items()}})
         next_q = nxt["quality"] if nxt else cur_q

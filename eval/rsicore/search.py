@@ -13,7 +13,7 @@ Records: gen_XX/candidates.jsonl (rewritten atomically; one line per candidate),
 feedback/<cid>.json. Resumable at candidate granularity: recorded candidates are skipped.
 cid = g{gen:02d}_t{thread}_s{step:02d}.
 Output directory: gen_dir(rc, gen) by default; pass out_dir=... (same value to inner_search,
-load_candidates and submit_to_gate) for additional searches of one generation (e.g. E_t, one per branch).
+load_candidates and submit_to_gate) to keep a search's records in another directory.
 """
 import inspect
 import json

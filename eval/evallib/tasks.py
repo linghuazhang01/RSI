@@ -410,20 +410,15 @@ KIND = {"math": MathTask, "mcq": MCQTask, "short_qa": ShortQATask, "squad_closed
 
 
 def eval_target_tasks(cfg: dict) -> dict:
-    """Task entries of the eval-set targets (configs/tasks.yaml `eval_targets`, objective eval_overfit): key K ->
-    task K_eval = the first source task's entry with dataset K_eval and allowed_pools [pool]. Entries `tasks`
-    defines itself (math_eval) are left out."""
+    """Task entries of the eval-set datasets (configs/tasks.yaml `eval_targets`, the simple_data sets
+    {task, file | ids_file, dataset}): task <dataset> = the source task's entry with dataset <dataset> and
+    allowed_pools [pool]. A name `tasks` defines itself is left out."""
     tasks, out = cfg.get("tasks") or {}, {}
-    for key, sources in (cfg.get("eval_targets") or {}).items():
-        if isinstance(sources, dict):              # {task, file, dataset}: a fixed item file (simple_data)
-            name, src = sources["dataset"], [tasks[sources["task"]]]
-        else:
-            name, src = f"{key}_eval", [tasks[t] for t, _ in sources]
+    for sources in (cfg.get("eval_targets") or {}).values():
+        name = sources["dataset"]
         if name in tasks:
             continue
-        if len({s["grader"] for s in src}) != 1:
-            raise ValueError(f"eval target {key}: sources must share one grader")
-        out[name] = dict(src[0], dataset=name, allowed_pools=["pool"])
+        out[name] = dict(tasks[sources["task"]], dataset=name, allowed_pools=["pool"])
     return out
 
 

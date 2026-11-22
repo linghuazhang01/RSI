@@ -1,4 +1,4 @@
-"""Using every GPU (2026-11-20): split scoring over replicas, parallel held-out tasks, the two-phase search
+"""Using every GPU (2026-11-20): split scoring over replicas, the held-out test set split over replicas, the two-phase search
 (editor phase / eval phase), parallel gate submissions, and vLLM sleep mode (mock: state; real: command / env).
 
   python -I -m pytest -q eval/tests/rsicore/test_gpu_use.py      (mock servers, no GPU)
@@ -31,7 +31,7 @@ class ReplicaScoringTest(unittest.TestCase):
         reg = cls.tmp / "reg.json"
         reg.write_text(json.dumps({"m": 0.7}))
         cls.srvs = [servers.VLLMServer("mock-m", "m", [i], mock=True, mock_registry=reg, seed=42,
-                                       log_dir=cls.tmp / "logs", extra_args=["--tasks", "dapo_math,math500,gsm8k,math500_eval"])
+                                       log_dir=cls.tmp / "logs", extra_args=["--tasks", "dapo_math"])
                     for i in range(3)]
         servers.start_all(cls.srvs)
 
@@ -57,40 +57,21 @@ class ReplicaScoringTest(unittest.TestCase):
                                       mock=True)
         self.assertNotIn("split_over_replicas", single.summary)                        # one replica: plain score
 
-    def test_heldout_tasks_in_parallel(self):
-        eps = [s.endpoint for s in self.srvs]
-        par = heldout.run_heldout(eps, "m", self.tmp / "hpar", domains="math", mock=True, limit=5)
-        seq = heldout.run_heldout(eps[0], "m", self.tmp / "hseq", domains="math", mock=True, limit=5)
-        self.assertEqual(list(par), [t for t, _ in heldout.HELDOUT["math"]])          # HELDOUT order
-        self.assertEqual({t: v["accuracy"] for t, v in par.items()}, {t: v["accuracy"] for t, v in seq.items()})
-        allsum = json.loads((self.tmp / "hpar" / "summary.json").read_text())
-        self.assertEqual(set(allsum), set(par))
-        again = heldout.run_heldout(eps, "m", self.tmp / "hpar", domains="math", mock=True, limit=5)   # resume
-        self.assertEqual(again, par)
-
     def test_single_task_split_over_replicas(self):
-        """eval_target (one task, 2026-11-21): the items are split over every replica, same scores, resumable."""
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("bet", ROOT / "data" / "scripts" / "build_eval_target.py")
-        bet = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(bet)
-        try:
-            bet.build("math500")                                                       # -> math500_eval
-        except SystemExit:
-            self.skipTest("math500 source data not present")
-        cfg = {"heldout": {"domains": "eval_target"}, "eval_target": {"dataset": "math500_eval"}}
-        dom = heldout.heldout_domains(cfg)
-        self.assertEqual(heldout.heldout_tasks(dom), [("math500_eval", "pool")])
-        self.assertNotIn(("math500_eval", "pool"), heldout.heldout_tasks("all"))
+        """The held-out test set (one task, 2026-11-21): its items are split over every replica, same scores,
+        resumable."""
+        dom = heldout.heldout_domains({}, "math")
+        self.assertEqual(heldout.heldout_tasks(dom), [("simple_math_test", "pool")])
         eps = [s.endpoint for s in self.srvs]
         sp = heldout.run_heldout(eps, "m", self.tmp / "hsplit", domains=dom, mock=True, limit=9)
         seq = heldout.run_heldout(eps[0], "m", self.tmp / "hseq1", domains=dom, mock=True, limit=9)
-        summ = json.loads((self.tmp / "hsplit" / "summary.json").read_text())["math500_eval"]
+        summ = json.loads((self.tmp / "hsplit" / "summary.json").read_text())["simple_math_test"]
         self.assertEqual((summ["split_over_replicas"], summ["n"], summ["limit"]), (3, 9, 9))
-        self.assertEqual(sp["math500_eval"]["accuracy"], seq["math500_eval"]["accuracy"])
+        self.assertEqual(sp["simple_math_test"]["accuracy"], seq["simple_math_test"]["accuracy"])
         again = heldout.run_heldout(eps, "m", self.tmp / "hsplit", domains=dom, mock=True, limit=9)   # resume
         self.assertEqual(again, sp)
         self.assertEqual(len(list((self.tmp / "hsplit").glob("_part*"))), 3)
+
 
 class SleepModeTest(unittest.TestCase):
     def test_command_env_and_mock_state(self):

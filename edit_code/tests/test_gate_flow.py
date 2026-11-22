@@ -103,10 +103,11 @@ def _runner_fns(tmp_path, monkeypatch, prob, seen_apis):
     monkeypatch.setattr(RUN, "run_program", fake_run)
     monkeypatch.setattr(RUN, "system_prompt", lambda *a, **k: "SYS")
     monkeypatch.setattr(RUN, "make_render_context", lambda *a, **k: (lambda h, t: "CTX"))
-    cfg = {"sandbox": {"timeout_s": 10, "mem_gb": 1}, "editor": {"tool_rounds": 0}, "feedback": {}}
+    cfg = {"sandbox": {"timeout_s": 10, "mem_gb": 1}, "editor": {"tool_rounds": 0}, "feedback": {},
+           "search": GATE_SCFG}
     runner = SimpleNamespace(rc=SimpleNamespace(mock=True, seed=42), cfg=cfg, chat_tools=None,
-                             search_history=lambda g, t: None)
-    return RUN.Runner.search_fns(runner, prob, tmp_path / "gen", None, task="main", archive="", scfg=GATE_SCFG)
+                             search_history=lambda g: None)
+    return RUN.Runner.search_fns(runner, prob, tmp_path / "gen", None, archive="")
 
 
 def test_screen_fn_gates_once(tmp_path, monkeypatch):

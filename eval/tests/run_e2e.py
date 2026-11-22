@@ -36,14 +36,15 @@ CASES = [
     ("humanevalplus", "test", ["--no-sandbox"], None, None, None),                # code: generation + extraction; exec PENDING
     ("mt_bench", "test", ["--judge-endpoint", "JUDGE"], "mean_rating", 10.0, 1.0),  # optional judge path
     ("alpaca_eval", "test", ["--limit", "100", "--judge-endpoint", "JUDGE"], "win_rate", 0.98, 0.02),
-    # ---- training sets (five, 2026-11-19): pool + ids from a draw (DRAW:<ds>.<role>) or the run's gate (GATE:<ds>)
-    ("dapo_math", "pool", ["--ids-file", "DRAW:dapo_math.signal"], "accuracy", 1.0, 0.0),
-    ("dapo_math", "pool", ["--ids-file", "GATE:dapo_math", "--limit", "300"], "accuracy", 1.0, 0.0),
-    ("triviaqa_train", "pool", ["--ids-file", "DRAW:triviaqa_train.screen"], "accuracy", 1.0, 0.0),
-    ("sealtool_train", "pool", ["--ids-file", "DRAW:sealtool_train.screen"], "accuracy", 1.0, 0.0),
+    # ---- training sets (five, 2026-11-19): pool + the ids of a simple_data set (SIMPLE:<dataset>, e.g. the gate
+    # simple_math_eval; built by data/scripts/build_eval_target.py)
+    ("dapo_math", "pool", ["--ids-file", "SIMPLE:simple_math_eval"], "accuracy", 1.0, 0.0),
+    ("dapo_math", "pool", ["--ids-file", "SIMPLE:simple_math_test", "--limit", "300"], "accuracy", 1.0, 0.0),
+    ("triviaqa_train", "pool", ["--ids-file", "SIMPLE:simple_knowledge_eval"], "accuracy", 1.0, 0.0),
+    ("sealtool_train", "pool", ["--ids-file", "SIMPLE:simple_tool_calling_eval"], "accuracy", 1.0, 0.0),
     ("ifeval_train", "pool", ["--ids-file", str(FX / "ifeval_train_e2e_ids.json")], "accuracy", 1.0, 0.0),  # hand-made
-    ("ifeval_train", "pool", ["--ids-file", "DRAW:ifeval_train.screen"], None, None, None),  # no oracle: run only
-    ("taco_verified", "pool", ["--ids-file", "DRAW:taco_verified.screen", "--no-sandbox"], None, None, None),
+    ("ifeval_train", "pool", ["--ids-file", "SIMPLE:simple_instruction_following_eval"], None, None, None),  # run only
+    ("taco_verified", "pool", ["--ids-file", "SIMPLE:simple_code_eval", "--no-sandbox"], None, None, None),
 ]
 
 
@@ -66,17 +67,17 @@ def wait_up(port, timeout=600):
     return False
 
 
-def make_draw():
-    """Draw generation 0 of a throwaway Paper A run; returns its ids/ directory."""
-    import tempfile
-    run = Path(tempfile.mkdtemp(prefix="e2e_draw_")) / "e2e_run"
-    subprocess.run([PY, "-I", str(EVAL.parent / "data/scripts/draw.py"), "--run", str(run), "--gen", "0",
-                    "--config", str(EVAL.parent / "data/draw/paper_a.yaml")], check=True, capture_output=True)
-    return run / "draws" / "gen_00" / "ids"
+def simple_ids(name: str) -> str:
+    """The ids file of the simple_data set `name` (data/splits/<name>/pool.json, built when missing)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("build_eval_target", EVAL.parent / "data/scripts/build_eval_target.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.build(name)
+    return str(EVAL.parent / "data" / "splits" / name / "pool.json")
 
 
 def main():
-    ids_dir = make_draw()
     tasks = sorted({c[0] for c in CASES})
     report, ok = {}, True
     for mode in ("gold", "wrong"):
@@ -89,9 +90,7 @@ def main():
             ep = f"http://127.0.0.1:{port}/v1"
             out = EVAL / "results" / f"e2e_oracle_{mode}"
             for task, pool, extra, key, gmin, wmax in CASES:
-                extra = [ep if x == "JUDGE" else str(ids_dir / (x[5:] + ".json")) if x.startswith("DRAW:")
-                         else str(ids_dir.parent.parent / "gate" / (x[5:] + ".gate.json")) if x.startswith("GATE:") else x
-                         for x in extra]
+                extra = [ep if x == "JUDGE" else simple_ids(x[7:]) if x.startswith("SIMPLE:") else x for x in extra]
                 cmd = [PY, "-I", str(EVAL / "run_eval.py"), "--task", task, "--pool", pool, "--endpoint", ep,
                        "--model", "oracle-model", "--out", str(out), "--no-cache", "--quiet", "--concurrency", "32"] + extra
                 r = subprocess.run(cmd, capture_output=True, text=True)
@@ -101,7 +100,7 @@ def main():
                     ok = False
                     continue
                 s = json.load(open(out / "summary.json"))[task]
-                if key is None and task in ("ifeval", "ifeval_train"):  # run-only (no hand-made oracle for drawn items)
+                if key is None and task in ("ifeval", "ifeval_train"):  # run-only (no hand-made oracle for these items)
                     recs = [json.loads(l) for l in open(out / f"{task}.jsonl")]
                     passed = len(recs) == s["n_units"] and len(recs) > 0
                     val = f"graded={len(recs)}"

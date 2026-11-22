@@ -8,7 +8,6 @@ HFModel lazily loads the current model (BF16, gradient checkpointing) and provid
   loss(examples, lora)            mean token NLL of the target spans
   sgd(examples, lora, ...)        LoRA training with peft (AdamW): only the raw LoRA of mode=edit (generation 0)
   acts(texts, modules, k)         input/output activation statistics (mean, norms, top principal directions)
-  grams(texts, modules)           input Gram matrices Σ x xᵀ (RegMean)
   act_ratio(texts, lora)          ||ΔW h|| / ||W h|| per module
 """
 from __future__ import annotations
@@ -424,28 +423,6 @@ class HFModel:
                           "in_norm": st["nx"] / n, "out_norm": st["ny"] / n,
                           "pcs": top, "pc_var": torch.flip(ev[-k:], dims=[0]).cpu().tolist(), "tokens": n}
             return out
-        return self._timed(run)
-
-    def grams(self, texts, modules, batch_size: int = 4) -> dict:
-        import torch
-
-        def run():
-            G = {m: None for m in modules}
-            hs = []
-            for m in modules:
-                def hook(_mod, inp, out, m=m):
-                    x = inp[0].detach().float().reshape(-1, inp[0].shape[-1])
-                    g = x.T @ x
-                    G[m] = g if G[m] is None else G[m] + g
-                hs.append(self.module(m).register_forward_hook(hook))
-            try:
-                with torch.no_grad():
-                    for ids, att in self._text_batches(texts, batch_size):
-                        self.model(input_ids=ids, attention_mask=att)
-            finally:
-                for h in hs:
-                    h.remove()
-            return {m: g.cpu() for m, g in G.items() if g is not None}
         return self._timed(run)
 
     def act_ratio(self, texts, lora, batch_size: int = 4) -> dict:

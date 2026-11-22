@@ -1,2 +1,2 @@
-# Target: TriviaQA train (triviaqa_train). Held-out: GPQA-Diamond, MMLU-Pro, TriviaQA.
-# Sizes (n, gate_n, retention_n, ...) come from data/draw/paper_b.yaml; override here only what differs.
+# Domain knowledge: train pool simple_knowledge_pool (from TriviaQA train), gate simple_knowledge_eval, held-out
+# simple_knowledge_test. Override here only what differs from base.yaml.

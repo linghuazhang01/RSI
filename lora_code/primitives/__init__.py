@@ -6,6 +6,6 @@ lora.py       LoRA (A, B factors), sandbox checks, PEFT save/load (vLLM-loadable
 wedit.py      WeightEdit (dense ops: scale, rows, cols, lowrank, toward_base), check_wedit, edit_into_model
 construct.py  rank1, from_direction, scale_singular
 ops.py        scale, interpolate, combine, drop, truncate_rank, intruder_scale, relchange_prune,
-              regmean_preserve, orthogonalize, ties
-train.py      TrainData (train-id restriction), HFModel (loss, sgd with peft for the raw LoRA, acts, grams, act_ratio)
+              orthogonalize, ties
+train.py      TrainData (train-id restriction), HFModel (loss, sgd with peft for the raw LoRA, acts, act_ratio)
 """

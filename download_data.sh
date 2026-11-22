@@ -8,7 +8,7 @@
 #                    Normalization and splitting still run over everything present in data/raw,
 #                    because make_splits.py decontaminates every training set against every eval set.
 #   --force          re-download files that already exist (default: existing files are skipped)
-#   --skip-checks    skip check_data.py --ngram and check_draw.py
+#   --skip-checks    skip check_data.py --ngram
 #   --skip-gated     do not touch the gated (kind: manual) sources at all
 #   --download-only  stop after downloading (no normalize / make_splits / checks)
 #
@@ -18,7 +18,7 @@
 #                                   fetched with YOUR OWN existing Hugging Face login (see below)
 #   3. data/scripts/normalize.py    raw -> processed (resets split_pool)
 #   4. data/scripts/make_splits.py  splits + MANIFEST.json, back-fills split_pool
-#   5. data/scripts/check_data.py --ngram, data/scripts/check_draw.py
+#   5. data/scripts/check_data.py --ngram
 #
 # Python: eval/.venv/bin/python, always run with -I. Override with RSI_PYTHON=/path/to/python.
 # Create the environment first with ./setup_env.sh (or bash eval/setup_env.sh).
@@ -212,8 +212,6 @@ else
   fi
   echo "== 5/5 check_data --ngram"
   py "$SCRIPTS/check_data.py" --ngram
-  echo "== 5/5 check_draw"
-  py "$SCRIPTS/check_draw.py"
 fi
 
 if [ "$GATED_RC" = 3 ]; then

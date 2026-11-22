@@ -17,7 +17,7 @@
     solve_allocation(...) knapsack over the profile table -> config (removable: tools.solve_allocation=false)
 Invalid configs raise a tool error whose message lists every problem (schema.ConfigError).
 
-Reference screen + gate per candidate (2026-11-21, objective simple: search.screen_candidates false):
+Reference screen + gate per candidate (2026-11-21, base.yaml default: search.screen_candidates false):
     screen_results(ids, filter, limit, offset)  the incumbent's (latest model's) answers to this round's screen items:
                           prompt, gold, per-sample scores / extracted answers / finish / lengths (rsicore.screen_view)
     screen_output(id, sample, offset)            one sample's full output text (thinking + answer) in pages

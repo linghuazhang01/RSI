@@ -16,7 +16,6 @@ REPO = LORA_DIR.parent
 EVAL_DIR = REPO / "eval"
 DATA_DIR = REPO / "data"
 PROC_DIR = DATA_DIR / "processed"
-SPLIT_DIR = DATA_DIR / "splits"
 
 
 def ensure_paths() -> None:
@@ -25,17 +24,6 @@ def ensure_paths() -> None:
     for p in (str(REPO), str(EVAL_DIR)):
         if p not in sys.path:
             sys.path.insert(0, p)
-
-
-DOMAINS = ["math", "code", "knowledge", "instruction_following", "tool_calling"]
-# one training set per domain (2026-11-19); the run_eval task name equals the dataset name
-DOMAIN_DATASET = {"math": "dapo_math", "code": "taco_verified", "knowledge": "triviaqa_train",
-                  "instruction_following": "ifeval_train", "tool_calling": "sealtool_train"}
-DATASET_DOMAIN = {v: k for k, v in DOMAIN_DATASET.items()}
-
-
-def retention_domains(target: str) -> list[str]:
-    return [d for d in DOMAINS if d != target]
 
 
 # ----------------------------------------------------------------------------- json helpers
@@ -102,10 +90,6 @@ def load_records(dataset: str, ids) -> dict[str, dict]:
     return out
 
 
-def pool_ids(dataset: str) -> list[str]:
-    return read_json(SPLIT_DIR / dataset / "pool.json", [])
-
-
 @lru_cache(maxsize=1)
 def eval_tasks():
     """The run_eval task registry (read-only import of eval/evallib): exact prompts the evaluator sends
@@ -135,7 +119,7 @@ def gold_target(dataset: str, item: dict) -> str | None:
 
 
 def prompt_text(dataset: str, item: dict) -> str:
-    """Plain text of the (rendered) prompt, used for token-KL contexts and activation statistics."""
+    """Plain text of the (rendered) prompt (the screen items shown to the editor, activation statistics)."""
     try:
         msgs = render_messages(dataset, item)
         return "\n\n".join(m["content"] for m in msgs if m.get("content"))
@@ -210,50 +194,37 @@ def gate_policy(cfg: dict) -> tuple[str, str]:
     return ref, fb
 
 
-PAPER_B_GROWTH = [("main", 2), ("train", 2), ("main", 4), ("theta0", 2), ("main", 8), ("theta0", 4)]
+PAPER_B_GROWTH = [("main", 2), ("train", 2), ("main", 4), ("main", 8)]
 
 
 def gpu_layout(rc, cfg: dict) -> tuple[dict, list[int]]:
-    """({role: [GPU ids]}, [unused GPU ids]) for Paper B.
-    gpu_layout.main_replicas (default, 2026-11-20): train = the last gpu_layout.train_gpus GPUs (default 1), theta0
-    = its own GPU before them when E_t is on and theta0_own_gpu (else it shares the first train GPU), main = every
-    other GPU, served as independent replicas of gpu_layout.main_tp GPUs each (main_groups): 4 GPUs, single domain
-    -> main [0, 1, 2] (3 replicas) | train [3]. gpu_roles pins roles as before (then main is one server).
-    Without main_replicas (the earlier layout): Roles: main (vLLM: M_t + candidate LoRAs, the
-    editor), theta0 (vLLM: original model, only for E_t / e_ref), train (HF model for training, weight store,
-    diagnostics, merge; several GPUs = the HF model is split across them). Several GPUs for a vLLM role =
-    tensor parallelism.
-    gpu_roles not set (default): every GPU of --gpus is used (rsicore.gpu_layout.allocate). theta0 gets its
-    own GPU only when E_t is on and gpu_layout.theta0_own_gpu (h20: a 27B per card); otherwise it shares the
-    first train GPU. Extra GPUs go to main (TP 2), train (2), main (TP 4), theta0 (TP 2), main (TP 8), and
+    """({role: [GPU ids]}, [unused GPU ids]) for Paper B. Roles: main (vLLM: M_t + candidate LoRAs, the editor),
+    train (HF model: weight store, diagnostics, merge, edit's raw LoRA; several GPUs = the HF model is split across
+    them).
+    gpu_layout.main_replicas (default, 2026-11-20): train = the last gpu_layout.train_gpus GPUs (default 1), main =
+    every other GPU, served as independent replicas of gpu_layout.main_tp GPUs each (main_groups): 4 GPUs -> main
+    [0, 1, 2] (3 replicas) | train [3]. gpu_roles pins roles (then main is one server).
+    Without main_replicas (the earlier layout): every GPU of --gpus is used (rsicore.gpu_layout.allocate); several
+    GPUs for main = tensor parallelism. Extra GPUs go to main (TP 2), train (2), main (TP 4), main (TP 8), and
     whatever is left to train (the HF model can be split over any number of GPUs), so no GPU stays idle.
-    e.g. h20 single-domain: 2 -> main | train, 3 -> main x2 | train, 4 -> main x2 | train x2,
-    5 -> main x2 | train x3, 6 -> main x4 | train x2.
+    e.g. 2 -> main | train, 3 -> main x2 | train, 4 -> main x2 | train x2, 5 -> main x2 | train x3,
+    6 -> main x4 | train x2.
     gpu_roles set: those roles are pinned (indices into --gpus, negative = from the end); the others are laid
     out automatically on the remaining GPUs."""
     from rsicore.gpu_layout import layout
     gpus = list(rc.gpus or [0])
     lay = cfg.get("gpu_layout") or {}
-    own_theta0 = bool(lay.get("theta0_own_gpu", False)) and bool((cfg.get("e_t") or {}).get("enabled", True))
     if lay.get("main_replicas", True) and not cfg.get("gpu_roles"):
         n = len(gpus)
         if n == 1:
             if not lay.get("share_single_gpu", False):
                 raise ValueError(f"Paper B on --gpus {gpus}: needs at least 2 GPUs (main | train)")
-            return {"main": gpus, "train": gpus, "theta0": gpus}, []
-        nt = max(1, int(lay.get("train_gpus", 1)))
-        nt = min(nt, n - 1 - int(own_theta0))
-        if nt < 1:
-            raise ValueError(f"Paper B on --gpus {gpus}: needs at least {2 + int(own_theta0)} GPUs "
-                             "(main | train" + (" | theta0" if own_theta0 else "") + ")")
-        train, rest = gpus[n - nt:], gpus[:n - nt]
-        theta0 = [rest.pop()] if own_theta0 else [train[0]]
-        return {"main": rest, "train": train, "theta0": theta0}, []
+            return {"main": gpus, "train": gpus}, []
+        nt = min(max(1, int(lay.get("train_gpus", 1))), n - 1)
+        return {"main": gpus[:n - nt], "train": gpus[n - nt:]}, []
     try:
-        idx, unused = layout(len(gpus), own=["main", "theta0", "train"] if own_theta0 else ["main", "train"],
-                             growth=PAPER_B_GROWTH, shared={} if own_theta0 else {"theta0": "train"},
-                             spill="train", share_single=bool(lay.get("share_single_gpu", False)),
-                             explicit=cfg.get("gpu_roles"))
+        idx, unused = layout(len(gpus), own=["main", "train"], growth=PAPER_B_GROWTH, spill="train",
+                             share_single=bool(lay.get("share_single_gpu", False)), explicit=cfg.get("gpu_roles"))
     except ValueError as e:
         raise ValueError(f"Paper B on --gpus {gpus}: {e}") from None
     return {r: [gpus[i] for i in ii] for r, ii in idx.items()}, [gpus[i] for i in unused]
@@ -281,8 +252,7 @@ def main_server_args(cfg: dict) -> list[str]:
     """vLLM args of every server started from server.main_args (the main replicas, which also host the editor;
     weights mode: the temporary servers on the candidate slots too, so every scoring server has the same context):
     server.main_args with --max-model-len = editor.context_tokens (2026-11-21: the one knob for the editor's
-    context length; it overrides a --max-model-len written in main_args; null keeps main_args as written).
-    theta0_args are never changed."""
+    context length; it overrides a --max-model-len written in main_args; null keeps main_args as written)."""
     from rsicore.editor import apply_context_tokens
     args = apply_context_tokens(list((cfg.get("server") or {}).get("main_args", []) or []), cfg)
     return replica_memory(args, cfg)
@@ -290,7 +260,7 @@ def main_server_args(cfg: dict) -> list[str]:
 
 def tools_on_replicas(cfg: dict) -> bool:
     """gpu_layout.tools_on_replicas (2026-11-22): every main replica's GPU also holds an HF copy of the current model
-    and its own weight store, and editor session k runs its tools (svd / acts / regmean_preserve / train_loss on
+    and its own weight store, and editor session k runs its tools (svd / acts / train_loss on
     HF) there, on the replica its editor talks to (k mod n), instead of all sessions queueing on the train GPU.
     Never in method.mode weights (the main GPUs are candidate slots there)."""
     return bool((cfg.get("gpu_layout") or {}).get("tools_on_replicas")) and method_mode(cfg) != "weights"

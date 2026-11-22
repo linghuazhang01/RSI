@@ -1,22 +1,22 @@
-"""The editor's tool surface for one generation (or one E_t session): a Workspace holding tensors behind
+"""The editor's tool surface for one generation: a Workspace holding tensors behind
 string handles, registered on an rsicore.sandbox.ToolAPI so programs call `api.<tool>(**kwargs)`.
 
 Handles: L* = LoRA, W* = weight edit (mode=weights), S* = SVD of a weight, A* = activation statistics,
 H<g> = adapter accepted in generation g (the stack), C:<cid> = an earlier candidate of this generation.
 merge.mode adapter (scratch, 2026-11-22): the current model is M_0 + the cumulative adapter C_g (base_lora, never
-merged); store reads W_0 + B_C A_C (OverlayStore), HF passes (acts / grams / train_loss) run with C_g applied, and
+merged); store reads W_0 + B_C A_C (OverlayStore), HF passes (acts / train_loss) run with C_g applied, and
 evaluator.register serves a candidate (a delta on M_g) as C_g (+) delta.
 Vector references (for rank1 / from_direction): "S3.u0", "S3.v1", "A2.in_mean", "A2.out_mean", "A2.pc0", and
 "T5.<name>" (a vector returned by tensor_compute).
 
 Budgets (RSI_LOOP_DESIGN §3.3): `evaluate` calls (an identical LoRA is evaluated once and only charged
-once) and `gpu_seconds` for acts / regmean_preserve (measured on gpu1; estimated in mock).
+once) and `gpu_seconds` for acts / train_loss (measured on gpu1; estimated in mock).
 All accounting is done by the workspace's rsicore.sandbox.ToolAPI (`ws.api`, created with the workspace):
 evaluate = cost_fn (1 per non-empty LoRA) + dedupe_key_fn (LoRA name = digest; identical LoRAs are free,
 also between program calls and the search's screen evaluation, which goes through the same tool);
 GPU tools = cost {"gpu_seconds": 0} (refused once exhausted) + cost_fn (measured seconds, capped at what
 was left before the call so a successful call keeps its result; the uncapped total is ws.gpu_measured).
-search.charge_screens false (2026-11-21, objective simple; search_settings): the automatic screen is free
+search.charge_screens false (2026-11-21; search_settings): the automatic screen is free
 (screen_candidate) and the `evaluate` budget is only the pool of the programs' api.evaluate calls
 (search.program_evaluate_total); an api.evaluate of a LoRA that was already evaluated (screened) is free.
 Data access: acts / train_example only accept this generation's `train` ids (TrainData).
@@ -34,7 +34,7 @@ reads the shard files itself). Outputs: `result` (JSON, cut to result_chars), `v
 "delta" ops on a new W handle; caps change_errors / no uniform rescale, never embed_tokens / final norm / lm_head).
 It runs WITHOUT the workspace lock (only resolving inputs / registering outputs take it), under a process-wide
 semaphore (max_concurrent), with timeout min(timeout_s, the calling program's / exploration call's time left).
-Objective simple, FINAL flow (2026-11-21; search_settings / paper_tools_enabled / screen_tools_enabled): no evaluate
+The simple flow (2026-11-21, base.yaml; search_settings / paper_tools_enabled / screen_tools_enabled): no evaluate
 tool (search.program_evaluate_calls 0); screen_results / screen_output read the current model's own answers on the
 generation's screen items (ws.screen, set by run.py); paper tools save_edit / load_edit / list_edits / drop_edit
 (out_dir/saved/<root cid>/), output_matrices, unit, direction, project_out, acts(source='own'),
@@ -73,7 +73,6 @@ TOOL_DOCS = {
     "truncate_rank": "truncate_rank(lora, k, modules=None) -> {lora}",
     "intruder_scale": "intruder_scale(lora, lam=0.5, eps=0.3, k0=32, modules=None) -> {lora}",
     "relchange_prune": "relchange_prune(lora, frac=0.03, modules=None) -> {lora}",
-    "regmean_preserve": "regmean_preserve(lora, alpha=1.0, modules=None) -> {lora} (costs gpu_seconds)",
     "orthogonalize": "orthogonalize(lora, against='stack') -> {lora}",
     "ties": "ties(loras, weights=None, density=0.2) -> {lora}",
     "inspect": "inspect(lora) -> {modules, max_rank, check, top, intruder_mean}",
@@ -137,7 +136,7 @@ WEIGHTS_DOC_OVERRIDES = {   # mode=weights: tools that also take an edit handle
 }
 
 
-# Paper-style tools (2026-11-21, objective simple; paper_tools_enabled): saved objects that survive between the
+# Paper-style tools (2026-11-21; paper_tools_enabled): saved objects that survive between the
 # exploration session and the final program of one candidate, the output-side matrices of a layer, vector algebra on
 # refs, activation statistics on the current model's OWN screen outputs, and projecting a direction out of a module.
 PAPER_DOCS = {
@@ -177,12 +176,11 @@ SCREEN_DOCS = {
 }
 
 
-def tools_for_mode(mode: str, retention: bool = True, cfg: dict | None = None) -> dict:
+def tools_for_mode(mode: str, cfg: dict | None = None) -> dict:
     """TOOL_DOCS available to the editor in method.mode: edit = every LoRA tool incl. raw_lora; scratch = no
     raw_lora; weights = no raw_lora, plus WEIGHT_TOOLS (and edit-aware docs of candidate / evaluate / train_loss).
-    retention=False (no retention texts: scope=single, or the E task): no regmean_preserve.
     cfg["tools"][name] = false removes a switchable tool (compare, train_loss, tensor_compute: also removes tensors).
-    tensor_compute / tensors are on only when tensor_compute_enabled(cfg) (objective simple by default)."""
+    tensor_compute / tensors are on unless tensor_compute_enabled(cfg) is false."""
     out = dict(TOOL_DOCS)
     if not tensor_compute_enabled(cfg):
         out.pop("tensor_compute", None)
@@ -197,8 +195,6 @@ def tools_for_mode(mode: str, retention: bool = True, cfg: dict | None = None) -
             out.pop(name, None)
             if name == "tensor_compute":           # the info tool goes with it (2026-11-21)
                 out.pop("tensors", None)
-    if not retention:
-        out.pop("regmean_preserve", None)
     if mode != "edit":
         out.pop("raw_lora", None)
     if mode == "scratch" and str(((cfg or {}).get("merge") or {}).get("mode") or "merge") == "adapter" and "stack" in out:
@@ -226,10 +222,9 @@ def tools_for_mode(mode: str, retention: bool = True, cfg: dict | None = None) -
 
 
 def tensor_compute_enabled(cfg: dict | None) -> bool:
-    """tools.tensor_compute (2026-11-21). Absent key: on for objective simple only, so runs of other objectives (and
-    runs locked before the tool existed) keep their tool surface."""
+    """tools.tensor_compute (2026-11-21; base.yaml sets it). Absent key: on (the simple flow, 2026-11-22)."""
     on = ((cfg or {}).get("tools") or {}).get("tensor_compute")
-    return bool(on) if on is not None else (cfg or {}).get("objective") == "simple"
+    return bool(on) if on is not None else True
 
 
 class BudgetError(Exception):
@@ -267,7 +262,7 @@ def program_evaluate_cap(cfg: dict) -> int | None:
 
 
 def search_settings(cfg: dict) -> dict:
-    """The search keys with code defaults that reproduce the runs before 2026-11-21 (objective simple sets them):
+    """The search keys with code defaults that reproduce the runs before 2026-11-21 (base.yaml sets the simple flow's):
     threads, steps; charge_screens (default true: the automatic screen of a returned candidate costs one `evaluate`);
     pool = the generation's `evaluate` budget (charge_screens: search.max_evaluate; else search.program_evaluate_total,
     null = threads x program_evaluate_calls: the api.evaluate calls of all programs); program_cap (per program, None =
@@ -284,7 +279,7 @@ def search_settings(cfg: dict) -> dict:
         pool = int(sc["program_evaluate_total"])
     else:
         pool = threads * cap if cap is not None else max_ev
-    # gate-per-candidate flow (2026-11-21, objective simple; defaults = the flow above): screen_candidates false =
+    # gate-per-candidate flow (2026-11-21, base.yaml; code defaults = the flow above): screen_candidates false =
     # candidates are not screened (the current model's screen is still computed once per generation and shown through
     # api.screen_results); gate_every_candidate true = every built candidate gets ONE gate evaluation paired vs the
     # current model and the generation accepts the passing one with the largest paired gain; program_evaluate_calls 0
@@ -306,14 +301,14 @@ def search_settings(cfg: dict) -> dict:
 
 def paper_tools_enabled(cfg: dict | None) -> bool:
     """tools.paper_tools (2026-11-21): save_edit / load_edit / list_edits / drop_edit, output_matrices, unit, direction,
-    project_out, acts(source='own') and tensor_compute(vectors=...). Absent key: on for objective simple only."""
+    project_out, acts(source='own') and tensor_compute(vectors=...). base.yaml sets it; absent key: on (2026-11-22)."""
     on = ((cfg or {}).get("tools") or {}).get("paper_tools")
-    return bool(on) if on is not None else (cfg or {}).get("objective") == "simple"
+    return bool(on) if on is not None else True
 
 
 def screen_tools_enabled(cfg: dict | None) -> bool:
     """tools.screen_results (2026-11-21): api.screen_results / api.screen_output over the current model's own answers
-    on this generation's screen items. Absent key: on when search.screen_candidates is false (objective simple)."""
+    on this generation's screen items. Absent key: on when search.screen_candidates is false (base.yaml)."""
     on = ((cfg or {}).get("tools") or {}).get("screen_results")
     return bool(on) if on is not None else not search_settings(cfg or {})["screen_candidates"]
 
@@ -328,7 +323,7 @@ def _budget_exc():
 
 class Workspace:
     def __init__(self, *, mock: bool, store, train, cfg: dict, out_dir: Path, evaluator=None, hf=None,
-                 stack=None, retention_texts=None, budget: dict | None = None, name_prefix: str = "c",
+                 stack=None, budget: dict | None = None, name_prefix: str = "c",
                  diagnostics: dict | None = None, seed: int = 42, mode: str = "scratch", raw=None,
                  raw_info: dict | None = None, base_store=None, base_lora=None):
         self.mock = mock
@@ -355,7 +350,6 @@ class Workspace:
         self.evaluator = evaluator
         self.hf = hf
         self.stack = list(stack or [])          # [(gen, LoRA|MockLoRA)]
-        self.retention_texts = list(retention_texts or [])
         from rsicore.sandbox import ToolAPI
         self.api = ToolAPI(dict(budget or {"evaluate": 32, "gpu_seconds": 7200}))   # the budget accountant
         self.budget = self.api.budget
@@ -374,11 +368,10 @@ class Workspace:
         # concurrently, so evaluate runs without the workspace lock in every mode (like mode=weights)
         self.charge_screens = True
         self.parallel_eval = False
-        # (2026-11-21, objective simple) the current model's own answers on this generation's screen items (dict or a
+        # (2026-11-21) the current model's own answers on this generation's screen items (dict or a
         # loader; Workspace.screen_data) for screen_results / screen_output / acts(source='own'); None = not available
         self.screen = None
         self.program_timeout_s = int((cfg.get("sandbox", {}) or {}).get("timeout_s", 1800))
-        self._gram_t, self._gram_r = {}, {}
         self.tool_log: dict[str, list] = {}
         self._registered = False
         self.rank_cap = int(self.lcfg.get("rank_cap", 64))
@@ -679,12 +672,12 @@ class Workspace:
             self.api._dedupe.setdefault(("evaluate", name), fb)
 
     # ------------------------------------------------------------------ registration
-    GPU_TOOLS = ("acts", "regmean_preserve", "train_loss")
+    GPU_TOOLS = ("acts", "train_loss")
 
     def build_api(self):
         if self._registered:
             return self.api
-        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts), cfg=self.cfg)
+        docs = tools_for_mode(self.mode, cfg=self.cfg)
         if self.mode == "edit" and self.raw is None:
             docs.pop("raw_lora", None)
         for name, doc in docs.items():
@@ -705,7 +698,7 @@ class Workspace:
     def explore_tool_names(self, gpu_tools: bool = False) -> list[str]:
         """Tools of explore_api: the program's tool set without EXPLORE_NEVER, and without GPU_TOOLS unless
         gpu_tools."""
-        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts), cfg=self.cfg)
+        docs = tools_for_mode(self.mode, cfg=self.cfg)
         drop = set(self.EXPLORE_NEVER) | (set() if gpu_tools else set(self.GPU_TOOLS))
         if not self.tc.get("explore", True):     # tensor_compute.explore false: programs only
             drop |= {"tensor_compute", "tensors"}
@@ -716,9 +709,9 @@ class Workspace:
 
         A separate ToolAPI over the same tensors and handles (the _wrap'ed t_* functions, serialised by ws._lock),
         without evaluate / raw_lora (the handle 'RAW' still works) and, unless gpu_tools, without the GPU tools
-        (acts / regmean_preserve / train_loss). It never charges the generation's budgets (ws.api.spent,
+        (acts / train_loss). It never charges the generation's budgets (ws.api.spent,
         gpu_measured): with gpu_tools the GPU tools are charged to a separate exploration budget of gpu_seconds per
-        session (2026-11-22: each proposal / cid has its own; their gram / parent-loss caches are shared with the
+        session (2026-11-22: each proposal / cid has its own; their parent-loss caches are shared with the
         programs). Runs under
         begin_program(tag) in the calling thread (the sandbox serves tool calls in it), so the handles made here
         are freed by cleanup() and the tool log lives under the '~x' tag, which classify() never reads.
@@ -733,7 +726,7 @@ class Workspace:
         api = ToolAPI({})
         if gpu_tools:
             api.budget, api.spent = xb          # this session's own budget (every run_python call of the proposal)
-        docs = tools_for_mode(self.mode, retention=bool(self.retention_texts), cfg=self.cfg)
+        docs = tools_for_mode(self.mode, cfg=self.cfg)
         clock = {"t0": time.time(), "deadline": time.time() + _explore_timeout(self.cfg)}
 
         def bind():
@@ -1081,39 +1074,6 @@ class Workspace:
         return self._op(lambda a: M.m_prune(a, frac),
                         lambda a: ops.relchange_prune(a, self.store, frac, modules,
                                                       device=getattr(self.hf, "device", "cpu") if self.hf else "cpu"), lo)
-
-    def t_regmean_preserve(self, lora, alpha=1.0, modules=None):
-        from .primitives import ops
-        lo = self._get(lora, "lora")
-        if self.mock:
-            self._gpu(lambda: None, est_seconds=20)
-            return {"lora": self._new("L", M.m_regmean(lo, float(alpha)))}
-        mods = [m for m in (self._mods(modules) if modules else lo.modules()) if m in lo.factors]
-        # (2026-11-22) sessions on several tool devices share the gram caches: one gram lock around check, compute
-        # and publish, so nobody reads a module whose target grams are in and retention grams are not yet
-        with self.__dict__.setdefault("_gram_lock", threading.Lock()):
-            need = [m for m in mods if m not in self._gram_t or m not in self._gram_r]
-            if need:
-                n = int(self.cfg.get("tools", {}).get("gram_items", 64))
-                tt = self.train.texts(self.train.ids()[:n])
-                rt = self.retention_texts[:n]
-                if not rt:
-                    raise ValueError("no retention contexts available for regmean_preserve")
-                def grams(texts):
-                    with self._hf_current():
-                        return self.hf.grams(texts, need)
-                gt = self._gpu(lambda: grams(tt), est_seconds=0)
-                gr = self._gpu(lambda: grams(rt), est_seconds=0)
-                self._gram_t.update(gt)
-                self._gram_r.update(gr)
-            gt = {m: self._gram_t[m] for m in mods if m in self._gram_t}
-            gr = {m: self._gram_r[m] for m in mods if m in self._gram_r}
-        miss = [m for m in mods if m not in gt or m not in gr]
-        if miss:
-            raise RuntimeError(f"regmean_preserve: no activation statistics for {miss[:4]} (their forward hooks "
-                               "never fired)")
-        out = ops.regmean_preserve(lo, gt, gr, float(alpha), modules=mods)
-        return {"lora": self._new("L", out)}
 
     def t_orthogonalize(self, lora, against="stack"):
         from .primitives import ops
@@ -2485,7 +2445,7 @@ def classify(tools) -> str:
     if "project_out.edit" in s:                 # project_out on a weight edit is a weights op, not a construction
         construct.discard("project_out")
     stack_ops = s & {"interpolate", "combine", "truncate_rank", "intruder_scale", "relchange_prune",
-                     "regmean_preserve", "orthogonalize", "ties", "scale", "drop"}
+                     "orthogonalize", "ties", "scale", "drop"}
     if s & {"w_scale", "w_scale_rows", "w_scale_cols", "w_add_lora", "w_toward_original", "tensor_compute.writes",
             "project_out.edit"}:
         return "weights" + ("+construct" if construct else "") + ("+ops" if stack_ops else "") \
@@ -2510,7 +2470,7 @@ EXPLORE_MOCK_CODE = "print(api.budget())"   # the mock editor's run_python call 
 def explore_doc(ws: Workspace, gpu_tools: bool = False, gpu_seconds: float = 300.0) -> str:
     """Description of the run_python chat tool for Paper B: the rsicore text plus what is missing in exploration."""
     from rsicore.chat_tools import RUN_PYTHON_DOC
-    have = set(tools_for_mode(ws.mode, retention=bool(ws.retention_texts), cfg=ws.cfg))
+    have = set(tools_for_mode(ws.mode, cfg=ws.cfg))
     missing = [n for n in Workspace.EXPLORE_NEVER + (() if gpu_tools else Workspace.GPU_TOOLS) if n in have]
     if not ws.tc.get("explore", True):         # tensor_compute.explore false (2026-11-21)
         missing += [n for n in ("tensors", "tensor_compute") if n in have]
@@ -2550,7 +2510,7 @@ def search_history(past: dict | None = None):
         if acc.get("source") == "keep" and acc.get("reason"):
             out["reason"] = str(acc["reason"])[:200]
         rs = (read_json(Path(d) / "reference_screen.json", {}) or {}).get("summary") or {}
-        if rs.get("n_items"):        # the then-current model's own screen answers (2026-11-21, objective simple)
+        if rs.get("n_items"):        # the then-current model's own screen answers (2026-11-21)
             out["reference_screen"] = {k: rs.get(k) for k in ("n_items", "samples_per_item", "accuracy",
                                                               "correct_counts", "truncation_rate")}
         return out

@@ -223,8 +223,8 @@ def role_gpus(rc, cfg: dict, role: str) -> list[int]:
 
 def candidate_args(cfg: dict) -> list[str]:
     """vLLM args of a candidate server (and of M_0's replicas / exported models on candidate GPUs):
-    vllm.candidate_args, with --max-model-len = vllm.candidate_max_model_len when that is set (2026-11-21, objective
-    simple: 32768, so a prompt + 16384 thinking tokens fit; null / absent = the args as written)."""
+    vllm.candidate_args, with --max-model-len = vllm.candidate_max_model_len when that is set (2026-11-21, base.yaml:
+    32768, so a prompt + 16384 thinking tokens fit; null / absent = the args as written)."""
     from rsicore.servers import set_max_model_len
     v = cfg.get("vllm") or {}
     n = v.get("candidate_max_model_len")
@@ -241,7 +241,7 @@ def search_settings(scfg: dict) -> dict:
         an api.evaluate of a config already evaluated is then free.
       program_evaluate_calls (default 2): api.evaluate calls per program (null = no per-program cap).
       max_candidates (null / absent = threads x steps; with charged screens also at most max_evaluate, the old cap).
-    Gate-per-candidate flow (2026-11-21, objective simple; defaults = the flow above):
+    Gate-per-candidate flow (2026-11-21, the base.yaml values; code defaults = the flow above):
       screen_candidates (default true): false = candidates are NOT screened (the incumbent's screen is still computed
         once per generation and shown to the editor); screens are then never charged.
       gate_every_candidate (default false): true = every built candidate gets ONE gate evaluation (paired vs the

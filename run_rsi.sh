@@ -6,14 +6,14 @@
 #                [--run-id ID] [--mock] [paper-specific args ...]
 #
 #   --paper    A -> python -I edit_code/run.py ; B -> python -I lora_code/run.py   (required)
-#   --domain   math | code | knowledge | instruction_following | tool_calling (Paper A also: all)
+#   --domain   math | code | knowledge | instruction_following | tool_calling
 #   --mock     no GPU / no real model: mock OpenAI server + mock builders (runs on a laptop)
 #   Every argument except --paper is passed to run.py unchanged (unknown ones too).
 #
 # Python: $RSI_PYTHON if set; else eval/.venv/bin/python with --mock; else ~/venvs/rsi-gpu/bin/python.
 # Outputs: experiment_records/<run-id>/ ; rerunning the same run-id resumes (finished steps are skipped).
 # Examples:
-#   ./run_rsi.sh --paper A --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id A_math_s42
+#   ./run_rsi.sh --paper A --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id A_math_s42_single_simple
 #   ./run_rsi.sh --paper B --domain math --gens 2 --mock
 set -euo pipefail
 

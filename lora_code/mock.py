@@ -317,15 +317,6 @@ def m_intruder(base, lam):
     return lo
 
 
-def m_regmean(base, alpha):
-    lo = base.copy()
-    f = alpha / (1 + alpha)
-    lo.damage *= 1 - 0.5 * f
-    lo.gain *= 1 - 0.06 * f
-    lo.ops.append(["regmean_preserve", alpha])
-    return lo
-
-
 def m_prune(base, frac):
     lo = base.copy()
     lo.damage *= max(0.5, 1 - 4 * frac)
@@ -545,7 +536,7 @@ def mock_diagnostics(store: MockStore, stack: list, seed: int = 42) -> dict:
 
 
 # ============================================================================ mock editor policy
-def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "scratch", retention: bool = True,
+def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str = "scratch",
                      tensor_compute: bool = False, paper: bool = False):
     """Return policy(history) -> program text. Choices vary with (thread, step) parsed from the last user
     message ("[thread=K step=S]"); a higher `skill` (the editor model's mock quality) picks better
@@ -553,9 +544,11 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
     (EDIT_PROGRAM); scratch = gradient-free constructions from zero (SCRATCH_PROGRAM); weights = structured edits
     of the dense weights returned as {"edit": handle} (WEIGHTS_PROGRAM). tensor_compute (2026-11-21, scratch, the
     tool is on): thread 1 writes TENSOR_PROGRAM instead (api.evaluate x2 + api.tensor_compute vectors / LoRA
-    factors); every other choice is unchanged. paper (2026-11-21, objective simple: paper and screen tools on, no
-    api.evaluate; scratch / weights): thread 1 writes PAPER_PROGRAM instead (screen_results / screen_output, acts on
-    its own screen answers, direction / unit / tensor_compute(vectors=...), project_out, save_edit / load_edit)."""
+    factors); every other choice is unchanged. paper (2026-11-21, paper and screen tools on, no api.evaluate;
+    scratch / weights): thread 1 writes PAPER_PROGRAM instead (screen_results / screen_output, acts on
+    its own screen answers, direction / unit / tensor_compute(vectors=...), project_out, save_edit / load_edit).
+    There is no regmean_preserve tool (2026-11-22): the recipes "regmean" / "singular_regmean" are written as
+    "intruder" / "singular_scale" (the recipe lists keep their length, so the other choices are unchanged)."""
 
     def policy(history):
         last = ""
@@ -569,7 +562,7 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
         good = rng.random() < skill
         if mode == "edit":
             recipe = EDIT_RECIPES[(th * 3 + st + rng.randrange(len(EDIT_RECIPES))) % len(EDIT_RECIPES)]
-            if recipe == "regmean" and not retention:   # no regmean_preserve without retention texts
+            if recipe == "regmean":                     # no regmean_preserve tool
                 recipe = "intruder"
             return EDIT_PROGRAM.format(recipe=recipe, th=th, st=st,
                                        k=rng.choice([8, 16] if good else [2, 4]),
@@ -592,7 +585,7 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
                                           s=rng.choice([0.99, 1.01] if good else [1.03, 0.96]),
                                           lo=rng.choice([8, 16]), hi=rng.choice([48, 56]))
         recipe = SCRATCH_RECIPES[(th + st + rng.randrange(len(SCRATCH_RECIPES))) % len(SCRATCH_RECIPES)]
-        if recipe == "singular_regmean" and not retention:
+        if recipe == "singular_regmean":
             recipe = "singular_scale"
         if tensor_compute and th == 1:
             return TENSOR_PROGRAM.format(th=th, st=st, n=rng.choice([8, 16] if good else [2, 32]),
@@ -606,6 +599,8 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
     return policy
 
 
+# The "regmean" / "singular_regmean" branches of the two templates below never run (make_mock_policy rewrites those
+# recipes); they stay so the mock program text of every other recipe is unchanged (2026-11-22).
 EDIT_RECIPES = ["trunc_scale", "intruder", "regmean", "prune_orth", "drop_attn", "layer_scale", "trunc_intruder",
                 "boost", "boost"]
 
@@ -688,7 +683,7 @@ def main(api):
 '''
 
 
-# (2026-11-21) objective simple: the paper-style recipe on the current model's own screen answers (no api.evaluate)
+# (2026-11-21) the simple flow: the paper-style recipe on the current model's own screen answers (no api.evaluate)
 PAPER_PROGRAM = '''\
 # mock editor program (mode={mode}): thread {th} step {st}, recipe paper
 def main(api):

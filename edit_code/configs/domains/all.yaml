@@ -1,3 +1,0 @@
-# Paper A main experiment: all five domains give signal and gate (one training set each,
-# rsicore.draws.DOMAIN_TRAIN); the gate requires a mean paired gain over the incumbent across the five gate datasets.
-domain: all

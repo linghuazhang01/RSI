@@ -1,7 +1,7 @@
 """Mock OpenAI-compatible server for GPU-free runs of the whole RSI loop (INTERFACES.md §5).
 
   eval/.venv/bin/python -I eval/rsicore/mock_server.py --port 8123 --served-name base \
-      --registry run/mock_registry.json [--tasks dapo_math,math500] [--enable-lora] [--seed 42]
+      --registry run/mock_registry.json [--tasks dapo_math,taco_verified] [--enable-lora] [--seed 42]
 
 * /v1/chat/completions: requests built by eval/run_eval.py are recognised through an index of
   (system+user messages) -> (task, item, unit), built like eval/tests/oracle_server.py and cached under
@@ -13,8 +13,8 @@
   (temperature 0 / absent) ignore the request seed; sampled requests (temperature > 0) also hash the
   request's `seed` and `temperature`, so repeated evaluations with different seeds differ (noise band)
   while each (seed, temperature, prompt) stays deterministic. ifeval_train gets a
-  constructed reply satisfying its single constraint (rsicore/_mock_answers.py); held-out IFEval/IFBench
-  only have the hand-made fixtures, so most of their items score 0 in mock mode.
+  constructed reply satisfying its single constraint (rsicore/_mock_answers.py). The default index covers the
+  five training sets, whose prompts the simple_<domain>_* eval sets reuse (same requests); other tasks need --tasks.
   Editor chats (metadata.mock_editor, or a model name ending in "editor") get a trivial program.
 * quality: registry JSON {name: value} for served names and LoRA names, re-read whenever the file
   changes (builders register candidates while the server runs); default 0.7. value = float, or a dict
@@ -49,8 +49,6 @@ from evallib.tasks import load_tasks  # noqa: E402
 from rsicore import mock_quality as MQ  # noqa: E402
 
 TRAIN_TASKS = ["dapo_math", "taco_verified", "triviaqa_train", "ifeval_train", "sealtool_train"]
-HELDOUT_TASKS = ["math500", "gsm8k", "aime24", "aime25", "humanevalplus", "mbppplus", "livecodebench",
-                 "gpqa_diamond", "mmlu_pro", "triviaqa", "ifeval", "ifbench", "sealtool", "apibank", "bfcl"]
 INDEX_VERSION = 1
 EDITOR_REPLY = "```python\ndef main(api):\n    return {}\n```"
 
@@ -74,12 +72,7 @@ class Mock:
         self.stats = {"requests": 0, "hits": 0, "misses": 0, "gold": 0, "wrong": 0, "editor": 0,
                       "completions": 0, "lora_loads": 0}
         self.tasks = load_tasks(yaml.safe_load(open(EVAL_DIR / "configs" / "tasks.yaml")))
-        names = [t for t in (a.tasks.split(",") if a.tasks else TRAIN_TASKS + HELDOUT_TASKS) if t]
-        if not a.tasks:                                # eval-set targets (objective eval_overfit), when built and
-            cfg = yaml.safe_load(open(EVAL_DIR / "configs" / "tasks.yaml"))   # their sources are not indexed already
-            for k, src in (cfg.get("eval_targets") or {}).items():            # (same prompts -> same requests)
-                if (PROC_DIR / f"{k}_eval.jsonl").exists() and not all(t in names for t, _ in src):
-                    names.append(f"{k}_eval")
+        names = [t for t in (a.tasks.split(",") if a.tasks else TRAIN_TASKS) if t]
         self.index = self._index(names)
         self.items: dict[str, dict] = {}
         self.if_ok: dict[str, bool] = {}

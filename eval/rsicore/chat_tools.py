@@ -165,7 +165,7 @@ class SearchHistory:
     gate.json); row_fn(record) -> dict: the paper's short summary of one candidates.jsonl record (artifact,
     screen, full, score, error); key_fn(record) -> str | None: identity of the result (e.g. a config hash),
     used for same_as; gen_fn(gen, directory) -> dict: the paper's outcome of an earlier generation.
-    SearchHistory({}) = no earlier generations (e.g. the fresh E_t session): search_history then lists this
+    SearchHistory({}) = no earlier generations (e.g. Paper A's generation 1): search_history then lists this
     step's candidates only."""
 
     def __init__(self, past: dict | None = None, *, row_fn=None, key_fn=None, gen_fn=None):

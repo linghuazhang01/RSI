@@ -4,8 +4,14 @@
     rc = load_run_config("A", ap.parse_args())
 
 run_config.yaml is written on the first run of a run-id and locked: later runs with a different
-paper / domain / model / seed / mock / draw_config / paper_cfg are refused. `gens` and `gpus` may change
-(extending a run, moving machines); the stored values are updated.
+paper / domain / model / seed / mock / paper_cfg are refused. `gens` and `gpus` may change
+(extending a run, moving machines); the stored values are updated. The paper_cfg comparison ignores the keys of
+removed features (LOCK_IGNORED_*, 2026-11-22: objective / scope profiles, data sizes, data roles, retention, E_t,
+eval_target, draw_config), so runs made before their removal resume with the same command.
+
+One flow (2026-11-22, formerly `objective: simple` + `scope: single`): train role simple_<d>_pool, gate
+simple_<d>_eval, held-out simple_<d>_test (rsicore.draws / rsicore.heldout). The default run id keeps the old
+suffix: <paper>_<domain>_s<seed>_single_simple[_mock].
 """
 import argparse
 import copy
@@ -21,8 +27,19 @@ ROOT = Path(__file__).resolve().parents[2]
 EVAL_DIR = ROOT / "eval"
 DOMAINS = ["math", "code", "knowledge", "instruction_following", "tool_calling"]
 PAPER_DIRS = {"A": ROOT / "edit_code", "B": ROOT / "lora_code"}
-DRAW_CONFIGS = {"A": ROOT / "data" / "draw" / "paper_a.yaml", "B": ROOT / "data" / "draw" / "paper_b.yaml"}
-LOCKED = ("paper", "domain", "model", "model_path", "seed", "mock", "draw_config", "paper_cfg")
+LOCKED = ("paper", "domain", "model", "model_path", "seed", "mock", "paper_cfg")
+RUN_SUFFIX = "_single_simple"     # default run-id suffix (kept from the objective simple / scope single era)
+
+# paper_cfg keys of removed features (2026-11-22), ignored by the run lock: names at any depth, names containing a
+# token, dotted paths, and the defaults of keys a newer base.yaml may add (absent = the default)
+LOCK_IGNORED_KEYS = frozenset({
+    "objective", "objective_profiles", "scope", "scope_profiles", "mock_objective_overrides", "data", "data_roles",
+    "eval_target", "draw_config", "e_t", "e_task", "e_ref", "e_branch", "kl_contexts", "lambda_kl", "kl_limit"})
+LOCK_IGNORED_TOKENS = ("retention", "theta0", "regmean")
+LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval")
+LOCK_DEFAULTS = {"simple.screen_n": 500}
+# --set / --config values of the removed selectors that are accepted as no-ops (the one remaining flow)
+LEGACY_SELECTORS = {"objective": "simple", "scope": "single"}
 
 
 @dataclass
@@ -37,13 +54,12 @@ class RunConfig:
     seed: int
     gpus: list
     mock: bool
-    draw_config: Path     # data/draw/paper_a.yaml or paper_b.yaml
     paper_cfg: dict       # base.yaml + domains/<domain>.yaml (+ --set overrides)
     cli_extra: dict = field(default_factory=dict)   # paper-specific CLI args (informational, not locked)
 
 
 def eval_python() -> str:
-    """Interpreter for eval/run_eval.py and data/scripts/draw.py (the CPU eval env)."""
+    """Interpreter for eval/run_eval.py (the CPU eval env)."""
     if os.environ.get("RSI_EVAL_PYTHON"):
         return os.environ["RSI_EVAL_PYTHON"]
     p = EVAL_DIR / ".venv" / "bin" / "python"
@@ -52,31 +68,42 @@ def eval_python() -> str:
 
 def build_arg_parser(paper: str) -> argparse.ArgumentParser:
     paper = paper.upper()
-    doms = DOMAINS + (["all"] if paper == "A" else [])
     ap = argparse.ArgumentParser(description=f"RSI Paper {paper} run (see eval/rsicore/INTERFACES.md)")
-    ap.add_argument("--domain", required=True, choices=doms)
+    ap.add_argument("--domain", required=True, choices=DOMAINS)
     ap.add_argument("--gens", type=int, default=5, help="number of generations")
     ap.add_argument("--model", default="qwen3.8-27b", help="download_models.sh name or a path")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gpus", default="0,1", help="comma-separated GPU ids")
-    ap.add_argument("--run-id", default=None, help="default <paper>_<domain>_s<seed>[_single][_mock]")
+    ap.add_argument("--run-id", default=None, help=f"default <paper>_<domain>_s<seed>{RUN_SUFFIX}[_mock]")
     ap.add_argument("--mock", action="store_true", help="no real model: mock OpenAI server + mock builders")
     ap.add_argument("--runs-dir", default=str(ROOT / "experiment_records"), help="parent of run directories")
     ap.add_argument("--paper-dir", default=None, help="override the paper code dir holding configs/")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a paper config value (dotted key, YAML value); repeatable")
     ap.add_argument("--config", action="append", default=[], metavar="YAML",
-                    help="experiment config file(s) (2026-11-21): merged after the hardware / scope / objective profiles "
-                         "and before --set (later files win); its objective / scope keys select those profiles")
+                    help="experiment config file(s) (2026-11-21): merged after the hardware profile and before --set "
+                         "(later files win); its hardware key selects that profile")
     return ap
 
 
-PROFILE_KEYS = ("hardware", "scope", "objective")
+PROFILE_KEYS = ("hardware",)
+
+
+def _legacy_selector(key: str, value, where: str) -> bool:
+    """True for objective / scope (removed 2026-11-22) given with the one remaining value (simple / single): a no-op.
+    Any other value is refused."""
+    if key not in LEGACY_SELECTORS:
+        return False
+    if value != LEGACY_SELECTORS[key]:
+        raise SystemExit(f"{where}: {key}={value!r} was removed (2026-11-22); the only flow is the former "
+                         f"{key} {LEGACY_SELECTORS[key]!r} (drop the setting)")
+    return True
 
 
 def _load_config_files(paths) -> list[dict]:
     """--config files (2026-11-21): YAML mappings of paper config overrides. *_profiles keys are refused (a config file
-    selects a profile by name, e.g. objective: simple; it does not redefine one)."""
+    selects a profile by name, e.g. hardware: h20; it does not redefine one). objective: simple / scope: single (removed
+    selectors) are dropped as no-ops."""
     out = []
     for p in paths or []:
         path = Path(p)
@@ -90,7 +117,7 @@ def _load_config_files(paths) -> list[dict]:
         bad = sorted(k for k in d if str(k).endswith("_profiles"))
         if bad:
             raise SystemExit(f"--config {p}: profile definitions are not allowed in a config file: {bad}")
-        out.append(d)
+        out.append({k: v for k, v in d.items() if not _legacy_selector(k, v, f"--config {p}")})
     return out
 
 
@@ -143,26 +170,6 @@ def _apply_profile(cfg: dict, sets, key: str, default: str) -> dict:
 def _apply_hardware(cfg: dict, sets) -> dict:
     """hardware: b300 | h20 ... (hardware_profiles)."""
     return _apply_profile(cfg, sets, "hardware", "b300")
-
-
-def _apply_scope(cfg: dict, sets, domain: str) -> dict:
-    """scope: single | all (scope_profiles). single = one domain only: training, signal, gate, feedback and
-    held-out evaluation all on the run's --domain (the paper's scope_profiles.single says which keys that
-    sets). --domain all (Paper A) runs with scope all unless --set scope=single is given (refused)."""
-    explicit = any(it.partition("=")[0].strip() == "scope" for it in sets)
-    if domain == "all" and cfg.get("scope_profiles"):
-        if explicit and any(it.partition("=")[0].strip() == "scope" and yaml.safe_load(it.partition("=")[2]) == "single"
-                            for it in sets):
-            raise SystemExit("scope=single needs one --domain, not 'all'")
-        cfg = dict(cfg, scope="all")
-    return _apply_profile(cfg, sets, "scope", "single")
-
-
-def _apply_objective(cfg: dict, sets) -> dict:
-    """objective: train_gate (default: train / signal / gate split) | eval_overfit (2026-11-20: optimise directly on
-    the eval sets, objective_profiles.eval_overfit) | simple (2026-11-21: simple_data: a fresh 500-item screen of the
-    clean pool every generation, gate on its 500 eval items, held-out report on its 500 test items)."""
-    return _apply_profile(cfg, sets, "objective", "train_gate")
 
 
 # ---------------------------------------------------------------------------- decoding (2026-11-21)
@@ -237,126 +244,12 @@ def _resolve_decoding(cfg: dict, seed: int) -> dict:
     return cfg
 
 
-def _resolve_eval_target(cfg: dict, domain: str) -> dict:
-    """objective eval_overfit (2026-11-21: any single eval set): eval_target.dataset = a key of tasks.yaml
-    eval_targets (e.g. humanevalplus) or its dataset name (humanevalplus_eval); null = the domain's default
-    (eval_target_defaults). Resolved to the dataset name; the eval set must belong to the run's --domain."""
-    et = cfg.get("eval_target") or {}
-    if cfg.get("objective") != "eval_overfit" or not et.get("enabled"):
-        return cfg
-    if domain == "all":
-        raise SystemExit("objective eval_overfit needs one --domain (the eval set's domain), not 'all'")
-    from . import evalsets
-    _, t = evalsets.resolve(et.get("dataset"), domain)
-    et["dataset"] = t["dataset"]
-    return cfg
-
-
-def _resolve_data_roles(cfg: dict, domain: str, scope_single: bool) -> dict:
-    """data_roles (2026-11-21; see rsicore.evalsets): train / gate -> dataset names (validated), eval -> heldout_tasks
-    tokens. Only keys the user set are written (defaults stay implicit, so older locked configs still match)."""
-    dr = cfg.get("data_roles")
-    if not dr or not any(dr.values()):              # absent, or every role null = the defaults
-        return cfg
-    from . import evalsets
-    if domain == "all":
-        raise SystemExit("data_roles needs one --domain, not 'all'")
-    unknown = sorted(set(dr) - {"train", "gate", "eval"})
-    if unknown:
-        raise SystemExit(f"data_roles: unknown key(s) {unknown}; known: train, gate, eval")
-    for role in ("train", "gate"):
-        if dr.get(role):
-            dr[role] = evalsets.resolve_set(dr[role], domain, role)
-    roles = dict(evalsets.default_roles(cfg, domain), **{k: dr[k] for k in ("train", "gate") if dr.get(k)})
-    if not scope_single and any(evalsets.is_eval_set(roles[k]) for k in ("train", "gate")):
-        raise SystemExit("data_roles: an eval-set train / gate needs scope single")
-    if dr.get("eval"):
-        dr["eval"] = evalsets.eval_tokens(dr["eval"], roles, domain)
-    return cfg
-
-
 def _resolve_run_domain(cfg: dict, domain: str) -> dict:
-    """heldout.domains: run -> the run's domain ('all' for Paper A's --domain all)."""
+    """heldout.domains: run -> the run's domain."""
     h = cfg.get("heldout")
     if isinstance(h, dict) and h.get("domains") == "run":
         h["domains"] = domain
     return cfg
-
-
-DATA_TOP = {"A": ("screen_n", "kl_contexts"), "B": ("screen_n", "target_train_frac", "retention_n", "retention_kl")}
-DATA_DOMAIN = ("n", "gate_n")
-
-
-def kl_domains_for(cfg: dict, paper: str, domain: str) -> list[str] | None:
-    """Paper A: the domains whose KL / calibration texts the run uses. kl.domains other than `all` (e.g. `run`,
-    set by scope=single) with one --domain -> [domain], so the draw puts every kl_contexts text in that domain.
-    None = the draw's default (kl_contexts split over all five domains)."""
-    if paper != "A" or domain == "all":
-        return None
-    return None if (cfg.get("kl") or {}).get("domains", "all") == "all" else [domain]
-
-
-def apply_data_sizes(draw: dict, data: dict | None, paper: str, kl_domains: list[str] | None = None) -> dict:
-    """Draw config with the run config's `data:` sizes applied (null = keep the draw config's value).
-    Top-level sizes (DATA_TOP) are numbers; per-domain sizes (n, gate_n) are a number (every domain) or
-    {domain: number} (the domains not listed keep theirs). kl_domains (Paper A, kl_domains_for) restricts the
-    domains kl_contexts is split over."""
-    out = copy.deepcopy(draw)
-    if kl_domains:
-        out["kl_domains"] = list(kl_domains)
-    data = {k: v for k, v in (data or {}).items() if v is not None}
-    known = DATA_TOP[paper] + DATA_DOMAIN
-    bad = sorted(set(data) - set(known))
-    if bad:
-        raise SystemExit(f"data: unknown size key(s) {bad} for Paper {paper}; known: {list(known)}")
-
-    def num(key, v, frac=False):
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            raise SystemExit(f"data.{key} must be a number, got {v!r}")
-        if frac:
-            if not 0 < float(v) < 1:
-                raise SystemExit(f"data.{key} must be in (0, 1), got {v!r}")
-            return float(v)
-        if int(v) != v or int(v) < 1:
-            raise SystemExit(f"data.{key} must be a positive integer, got {v!r}")
-        return int(v)
-
-    for k in DATA_TOP[paper]:
-        if k in data:
-            out[k] = num(k, data[k], frac=(k == "target_train_frac"))
-    doms = out.get("domains") or {}
-    for k in DATA_DOMAIN:
-        if k not in data:
-            continue
-        spec = data[k]
-        if isinstance(spec, dict):
-            unknown = sorted(set(spec) - set(doms))
-            if unknown:
-                raise SystemExit(f"data.{k}: unknown domain(s) {unknown}; known: {sorted(doms)}")
-            vals = {d: num(f"{k}.{d}", v) for d, v in spec.items() if v is not None}
-        else:
-            vals = {d: num(k, spec) for d in doms}
-        for d, v in vals.items():
-            doms[d][k] = v
-    return out
-
-
-def _effective_draw_config(base: Path, data: dict | None, paper: str, run_dir: Path,
-                           kl_domains: list[str] | None = None, seed: int | None = None) -> Path:
-    """Write run_dir/draw_config.effective.yaml: `base` with the `data:` sizes, kl_domains and the run's seed
-    (the per-generation draws; the gate split keeps gate.seed) applied
-    (deterministic content, so a resume with the same settings matches the copy data/scripts/draw.py locked in
-    draws/draw_config.yaml; different settings are refused there)."""
-    eff = apply_data_sizes(_load_yaml(base), data, paper, kl_domains)
-    if seed is not None:
-        eff["seed"] = int(seed)
-    eff["data_sizes_from"] = {"draw_config": str(base), "run_config_data": copy.deepcopy(data or {}),
-                              "kl_domains": kl_domains}
-    p = run_dir / "draw_config.effective.yaml"
-    txt = yaml.safe_dump(eff, sort_keys=True, allow_unicode=True)
-    if not p.exists() or p.read_text() != txt:
-        p.write_text(txt)
-    return p
 
 
 def resolve_model(model: str) -> Path:
@@ -368,9 +261,91 @@ def resolve_model(model: str) -> Path:
 
 def _plain(rc: RunConfig) -> dict:
     d = {k: getattr(rc, k) for k in rc.__dataclass_fields__}
-    for k in ("run_dir", "model_path", "draw_config"):
+    for k in ("run_dir", "model_path"):
         d[k] = str(d[k])
     return d
+
+
+# top-level paper config keys that rsicore no longer reads (2026-11-22); setting them is refused
+REMOVED_SET_KEYS = {"data": "simple.screen_n", "data_roles": None, "eval_target": None, "draw_config": None}
+
+
+def _check_removed(key: str, where: str) -> None:
+    top = str(key).split(".")[0]
+    if top in REMOVED_SET_KEYS:
+        alt = REMOVED_SET_KEYS[top]
+        raise SystemExit(f"{where}: {top} was removed (2026-11-22; the train / gate / held-out sets are fixed to "
+                         f"simple_<domain>_pool / _eval / _test)" + (f"; use {alt}" if alt else ""))
+
+
+def _lock_ignored(key: str, path: str) -> bool:
+    return key in LOCK_IGNORED_KEYS or any(t in key for t in LOCK_IGNORED_TOKENS) or path in LOCK_IGNORED_PATHS
+
+
+def _strip_ignored(x, path: str = ""):
+    if not isinstance(x, dict):
+        return x
+    out = {}
+    for k, v in x.items():
+        p = f"{path}.{k}" if path else str(k)
+        if not _lock_ignored(str(k), p):
+            sv = _strip_ignored(v, p)
+            if not (isinstance(v, dict) and v and not sv):      # a mapping that held only ignored keys: absent
+                out[k] = sv
+    return out
+
+
+def lock_view(cfg: dict | None) -> dict:
+    """paper_cfg as the run lock compares it (2026-11-22): the former mock_objective_overrides.simple folded into
+    mock_overrides (both were applied after --set, in this order), the former data.screen_n read as simple.screen_n,
+    LOCK_DEFAULTS filled in, then every LOCK_IGNORED_* key dropped. A run locked before the removals and the same
+    command today give the same view."""
+    c = copy.deepcopy(cfg or {})
+    moo = (c.get("mock_objective_overrides") or {}).get("simple") if isinstance(c.get("mock_objective_overrides"), dict) else None
+    if moo:
+        c["mock_overrides"] = _deep_merge(c.get("mock_overrides") or {}, moo)
+    sn = (c.get("data") or {}).get("screen_n") if isinstance(c.get("data"), dict) else None
+    if sn is not None and not (isinstance(c.get("simple"), dict) and c["simple"].get("screen_n") is not None):
+        c["simple"] = dict(c.get("simple") or {}, screen_n=sn)
+    for path, v in LOCK_DEFAULTS.items():
+        *head, leaf = path.split(".")
+        d = c
+        for h in head:
+            if d.get(h) is None:
+                d[h] = {}
+            d = d[h]
+            if not isinstance(d, dict):
+                break
+        else:
+            if d.get(leaf) is None:
+                d[leaf] = v
+    return _strip_ignored(c)
+
+
+def _removed_features_used(ocfg: dict, domain: str) -> list[str]:
+    """Removed features (2026-11-22) a locked paper_cfg actually used: E_t on, retention domains, data_roles other
+    than the fixed simple sets. The lock view ignores these keys, so they are checked by value here."""
+    out = []
+    for k in ("e_t", "e_task"):
+        if isinstance(ocfg.get(k), dict) and ocfg[k].get("enabled"):
+            out.append(f"{k}.enabled true")
+    if isinstance(ocfg.get("retention"), dict) and ocfg["retention"].get("domains"):
+        out.append("retention.domains " + repr(ocfg["retention"]["domains"]))
+    fixed = {"train": f"simple_{domain}_pool", "gate": f"simple_{domain}_eval"}
+    for role, want in fixed.items():
+        v = (ocfg.get("data_roles") or {}).get(role) if isinstance(ocfg.get("data_roles"), dict) else None
+        if v not in (None, want, f"eval:{want}"):
+            out.append(f"data_roles.{role} {v!r}")
+    return out
+
+
+def _diff_paths(a, b, path: str = "") -> list[str]:
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = []
+        for k in list(a) + [k for k in b if k not in a]:
+            out += _diff_paths(a.get(k, "<absent>"), b.get(k, "<absent>"), f"{path}.{k}" if path else str(k))
+        return out
+    return [] if a == b else [f"{path}: locked={a!r} now={b!r}"]
 
 
 def load_run_config(paper: str, args) -> RunConfig:
@@ -382,52 +357,37 @@ def load_run_config(paper: str, args) -> RunConfig:
     if not (cdir / "base.yaml").exists():
         print(f"[rsicore] warning: {cdir / 'base.yaml'} not found; using empty paper config", file=sys.stderr)
     cfg = _deep_merge(_load_yaml(cdir / "base.yaml"), _load_yaml(cdir / "domains" / f"{args.domain}.yaml"))
-    sets = list(getattr(args, "set", []) or [])
+    sets = []
+    for it in list(getattr(args, "set", []) or []):   # objective=simple / scope=single: accepted no-ops
+        k, eq, v = it.partition("=")
+        if not (eq and _legacy_selector(k.strip(), yaml.safe_load(v), "--set")):
+            if eq and k.strip() == "data.screen_n":     # removed 2026-11-22: same value, new key
+                print("[rsicore] note: --set data.screen_n is now simple.screen_n", file=sys.stderr)
+                sets.append(f"simple.screen_n={v}")
+                continue
+            _check_removed(k.strip(), "--set")
+            sets.append(it)
     files = _load_config_files(getattr(args, "config", None))
-    for f in files:                              # a config file's hardware / scope / objective select the profile
+    for f in files:
+        for k in f:
+            _check_removed(k, "--config")
+    for f in files:                              # a config file's hardware selects the profile
         cfg.update({k: f[k] for k in PROFILE_KEYS if f.get(k) is not None})   # (--set key=... still wins)
     cfg = _apply_hardware(cfg, sets)
-    cfg = _apply_scope(cfg, sets, args.domain)
-    cfg = _apply_objective(cfg, sets)
-    for f in files:                              # then the file's values, over the profiles, under --set
+    for f in files:                              # then the file's values, over the profile, under --set
         cfg = _deep_merge(cfg, {k: v for k, v in f.items() if k not in PROFILE_KEYS})
     cfg = _apply_set(cfg, sets)
     cfg = _resolve_run_domain(cfg, args.domain)
-    cfg = _resolve_eval_target(cfg, args.domain)
-    cfg = _resolve_data_roles(cfg, args.domain, cfg.get("scope") == "single" and args.domain != "all")
     # one experiment seed (2026-11-20): a null decoding seed (decoding.<stage>, heldout.decoding) = the run's --seed
     cfg = _resolve_decoding(cfg, int(args.seed))
-    draw_cfg = cfg.get("draw_config")
-    draw_cfg = base_draw = (ROOT / draw_cfg).resolve() if draw_cfg else DRAW_CONFIGS[paper]
-    apply_data_sizes(_load_yaml(base_draw), cfg.get("data"), paper)   # validate the `data:` sizes early
-    kl_doms = kl_domains_for(cfg, paper, args.domain)
-    # the per-generation draws use the run's --seed too: a seed other than the draw config's -> effective copy
-    seed_differs = int(_load_yaml(base_draw).get("seed", args.seed)) != int(args.seed)
-    sized = kl_doms is not None or seed_differs or any(v is not None for v in (cfg.get("data") or {}).values())
-    single = cfg.get("scope") == "single" and args.domain != "all"
-    evalfit = "_simple" if cfg.get("objective") == "simple" else ""
-    if cfg.get("objective") == "eval_overfit":
-        from . import evalsets
-        evalfit = evalsets.run_suffix(evalsets.key_of((cfg.get("eval_target") or {}).get("dataset") or "") or "math")
-    roles_sfx = ""
-    if cfg.get("data_roles") and any(cfg["data_roles"].values()) and args.domain != "all":   # roles that differ from the objective's default
-        from . import evalsets
-        dflt = evalsets.default_roles(cfg, args.domain)
-        for role in ("train", "gate"):
-            v = cfg["data_roles"].get(role)
-            if v and v != dflt[role]:
-                roles_sfx += f"_{role}-{evalsets.short(v)}"
-    run_id = args.run_id or (f"{paper}_{args.domain}_s{args.seed}" + ("_single" if single else "")
-                             + evalfit + roles_sfx + ("_mock" if args.mock else ""))
+    run_id = args.run_id or f"{paper}_{args.domain}_s{args.seed}{RUN_SUFFIX}" + ("_mock" if args.mock else "")
     run_dir = Path(getattr(args, "runs_dir", None) or ROOT / "experiment_records").resolve() / run_id
-    if sized:
-        draw_cfg = run_dir / "draw_config.effective.yaml"   # written below, once the lock check passed
     gpus = [int(g) for g in str(args.gpus).split(",") if str(g).strip() != ""]
     common = {"domain", "gens", "model", "seed", "gpus", "run_id", "mock", "runs_dir", "paper_dir", "set"}
     extra = {k: v for k, v in vars(args).items() if k not in common}
     rc = RunConfig(paper=paper, domain=args.domain, gens=int(args.gens), run_id=run_id, run_dir=run_dir,
                    model=args.model, model_path=resolve_model(args.model), seed=int(args.seed), gpus=gpus,
-                   mock=bool(args.mock), draw_config=draw_cfg, paper_cfg=cfg,
+                   mock=bool(args.mock), paper_cfg=cfg,
                    cli_extra=yaml.safe_load(yaml.safe_dump(extra, default_flow_style=False)) if extra else {})
     if not rc.mock and not rc.model_path.exists():
         raise SystemExit(f"model not found: {rc.model_path} (download with ./download_models.sh, or use --mock)")
@@ -436,16 +396,24 @@ def load_run_config(paper: str, args) -> RunConfig:
     new = _plain(rc)
     if lock.exists():
         old = yaml.safe_load(lock.read_text()) or {}
-        diff = [k for k in LOCKED if old.get(k) != new[k]]
-        if diff:
-            lines = "\n".join(f"  {k}: locked={old.get(k)!r} now={new[k]!r}" for k in diff)
-            raise SystemExit(f"{lock} is locked and differs from this invocation:\n{lines}\n"
+        ocfg = old.get("paper_cfg") or {}
+        for k, want in LEGACY_SELECTORS.items():    # runs of a removed objective / scope cannot be resumed
+            if ocfg.get(k) not in (None, want):
+                raise SystemExit(f"{lock} was made with {k} {ocfg[k]!r}, which was removed (2026-11-22); "
+                                 "it cannot be resumed. Use a new --run-id.")
+        used = _removed_features_used(ocfg, rc.domain)
+        if used:
+            raise SystemExit(f"{lock} was made with {', '.join(used)}, removed 2026-11-22; it cannot be resumed. "
+                             "Use a new --run-id.")
+        lines = [f"  {k}: locked={old.get(k)!r} now={new[k]!r}" for k in LOCKED
+                 if k != "paper_cfg" and old.get(k) != new[k]]
+        lines += [f"  paper_cfg.{d}" for d in _diff_paths(lock_view(ocfg), lock_view(cfg))]
+        if lines:
+            raise SystemExit(f"{lock} is locked and differs from this invocation:\n" + "\n".join(lines) + "\n"
                              "Use a new --run-id, or rerun with the original arguments.")
         new["created"] = old.get("created")
     else:
         new["created"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    if sized:
-        _effective_draw_config(base_draw, cfg.get("data"), paper, run_dir, kl_doms, seed=int(args.seed))
     tmp = lock.with_suffix(".yaml.tmp")
     tmp.write_text(yaml.safe_dump(new, sort_keys=False, allow_unicode=True))
     os.replace(tmp, lock)

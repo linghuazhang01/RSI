@@ -181,9 +181,7 @@ def test_operators(store):
     assert all(m not in intr.factors or float(intr.delta(m).norm()) < 1e-6 for m in mods)
     o = ops.orthogonalize(lo, [s])                                   # same column space -> removed
     assert float(o.delta(mods[0]).norm()) < 1e-4 * float(lo.delta(mods[0]).norm()) + 1e-8
-    G = {m: torch.eye(store.shape(m)[1]) for m in mods}
-    rm = ops.regmean_preserve(lo, G, G, alpha=1.0, ridge=0.0)       # identical Grams -> dW / 2
-    assert torch.allclose(rm.delta(mods[0]), 0.5 * lo.delta(mods[0]), atol=1e-5)
+    assert not hasattr(ops, "regmean_preserve")                      # removed with the retention domains (2026-11-22)
     ti = ops.ties([lo, lo], density=1.0, cap=64)
     assert torch.allclose(ti.delta(mods[0]), lo.delta(mods[0]), atol=1e-5)
 
@@ -241,11 +239,11 @@ def test_diagnostics_real(store):
     from lora_code.primitives.train import HFModel
     hf = HFModel(store.model_dir, store, device="cpu", dtype="float32", max_len=64)
     lo = _rand_lora(store, ["layers.0.mlp.down_proj", "layers.3.self_attn.q_proj"], r=4, s=0.02)
-    diag = D.finalize(D.compute(store, [(0, lo)], hf=hf, target_texts=["a b c", "d e f"],
-                                retention_texts=["x y", "z"], svd_k=4, intruder_k=4))
+    diag = D.finalize(D.compute(store, [(0, lo)], hf=hf, target_texts=["a b c", "d e f"], svd_k=4, intruder_k=4))
     rows = {r["module"]: r for r in diag["rows"]}
     e = rows["layers.0.mlp.down_proj"]["stack"][0]
     assert e["rel_norm"] > 0 and 1 <= e["eff_rank"] <= 4 and 0 <= e["intruder"] <= 1
-    assert e["relchange_q"]["q99"] >= e["relchange_q"]["q50"] and e["act_ratio_ratio"] > 0
+    assert e["relchange_q"]["q99"] >= e["relchange_q"]["q50"] and e["act_ratio_target"] > 0
+    assert "act_ratio_retention" not in e and "act_ratio_ratio" not in e      # no retention texts (2026-11-22)
     assert not rows["layers.1.mlp.up_proj"]["stack"] and len(diag["summary"]) == store.num_layers
     assert "most-changed modules" in D.render(diag)

@@ -1,4 +1,4 @@
-# Target: TACO-verified (taco_verified). Held-out: HumanEval+, MBPP+, LiveCodeBench. Code scores need the Docker sandbox.
-# Sizes (n, gate_n, retention_n, ...) come from data/draw/paper_b.yaml; override here only what differs.
+# Domain code: train pool simple_code_pool (from TACO-verified), gate simple_code_eval, held-out simple_code_test.
+# Code scores need the Docker sandbox. Override here only what differs from base.yaml.
 train_data:
   mode: gold                # sampled solutions cannot be verified without Docker; use TACO reference solutions

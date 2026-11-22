@@ -23,14 +23,14 @@
 
 - `run_rsi.sh`（根目录，core 负责）：解析参数 → 选 Python（默认 `~/venvs/rsi-gpu/bin/python`，`--mock` 时用 `eval/.venv/bin/python`，可用 `RSI_PYTHON` 覆盖）→ `python -I edit_code/run.py ...` 或 `python -I lora_code/run.py ...`，参数原样透传。
 - `--model` 可以是 `download_models.sh` 里的名字（解析为 `${MODELS_DIR:-$HOME/models}/<name>`）或路径。
-- `--domain`：`math | code | knowledge | instruction_following | tool_calling`，Paper A 另有 `all`。
+- `--domain`：`math | code | knowledge | instruction_following | tool_calling`（2026-11-22 起只有单领域；`all` 已删）。
 
 ## 2. 运行目录 `experiment_records/<run-id>/`
 
 ```
 run_config.yaml          合并后的配置（首次运行写入并锁定；之后参数不一致则报错）
 state.json               已完成步骤 {key: info}（RunState）
-draws/                   data/scripts/draw.py 的输出（gate/、gen_XX/、ledger.json）
+draws/                   每代抽样（rsicore.draws.simple_draw）：gen_XX/{manifest.json, ids/simple_<d>_pool.<role>.json}
 baseline/                第 0 代：原模型在验收集和留出集上的结果、噪声带
 gen_XX/
   editor/thread_K.jsonl  改造者对话记录
@@ -41,7 +41,6 @@ gen_XX/
   accepted.json          接任的候选（或 null + 原因）
   model/                 接任后的模型（A：量化权重；B：合并 LoRA 后的权重）或指向它的路径
   heldout/               留出评测（run_eval.py 的 out 目录）
-  e_t/                   改造者能力测量
 summary.json             每代汇总（逐代追加）
 ```
 
@@ -61,10 +60,11 @@ class RunConfig:
     seed: int
     gpus: list[int]
     mock: bool
-    draw_config: Path     # data/draw/paper_a.yaml 或 paper_b.yaml
     paper_cfg: dict       # 论文 base.yaml + domains/<domain>.yaml 合并后的内容
 def build_arg_parser(paper: str) -> argparse.ArgumentParser   # 通用参数；论文可再加参数
 def load_run_config(paper: str, args) -> RunConfig            # 合并 <paper_dir>/configs/base.yaml、domains/<domain>.yaml、CLI；写入 / 校验 run_config.yaml
+def lock_view(cfg: dict) -> dict                              # 2026-11-22：锁比较用的 paper_cfg（去掉已删功能的键，见 §3.1 config）
+RUN_SUFFIX = "_single_simple"                                 # 默认 run id：<paper>_<domain>_s<seed>_single_simple[_mock]
 def check_decoding(dec, where="decoding", extra_keys=()) -> dict | None   # 2026-11-21：校验解码 dict（去掉 null 值；None / {} -> None）
 def stage_decoding(cfg: dict, stage: str, run_seed: int | None = None) -> dict | None
     # 2026-11-21：stage = screen | full | gate；读论文配置 decoding.<stage>（full 没有时用 screen），null = tasks.yaml（贪心）；
@@ -84,21 +84,22 @@ def write_json(path: Path, obj) -> None          # 原子写
 def append_jsonl(path: Path, obj) -> None
 def update_summary(rc: RunConfig, gen: int, info: dict) -> None
 
-# draws.py   （包装 data/scripts/draw.py，子进程调用）
-DOMAIN_TRAIN = {"math": ["dapo_math"], "code": ["taco_verified"], "knowledge": ["triviaqa_train"],
-                "instruction_following": ["ifeval_train"], "tool_calling": ["sealtool_train"]}
-def ensure_gate(rc) -> dict          # {domain: {dataset: [ids]}}（draw.py --gate-only）
-def draw_gen(rc, gen: int, target: str | None = None) -> dict    # 返回 manifest
-def ids(rc, gen: int, dataset: str, role: str) -> list[str]      # role: signal|screen|train|kl
-def gate_ids(rc, dataset: str) -> list[str]
-def ids_file(rc, gen: int, dataset: str, role: str) -> Path
-def gate_ids_file(rc, dataset: str) -> Path
-def mark_shown(rc, gen: int, shown: dict[str, list[str]]) -> None
-# objective simple（2026-11-21，不走 draw.py）：
+# draws.py   （每代抽样，2026-11-21；2026-11-22 起是唯一流程，没有 draw.py）
+DOMAIN_TRAIN = {...}                 # 领域 -> 训练集名（只给 gate.fixed_noise_band 和旧调用方用）
+ROLES = ("signal", "screen", "train", "kl"); KL_N = 400
+def train_dataset(rc) -> str         # simple_<domain>_pool（训练角色，每代抽样）
+def gate_dataset(rc) -> str          # simple_<domain>_eval（验收，全部 500）
+def test_dataset(rc) -> str          # simple_<domain>_test（留出评测，全部 500）
+def is_eval_set(dataset) -> bool     # tasks.yaml eval_targets 里注册的数据集（simple_*）
 def build_eval_set(name: str) -> list[str]       # build_eval_target.build(name)（每进程一次）+ 返回排序后的 id
-def is_simple(rc) -> bool; def simple_pool(rc) -> str | None; def test_dataset(rc) -> str | None
-def simple_screen_n(rc) -> int                    # simple.screen_n > data.screen_n > 500
+def simple_screen_n(rc) -> int                    # simple.screen_n，否则 500
+def search_round(rc, gen: int) -> int             # A：gen，B：gen + 1（两篇论文第 k 次搜索筛同样的题）
 def simple_draw(rc, gen: int) -> dict             # {signal, screen, train, kl: [ids]}；写 draws/gen_XX/ids/simple_<d>_pool.<role>.json
+def ensure_gate(rc) -> dict          # 构建验收集和 test 集；{domain: {simple_<d>_eval: [ids]}}
+def draw_gen(rc, gen: int, target: str | None = None) -> dict    # simple_draw + 返回 manifest（target 原样写回）
+def ids(rc, gen: int, dataset: str, role: str) -> list[str]      # 只接受 train_dataset(rc)；role: signal|screen|train|kl
+def ids_file(rc, gen: int, dataset: str, role: str) -> Path
+def gate_ids(rc, dataset: str) -> list[str]      # eval set 的全部 id（其它数据集 ValueError）
 
 # servers.py
 class VLLMServer:  # context manager
@@ -150,7 +151,6 @@ def reference_logprobs(endpoint, served_name, texts: list[str], cache: Path, top
     # vLLM prompt_logprobs，结果缓存到 cache（jsonl）
 def token_kl(ref_cache: Path, endpoint, served_name, texts: list[str], lora: str | None = None,
              top_k: int = 20) -> dict   # {"mean": float, "per_text": [...]}（top-k 近似 KL(ref || cand)）
-def domain_eval_tasks(domain: str) -> list[str]   # 训练集对应的 run_eval 任务名（与 DOMAIN_TRAIN 一致）
 
 # sandbox.py
 class BudgetExceeded(Exception): ...
@@ -230,7 +230,7 @@ class ChatTools:
 class SearchHistory:                                  # 2026-11-21：search_history / 跨代 read_record 的数据来源
     def __init__(self, past: dict | None = None, *, row_fn=None, key_fn=None, gen_fn=None): ...
     # past {代号: 该代搜索目录}；row_fn(候选记录) -> dict 论文自己的一行摘要；key_fn(记录) -> 结果身份（同值 = same_as）；
-    # gen_fn(代号, 目录) -> dict 该代结果（接受了谁、验收原因）。SearchHistory({}) = 不给往期（E_t）
+    # gen_fn(代号, 目录) -> dict 该代结果（接受了谁、验收原因）。SearchHistory({}) = 不给往期（第 1 代：没有往期）
     def call(self, name, arguments, ctx, r, i, deadline_s=None) -> dict   # {"content": JSON 文本, "ok", "seconds", "args"}；从不抛异常
 def chat_tools_kwargs(cfg) -> dict                    # {"timeout_s", "mem_gb", "result_chars", "persistent"}：editor.explore.* 与 editor.tool_result_chars
 RUN_PYTHON_DOC / RUN_PYTHON_DOC_PERSISTENT; def run_python_doc(persistent=False) -> str   # 持久模式下以 RUN_PYTHON_DOC 开头的 doc 自动换成持久版前缀
@@ -265,8 +265,8 @@ def inner_search(rc, gen: int, *, editor_factory, render_context, build_fn, scre
     # parallel / phases（2026-11-20）：见 search.py 的 docstring（同一步内并行提案 / 改造者阶段与评测阶段分开）
     # build_fn(program, cid)->(artifact|None, error|None)；screen_fn(artifact, cid)->(score, feedback)；full_fn 同
     # 写 <out_dir>/candidates.jsonl、programs/、feedback/（out_dir 默认 gen_dir(rc, gen)）；返回按 full（无则 screen）分数降序
-    # out_dir（2026-11-19 增补）：同一代的额外搜索（E_t，Paper B 每个分支一个）传自己的目录，例如 gen_XX/e_t[/<branch>]，
-    # 不要再用 dataclasses.replace(rc, run_dir=...)（会产生 gen_XX/e_t/gen_XX/ 嵌套）；续跑语义不变（按 out_dir 里的记录跳过）
+    # out_dir（2026-11-19 增补）：把一次搜索的记录放到别的目录（inner_search / load_candidates / submit_to_gate 传同一个值），
+    # 不要用 dataclasses.replace(rc, run_dir=...)（会产生嵌套的 gen_XX/）；续跑语义不变（按 out_dir 里的记录跳过）
 def submit_to_gate(rc, gen: int, ranked: list[Candidate], gate_fn, max_submissions: int = 3,
                    out_dir: Path | None = None) -> Candidate | None
     # gate_fn(candidate)->(passed: bool, info: dict)；写 <out_dir 或 gen_XX>/gate.json
@@ -285,76 +285,55 @@ def fixed_noise_band(spec, dataset: str) -> float | None   # 2026-11-20：config
 def noise_ids(ids, n: int | None, seed: int) -> list | None   # 2026-11-20：噪声重评用的固定子集（n=None 或 >= len 时全部）
 def relative_pass(score: float, baseline: float, ratio: float) -> bool
 
-# heldout.py
-HELDOUT = {"math": [("math500", "test"), ("gsm8k", "test"), ("aime24", "test"), ("aime25", "test")],
-           "code": [("humanevalplus", "test"), ("mbppplus", "test"), ("livecodebench", "test")],
-           "knowledge": [("gpqa_diamond", "test"), ("mmlu_pro", "test"), ("triviaqa", "test")],
-           "instruction_following": [("ifeval", "test"), ("ifbench", "test")],
-           "tool_calling": [("sealtool", "test"), ("apibank", "test"), ("bfcl", "test")]}
-def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=None, mock=False, limit=None,
+# heldout.py   （2026-11-22：只有本领域的 test 集；公开基准 HELDOUT 已删）
+def heldout_domains(cfg: dict, domain: str | None = None) -> str   # "eval:simple_<domain>_test"；domain 默认 cfg["domain"]，
+    # 否则解析后的 heldout.domains（run -> 运行的领域）；都没有时 ValueError。论文请传 rc.domain
+def heldout_tasks(domains) -> list[tuple[str, str]]   # 逗号分隔的 eval:<dataset> -> [(dataset, "pool")]；其它写法 ValueError
+def run_heldout(endpoint, served_name, out_dir: Path, *, domains, lora=None, mock=False, limit=None,
                 decoding: dict | None = None) -> dict
+    # endpoint 是多个副本的列表时，单个任务按题拆到所有副本（score_split）；否则在第一个副本上逐个任务跑
 def decoding_args(decoding: dict | None, task: str) -> dict
     # {"kw": {temperature, top_p, top_k, seed}, "extra": ["--n", n, (--thinking on|off), (--max-tokens N)], "key": 续跑键,
     #  "decoding": 同一设置的 decoding dict（2026-11-21）}；decoding 为 null 时 {"kw": {}, "extra": [], "key": None}
-def ensure_built(domains="all") -> None                       # 2026-11-21：先构建 held-out 里的 eval set（eval:<dataset>）
+def ensure_built(domains) -> None                             # 2026-11-21：先构建 held-out 里的 eval set（eval:<dataset>）
 ```
 
 ### 3.1 core 实现说明（2026-11-19，均为增补，原签名不变）
 
-- `config`：`hardware_profiles[hardware]`（`--set hardware=h20`）和 `scope_profiles[scope]`（`--set scope=single`：只用这次运行的领域；`--domain all` 时拒绝）依次在 base/domain 之后、`--set` 之前合并（`--set` 优先），之后 `heldout.domains: run` 解析成运行的领域，结果锁进 run_config.yaml。CLI 另有 `--runs-dir`（默认 `experiment_records/`）、`--paper-dir`（覆盖读取 configs/ 的目录）、`--set KEY=VALUE`（可重复，点号键，YAML 值，并入 paper_cfg）。`run_config.yaml` 锁定 paper/domain/model/model_path/seed/mock/draw_config/paper_cfg；`gens`、`gpus` 可改（延长运行、换机器）。`RunConfig.cli_extra` 记录论文自加的 CLI 参数（不锁定）。paper_cfg 的 `data:`（2026-11-20）覆盖抽题配置里的数量（Paper A：`n`、`gate_n`、`screen_n`、`kl_contexts`；Paper B：`n`、`gate_n`、`screen_n`、`target_train_frac`、`retention_n`、`retention_kl`；`n` / `gate_n` 可以是一个数或 {领域: 数}），有值时 `config.apply_data_sizes` 生成 `<run>/draw_config.effective.yaml`，`rc.draw_config` 指向它（锁检查通过后才写）。Paper A 单领域（`kl.domains` 不是 `all`、`--domain` 不是 all）时 `config.kl_domains_for` 还会在里面写 `kl_domains: [<domain>]`，draw.py 把 `kl_contexts` 只分给这些领域。`config.eval_python()`：run_eval.py / draw.py 用的解释器（`RSI_EVAL_PYTHON` > `eval/.venv/bin/python` > 当前解释器）。真实模式下 model_path 不存在直接报错。
-- `state.RunState`：另有 `unmark(key)`、`keys()`；`step()` 块内自己调用 `mark(key, info)` 不会被覆盖。
-- `records`：另有 `read_json(path, default)`、`read_jsonl(path)`；`summary.json = {"run_id","paper","domain","gens": {"<g>": {...}}}`。
-- `draws`：已抽过的代 / 已切过的 gate 直接读文件，不再起子进程；`ids()` 文件不存在返回 `[]`。
-- `servers.VLLMServer` 真实命令：`vllm serve <model> --served-model-name N --host 127.0.0.1 --port P --seed S --enable-auto-tool-choice --tool-call-parser <hermes|qwen3_coder，auto 检测，见下> --reasoning-parser qwen3 --max-model-len 40960 --tensor-parallel-size len(gpu_ids) [--enable-lora --max-loras --max-lora-rank] <extra_args>`（extra_args 里给了 `--max-model-len` / `--tensor-parallel-size` 就不加默认值）；vllm 可执行文件：`RSI_VLLM` > 解释器同目录的 `vllm` > PATH > `python -m vllm.entrypoints.cli.main`。extra_args 里的 `--rsi-gpu-memory-gib X` 在启动时换算成 `--gpu-memory-utilization = X / 卡的总显存`（nvidia-smi，上限 0.95；读不到时保留配置里的比例），mock 时去掉。日志 `<log_dir>/<served_name>.<port>.log`。mock 时其余 extra_args 原样传给 mock_server（如 `["--tasks", "dapo_math,math500"]`）。`load_lora` 同名同路径重复调用是空操作。
-- `evaluate`：`EvalResult.accuracy` 属性；`ids=[]` 直接返回 n=0；mock 时自动加 `--no-sandbox`（不启动 Docker）。同一 out_dir 不要并发 score（run_eval 合并写 summary.json）。**`paired_delta(a, b)` 的 delta = mean(b − a)**（b=候选，a=参照）；同一 id 的多个单元先平均，score=None 跳过。`token_kl` 另返回 `token_mean`、`n_tokens`；KL 在"参照报告的 top-k token + 其余"划分上计算（数据处理不等式下是真 KL 的下界），候选没报告的 token 用候选最小 logprob 代替。
-- `sandbox.ToolAPI`：另有 `charge(key, amount)`（直接记账，不检查）、`remaining()`、`names()`、`calls`、`log`（每条 `{tool, ok, seconds}`，实测费用另有 `measured`，去重命中为 `deduped: true`）。实测费用 / 去重见 §3 的 `register`；`describe()` 里标注 `measured: <keys>` 和 `repeated identical calls are free`。超时是总墙钟时间（含工具调用耗时，在两条 RPC 消息之间检查）。子进程 = 同一解释器 `python -I`；文件写只允许 workdir，读禁止仓库根 / $HOME / /proc（解释器自身前缀除外）；禁止 subprocess/fork/exec/kill/socket connect|bind|getaddrinfo（Python audit hook，C 扩展可绕过，属于纵深防御）。断网：Linux `unshare -rn`，macOS `sandbox-exec (deny network*)`，都不可用则 `info["network_isolation"]="none ..."`。程序里可用 `api.BudgetExceeded`、`api.ToolError`（全局名 `BudgetExceeded`、`ToolError` 也可用），工具只能用关键字参数。
-- `editor.Editor`：transcript 在构造时重新载入；`propose()` 收到与下一条记录相同的 user 消息时直接重放记录的回答（不调模型），消息不同则从该处截断——所以续跑的内层搜索会得到完全相同的程序。续跑时 search 跳过已记录的 cid：`ctx` 带 cid 时，先把记录里开头那些 cid 不同的完成提案吸收进历史（等同重放，不返回），再与本 cid 的记录比较（2026-11-21 修复：之前第一次实时调用会清空整份 transcript 和跨步历史）；user 行带 `cid`，旧记录没有 cid 时按旧规则。`extra_body` 并入请求（如 `{"chat_template_kwargs": {"enable_thinking": true}}`）。历史里只放 content（reasoning 只写入 transcript）。
-- `editor.Editor` 工具循环（2026-11-21，"改造者：thinking + 工具轮次"）：
-  - **开关**：`tools` 不为 None 且 `tool_rounds > 0` 时进入循环；否则与之前完全一样只发一次请求（请求体没有 `tools` / `tool_choice` 键，键顺序 model, messages, temperature, top_p, max_tokens, seed + extra_body）。
-  - **一轮** = 一次带工具调用的模型回答（同一回答里的多个并行调用只算一轮）。最多 `tool_rounds` 轮，之后再发一次 `tool_choice: "none"` 的强制最终轮；提示语（以 `FORCED_MARK` 开头）**追加在最后一条 tool 消息末尾**，不新增 user 消息（保持前缀缓存，mock 策略找最后一条 user 消息仍能找到 `[thread=K step=S]`）。剩 5 轮以内时每条工具结果末尾加 `[N tool rounds left]`。
-  - **结束**：模型给出不带工具调用、含 ```python 块的回答（没有 submit 工具）。空回答、`finish_reason == "length"`、内容里有未解析的 `<tool_call>` / `<function=` 文本时最多提醒 2 次（user 消息），强制最终轮另有 1 次提醒（仍是 tool_choice none；`<tool_call>` 文本用 `NUDGE["tool_text_final"]`）；最终仍无代码块则用循环中最后见到的代码块（stop = "fallback"）。
-  - **守卫**（任一触发即强制最终轮，stop = "forced:<原因>"）：rounds ≥ tool_rounds（rounds）、工具调用数 ≥ max_tool_calls（tool_calls；超出的并行调用得到 "skipped: tool-call cap" 错误结果）、completion tokens 累计 ≥ proposal_tokens（tokens）、墙钟 ≥ proposal_wall_s（wall；每次模型调用和工具调用前检查）、上下文剩余不足（context）、HTTP 400（http400）、工具轮回复超时（timeout）。HTTP 超时：工具轮 = max(60, min(timeout_s, 剩余墙钟 + 600))，最终轮 = timeout_s；循环内读超时不重试（event kind timeout）。
-  - **上下文**：每轮 max_tokens = min(turn_max_tokens（最终轮用 max_tokens）, context_tokens − 估计 prompt − 512)；估计 = 请求字符数 × 上一次 usage 的 token/字符比（初始 1/3）。真实服务器第一次调用前读 `/v1/models` 的 `max_model_len`，比 context_tokens 小就用它（servers 已按 max_position_embeddings 截过）；LoRA adapter 的条目没有 max_model_len 时用其 parent（基座）条目的，再没有就用列表里最小的。估计超过 compact_at × context_tokens 时确定性压缩（只改本次提案的消息）：除最近 keep_reasoning_rounds 轮外去掉 reasoning，早于最近 keep_tool_rounds 轮的工具输出换成 `[elided: run_python output rN, X chars]`，仍超过 0.85 时再把这些轮里超过 1000 字符的调用参数换成 `{"code": "[elided]"}`；剩余 < 2048 时激进压缩（不留 reasoning、只留最近 2 轮工具输出），仍不够则强制最终轮。HTTP 400 且报错与上下文 / token 有关 → 激进压缩后重试一次 → 强制最终轮 → 仍失败（或最终轮超时）时有 fallback 代码块就用它（stop = "fallback"，stats.error 记原因），否则抛 `EditorReplyError`（transcript 记一条 `failed: true` 的 final 行，不进跨步历史；重放时再次抛出）。其他 4xx、连接错误和 5xx（重试 5 次后）仍抛 RuntimeError（致命）。
-  - **reasoning 回传**（循环内的 assistant 轮）：`think_tag`（默认，content 前加 `<think>\n…\n</think>\n\n`，由 Qwen3 模板拆分并只保留最后一条 user 之后的推理）、`field`（`reasoning_content`）、`drop`。
-  - **跨步历史**：永远是折叠后的（每个旧提案一条 user + 一条 assistant：最终回答；代码来自 fallback 时把代码块附在后面），不含工具轮次和 reasoning；`history_keep=K` 保留提案 0 和最近 K 个旧提案全文，中间的变成 `HISTORY_STUB` + 只含代码块的 assistant；None = 全部保留（构造函数默认 None，`editor_kwargs` 默认 2；`tool_rounds` 0 时 `editor_kwargs` 给 None，单次调用与之前的请求完全相同）。
-  - **transcript v2**：system 行带 `"format": 2`；之后每行带 `p`（提案序号），循环内的行另带 `r`（轮次）：user、assistant（content, reasoning, tool_calls [{id, name, arguments}], usage, finish_reason）、tool（tool_call_id, name, args, content（发出去的、已截断）, full_chars, ok, seconds）、提醒用的 assistant（nudge）+ user（nudge: true）、event（kind: compact | nudge | forced_final | http400 | timeout, detail）、final（final: true, content, reasoning, code, usage, finish_reason, stats）。载入时按 p 分组，有 final 行才算完成；末尾未完成的提案（循环中途崩溃）丢弃，下次 propose 重新实时运行并重写文件。旧格式（严格 user/assistant 交替）按零轮的完成提案载入，重放后第一次实时提案时整份重写为 v2。重放既不调模型也不调工具，last_stats 取记录值。
-  - **mock**：mock_policy 收到本次提案的完整消息（含工具轮次），可返回 dict 发起工具调用；`chat_tools.with_mock_exploration(policy, rounds, code)` 先做 rounds 次 run_python，再把去掉循环轮次的消息交给原策略，所以程序与不带工具时相同。
-- `chat_tools.ChatTools`（2026-11-21）：`run_python(code)` 用 `sandbox.run_program(..., save_output=True)` 运行包装后的代码（`def main(api)` 里 `exec` 用户代码；顶层代码即可，`result = ...` 返回值，也可以定义 `main(api)`；返回值不能 JSON 序列化时给 repr），超时 `timeout_s`（默认 300，且不超过本次提案剩余墙钟、至少 5 s），内存 `mem_gb`（默认 8），workdir `gen_dir/explore/<cid>/r{r:02d}_{i}/`（program.py、完整的 stdout.txt / stderr.txt、result.json）。返回 JSON `{ok, seconds, tool_calls: {工具名: 次数}, error?, stderr?（失败时）, result?, stdout?}`，整体约 result_chars（6000）字符（stdout 头 1/4 + 尾部，中间 `[... N chars cut ...]`）；Editor 再按 tool_result_chars 硬截一次。`search_history(gen=None, sort="score", offset=0)`（2026-11-21，只在传了 `history` 时有）：列出已经试过的所有候选：往期（`history.past` 各目录的 candidates.jsonl）加本步可见的（`ctx["visible_cids"]`，同一步并行的其他线程看不到），每个一行：cid、gen、score / screen / full、错误首行、验收结果（该代 gate.json：passed + reason）、论文摘要（row_fn）、same_as（key_fn 相同的最早候选）；最新一代在前，代内按分数（`sort="order"` 按尝试顺序）；offset=0 时附每代一行（gen_fn）；按 result_chars 分页（`next_offset`）。有 history 时 `read_record` 也接受往期的 cid（在对应目录的 programs/、feedback/ 里读）。`read_record(cid, part, offset=0)`：只允许 `ctx["visible_cids"]` 里的 cid，读 `gen_dir/programs/<cid>.py` 或 `gen_dir/feedback/<cid>.json`，按页返回（`next_offset`）。参数不是 JSON、未知工具、参数不对、factory / 沙箱出错、超时都变成 `{"ok": false, "error": "<Type>: msg"}`（最多 2000 字符），循环继续；子进程因 CPU 时间上限（SIGXCPU）退出也报为 timeout。`begin(ctx)`：提案实时开始时（Editor 调用）删除 `gen_dir/explore/<cid>/`（被丢弃的上一次尝试留下的目录）。探索不花任何本代预算（由论文的 explore API 保证）。
-- 配置键（`editor:` 块，`editor_settings` 的默认值）：`temperature` 0.6、`top_p` 0.95、`max_tokens` 16384（最终轮）、`extra_body` `{chat_template_kwargs: {enable_thinking: true}, top_k: 20, min_p: 0.0}`（给了这个键就原样使用，`{}` 即关闭）、`tool_rounds` 50（0 = 单次调用）、`turn_max_tokens` 8192、`max_tool_calls` 100、`proposal_tokens` 160000、`proposal_wall_s` 2400、`context_tokens` 131072、`tool_result_chars` 6000、`compact_at` 0.6、`keep_tool_rounds` 8、`keep_reasoning_rounds` 2、`reasoning_passback` think_tag、`history_keep` 2、`timeout_s` 3600、`mock_tool_rounds` 1、`explore: {timeout_s: 300, mem_gb: 8, gpu_tools: false, gpu_seconds: 300, persistent: false}`（persistent 2026-11-21：run_python 用每个提案一个的持久内核，见 chat_tools）（gpu_tools / gpu_seconds 由论文的 explore API 读取）。**`editor.context_tokens` 是上下文长度的唯一旋钮**：客户端用它截每轮 max_tokens、决定何时压缩；论文用 `apply_context_tokens(args, cfg)` 把它写进改造者所用服务器的 `--max-model-len`（Paper A `vllm.editor_args`，Paper B `server.main_args`；args 里原有的 `--max-model-len` 被覆盖；Paper A 的候选服务器不变，Paper B 按 main_args 启动的服务器都用它）；显式 null 时反过来用 `context_tokens(cfg, server_args)` 读服务器参数（没有则 40960）。
-- `servers.VLLMServer`（2026-11-21）：`tool_call_parser="auto"`（默认）读模型的 chat template（tokenizer_config.json 的 `chat_template`，或 chat_template.jinja），含 `<function=` 用 `qwen3_coder`，否则 `hermes`；extra_args 里给了 `--tool-call-parser` 就不加。`--max-model-len`（extra_args 里的，否则 40960）大于模型 `max_position_embeddings`（config.json 或其 text_config）时截到后者并警告（stderr + 日志），从不加 YaRN。选择结果在 `srv.notes` 里，也写进日志开头。mock 路径不受影响（extra_args 里的 `--max-model-len` 会被去掉）。
+- `config`：`hardware_profiles[hardware]`（`--set hardware=h20`，或 `--config` 文件里的 `hardware:`）在 base/domain 之后、`--config` 文件和 `--set` 之前合并（`--set` 优先），之后 `heldout.domains: run` 解析成运行的领域，结果锁进 run_config.yaml。CLI 另有 `--runs-dir`（默认 `experiment_records/`）、`--paper-dir`（覆盖读取 configs/ 的目录）、`--set KEY=VALUE`（可重复，点号键，YAML 值，并入 paper_cfg）。`run_config.yaml` 锁定 paper/domain/model/model_path/seed/mock/paper_cfg；`gens`、`gpus` 可改（延长运行、换机器）。`RunConfig.cli_extra` 记录论文自加的 CLI 参数（不锁定）。`config.eval_python()`：run_eval.py 用的解释器（`RSI_EVAL_PYTHON` > `eval/.venv/bin/python` > 当前解释器）。真实模式下 model_path 不存在直接报错。
+  2026-11-22（只剩一个流程，原 objective simple + scope single）：不再有 objective / scope 及其 profiles、`data:` 抽题数量、`data_roles`、`eval_target`、`draw_config`（`RunConfig.draw_config`、`DRAW_CONFIGS`、`apply_data_sizes`、`kl_domains_for` 都已删）。`--set objective=simple` / `scope=single`（以及 `--config` 文件里的同名键）是接受的空操作，其它值报错；`--set data.* / data_roles.* / eval_target.* / draw_config` 报错（筛选题数用 `simple.screen_n`）。默认 run id 仍是 `<paper>_<domain>_s<seed>_single_simple[_mock]`。锁检查比较 `lock_view(paper_cfg)`：旧锁里的 `mock_objective_overrides.simple` 并入 `mock_overrides`、`data.screen_n` 当作 `simple.screen_n`、补 `LOCK_DEFAULTS`（`simple.screen_n` 500），再去掉 `LOCK_IGNORED_KEYS`（任意深度的键名：objective、objective_profiles、scope、scope_profiles、mock_objective_overrides、data、data_roles、eval_target、draw_config、e_t、e_task、e_ref、e_branch、kl_contexts、lambda_kl、kl_limit）、键名含 `LOCK_IGNORED_TOKENS`（retention、theta0、regmean）的键和 `LOCK_IGNORED_PATHS`（kl.domains、heldout.domains、max_tokens.math_eval），只剩这些键的映射也去掉；所以删除这些功能之前锁定的 *_single_simple 运行用原命令能续跑。旧锁的 objective 不是 simple（或 scope 不是 single），或实际用了已删功能（`e_t`/`e_task.enabled` 为真、`retention.domains` 非空、`data_roles.train/gate` 不是固定的 simple 集）时拒绝续跑；`--set data.screen_n` 自动改成 `simple.screen_n`。
 - `search`：cid = `g{gen:02d}_t{thread}_s{step:02d}`；步骤按 step 轮转所有线程；`screen = {"score", "feedback"}`，`full = {"first", "reruns", "score", "feedback"}`（score = first 与 reruns 的平均，rerun 调用为 `full_fn(artifact, f"{cid}_r{i}")`）；`cost` 含 propose_s/build_s/screen_s/full_s 并合并 `artifact["cost"]`。build_fn 抛异常记为该候选的 error；screen_fn / full_fn 的异常向上抛（视为基础设施故障，续跑时重做该候选）。程序为空（无 ```python 块）时不调用 build_fn。另有 `load_candidates(rc, gen) -> {cid: Candidate}`、`ranked(cands)`、`Candidate.to_record()`。`submit_to_gate` 跳过 error / 无分数的候选，gate.json = `{"submissions": [{cid, passed, info, t}]}`，续跑时已提交的不再提交，已通过的直接返回。
-- `gate.measure_noise_band`：mock 下 temperature > 0 时答案依赖请求的 seed（见 §5），所以 band > 0；论文用它算第 0 代噪声带（Paper A：`baseline/noise.json` = {dataset: band}，详情 `noise_detail.json`；Paper B：gate 余量 = max(band, 2×SE)）。`run_eval.py --seed N` 覆盖任务 / 默认 seed（与 `--temperature` 同样写入 `decoding`）；seed 只在 temperature > 0 时进入请求体，因而也进入生成缓存键（缓存键 = 请求体）。
-- `heldout`：另有 `heldout_tasks(domains)`；out_dir/summary.json 里已有同一服务名 / LoRA / limit 的任务会跳过。
+- `gate.measure_noise_band`：mock 下 temperature > 0 时答案依赖请求的 seed（见 §5），所以 band > 0；论文用它算第 0 代噪声带（Paper A：`baseline/noise.json` = {dataset: band}，详情 `noise_detail.json`；Paper B：gate 余量 = max(band, 2×SE)）。`fixed_noise_band` 的领域键按 `draws.DOMAIN_TRAIN`（训练集名）匹配，simple_* 数据集只匹配数据集名或 "default"（行为与之前相同）。`run_eval.py --seed N` 覆盖任务 / 默认 seed（与 `--temperature` 同样写入 `decoding`）；seed 只在 temperature > 0 时进入请求体，因而也进入生成缓存键（缓存键 = 请求体）。
+- `heldout`：out_dir/summary.json 里已有同一服务名 / LoRA / limit 的任务会跳过。
   2026-11-21：`heldout.decoding` 还可以给 `thinking`（bool）和 `max_tokens`（优先于 max_tokens 表），给了就进入续跑键（与
   summary 里 run_eval 记录的 decoding 比较）；`run_heldout` 先 `ensure_built(domains)`（eval:<dataset> 形式的任务，如
   simple_<d>_test，按需构建 data/processed + data/splits）。
-- **objective simple（2026-11-21，第二版）**：数据集（tasks.yaml `eval_targets`，`build_eval_target.py` 按需构建，不进 git）：
-  `simple_<d>_pool` = 训练集 processed 记录中 id 在 `simple_data/<d>/pool_ids.json` 里的（`{task, ids_file, dataset}` 形式，
-  ids 文件或 processed 文件大小变化时重建）、`simple_<d>_eval`（500，gate）、`simple_<d>_test`（500，held-out）、
-  `simple_<d>_train`（1,500，旧运行用，保留）。`evalsets.default_roles` = {train: simple_<d>_pool, gate: simple_<d>_eval,
-  test: simple_<d>_test}；`data_roles.eval` 接受 `test`（-> `eval:simple_<d>_test`），train / gate / eval 接受简写
-  simple_pool / simple_train / simple_eval / simple_test。每代抽样（`draws.simple_draw`，`draw_gen` / `ids` 都会触发，
-  `ids()` 在 eval set 捷径之前返回它）：候选 = pool − gate − test；screen = signal = `Random(f"{seed}:simple:{domain}:{g}")`
-  抽 simple_screen_n 个（种子不含 run id 和 paper：A / B 同一代 screen 完全相同；每代独立重抽，可与前几代重叠）；
-  train = 其余候选；kl = train 中 `Random(f"{seed}:simple_kl:{domain}:{g}")` 抽 eval_target.kl_n（默认 400）个；写
-  `draws/gen_XX/ids/simple_<d>_pool.<role>.json` + `manifest.json`（simple: true）。`ensure_gate` / `gate_ids` 不变（全部 500）；
-  `mark_shown` 对 simple 的数据集是空操作；`ensure_gate` 顺带构建 test 集。论文配置 `decoding: {screen, full, gate}` 用
-  `config.stage_decoding` 读。改了 simple profile 的运行不能续跑旧的 _simple 运行（paper_cfg 锁定）：用新 run id / `--tag`。
-- `mock_server`：默认索引全部训练集 + 留出任务（首次约 5 s，之后读 `eval/.cache/mock_index/` 缓存约 1 s）；`--tasks` 只索引指定任务——**不在索引里的请求回答 "UNKNOWN REQUEST"（得 0 分）**，所以 mock 下要跑留出评测的服务器不要把 `--tasks` 限制成只有训练集。ifeval_train 的"金标准"回复按约束构造（全部通过判分器）；留出的 IFEval/IFBench 只有手写样例，mock 下大多为 0 分。未知模型名返回 vLLM 式 404；`load_lora_adapter` 需 `--enable-lora`，且 lora_path 必须存在。
-- 自测：`eval/.venv/bin/python -I eval/tests/rsicore/test_core.py`；工具循环：`python -I -m pytest -q eval/tests/rsicore/test_editor_loop.py -p no:cacheprovider`（假 OpenAI 服务器）；玩具论文（不依赖 edit_code/lora_code 的整条闭环）：`eval/tests/rsicore/toy_paper.py`。
+- **数据与抽样（2026-11-21 的 objective simple 第二版；2026-11-22 起是唯一流程）**：数据集（tasks.yaml `eval_targets`，只有
+  `{task, file, dataset}` / `{task, ids_file, dataset}` 两种形式，`build_eval_target.py` 按需构建，不进 git）：
+  `simple_<d>_pool` = 训练集 processed 记录中 id 在 `simple_data/<d>/pool_ids.json` 里的（ids 文件或 processed 文件大小变化时
+  重建）、`simple_<d>_eval`（500，gate）、`simple_<d>_test`（500，held-out）、`simple_<d>_train`（1,500，旧运行用，保留）。
+  `evalsets.simple_sets(d)` = {train: simple_<d>_pool, gate: simple_<d>_eval, test: simple_<d>_test}。每代抽样
+  （`draws.simple_draw`，`draw_gen` / `ids` 都会触发）：候选 = pool − gate − test；screen = signal =
+  `Random(f"{seed}:simple:{domain}:{r}")`（r = search_round）抽 simple_screen_n 个（种子不含 run id 和 paper：A 的第 g 代和
+  B 的第 g−1 代 screen 完全相同；每代独立重抽，可与前几代重叠）；train = 其余候选；kl = train 中
+  `Random(f"{seed}:simple_kl:{domain}:{r}")` 抽 `draws.KL_N`（400）个；写 `draws/gen_XX/ids/simple_<d>_pool.<role>.json` +
+  `manifest.json`（simple: true）。`ensure_gate` 构建验收集和 test 集；`gate_ids` = 全部 500；没有 mark_shown（已删）。
+  论文配置 `decoding: {screen, full, gate}` 用 `config.stage_decoding` 读。
+- `mock_server`：默认索引五个训练集（simple_<d>_* 的题用同样的 prompt，因而命中这些条目；首次构建较慢，之后读 `eval/.cache/mock_index/` 缓存约 1 s）；`--tasks` 只索引指定任务——**不在索引里的请求回答 "UNKNOWN REQUEST"（得 0 分）**。ifeval_train 的"金标准"回复按约束构造（全部通过判分器）。未知模型名返回 vLLM 式 404；`load_lora_adapter` 需 `--enable-lora`，且 lora_path 必须存在。
+- 自测：`eval/.venv/bin/python -I eval/tests/rsicore/test_core.py`；工具循环：`python -I -m pytest -q eval/tests/rsicore/test_editor_loop.py -p no:cacheprovider`（假 OpenAI 服务器）；玩具论文（不依赖 edit_code/lora_code 的整条闭环，simple 流程：每代抽样、逐候选验收、接受最大正增益、test 集留出评测）：`eval/tests/rsicore/toy_paper.py`。
 
 ## 4. 论文侧（各自实现）
 
 ### Paper A：`edit_code/`（A agent）
 - `edit_code/run.py`（2026-11-19 修订为固定体积）：`main()` 用 `rsicore.config.build_arg_parser("A")`（加 `--budget-gib`）。第 0 代：原模型的验收分、噪声带、留出评测，原模型的逐层量化缓存和诊断表（只算一次），定体积，Q_0 = 参照配置（第一个 incumbent）。逐代：draw → 原模型参照 → incumbent 在本代题上的分数 → `inner_search`（改造者默认是冻结的原模型）→ 只把分数高于 incumbent 的候选交 `submit_to_gate`（验收 = 在验收集上逐题配对超过 incumbent）→ 通过则导出新 incumbent 并做留出评测，否则保留；连续 `loop.patience` 代无提升就停。
-- 配置：`edit_code/configs/base.yaml`、`edit_code/configs/domains/<domain>.yaml`（含 `all.yaml`）。`budget`（一个体积）、`loop.editor`（frozen / current）、`hardware`（b300 / h20）。
+- 配置：`edit_code/configs/base.yaml`、`edit_code/configs/domains/<domain>.yaml`。`budget`（一个体积）、`loop.editor`（frozen / current）、`hardware`（b300 / h20）。
 - 候选格式：**模拟量化（fake-quant）**——权重量化再反量化成 BF16 写成普通 checkpoint，vLLM 照常加载，用于测质量；大小按配置解析计算。速度只对 vLLM 有内核的格式另行测量。
 - mock：不加载真实权重；候选 artifact 只记录配置与一个由配置算出的 `quality`（越接近原精度越高），写入 mock registry。
 
 ### Paper B：`lora_code/`（B agent）
-- `lora_code/run.py`：逐代：draw（`--target <domain>`）→ 诊断表 → `inner_search`（工具：`svd`、`acts`、构造工具、LoRA 栈操作、`evaluate(lora)`；没有训练 / 梯度工具）→ `submit_to_gate` → 把 LoRA 合并进权重得 M_{t+1} → 对照分支（非 LLM 搜索；没有 SFT 基线）→ E_t（固定任务：为原始基座在 Seal-Tools 上写 LoRA；工具调用领域单独跑时换成代码领域）→ 留出评测。
+- `lora_code/run.py`：逐代：draw（`draws.draw_gen`）→ 诊断表 → `inner_search`（工具：`svd`、`acts`、构造工具、LoRA 栈操作、`evaluate(lora)`；没有训练 / 梯度工具）→ `submit_to_gate` → 把 LoRA 合并进权重得 M_{t+1} → 对照分支（非 LLM 搜索；没有 SFT 基线）→ 留出评测（simple_<d>_test）。
 - 配置：`lora_code/configs/base.yaml`、`lora_code/configs/domains/<domain>.yaml`。
-- 改造者（2026-11-21，主搜索和 E_t 相同）：`Editor(..., tools=tools.editor_chat_tools(ws, cfg), mock_policy=tools.editor_mock_policy(policy, cfg), **editor_kwargs(cfg, server_args=common.main_server_args(cfg)))`；run_python 的 api = `Workspace.explore_api(tag)`（返回 `(ToolAPI, cleanup)`：begin_program(tag) / end_program；没有 evaluate、raw_lora，`editor.explore.gpu_tools` 为 false 时也没有 acts / train_loss / regmean_preserve，为 true 时记在单独的探索预算 `explore.gpu_seconds` 上；从不动本代的 `ws.api.spent` / `gpu_measured`）。`common.main_server_args(cfg)` = `apply_context_tokens(server.main_args, cfg)`，用于所有按 main_args 启动的服务器（main 副本；weights 模式下候选槽的临时服务器也用，保证打分服务器上下文一致）；theta0_args 不变。mock 探索代码 `print(api.budget())`。
+- 改造者（2026-11-21）：`Editor(..., tools=tools.editor_chat_tools(ws, cfg), mock_policy=tools.editor_mock_policy(policy, cfg), **editor_kwargs(cfg, server_args=common.main_server_args(cfg)))`；run_python 的 api = `Workspace.explore_api(tag)`（返回 `(ToolAPI, cleanup)`：begin_program(tag) / end_program；没有 evaluate、raw_lora，`editor.explore.gpu_tools` 为 false 时也没有 acts / train_loss，为 true 时记在单独的探索预算 `explore.gpu_seconds` 上；从不动本代的 `ws.api.spent` / `gpu_measured`）。`common.main_server_args(cfg)` = `apply_context_tokens(server.main_args, cfg)`，用于所有按 main_args 启动的服务器（main 副本；weights 模式下候选槽的临时服务器也用，保证打分服务器上下文一致）。mock 探索代码 `print(api.budget())`。
 - LoRA 存成 PEFT 格式（`adapter_config.json` + `adapter_model.safetensors`），目标模块名要能被 vLLM 0.24.0 的 Qwen3.5 LoRA 加载；唯一的训练（edit 模式第 0 代的 raw LoRA）和激活统计用 transformers + peft（只能用本代 `train` 角色的题）。
 - mock：不加载真实权重；LoRA artifact 是一个小 JSON（含由程序参数算出的 gain / damage），登记到 mock registry 的是按领域的 dict：目标领域 = 父模型该领域 + gain，其余领域 = 父模型 − damage（2026-11-19），合并后的 M_{g+1} 继承这个 dict。
 

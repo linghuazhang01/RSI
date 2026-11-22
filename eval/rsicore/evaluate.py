@@ -36,7 +36,6 @@ from pathlib import Path
 
 from . import _net
 from .config import EVAL_DIR, check_decoding, eval_python
-from .draws import DOMAIN_TRAIN
 
 RUN_EVAL = EVAL_DIR / "run_eval.py"
 TASKS_YAML = EVAL_DIR / "configs" / "tasks.yaml"
@@ -49,7 +48,7 @@ def set_max_tokens(spec: dict | None) -> dict[str, int]:
     import yaml
     spec = {k: v for k, v in (spec or {}).items() if v is not None}
     from .evalsets import task_names
-    known = task_names()                                # tasks.yaml tasks + the eval-set targets K_eval
+    known = task_names()                                # tasks.yaml tasks + the eval-set tasks (simple_*)
     bad = sorted(set(spec) - known)
     if bad:
         raise SystemExit(f"max_tokens: unknown task(s) {bad} (see eval/configs/tasks.yaml)")
@@ -72,12 +71,6 @@ class EvalResult:
     @property
     def accuracy(self):
         return self.summary.get("accuracy")
-
-
-def domain_eval_tasks(domain: str) -> list[str]:
-    if domain == "all":
-        return [t for d in DOMAIN_TRAIN.values() for t in d]
-    return list(DOMAIN_TRAIN[domain])
 
 
 def _decoding_flags(task: str, dec: dict, extra) -> list[str]:

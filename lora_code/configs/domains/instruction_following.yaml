@@ -1,6 +1,6 @@
-# Target: RLVR-IFeval (ifeval_train; no gold text -> the raw LoRA's training targets (mode=edit, generation 0) are the model's own
-# constraint-satisfying samples). Held-out: IFEval, IFBench.
-# Sizes (n, gate_n, retention_n, ...) come from data/draw/paper_b.yaml; override here only what differs.
+# Domain instruction_following: train pool simple_instruction_following_pool (from RLVR-IFeval; no gold text -> the raw
+# LoRA's training targets (mode=edit, generation 0) are the model's own constraint-satisfying samples), gate
+# simple_instruction_following_eval, held-out simple_instruction_following_test. Override here only what differs.
 train_data:
   mode: self_correct
   samples: 8                     # no gold text: more samples to find a constraint-satisfying answer

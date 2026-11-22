@@ -5,8 +5,9 @@ One row per (layer, module) of the CURRENT model:
   (the stack, one entry per earlier generation): norm, rel_norm (||ΔW||/||W0||, W0 = base θ0), sv (singular
   values of ΔW), eff_rank (exp of the entropy of σ²), intruder (mean max-alignment of ΔW's singular
   directions with θ0's top-k left singular subspace; low = intruder), relchange_q (quantiles of
-  |ΔW|/|W0|), act_ratio_target / act_ratio_retention (mean ||ΔW h||/||W h|| on target `train` prompts vs
-  retention `kl` prompts) and their ratio.
+  |ΔW|/|W0|), act_ratio_target (mean ||ΔW h||/||W h|| on target `train` prompts). act_ratio_retention and the
+  ratio are only filled where an entry carries both (the mock diagnostics; there is no retention domain since
+  2026-11-22, so real runs show None in that column).
 Cached per generation in gen_XX/diagnostics.json; render() gives the compact text shown to the editor.
 """
 from __future__ import annotations
@@ -26,20 +27,17 @@ def eff_rank(sv) -> float:
     return math.exp(-sum(x * math.log(x) for x in p if x > 0))
 
 
-def compute(store, stack, *, base_store=None, hf=None, target_texts=(), retention_texts=(), svd_k: int = 8,
+def compute(store, stack, *, base_store=None, hf=None, target_texts=(), svd_k: int = 8,
             intruder_k: int = 32, relchange: bool = True, device: str = "cpu", act_items: int = 32) -> dict:
     """Real diagnostics (torch). `stack` = [(gen, LoRA)], `base_store` = WeightStore of θ0 (defaults to store)."""
     import torch
 
     base_store = base_store or store
     rows = []
-    ratios_t, ratios_r = {}, {}
-    if hf is not None and stack:
+    ratios_t = {}
+    if hf is not None and stack and target_texts:
         for g, lo in stack:
-            if target_texts:
-                ratios_t[g] = hf.act_ratio(list(target_texts)[:act_items], lo)
-            if retention_texts:
-                ratios_r[g] = hf.act_ratio(list(retention_texts)[:act_items], lo)
+            ratios_t[g] = hf.act_ratio(list(target_texts)[:act_items], lo)
     for m in store.modules():
         inf = store.info(m)
         _, S, _ = store.svd(m, svd_k)
@@ -67,8 +65,6 @@ def compute(store, stack, *, base_store=None, hf=None, target_texts=(), retentio
                 ent["relchange_q"] = {"q50": float(q[0]), "q90": float(q[1]), "q99": float(q[2])}
             if g in ratios_t:
                 ent["act_ratio_target"] = round(ratios_t[g].get(m, 0.0), 6)
-            if g in ratios_r:
-                ent["act_ratio_retention"] = round(ratios_r[g].get(m, 0.0), 6)
             row["stack"].append(ent)
         rows.append(row)
     return {"model": str(getattr(store, "model_dir", "")), "n_modules": len(rows), "rows": rows,

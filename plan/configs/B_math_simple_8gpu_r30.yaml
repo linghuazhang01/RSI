@@ -1,20 +1,20 @@
-# Paper B · math · 8 GPUs (B300) · 8 threads x 1 step · up to 30 tool rounds per candidate · objective simple v2
+# Paper B · math · 8 GPUs (B300) · 8 threads x 1 step · up to 30 tool rounds per candidate · simple flow v2
 # self-written LoRA (scratch, nothing trained): the current model M_g writes LoRAs; the accepted one is merged and M_{g+1} is the next editor.
-# Generated (2026-11-21) from the merged config: lora_code/configs/base.yaml + domains/math.yaml + hardware b300 + scope single
-# + objective simple + --set editor.tool_rounds=30. Not read by the code; the run locks its own copy in
+# Generated (2026-11-21; regenerated 2026-11-22 after the simple flow was folded into base.yaml) from the merged config: lora_code/configs/base.yaml + domains/math.yaml + hardware b300 +
+# --set editor.tool_rounds=30. Not read by the code; the run locks its own copy in
 # experiment_records/B_math_s42_single_simple_r30/run_config.yaml.
 #
 # Runnable experiment file (overrides only, hardware from --hw): plan/configs/run/B_math_r30_nosig.yaml
 #   ./launch.sh --hw b300 --paper B --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/B_math_r30_nosig.yaml --tag r30_nosig
 # Equivalent with --set (one experiment uses all 8 GPUs):
-#   ./launch.sh --hw b300 --paper B --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30 --set editor.tool_rounds=30
+#   ./launch.sh --hw b300 --paper B --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30 --set editor.tool_rounds=30
 # Without the significance test and without the non-LLM control (nosig):
-#   ./launch.sh --hw b300 --paper B --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30_nosig --set editor.tool_rounds=30 --set gate.require_significant=false --set nonllm.enabled=false
+#   ./launch.sh --hw b300 --paper B --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag r30_nosig --set editor.tool_rounds=30 --set gate.require_significant=false --set nonllm.enabled=false
 # H20 (110 GB): replace --hw b300 with --hw h20.
 #
 # GPU roles: GPUs 0-6 = 7 replicas of the current model M_g (editor, screen / gate / test scoring, LoRA serving);
 #   since 2026-11-22 (gpu_layout.tools_on_replicas, b300 profile) each of them also holds an HF copy of M_g and editor
-#   session k runs its tools (svd / acts / regmean_preserve) on GPU k mod 7, and train_loss on that replica's vLLM
+#   session k runs its tools (svd / acts) on GPU k mod 7, and train_loss on that replica's vLLM
 #   (tools.train_loss_backend vllm); vLLM there is planned at 140 GB instead of 220.
 #   GPU 7 = HF model for diagnostics, merge and the baselines
 #   Exploration GPU budget: editor.explore.gpu_seconds 600 per session (was one 600 s pool for all 8).
@@ -30,21 +30,14 @@
 #   4. accept the candidate with the largest paired gate gain >= gate.min_gain 0.0 (any strictly positive gain) (require_significant True
 #      here; the nosig command sets it false); then the test set (500 x 4).
 # Decoding (screen / gate / test): thinking on, temperature 0.6, top_p 0.95, top_k 20, max_tokens 16384.
-draw_config: data/draw/paper_b.yaml
-data:
-  n: null
-  target_train_frac: null
-  screen_n: null
-  gate_n: null
-  retention_n: null
-  retention_kl: null
+simple:
+  screen_n: 500
 max_tokens:
   dapo_math: 4096
   taco_verified: 4096
   ifeval_train: 2048
   sealtool_train: 1024
   triviaqa_train: 1024
-  math_eval: 4096
 method:
   mode: scratch
 weights:
@@ -52,8 +45,6 @@ weights:
   max_modules: null
   vector_cap_tau: 0.5
   rescale_tol: 0.05
-scope: single
-objective: simple
 raw:
   n_train: null
   rank: 16
@@ -127,20 +118,16 @@ sandbox:
   timeout_s: 1800
   mem_gb: 16
 feedback:
-  lambda_retention: 1.0
-  lambda_kl: 0.5
   n_examples: 3
   mark_shown: true
-retention:
-  domains: []
 loop:
   patience: 3
 tools:
   compare: true
   train_loss: true
+  train_loss_backend: vllm
   tensor_compute: true
   paper_tools: true
-  train_loss_backend: vllm
 tensor_compute:
   max_tensors: 4
   timeout_s: 300
@@ -180,7 +167,6 @@ eval:
   screen_limit: null
   full_limit: null
   gate_limit: null
-  kl_limit: null
 train_data:
   mode: self_correct
   samples: 4
@@ -200,36 +186,18 @@ nonllm:
   - 1.25
 diagnostics:
   svd_k: 8
-e_t:
-  enabled: false
-  task: tool_calling
-  task_when_target_is_tool_calling: code
-  branches:
-  - parent
-  - llm
-  - nonllm
-  evaluate: 16
-  gpu_seconds: 3600
-  threads: 4
-  steps: 4
-  top_full: 1
-  n_train: 1600
-  n_signal: 200
-  items_seed: 20261118
-  test_limit: null
 heldout:
   enabled: true
-  domains: math
   limit: null
   decoding:
     temperature: 0.6
     top_p: 0.95
     top_k: 20
-    seed: 42
-    n: 4
-    n_by_task: null
     thinking: true
     max_tokens: 16384
+    n: 4
+    seed: 42
+    n_by_task: null
 baseline:
   noise_repeats: 3
   noise_temperature: 0.0
@@ -251,21 +219,9 @@ server:
   - '128'
   - --max-logprobs
   - '20'
-  theta0_args:
-  - --rsi-gpu-memory-gib
-  - '100'
-  - --gpu-memory-utilization
-  - '0.37'
-  - --max-model-len
-  - '20480'
-  - --max-num-seqs
-  - '128'
-  - --max-logprobs
-  - '20'
   mock_tasks: null
 gpu_roles: null
 gpu_layout:
-  theta0_own_gpu: false
   share_single_gpu: false
   main_replicas: true
   main_tp: 1
@@ -273,5 +229,3 @@ gpu_layout:
   tools_on_replicas: true
   replica_vllm_gib: 140
 hardware: b300
-data_roles:
-  eval: eval:simple_math_test

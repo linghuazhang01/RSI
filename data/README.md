@@ -27,6 +27,7 @@ $PY data/scripts/normalize.py          # raw -> processed（split_pool 先为 nu
 $PY data/scripts/make_splits.py        # 生成 splits/ 与 MANIFEST.json，并回填 processed 的 split_pool
 $PY data/scripts/check_data.py --ngram # 计数、互斥、manifest 哈希、训练/评测去污染；写 splits/check_report.json
 $PY data/scripts/report_table.py       # 打印下表
+$PY data/scripts/make_simple_data.py   # simple_data/<领域>/：RSI 循环用的池子 id、500 验收、500 留出（见 simple_data/README.md）
 ```
 
 `make_splits.py` 只依赖 item id、`split_config.yaml` 和种子 `seed=20261118`，可重复生成；改划分规模时只需改 `split_config.yaml` 后重跑。
@@ -40,30 +41,29 @@ eval/.venv/bin/python -I data/scripts/make_splits.py
 
 `rsi_math` 只读取 DAPO-Math，不读取代码或知识来源。默认的完整规范化仍调用 `rsi_train`，保持原有行为。
 数学来源还应包含 MATH-500、AMC23、OlympiadBench，供 MATH-500 划分和数学去污染使用。
-运行时将 draw 配置的 `domains` 限定为 `math`。
-Paper A 设置 `kl.domains=run` 和 `heldout.domains=math`。
-Paper B 设置 `retention.domains=[]`、`heldout.domains=math` 和 `e_t.enabled=false`，关闭跨域保持评测与 E_t 分支。
-这些选项不缩减单代训练、搜索和数学留出评测预算。
+之后 `make_simple_data.py --only math` 生成 `simple_data/math/`。每个运行本来就只用自己的领域，不需要别的设置。
 
-## 当前配置（2026-11-19 修订）
+## 当前配置（2026-11-22 修订）
 
-每个领域**只用一个训练集**，配 1–3 个留出集。自量化 / 自编辑循环**只看训练集**：
-- 数据文件里每个训练集是一个整体的抽样池（`pool`）；
-- **固定验收集动态切分**：每次运行开始时，`scripts/draw.py` 按配置的 `gate_n` 从池里切出验收集，写到运行目录 `draws/gate/`，每代都用这一份；切分只由 `gate.seed`（20261118）和 `gate_n` 决定，验收集大小相同的运行验收集完全一样；
-- 每一代从验收集以外的池子里抽 1,000–2,000 题，作为信号、KL 文本（Paper A）和梯度训练数据（Paper B）。
+每个领域**只用一个训练集**。RSI 循环（两篇相同，`launch.sh` / `run_rsi.sh`）只用 `simple_data/<领域>/`（由
+`data/scripts/make_simple_data.py` 从训练集的抽样池 `pool` 里切出，种子 20261118，详见 `simple_data/README.md`）：
+- **验收**：`simple_<领域>_eval`，固定 500 道；
+- **留出**：`simple_<领域>_test`，固定 500 道，只用于报告；
+- **每代筛题**：从池子里去掉验收和留出的题，每代重新抽 500 道（`rsicore.draws`，在进程内抽，写到运行目录
+  `draws/gen_XX/ids/`）；池子里其余的题是改造者可用的 train 数据。
 
-benchmark 全部是**留出集**（`test` 池），每一代结束后评测、只用于报告。
+公开 benchmark 是 `test` 池，用作去污染的对照，也可以用 `eval/run_eval.py` 单独评测；RSI 循环不评测它们。
 
-| 领域 | 训练集 | 池（去污染、去重后） | 默认验收 `gate_n` | 留出集（主表） |
+| 领域 | 训练集 | 池（去污染、去重后） | RSI 循环（`simple_data/<领域>/`） | 公开 benchmark（`test` 池） |
 |---|---|---|---|---|
-| 数学 | `dapo_math`（DAPO-Math-17K） | 14,738 | 1,000 | MATH-500（500）、GSM8K test（1,319）、AIME 2024+2025（60） |
-| 代码 | `taco_verified`（TACO-verified） | 10,791 | 1,000（按难度分层） | HumanEval+（164）、MBPP+（378）、LiveCodeBench（131） |
-| 通用推理 / 知识 | `triviaqa_train`（TriviaQA train） | 73,101 | 3,000 | GPQA-Diamond（198）、MMLU-Pro（2,000）、TriviaQA（2,000） |
-| 指令遵循 | `ifeval_train`（RLVR-IFeval） | 14,949 | 1,000（按约束类型分层） | IFEval（271）、IFBench（300，领域外） |
-| 工具调用 | `sealtool_train`（Seal-Tools train） | 12,015 | 1,000 | Seal-Tools test（1,354）、API-Bank test（584）、BFCL（4,696） |
+| 数学 | `dapo_math`（DAPO-Math-17K） | 14,738 | 每代筛 500 / 验收 500 / 留出 500 | MATH-500（500）、GSM8K test（1,319）、AIME 2024+2025（60） |
+| 代码 | `taco_verified`（TACO-verified） | 10,791 | 同上 | HumanEval+（164）、MBPP+（378）、LiveCodeBench（131） |
+| 通用推理 / 知识 | `triviaqa_train`（TriviaQA train） | 73,101 | 同上 | GPQA-Diamond（198）、MMLU-Pro（2,000）、TriviaQA（2,000） |
+| 指令遵循 | `ifeval_train`（RLVR-IFeval） | 14,949 | 同上 | IFEval（271）、IFBench（300，领域外） |
+| 工具调用 | `sealtool_train`（Seal-Tools train） | 12,015 | 同上 | Seal-Tools test（1,354）、API-Bank test（584）、BFCL（4,696） |
 
-额外留出集（附录）：AMC23、OlympiadBench、FreebaseQA、MetaTool、T-Eval；MT-Bench、AlpacaEval 2 需要 LLM judge。
-不再使用（`reserve`）：GSM8K train、MATH train、ARC、GPQA Main、APPS、IFEval 的 270 个非测试题、Magicoder、Tulu-3 IF、API-Bank train。ToolACE 只作 Paper A 的 KL 文本。SQuAD 保留为 Paper B 的可选知识注入任务。
+额外的公开 benchmark（附录）：AMC23、OlympiadBench、FreebaseQA、MetaTool、T-Eval；MT-Bench、AlpacaEval 2 需要 LLM judge。
+不再使用（`reserve`）：GSM8K train、MATH train、ARC、GPQA Main、APPS、IFEval 的 270 个非测试题、Magicoder、Tulu-3 IF、API-Bank train。ToolACE 原来只作 Paper A 的 KL 文本，现在也不再使用。SQuAD 保留为 Paper B 的可选知识注入任务。
 
 ## 数据集总表
 
@@ -134,7 +134,7 @@ MetaTool：Task1 1040、Task2-Subtask1 995、Subtask2 1800、Subtask3 995、Subt
 
 | 数据集 | pool（整体抽样池） | 固定验收集 | test（留出） | 其他 |
 |---|---|---|---|---|
-| dapo_math / taco_verified / triviaqa_train / ifeval_train / sealtool_train | 14,738 / 10,791 / 73,101 / 14,949 / 12,015 | 运行时由 `draw.py` 按 `gate_n` 动态切分 | — | 去污染移除的 → train_excluded；内部重复 → train_duplicate |
+| dapo_math / taco_verified / triviaqa_train / ifeval_train / sealtool_train | 14,738 / 10,791 / 73,101 / 14,949 / 12,015 | —（验收 / 留出：`simple_data/<领域>/eval.jsonl`、`test.jsonl`） | — | 去污染移除的 → train_excluded；内部重复 → train_duplicate |
 | gsm8k_train / math_train / arc / gpqa_main / apps | — | — | — | 全部 reserve（2026-11-19 起不再使用） |
 | IFEval（541） | — | — | 271 | 其余 270 → reserve（按首个指令类型分层，测试集与之前相同） |
 | MATH test | — | — | 500（MATH-500） | 其余 4,500 → reserve |
@@ -146,58 +146,18 @@ MetaTool：Task1 1040、Task2-Subtask1 995、Subtask2 1800、Subtask3 995、Subt
 | Seal-Tools | — | — | test_in_domain 700 + test_out_domain 654 | dev 700 → reserve |
 | BFCL / API-Bank test / MetaTool / T-Eval | — | — | 全部 | BFCL 多轮与 agentic 只能用官方 CLI 评 |
 | SQuAD（SEAL 设定） | 50 段（train，50 个不同标题） | 50 段（train，另 50 个标题） | SEAL 的 200 段 | 见下 |
-| toolace | — | — | — | 全部 train（只作 KL 文本） |
+| toolace | — | — | — | 全部 train（原作 KL 文本，现不使用） |
 | magicoder_oss / tulu3_if / apibank_train | — | — | — | 全部 reserve（不再使用） |
 
 说明：
 - 采样方法：每个数据集（或层）内按 id 排序后用 `random.Random(f"{seed}:{dataset}:{stratum}")` 打乱，再依次切出固定池；分层按最大余数法分配名额。训练集先去污染、再切分，所以验收集和抽样池都是干净的。
-- `eval/run_eval.py` 中训练集任务（`gsm8k_train`、`math_train`、`dapo_math`、`taco_verified`、`arc`、`gpqa_main`、`triviaqa_train`、`sealtool_train`、`ifeval_train`）只允许 `--pool pool|gate`；用 `--pool pool` 时配合抽样结果 `--ids-file`。
-
-## 两个配置开关（都在 `draw/paper_{a,b}.yaml`）
-
-| 开关 | 键 | 默认 | 说明 |
-|---|---|---|---|
-| 固定验收集大小 | `domains.<领域>.gate_n` | 数学 / 代码 / 指令 / 工具 1,000，知识 3,000 | 运行开始时从池里动态切分（`gate.seed` 固定为 20261118），写到 `draws/gate/`；改大小不用重切数据 |
-| 每代抽样量 | `domains.<领域>.n` | 数学 / 知识 / 指令 / 工具 2,000，代码 1,000 | 从验收集以外的池子抽；Paper B 的目标领域再按 `target_train_frac` 分成训练 / 信号；其余领域用 `retention_n` |
-
-评测验收集：`eval/run_eval.py --task <训练集> --pool pool --ids-file experiment_records/<run>/draws/gate/<训练集>.gate.json`。只切验收集、不抽题：`draw.py --run ... --gate-only --config ...`。
-
-## 每代抽样（`scripts/draw.py`）
-
-每一代从抽样池里抽一批新题，配置在 `data/draw/paper_a.yaml`、`data/draw/paper_b.yaml`，结果写在运行目录（`experiment_records/<run_id>/draws/`）。
-
-```bash
-PY="eval/.venv/bin/python -I"
-$PY data/scripts/draw.py --run experiment_records/<run_id> --gen 0 --config data/draw/paper_a.yaml   # 第一次：锁定配置
-$PY data/scripts/draw.py --run experiment_records/<run_id> --gen 1                                 # 之后每代
-$PY data/scripts/draw.py --run experiment_records/<run_id> --gen 0 --target math --config data/draw/paper_b.yaml  # Paper B 要指定目标领域
-$PY data/scripts/draw.py --run experiment_records/<run_id> --status                                # 每代数量、剩余新题
-$PY eval/run_eval.py --task gsm8k_train --pool pool --ids-file experiment_records/<run_id>/draws/gen_01/ids/gsm8k_train.signal.json ...
-```
-
-| 角色 | Paper A | Paper B |
-|---|---|---|
-| `signal` | 每个领域 N 题（数学 / 知识 / 工具 / 指令遵循 2,000，代码 1,000） | 目标领域 20%；其余领域各 400 题（保留探针） |
-| `screen` | `signal` 中按数据集分层抽 200 题，用于第一阶段快速评测 | 同左 |
-| `kl` | 共 256 段 KL / 校准上下文，各领域均分，与 `signal` 不重叠 | 其余领域各 64 条，算相对当前模型的逐 token KL |
-| `train` | — | 目标领域 80%（梯度工具唯一可用的数据） |
-
-规则：
-- **复用规则**（2026-11-19 修订，配置键 `reuse`；`ledger.json` 记录每道题在哪一代、以什么角色用过）：
-  - 每代内部各角色互不重叠（`screen` 是 `signal` 的子集）；
-  - 跨代可以复用：先抽从没用过的题，用完后按最久未用的顺序复用（`across_generations: true`）；
-  - 用作过 `train`（Paper B 梯度数据）或在反馈里展示给编辑者看过的题（`--mark-shown` 记录），之后不再当 `signal` / `screen` / `kl`，但可以再次当 `train`（`never_signal_after: [train, shown]`）。
-  - 编辑循环每代结束时，把展示过的错例写成 `{"<dataset>": ["<id>", ...]}`，调用 `draw.py --run ... --gen t --mark-shown shown.json`。
-- 同样的切分、配置、运行名和抽样顺序，得到完全相同的题号（`check_draw.py` 检查）。
-- 抽样池在运行中途变化（重新切分）会被拒绝；`--force` 只能重抽最新一代。
-- 有了复用，能跑几代不再受抽样池大小限制。小池子（ARC 2,870）在几代后开始复用，自测里 6 代都能抽满。
-- 自测：`$PY data/scripts/check_draw.py`（Paper A、B 各抽 6 代，检查数量、互斥、先新后旧的复用顺序、训练过或展示过的题不再当信号、可复现、`--force` 和各种拒绝情况）。
+- `eval/run_eval.py` 中训练集任务（`gsm8k_train`、`math_train`、`dapo_math`、`taco_verified`、`arc`、`gpqa_main`、`triviaqa_train`、`sealtool_train`、`ifeval_train`）只允许 `--pool pool|gate`；用 `--pool pool` 时配合 id 列表 `--ids-file`。
 - 代码训练集的测试用例在规范化时转换成 LiveCodeBench 评测器的格式，写在 `processed/aux/taco_verified_tests.jsonl`（APPS 的在 `apps_tests.jsonl`，已不再使用），只在 Docker 沙箱里执行。
 - **SQuAD 的口径**：SEAL 代码中的 “article” 指一个段落，因此 search/gate 各取 50 个段落。SEAL 的 200 个评测段落覆盖了 SQuAD 验证集 48 个维基标题中的 47 个，所以 search/gate 段落取自 SQuAD **train**，每个标题只取 1 段，search、gate、train 三池按标题互斥；search/gate 标题下的其余段落放入 reserve。test 是 SEAL 官方仓库 `general-knowledge/data/synthetic_data/eval/base_val.json`（200 段、974 问）。
 
 ## 去污染
 
-`make_splits.py` 对每个训练集在**切分前**做两步过滤，命中的样本放进 `train_excluded`，不进入信号 / 验收 / train 任何一池（2026-11-21 收紧）：
+`make_splits.py` 对每个训练集在**切分前**做两步过滤，命中的样本放进 `train_excluded`，不进入任何池，也就不会进 `simple_data/`（2026-11-21 收紧）：
 1. **精确匹配**：与任何评测样本（所有池，包括 reserve）题面相同。两种规范化，任一命中即算：小写 + 合并空白；再去掉 LaTeX 标记（`\left`、`\frac`、`$` 等）、标点和空格（抓只差格式、引号、标点的同一道题）。
 2. **13-gram 近似重复**：与同类别某一条评测样本（所有池，包括 reserve；2026-11-21 前只比 test 池）共享的 13-gram 占任一方 13-gram 的 ≥50%（双向，能抓到"长训练题里包含一道留出题"的情况）。指令遵循和工具调用两类里，出现在 ≥5 条评测样本中的 13-gram 视为模板句（约束说明、调用格式说明），不计入。
    Seal-Tools 只比较 task_instruction 一行（第 1 条的严格规范化也是），跳过共用模板和 api_list。
@@ -215,7 +175,7 @@ $PY eval/run_eval.py --task gsm8k_train --pool pool --ids-file experiment_record
 要点：
 - **DAPO-Math-17K 含有大量 MATH test 原题**，绝大多数是 MATH-500 以外的 4,500 道。2026-11-21 收紧规则后又多移除 473 条（470 条撞 MATH reserve，2 条撞 OlympiadBench，1 条撞 MATH-500），抽样池从 16,314 降到 15,841，再去掉内部重复 1,103 条后为 14,738。
 - **TriviaQA train 与 FreebaseQA、TriviaQA validation 有大量只差标点的同题**；收紧后又多移除 387 条（FreebaseQA 287、TriviaQA reserve 86、TriviaQA test 14），抽样池从 73,725 降到 73,338，再去掉内部重复 237 条后为 73,101。
-- **训练集内部去重**（2026-11-21）：去污染之后，同一训练集里按严格规范化（只比 Seal-Tools 的 task_instruction）题面相同的题只保留 id 最小的一条，其余放进 `train_duplicate`，不进入任何池。否则同一道题可能在 Paper B 的同一代里既当 `train` 又当 `signal`，或者同时进验收集和某一代的抽样。移除数量：dapo_math 1,103、triviaqa_train 237、toolace 135、taco_verified 15、math_train 11、sealtool_train 2、squad_train 2，其余为 0。`check_data.py` 断言 pool/gate/train 内没有重复题面。
+- **训练集内部去重**（2026-11-21）：去污染之后，同一训练集里按严格规范化（只比 Seal-Tools 的 task_instruction）题面相同的题只保留 id 最小的一条，其余放进 `train_duplicate`，不进入任何池。否则同一道题可能同时出现在某一代的筛题（或 train 数据）和验收集 / 留出集里。移除数量：dapo_math 1,103、triviaqa_train 237、toolace 135、taco_verified 15、math_train 11、sealtool_train 2、squad_train 2，其余为 0。`check_data.py` 断言 pool/gate/train 内没有重复题面。
 - 去污染后，按"评测样本被单条训练样本覆盖 ≥50% 的 13-gram"统计，所有评测集都是 0。
 - `check_data.py` 独立断言训练集的 search/gate/train 三池与评测集零精确重合（两种规范化）；`--ngram` 给出任意 13-gram 重合的参考数字（已去掉在 ≥5 条评测样本中出现的模板性 n-gram），完整数字见 `splits/check_report.json`。任意一个 13-gram 重合大多是常见措辞（如 "find the remainder when ... is divided by 1000"）。
 - 评测集之间的精确重合（不是错误，仅提示）：FreebaseQA 与 TriviaQA 有 308 道题面相同；BFCL 与 TriviaQA 有 1 道。

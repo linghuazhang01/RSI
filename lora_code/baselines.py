@@ -3,12 +3,12 @@
 2026-11-20: there is no SFT baseline and nothing else is ever trained. The only training of a run is the
 raw LoRA of mode=edit: the fixed `raw` recipe (rank 16 by default, all attention / MLP projections except
 in_proj_a/b), trained once in generation 0 on raw.n_train of that generation's train items; the editor edits
-it in every generation. (The E task of scope=all, mode=edit, trains the same recipe once for θ0.)
+it in every generation.
 Non-LLM search (the 4th branch), same evaluate budget as the editor, by method.mode: edit = random rule-based
 edits of the raw LoRA (random_edit_search); scratch = random gradient-free constructions
 (random_construct_search); weights = random structured edits of the dense weights (random_weight_search).
 Best by screen, top-3 re-scored on the full signal.
-All points report target gain, worst retention delta and token-KL vs the current model.
+All points report the target gain vs the current model.
 """
 from __future__ import annotations
 
@@ -87,11 +87,7 @@ def point(ws, lo, label: str, level: str = "screen") -> dict:
     """Evaluate one LoRA (not charged to the editor budget) and summarise the trade-off."""
     sc, fb = ws.evaluate_lora(lo, level, charge=False)
     tgt = fb.get("target") or {}
-    ret = fb.get("retention") or {}
-    ds = [(v.get("vs_parent") or {}).get("delta") for v in ret.values()]
-    ds = [d for d in ds if d is not None]
     return {"label": label, "score": sc, "target_gain": (tgt.get("vs_parent") or {}).get("delta"),
-            "worst_retention_delta": min(ds) if ds else None, "kl": fb.get("kl_vs_parent"),
             "check_error": fb.get("error"), "name": ws.lora_name(lo) if lo.modules() else None}
 
 
@@ -102,11 +98,11 @@ def _apply(ws, tool: str, lo, **kw):
     return ws._get(out["lora"])
 
 
-def random_edit_search(ws, raw, *, evals: int, seed: int, top_full: int = 3, scales=(0.5, 0.75, 1.0, 1.25),
-                       use_regmean: bool = True) -> tuple[object, dict]:
+def random_edit_search(ws, raw, *, evals: int, seed: int, top_full: int = 3,
+                       scales=(0.5, 0.75, 1.0, 1.25)) -> tuple[object, dict]:
     """mode=edit non-LLM branch: random rule-based edits of the raw LoRA (the operators the editor has,
-    without an LLM): truncate_rank -> relchange_prune -> intruder_scale -> regmean_preserve -> orthogonalize
-    (against the stack) -> global scale. Same evaluate budget as the editor. Returns (best LoRA, log)."""
+    without an LLM): truncate_rank -> relchange_prune -> intruder_scale -> orthogonalize (against the stack) ->
+    global scale. Same evaluate budget as the editor. Returns (best LoRA, log)."""
     rng = random.Random(f"{seed}:nonllm-edit")
     tried, seen = [], set()
     for _ in range(evals * 4):
@@ -114,7 +110,6 @@ def random_edit_search(ws, raw, *, evals: int, seed: int, top_full: int = 3, sca
             break
         spec = {"truncate": rng.choice([None, 4, 8, 16, 32]), "prune": rng.choice([None, 0.01, 0.03, 0.05]),
                 "intruder": rng.choice([None, 0.3, 0.5, 0.7]),
-                "regmean": rng.choice([None, 0.5, 1.0, 2.0]) if use_regmean else None,
                 "orth": bool(ws.stack) and rng.random() < 0.5, "scale": rng.choice(list(scales))}
         key = tuple(sorted(spec.items()))
         if key in seen:
@@ -128,13 +123,11 @@ def random_edit_search(ws, raw, *, evals: int, seed: int, top_full: int = 3, sca
                 lo = _apply(ws, "relchange_prune", lo, frac=spec["prune"])
             if spec["intruder"]:
                 lo = _apply(ws, "intruder_scale", lo, lam=spec["intruder"])
-            if spec["regmean"]:
-                lo = _apply(ws, "regmean_preserve", lo, alpha=spec["regmean"])
             if spec["orth"]:
                 lo = _apply(ws, "orthogonalize", lo, against="stack")
             if spec["scale"] != 1.0:
                 lo = _apply(ws, "scale", lo, s=spec["scale"])
-        except Exception as e:  # noqa: BLE001  (e.g. GPU budget for regmean exhausted)
+        except Exception as e:  # noqa: BLE001
             tried.append(({"label": "edit", **spec, "score": None, "error": str(e)[:200]}, None))
             continue
         p = point(ws, lo, "edit " + ",".join(f"{k}={v}" for k, v in spec.items() if v))

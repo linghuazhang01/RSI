@@ -1,63 +1,41 @@
-"""Held-out benchmark evaluation (report only; never fed back to the editor).
+"""Held-out evaluation (report only; never fed back to the editor): the run's test set simple_<domain>_test.
 
-Decoding (2026-11-20): search, gate and noise are greedy; the held-out evaluation uses the paper config's
-`heldout.decoding` (Qwen's non-thinking recommendation: temperature 0.7, top_p 0.8, top_k 20, seed 42) with
-n samples per item (avg@n; per-task n in `n_by_task`). decoding=None keeps the task's tasks.yaml decoding.
-2026-11-21: heldout.decoding may also set thinking (bool) and max_tokens (wins over the max_tokens table); both enter
-the resume key. An eval-set held-out task (eval:<dataset>, e.g. objective simple's simple_<d>_test) is built
-(data/scripts/build_eval_target.py) before it is read."""
+Decoding: the paper config's `heldout.decoding` with n samples per item (avg@n; per-task n in `n_by_task`);
+decoding=None keeps the task's tasks.yaml decoding. heldout.decoding may also set thinking (bool) and max_tokens
+(wins over the max_tokens table); both enter the resume key. A held-out task eval:<dataset> (an eval set, pool
+`pool`) is built (data/scripts/build_eval_target.py) before it is read. With several replicas of the model its items
+are split over them (score_split), so every GPU works on it."""
 import json
-import shutil
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
 
-from .config import EVAL_DIR, ROOT
+from .config import DOMAINS, EVAL_DIR, ROOT
 from .evaluate import score, score_split
 
-HELDOUT = {"math": [("math500", "test"), ("gsm8k", "test"), ("aime24", "test"), ("aime25", "test")],
-           "code": [("humanevalplus", "test"), ("mbppplus", "test"), ("livecodebench", "test")],
-           "knowledge": [("gpqa_diamond", "test"), ("mmlu_pro", "test"), ("triviaqa", "test")],
-           "instruction_following": [("ifeval", "test"), ("ifbench", "test")],
-           "tool_calling": [("sealtool", "test"), ("apibank", "test"), ("bfcl", "test")]}
 
-# objective eval_overfit (2026-11-21): heldout.domains `eval_target` = the run's eval set itself (eval_target.dataset,
-# e.g. math_eval = MATH-500 + GSM8K test, humanevalplus_eval), task K_eval on pool `pool`, greedy. heldout_domains(cfg)
-# turns it into "eval:<dataset>", which heldout_tasks understands (never part of "all").
-
-
-def heldout_domains(cfg: dict):
-    """The `domains` argument of run_heldout for a paper config: heldout.domains, with eval_target resolved."""
-    ev = (cfg.get("data_roles") or {}).get("eval")
-    if ev:                                          # data_roles.eval (normalised by rsicore.config) wins
-        return ev
-    d = (cfg.get("heldout") or {}).get("domains", "all")
-    if d == "eval_target":
-        ds = (cfg.get("eval_target") or {}).get("dataset")
-        if not ds:
-            raise ValueError("heldout.domains eval_target needs eval_target.dataset")
-        return f"eval:{ds}"
-    return d
+def heldout_domains(cfg: dict, domain: str | None = None) -> str:
+    """The `domains` argument of run_heldout: "eval:simple_<domain>_test". domain: the run's --domain (rc.domain);
+    None = the paper config's `domain`, else its resolved heldout.domains (`run` -> the run's domain)."""
+    d = domain or cfg.get("domain") or (cfg.get("heldout") or {}).get("domains")
+    if d not in DOMAINS:
+        raise ValueError(f"heldout_domains: no run domain (pass the run's --domain), got {d!r}")
+    return f"eval:simple_{d}_test"
 
 
 _KEYS = ("accuracy", "n", "n_pending", "prompt_strict", "avg_at_n", "pass_at_n", "maj_at_n", "em", "f1")
 
 
-def heldout_tasks(domains="all") -> list[tuple[str, str]]:
-    if domains in (None, "all"):
-        doms = list(HELDOUT)
-    elif isinstance(domains, str):
-        doms = [d.strip() for d in domains.split(",") if d.strip()]
-    else:
-        doms = list(domains)
-    by_task = {t: (t, p) for v in HELDOUT.values() for t, p in v}
+def heldout_tasks(domains) -> list[tuple[str, str]]:
+    """[(task, pool)] of a held-out spec: comma-separated eval:<dataset> tokens (heldout_domains), pool `pool`."""
+    toks = [d.strip() for d in domains.split(",")] if isinstance(domains, str) else list(domains or [])
     out = []
-    for d in doms:                                  # a domain, a held-out task, or eval:<K_eval> (pool `pool`)
-        tps = HELDOUT[d] if d in HELDOUT else [(d.split(":", 1)[1], "pool")] if d.startswith("eval:") \
-            else [by_task[d]] if d in by_task else HELDOUT[d]
-        out += [tp for tp in tps if tp not in out]
+    for d in (t for t in toks if t):
+        if not d.startswith("eval:"):
+            raise ValueError(f"held-out task {d!r}: expected eval:<dataset> (the run's simple_<domain>_test)")
+        tp = (d.split(":", 1)[1], "pool")
+        if tp not in out:
+            out.append(tp)
     return out
 
 
@@ -81,7 +59,7 @@ def decoding_args(decoding: dict | None, task: str) -> dict:
     return {"kw": kw, "extra": extra, "key": key, "decoding": dec}
 
 
-def ensure_built(domains="all") -> None:
+def ensure_built(domains) -> None:
     """Build every eval-set dataset among the held-out tasks of `domains` (eval:<dataset>, pool `pool`), so run_eval
     and _task_ids find data/processed/<dataset>.jsonl and data/splits/<dataset>/pool.json (once per process)."""
     from .draws import build_eval_set, is_eval_set
@@ -97,20 +75,17 @@ def _same_decoding(prev_dec: dict | None, key: dict | None) -> bool:
     return all(prev_dec.get(k) == v for k, v in key.items())
 
 
-def run_heldout(endpoint, served_name, out_dir: Path, *, domains="all", lora=None, mock=False, limit=None,
+def run_heldout(endpoint, served_name, out_dir: Path, *, domains, lora=None, mock=False, limit=None,
                 decoding: dict | None = None) -> dict:
-    """endpoint: one URL, or a list of URLs of replicas of the same model (2026-11-20): the tasks are then run
-    in parallel, one replica per task (each task in out_dir/_par/<task>/, merged into out_dir afterwards).
-    A single task (eval_target: the run's eval set, 2026-11-21) is instead split item-wise over all
-    replicas (score_split), so every GPU works on it."""
+    """endpoint: one URL, or a list of URLs of replicas of the same model (2026-11-20). domains: heldout_domains(cfg).
+    With several replicas a single task is split item-wise over all of them (score_split), so every GPU works on it;
+    otherwise (one replica, or several tasks) the tasks run one after another on the first replica."""
     ensure_built(domains)
     if isinstance(endpoint, (list, tuple)) and len(endpoint) > 1:
         tasks = heldout_tasks(domains)
         if len(tasks) == 1 and _task_ids(*tasks[0], limit) is not None:
             return _run_heldout_split(list(endpoint), served_name, Path(out_dir), tasks[0], lora=lora, mock=mock,
                                       limit=limit, decoding=decoding)
-        return _run_heldout_parallel(list(endpoint), served_name, Path(out_dir), domains=domains, lora=lora,
-                                     mock=mock, limit=limit, decoding=decoding)
     if isinstance(endpoint, (list, tuple)):
         endpoint = endpoint[0]
     return _run_heldout_one(endpoint, served_name, out_dir, domains=domains, lora=lora, mock=mock, limit=limit,
@@ -149,42 +124,7 @@ def _run_heldout_split(endpoints, served_name, out_dir: Path, task_pool, *, lora
     return {task: {k: summ[k] for k in _KEYS if k in summ}}
 
 
-def _run_heldout_parallel(endpoints, served_name, out_dir: Path, *, domains, lora, mock, limit, decoding) -> dict:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tasks = heldout_tasks(domains)
-    lock = threading.Lock()
-    queue = list(tasks)
-
-    def worker(ep):
-        res = {}
-        while True:
-            with lock:
-                if not queue:
-                    return res
-                task, pool = queue.pop(0)
-            sub = out_dir / "_par" / task
-            r = _run_heldout_one(ep, served_name, sub, tasks=[(task, pool)], lora=lora, mock=mock, limit=limit,
-                                 decoding=decoding)
-            with lock:                              # merge this task into out_dir (summary.json + records)
-                sp, ssp = out_dir / "summary.json", sub / "summary.json"
-                allsum = json.loads(sp.read_text()) if sp.exists() else {}
-                if ssp.exists():
-                    allsum[task] = json.loads(ssp.read_text()).get(task, {})
-                    sp.write_text(json.dumps(allsum, indent=1, ensure_ascii=False))
-                if (sub / f"{task}.jsonl").exists():
-                    shutil.copyfile(sub / f"{task}.jsonl", out_dir / f"{task}.jsonl")
-            res.update(r)
-    with ThreadPoolExecutor(max_workers=len(endpoints)) as ex:
-        parts = list(ex.map(worker, endpoints))
-    out = {}
-    for task, _ in tasks:                           # task order as in HELDOUT
-        for p in parts:
-            if task in p:
-                out[task] = p[task]
-    return out
-
-
-def _run_heldout_one(endpoint, served_name, out_dir: Path, *, domains="all", lora=None, mock=False, limit=None,
+def _run_heldout_one(endpoint, served_name, out_dir: Path, *, domains, lora=None, mock=False, limit=None,
                      decoding: dict | None = None, tasks: list | None = None) -> dict:
     """Evaluate every held-out task of `domains` into out_dir (run_eval layout). Tasks already present in
     out_dir/summary.json for the same served model / LoRA / limit / decoding are skipped (resumable).

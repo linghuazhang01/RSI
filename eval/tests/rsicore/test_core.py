@@ -4,9 +4,10 @@
 
 Covers: RunState resume, ToolAPI budgets (fixed, measured cost_fn, dedupe), sandbox (tool round trip, timeout kill, budget exceeded,
 error propagation, environment isolation, file/subprocess/network denial), Editor with mock_policy
-(transcript + replay), inner_search / submit_to_gate with toy functions (resume, out_dir), draws wrappers in a
-temp run dir, evaluate.score / paired_delta / token_kl / run_heldout against the mock server, per-domain
-mock quality (target up, retention down), measure_noise_band (greedy: nothing re-run, band 0; > 0 sampled), gate helpers, and the end-to-end toy paper (twice: the second run must skip everything).
+(transcript + replay), inner_search / submit_to_gate with toy functions (resume, out_dir), the per-generation draws
+of simple_<d>_pool in a temp run dir, evaluate.score / paired_delta / token_kl / run_heldout (simple_<d>_test) against
+the mock server, per-domain mock quality (target up, other domain down), measure_noise_band (greedy: nothing re-run,
+band 0; > 0 sampled), gate helpers, and the end-to-end toy paper (twice: the second run must skip everything).
 """
 import argparse
 import json
@@ -252,42 +253,42 @@ def test_inner_search_resume():
 
 
 def test_draws():
-    rc = make_rc("draws")
+    rc = make_rc("draws", argv=["--set", "simple.screen_n=40"])
     g = draws.ensure_gate(rc)
-    check(len(g["math"]["dapo_math"]) == 1000, "gate size")
+    check(list(g) == ["math"] and len(g["math"]["simple_math_eval"]) == 500, "gate size")
     m = draws.draw_gen(rc, 0, target="math")
-    check(m["target"] == "math", "manifest target")
-    tr, sig, scr = (draws.ids(rc, 0, "dapo_math", r) for r in ("train", "signal", "screen"))
-    # data/draw/paper_b.yaml (2026-11-20): n 2000, target_train_frac 0.5, screen_n 400
-    check(len(tr) == 1000 and len(sig) == 1000 and len(scr) == 400 and set(scr) <= set(sig), "role sizes")
-    check(not set(tr) & set(draws.gate_ids(rc, "dapo_math")), "train overlaps gate")
-    check(len(draws.ids(rc, 0, "triviaqa_train", "kl")) == 64, "retention kl")
-    m2 = draws.draw_gen(rc, 0, target="math")
-    check(m2 == m, "redraw changed manifest")
-    draws.mark_shown(rc, 0, {"dapo_math": scr[:5]})
-    led = json.loads((rc.run_dir / "draws" / "ledger.json").read_text())
-    check([0, "shown"] in led["items"]["dapo_math"][scr[0]], "mark_shown not recorded")
+    check(m["target"] == "math" and m["simple"] and m["dataset"] == "simple_math_pool", "manifest")
+    tr, sig, scr, kl = (draws.ids(rc, 0, "simple_math_pool", r) for r in ("train", "signal", "screen", "kl"))
+    check(len(scr) == 40 and sig == scr and len(kl) == draws.KL_N and set(kl) <= set(tr), "role sizes")
+    test = set(draws.build_eval_set("simple_math_test"))
+    check(not (set(tr) | set(scr)) & (set(draws.gate_ids(rc, "simple_math_eval")) | test), "train / screen overlap gate")
+    check(draws.draw_gen(rc, 0, target="math") == m, "redraw changed manifest")
     m1 = draws.draw_gen(rc, 1, target="math")
-    check(not set(scr[:5]) & set(draws.ids(rc, 1, "dapo_math", "signal")), "shown item drawn as signal again")
-    check(m1["gen"] == 1, "gen 1")
-    return f"gate {len(g['math']['dapo_math'])}, gen0 train/signal/screen = {len(tr)}/{len(sig)}/{len(scr)}"
+    check(m1["gen"] == 1 and draws.ids(rc, 1, "simple_math_pool", "screen") != scr, "gen 1 draws anew")
+    for bad in (lambda: draws.ids(rc, 0, "dapo_math", "screen"), lambda: draws.gate_ids(rc, "dapo_math")):
+        try:
+            bad()
+            raise AssertionError("a non-simple dataset was accepted")
+        except ValueError:
+            pass
+    return f"gate 500, gen0 train/screen/kl = {len(tr)}/{len(scr)}/{len(kl)}"
 
 
 def test_evaluate_mock():
-    rc = make_rc("evalmock")
+    rc = make_rc("evalmock", argv=["--set", "simple.screen_n=400"])
     draws.draw_gen(rc, 0, target="math")
     reg = rc.run_dir / "mock_registry.json"
     records.write_json(reg, {"base": 0.8, "weak": 0.3})
     with servers.VLLMServer(rc.model_path, "base", [0], mock=True, mock_registry=reg, enable_lora=True,
                             seed=rc.seed, log_dir=rc.run_dir / "logs") as srv:
-        ids = draws.ids(rc, 0, "dapo_math", "screen")
-        a = evaluate.score(srv.endpoint, "base", "dapo_math", pool="pool", ids=ids, out_dir=rc.run_dir / "ev" / "base",
-                           mock=True)
+        ids = draws.ids(rc, 0, "simple_math_pool", "screen")
+        a = evaluate.score(srv.endpoint, "base", "simple_math_pool", pool="pool", ids=ids,
+                           out_dir=rc.run_dir / "ev" / "base", mock=True)
         check(a.summary["n"] == 400 and 0.7 <= a.accuracy <= 0.9, f"base accuracy {a.accuracy}")
         (rc.run_dir / "weak_lora").mkdir(exist_ok=True)
         srv.load_lora("weak", rc.run_dir / "weak_lora")
-        b = evaluate.score(srv.endpoint, "base", "dapo_math", pool="pool", ids=ids, out_dir=rc.run_dir / "ev" / "weak",
-                           lora="weak", mock=True)
+        b = evaluate.score(srv.endpoint, "base", "simple_math_pool", pool="pool", ids=ids,
+                           out_dir=rc.run_dir / "ev" / "weak", lora="weak", mock=True)
         check(0.2 <= b.accuracy <= 0.4, f"weak accuracy {b.accuracy}")
         d = evaluate.paired_delta(a.records, b.records)
         check(d["n"] == 400 and d["ci"][0] <= d["delta"] <= d["ci"][1] < 0, f"paired delta {d}")
@@ -301,19 +302,22 @@ def test_evaluate_mock():
         k_mid = evaluate.token_kl(cache, srv.endpoint, "base", texts, lora="mid")
         check(k_self["mean"] < 1e-9 < k_mid["mean"] < k_weak["mean"], f"KL order {k_self['mean']} {k_mid['mean']} {k_weak['mean']}")
         srv.unload_lora("mid")
-        h = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout", domains="math", mock=True, limit=5)
-        check(set(h) == {"math500", "gsm8k", "aime24", "aime25"} and all(v["n"] == 5 for v in h.values()), f"heldout {h}")
+        dom = heldout.heldout_domains(rc.paper_cfg, rc.domain)
+        check(dom == "eval:simple_math_test", dom)
+        h = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout", domains=dom, mock=True, limit=5)
+        check(set(h) == {"simple_math_test"} and h["simple_math_test"]["n"] == 5, f"heldout {h}")
         t0 = time.time()
-        heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout", domains="math", mock=True, limit=5)
+        heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout", domains=dom, mock=True, limit=5)
         check(time.time() - t0 < 2, "heldout rerun not skipped")
-        hc = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout_code", domains="code", mock=True, limit=3)
-        check(hc["humanevalplus"]["n_pending"] == 3, f"code pending {hc}")
+        hc = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout_code", domains="eval:simple_code_test",
+                                 mock=True, limit=3)
+        check(hc["simple_code_test"]["n_pending"] == 3, f"code pending {hc}")
     runs = [a.records, b.records]
     check(abs(gate.noise_band(runs) - (a.accuracy - b.accuracy)) < 1e-9, "noise band")
     check(gate.relative_pass(0.8, 1.0, 0.8) and not gate.relative_pass(0.79, 1.0, 0.8), "relative_pass")
-    return (f"dapo_math screen acc base={a.accuracy:.3f} weak={b.accuracy:.3f} delta={d['delta']:.3f} "
+    return (f"simple_math_pool screen acc base={a.accuracy:.3f} weak={b.accuracy:.3f} delta={d['delta']:.3f} "
             f"ci=[{d['ci'][0]:.3f},{d['ci'][1]:.3f}]; KL self={k_self['mean']:.3g} mid={k_mid['mean']:.3f} "
-            f"weak={k_weak['mean']:.3f}; heldout math acc={ {k: v['accuracy'] for k, v in h.items()} }")
+            f"weak={k_weak['mean']:.3f}; heldout acc={ {k: v['accuracy'] for k, v in h.items()} }")
 
 
 def test_toolapi_cost_fn_dedupe():
@@ -364,7 +368,7 @@ def test_toolapi_cost_fn_dedupe():
 
 def test_search_out_dir():
     rc = make_rc("search_out")
-    out = rc.run_dir / "gen_01" / "e_t" / "llm"
+    out = rc.run_dir / "gen_01" / "extra" / "llm"
     calls = {"build": 0}
 
     def factory(th):
@@ -400,33 +404,33 @@ def test_mock_domain_quality_and_noise():
     check(MQ.resolve({"quality": {"default": 0.5}}, task="x", domain="code") == 0.5, "wrapped default")
     check(MQ.resolve(0.3, task="x") == 0.3 and abs(MQ.scalar({"default": 0.5, "math": 1.0}) - 0.6) < 1e-12, "scalar")
     rc = make_rc("domainq")
-    draws.draw_gen(rc, 0, target="math")
     reg = rc.run_dir / "mock_registry.json"
     records.write_json(reg, {"base": 0.6, "cand": {"default": 0.3, "math": 0.9}})
-    tasks = ["dapo_math", "triviaqa_train"]
+    tasks = ["simple_math_test", "simple_knowledge_test"]          # indexed through their source training sets
     with servers.VLLMServer(rc.model_path, "base", [0], mock=True, mock_registry=reg, enable_lora=True, seed=rc.seed,
-                            log_dir=rc.run_dir / "logs", extra_args=["--tasks", ",".join(tasks)]) as srv:
+                            log_dir=rc.run_dir / "logs", extra_args=["--tasks", "dapo_math,triviaqa_train"]) as srv:
         (rc.run_dir / "cand_lora").mkdir(exist_ok=True)
         srv.load_lora("cand", rc.run_dir / "cand_lora")
         acc = {}
         for name, lora in (("base", None), ("cand", "cand")):
             for t in tasks:
-                ids = draws.ids(rc, 0, t, "screen")
+                ids = draws.build_eval_set(t)[:300]
                 acc[(name, t)] = evaluate.score(srv.endpoint, "base", t, pool="pool", ids=ids, lora=lora, mock=True,
                                                 out_dir=rc.run_dir / "ev" / name).accuracy
-        check(acc[("cand", "dapo_math")] > acc[("base", "dapo_math")] + 0.15, f"target did not rise {acc}")
-        check(acc[("cand", "triviaqa_train")] < acc[("base", "triviaqa_train")] - 0.15, f"retention did not fall {acc}")
-        ids = draws.ids(rc, 0, "dapo_math", "screen")
-        g0 = gate.measure_noise_band(srv.endpoint, "base", "dapo_math", ids, rc.run_dir / "nb_greedy", repeats=3,
+        check(acc[("cand", "simple_math_test")] > acc[("base", "simple_math_test")] + 0.15, f"target did not rise {acc}")
+        check(acc[("cand", "simple_knowledge_test")] < acc[("base", "simple_knowledge_test")] - 0.15,
+              f"other domain did not fall {acc}")
+        ds, ids = "simple_math_test", draws.build_eval_set("simple_math_test")[:300]
+        g0 = gate.measure_noise_band(srv.endpoint, "base", ds, ids, rc.run_dir / "nb_greedy", repeats=3,
                                      temperature=0.0, base_seed=rc.seed, mock=True)
-        g1 = gate.measure_noise_band(srv.endpoint, "base", "dapo_math", ids, rc.run_dir / "nb_t06", repeats=3,
+        g1 = gate.measure_noise_band(srv.endpoint, "base", ds, ids, rc.run_dir / "nb_t06", repeats=3,
                                      temperature=0.6, base_seed=rc.seed, mock=True)
-        g1b = gate.measure_noise_band(srv.endpoint, "base", "dapo_math", ids, rc.run_dir / "nb_t06b", repeats=3,
+        g1b = gate.measure_noise_band(srv.endpoint, "base", ds, ids, rc.run_dir / "nb_t06b", repeats=3,
                                       temperature=0.6, base_seed=rc.seed, mock=True)
     check(g0["band"] == 0.0 and g0["scores"] == [] and g0["source"].startswith("greedy"), f"greedy band {g0}")   # nothing re-run
     check(g1["band"] > 0 and g1["se"] > 0 and g1["seeds"] == [rc.seed, rc.seed + 1, rc.seed + 2], f"sampled band {g1}")
     check(g1b["scores"] == g1["scores"], "sampled repeats not deterministic per seed")
-    s = json.loads((rc.run_dir / "nb_t06" / f"seed{rc.seed + 1}" / "summary.json").read_text())["dapo_math"]
+    s = json.loads((rc.run_dir / "nb_t06" / f"seed{rc.seed + 1}" / "summary.json").read_text())[ds]
     check(s["decoding"]["seed"] == rc.seed + 1 and s["decoding"]["temperature"] == 0.6, f"decoding {s['decoding']}")
     return (f"acc {{{', '.join(f'{k[0]}/{k[1]}={v:.2f}' for k, v in acc.items())}}}; band greedy={g0['band']:.3f} "
             f"t=0.6 band={g1['band']:.3f} se={g1['se']:.3f} scores={[round(x, 3) for x in g1['scores']]}")

@@ -1,6 +1,6 @@
 """LoRA / adapter-stack operators (METHOD_DESIGN §3.3). All return a NEW LoRA (inputs untouched).
 
-scale, interpolate, combine, drop, truncate_rank, intruder_scale, relchange_prune, regmean_preserve,
+scale, interpolate, combine, drop, truncate_rank, intruder_scale, relchange_prune,
 orthogonalize, ties; plus intruder_scores() used by diagnostics and feedback.
 """
 from __future__ import annotations
@@ -114,29 +114,6 @@ def relchange_prune(lora: LoRA, store, frac: float = 0.03, modules=None, device:
         U, S, Vh = torch.linalg.svd(dW, full_matrices=False)
         out.set_from_svd(m, U[:, :r].cpu(), S[:r].cpu(), Vh[:r].T.cpu(), tol=1e-7)
     out.meta.setdefault("ops", []).append(["relchange_prune", frac])
-    return out
-
-
-def regmean_preserve(lora: LoRA, grams_target: dict, grams_preserve: dict, alpha: float = 1.0,
-                     modules=None, ridge: float = 1e-4) -> LoRA:
-    """RegMean-style preservation with the base as a merge member:
-        W* = argmin_W ||(W − W0 − ΔW) X_t||² + α ||(W − W0) X_r||²   ⇒   ΔW* = ΔW G_t (G_t + α G_r)^{-1}
-    computed in factored form A' = A G_t (G_t + α G_r)^{-1} (input Grams G = Σ x xᵀ, from acts/gram)."""
-    import torch
-    out = lora.copy()
-    for m in _sel(out, modules):
-        if m not in grams_target or m not in grams_preserve:
-            continue
-        Gt, Gr = grams_target[m].float(), grams_preserve[m].float()
-        Gt = Gt / max(float(torch.trace(Gt)), 1e-12)
-        Gr = Gr / max(float(torch.trace(Gr)), 1e-12)
-        M = Gt + float(alpha) * Gr
-        M = M + ridge * torch.eye(M.shape[0]) * float(torch.trace(M)) / M.shape[0]
-        A, B = out.factors[m]
-        # A' = A Gt M^{-1}  <=>  M^T A'^T = (A Gt)^T
-        At = torch.linalg.solve(M.T, (A @ Gt).T)
-        out.factors[m] = (At.T.contiguous(), B)
-    out.meta.setdefault("ops", []).append(["regmean_preserve", alpha])
     return out
 
 

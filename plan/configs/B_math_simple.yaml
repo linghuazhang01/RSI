@@ -1,6 +1,6 @@
-# Paper B · self-written LoRA (method.mode scratch: nothing is trained; the merged model is the next editor) · math only · objective simple (v2, 2026-11-21) · B300 planned at 220 GB per card
-# Generated snapshot of the MERGED config (lora_code/configs/base.yaml + domains/math.yaml + hardware b300 + scope single
-# + objective simple). Not read by the code (source of truth: base.yaml + --set); a run locks its own copy in
+# Paper B · self-written LoRA (method.mode scratch: nothing is trained; the merged model is the next editor) · math only · simple flow (v2, 2026-11-21) · B300 planned at 220 GB per card
+# Generated snapshot of the MERGED config (lora_code/configs/base.yaml (2026-11-22: the simple flow folded in) + domains/math.yaml + hardware b300).
+# Not read by the code (source of truth: base.yaml + --set); a run locks its own copy in
 # experiment_records/<run id>/run_config.yaml. Regenerate after changing base.yaml.
 # Data (simple_data/math/, data/scripts/make_simple_data.py): the decontaminated, de-duplicated dapo_math pool (pool_ids.json)
 #   gate  = simple_math_eval, 500 fixed items (hidden; the editor sees only statistics of earlier candidates' gate results)
@@ -15,22 +15,15 @@
 #   3. accept the candidate with the largest paired gate gain >= gate.min_gain 0.0 (require_significant
 #      True); then the test set (500 x 4).
 # Decoding (screen / gate / test): thinking on, temperature 0.6, top_p 0.95, top_k 20, max_tokens 16384.
-# Start: ./launch.sh --hw b300 --paper B --domains math --simple --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag <name>
-draw_config: data/draw/paper_b.yaml
-data:
-  n: null
-  target_train_frac: null
-  screen_n: null
-  gate_n: null
-  retention_n: null
-  retention_kl: null
+# Start: ./launch.sh --hw b300 --paper B --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --tag <name>
+simple:
+  screen_n: 500
 max_tokens:
   dapo_math: 4096
   taco_verified: 4096
   ifeval_train: 2048
   sealtool_train: 1024
   triviaqa_train: 1024
-  math_eval: 4096
 method:
   mode: scratch
 weights:
@@ -38,8 +31,6 @@ weights:
   max_modules: null
   vector_cap_tau: 0.5
   rescale_tol: 0.05
-scope: single
-objective: simple
 raw:
   n_train: null
   rank: 16
@@ -113,17 +104,14 @@ sandbox:
   timeout_s: 1800
   mem_gb: 16
 feedback:
-  lambda_retention: 1.0
-  lambda_kl: 0.5
   n_examples: 3
   mark_shown: true
-retention:
-  domains: []
 loop:
   patience: 3
 tools:
   compare: true
   train_loss: true
+  train_loss_backend: vllm
   tensor_compute: true
   paper_tools: true
 tensor_compute:
@@ -165,7 +153,6 @@ eval:
   screen_limit: null
   full_limit: null
   gate_limit: null
-  kl_limit: null
 train_data:
   mode: self_correct
   samples: 4
@@ -185,36 +172,18 @@ nonllm:
   - 1.25
 diagnostics:
   svd_k: 8
-e_t:
-  enabled: false
-  task: tool_calling
-  task_when_target_is_tool_calling: code
-  branches:
-  - parent
-  - llm
-  - nonllm
-  evaluate: 16
-  gpu_seconds: 3600
-  threads: 4
-  steps: 4
-  top_full: 1
-  n_train: 1600
-  n_signal: 200
-  items_seed: 20261118
-  test_limit: null
 heldout:
   enabled: true
-  domains: math
   limit: null
   decoding:
     temperature: 0.6
     top_p: 0.95
     top_k: 20
-    seed: 42
-    n: 4
-    n_by_task: null
     thinking: true
     max_tokens: 16384
+    n: 4
+    seed: 42
+    n_by_task: null
 baseline:
   noise_repeats: 3
   noise_temperature: 0.0
@@ -236,25 +205,13 @@ server:
   - '128'
   - --max-logprobs
   - '20'
-  theta0_args:
-  - --rsi-gpu-memory-gib
-  - '100'
-  - --gpu-memory-utilization
-  - '0.37'
-  - --max-model-len
-  - '20480'
-  - --max-num-seqs
-  - '128'
-  - --max-logprobs
-  - '20'
   mock_tasks: null
 gpu_roles: null
 gpu_layout:
-  theta0_own_gpu: false
   share_single_gpu: false
   main_replicas: true
   main_tp: 1
   train_gpus: 1
+  tools_on_replicas: true
+  replica_vllm_gib: 140
 hardware: b300
-data_roles:
-  eval: eval:simple_math_test

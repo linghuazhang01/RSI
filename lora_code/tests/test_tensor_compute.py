@@ -30,7 +30,7 @@ def _ws(tmp_path, mode="scratch", cfg=None, store=None):
     from lora_code.tools import Workspace
     train = TrainData({f"t/{i}": {"messages": [{"role": "user", "content": "q"}], "target": "a", "source": "gold"}
                        for i in range(10)})
-    c = {"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}, "weights": {"norm_cap_tau": 0.05}, "objective": "simple"}
+    c = {"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}, "weights": {"norm_cap_tau": 0.05}}
     for k, v in (cfg or {}).items():
         c[k] = {**c.get(k, {}), **v} if isinstance(v, dict) else v
     ws = Workspace(mock=store is None, store=store or MockStore(), train=train, cfg=c, out_dir=tmp_path,
@@ -47,10 +47,9 @@ def _tc(ws, code, tensors, **kw):
 def test_surface_and_catalogue(tmp_path):
     from lora_code.tools import TOOL_DOCS, WEIGHT_TOOLS, tools_for_mode
     assert "tensor_compute" not in WEIGHT_TOOLS and {"tensors", "tensor_compute"} <= set(TOOL_DOCS)
-    on = {"objective": "simple"}               # default: on for objective simple only (2026-11-21)
+    on = {}                                    # absent key: on (2026-11-22; base.yaml sets it explicitly)
     for mode in ("scratch", "edit", "weights"):
-        assert not {"tensors", "tensor_compute"} & set(tools_for_mode(mode))                       # no cfg: off
-        assert not {"tensors", "tensor_compute"} & set(tools_for_mode(mode, cfg={"objective": "train_gate"}))
+        assert {"tensors", "tensor_compute"} <= set(tools_for_mode(mode))                          # no cfg: on
         assert {"tensors", "tensor_compute"} <= set(tools_for_mode(mode, cfg={"tools": {"tensor_compute": True}}))
         t = tools_for_mode(mode, cfg=on)
         assert {"tensors", "tensor_compute"} <= set(t)

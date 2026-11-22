@@ -1,10 +1,10 @@
 """Evaluation of LoRA candidates on the served model M_t (vLLM multi-LoRA, hot-loaded adapters).
 
-Levels: `screen` (target screen + retention screen, ~200 items each), `full` (whole signal draw of the
-generation), `gate` (fixed gate of every domain). Every result is cached on disk per (name, level), so a
-resumed run never re-evaluates. Feedback follows RSI_LOOP_DESIGN §3.4.
-data roles (2026-11-21): the screen / full levels hold the train dataset (`target_dataset`), the gate level the gate
-dataset (`gate_dataset`, default the same); a level's target is the one it holds.
+Levels: `screen` (this generation's screen draw of the target domain), `full` (the signal draw; = screen in the
+simple flow), `gate` (the fixed gate set of the target domain). Every result is cached on disk per (name, level), so
+a resumed run never re-evaluates. Feedback follows RSI_LOOP_DESIGN §3.4 (target domain only).
+datasets (2026-11-21): the screen / full levels hold the train dataset (`target_dataset`, simple_<d>_pool), the gate
+level the gate dataset (`gate_dataset`, simple_<d>_eval; default the same); a level's target is the one it holds.
 decoding (2026-11-21): `decoding` = {level: rsicore decoding dict | None} (rsicore.config.stage_decoding; None =
 tasks.yaml greedy). The parent (the current model) and every candidate of a level are scored with the same dict,
 seed included; a level's cache directory carries a tag of its decoding (evals/<name>/<level>@<tag>/, plain <level>/
@@ -21,7 +21,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-from .common import DATASET_DOMAIN, load_records, read_json, stable_hash, write_json
+from .common import load_records, read_json, stable_hash, write_json
 
 
 def mean_ci(scores: list[float], seed: int = 42, n_boot: int = 500) -> tuple[float | None, list]:
@@ -75,8 +75,8 @@ def _short(s, n=400):
 
 class Evaluator:
     def __init__(self, rc, cfg: dict, *, out_dir: Path, endpoint: str, served: str, server, ids: dict,
-                 target_dataset: str, kl_texts: list[str], store, mock: bool, registry: Path | None,
-                 parent_quality: float | dict | None = None, max_loaded: int = 6, tag: str = "",
+                 target_dataset: str, store, mock: bool, registry: Path | None,
+                 parent_quality: float | dict | None = None, max_loaded: int = 6,
                  replicas: list | None = None, weights_scorer=None, gate_dataset: str | None = None,
                  decoding: dict | None = None):
         self.rc, self.cfg = rc, cfg
@@ -86,7 +86,7 @@ class Evaluator:
         self.out_dir = Path(out_dir)
         self.endpoint, self.served, self.server = endpoint, served, server
         # replicas of the served model (2026-11-20, data parallelism): every LoRA is loaded on all of them and the
-        # items of a scoring job are split over them (rsicore.evaluate.score_split); KL uses the first
+        # items of a scoring job are split over them (rsicore.evaluate.score_split)
         self.replicas = list(replicas) if replicas else [server]
         if self.replicas[0] is not server and server in self.replicas:
             self.replicas.remove(server)
@@ -98,9 +98,8 @@ class Evaluator:
         self.weights_scorer = weights_scorer
         self._kinds: dict[str, str] = {}
         self.ids = ids                      # level -> {dataset: [ids]}
-        self.target = target_dataset        # screen / full target (data_roles.train)
-        self.gate_target = gate_dataset or target_dataset   # gate target (data_roles.gate)
-        self.kl_texts = kl_texts
+        self.target = target_dataset        # screen / full target (the train dataset)
+        self.gate_target = gate_dataset or target_dataset   # gate target (the gate dataset)
         self.store = store
         self.mock = mock
         self.registry = registry
@@ -120,11 +119,7 @@ class Evaluator:
         self._paths: dict[str, Path] = {}
         self._max_loaded = max_loaded
         self._lock = threading.RLock()
-        self._ref_cache = None
-        self.tag = tag
         ec = cfg.get("feedback", {})
-        self.lam = float(ec.get("lambda_retention", 1.0))
-        self.lam_kl = float(ec.get("lambda_kl", 0.5))
         self.n_examples = int(ec.get("n_examples", 3))
         self.mark_shown_examples = bool(ec.get("mark_shown", True))
 
@@ -148,7 +143,7 @@ class Evaluator:
     def register(self, lora, name: str, *, full: bool = False) -> Path:
         """Save `lora` (PEFT dir, or mock JSON spec) and make it servable under `name`. Adapter mode: a delta is
         saved as C_g (+) delta (full=False); full=True registers a complete adapter on M_0 as is (C_g itself, the
-        next C, an E_t parent). Mock quality is always the delta's, relative to parent_quality (= the current model);
+        next C). Mock quality is always the delta's, relative to parent_quality (= the current model);
         a full adapter whose quality is already in the registry keeps it."""
         weights = getattr(lora, "kind", "lora") == "weights"
         serve = lora if full else self.compose(lora)
@@ -161,10 +156,9 @@ class Evaluator:
                 if full and name in (read_json(self.registry, {}) or {}):
                     self._paths[name] = path
                     return path
-                # per-domain mock quality: the target domain gains, retention domains take the damage
-                # (train and gate datasets differ: the gain goes to the domain, so both of them see it)
-                tkey = DATASET_DOMAIN.get(self.target, self.target) if self.gate_target == self.target \
-                    else (DATASET_DOMAIN.get(self.target) or getattr(self.rc, "domain", None) or self.target)
+                # per-domain mock quality: the run's domain gains (the train and gate datasets both belong to it, so
+                # both of them see it), the other domains take the damage
+                tkey = getattr(self.rc, "domain", None) or self.target
                 q = lora.quality(self.parent_quality if self.parent_quality is not None else 0.7, salt=name,
                                  target=tkey)
                 reg = read_json(self.registry, {}) or {}
@@ -301,9 +295,8 @@ class Evaluator:
 
     def _cache_level(self, level: str, ds: str, ids) -> str:
         """Cache directory level of (level, ds): a level with the same dataset, the same items AND the same decoding
-        as the screen level (objective eval_overfit: every level is the whole eval set; objective simple: full =
-        screen) shares the screen result instead of scoring them again; a different dataset (data_roles: gate !=
-        train) never does. A sampled decoding adds its tag (<level>@<hash>, 2026-11-21)."""
+        as the screen level (full = screen in the simple flow) shares the screen result instead of scoring them again; a
+        different dataset (the gate set) never does. A sampled decoding adds its tag (<level>@<hash>, 2026-11-21)."""
         scr = self.ids.get("screen") or {}
         if (level != "screen" and ds in scr and sorted(ids) == sorted(scr[ds])
                 and self.level_decoding(level) == self.level_decoding("screen")):
@@ -332,28 +325,6 @@ class Evaluator:
             res[ds] = got
         return res
 
-    def kl(self, name: str | None) -> float | None:
-        if name is None or not self.kl_texts:
-            return 0.0 if name is None else None
-        if self._kinds.get(name) == "weights" and not self.mock:
-            return None                             # weight edits: no token KL (would need the model served here)
-        from rsicore.evaluate import reference_logprobs, token_kl
-
-        cache = self.out_dir / "evals" / name / "kl.json"
-        got = read_json(cache)
-        if got is not None:
-            return got["mean"]
-        with self._lock:
-            if self._ref_cache is None:
-                if self.parent_lora:   # reference = M_0 + current LoRA (adapter name as the model)
-                    self.ensure_loaded(self.parent_lora)
-                self._ref_cache = reference_logprobs(self.endpoint, self.parent_lora or self.served, self.kl_texts,
-                                                     self.out_dir / "evals" / "__parent__" / "ref_logprobs.jsonl")
-            self.ensure_loaded(name)
-        out = token_kl(self._ref_cache, self.endpoint, self.served, self.kl_texts, lora=name)
-        write_json(cache, {"mean": out.get("mean"), "per_text": out.get("per_text", [])[:256]})
-        return out.get("mean")
-
     # ------------------------------------------------------------------ comparisons
     def _paired(self, cand: list[dict], ref: list[dict]) -> dict:
         """delta = candidate − reference, paired by item id (rsicore.paired_delta(a=ref, b=cand))."""
@@ -375,7 +346,6 @@ class Evaluator:
                  parent_gen0: dict | None = None) -> tuple[float | None, dict]:
         cand = self.run(name, level)
         par = self.run(None, level)
-        kl = self.kl(name)
         vs_par = self.compare(cand, par)
         fb = {"level": level, "lora": name}
         T = self.gate_target if level == "gate" else self.target
@@ -390,25 +360,6 @@ class Evaluator:
         tgt["errors"] = self._examples(t.get("records", []), par.get(T, {}).get("records", []),
                                        T, mode="errors") if name else []
         fb["target"] = tgt
-        ret, drops = {}, []
-        for ds, r in cand.items():
-            if ds == T:
-                continue
-            d = vs_par.get(ds) or {}
-            ret[DATASET_DOMAIN.get(ds, ds)] = {"dataset": ds, "score": r.get("score"),
-                                                "parent": par.get(ds, {}).get("score"), "vs_parent": d,
-                                                "significant": _sig(d)}
-            if d.get("delta") is not None:
-                drops.append(max(0.0, -d["delta"]))
-        fb["retention"] = ret
-        fb["kl_vs_parent"] = kl
-        regs = []
-        if name:
-            for ds, r in cand.items():
-                if ds != T:
-                    regs += self._examples(r.get("records", []), par.get(ds, {}).get("records", []), ds,
-                                           mode="regressions")
-        fb["regressions"] = regs[: self.n_examples]
         fb["behavior"] = _behavior(cand, par)
         if lora_report is not None:
             fb["lora_stats"] = lora_report
@@ -420,28 +371,20 @@ class Evaluator:
         elif gain is None:
             score = None
         else:
-            score = gain - self.lam * (sum(drops) / len(drops) if drops else 0.0) - self.lam_kl * float(kl or 0.0)
+            score = gain
         fb["score"] = score
-        fb["score_formula"] = f"target_gain - {self.lam} * mean_retention_drop - {self.lam_kl} * kl"
+        fb["score_formula"] = "target_gain (paired vs the current model)"
         return score, fb
 
-    def _examples(self, cand_recs, par_recs, ds, mode):
-        """errors: items the candidate gets wrong (avg@n records: mostly wrong, score <= 0.5); regressions: items the
-        parent got right and the candidate does not (avg@n: parent > 0.5 >= candidate, like Paper A)."""
+    def _examples(self, cand_recs, par_recs, ds, mode="errors"):
+        """errors: items the candidate gets wrong (avg@n records: mostly wrong, score <= 0.5), the ones the parent got
+        right first."""
         pmap = {r["id"]: r for r in par_recs}
 
         def wrong(r):
             return r["score"] <= 0.5 if _multi(r) else r["score"] < 1
-
-        def right(r):
-            return (r.get("score") or 0) > 0.5 if _multi(r) else (r.get("score") or 0) >= 1
-        if mode == "errors":
-            pick = [r for r in cand_recs if r.get("score") is not None and wrong(r)]
-            pick.sort(key=lambda r: (-(pmap.get(r["id"], {}).get("score") or 0), stable_hash(r["id"])))
-        else:
-            pick = [r for r in cand_recs if r.get("score") is not None and wrong(r)
-                    and right(pmap.get(r["id"], {}))]
-            pick.sort(key=lambda r: stable_hash(r["id"]))
+        pick = [r for r in cand_recs if r.get("score") is not None and wrong(r)]
+        pick.sort(key=lambda r: (-(pmap.get(r["id"], {}).get("score") or 0), stable_hash(r["id"])))
         pick = pick[: self.n_examples]
         if not pick:
             return []
@@ -453,10 +396,7 @@ class Evaluator:
                  "output": r.get("out")}
             if _multi(r):                           # avg@n: the score is the share of correct samples
                 e["score"] = r["score"]
-            if mode == "errors":
-                e["expected"] = _short(it.get("reference"), 200)
-            else:
-                e["before"] = pmap.get(r["id"], {}).get("out")
+            e["expected"] = _short(it.get("reference"), 200)
             out.append(e)
             if self.mark_shown_examples:
                 self.shown.setdefault(ds, set()).add(r["id"])

@@ -7,6 +7,7 @@ since 2026-11-20: every evaluation is greedy) nothing is re-run and the band is 
 fixed_noise_band() reads a fixed band from the config instead (no repeated evaluations).
 noise_ids() picks the (smaller) item subset the re-runs score.
 """
+import re
 import math
 from pathlib import Path
 
@@ -32,7 +33,7 @@ def noise_band(results_runs: list[list[dict]]) -> float:
 def fixed_noise_band(spec, dataset: str) -> float | None:
     """A fixed noise band from the config, so the repeated sampled runs can be skipped.
     spec: None (measure as usual) | a number (every dataset) | {key: number} with key = dataset name
-    (dapo_math), domain name (math) or "default". Returns None when spec gives no value for `dataset`."""
+    (simple_math_eval), domain name (math) or "default". Returns None when spec gives no value for `dataset`."""
     if spec is None:
         return None
     if isinstance(spec, bool):
@@ -43,6 +44,9 @@ def fixed_noise_band(spec, dataset: str) -> float | None:
         raise ValueError(f"fixed noise band must be a number or a mapping, got {spec!r}")
     from .draws import DOMAIN_TRAIN
     domain = next((d for d, dss in DOMAIN_TRAIN.items() if dataset in dss), None)
+    if domain is None:          # simple_<domain>_{pool,eval,test,train} (2026-11-22: the only datasets)
+        domain = next((d for d in sorted(DOMAIN_TRAIN, key=len, reverse=True)
+                       if re.fullmatch(rf"simple_{d}_(pool|eval|test|train)", dataset)), None)
     for k in (dataset, domain, "default"):
         if k is not None and spec.get(k) is not None:
             return float(spec[k])

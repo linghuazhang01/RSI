@@ -357,7 +357,7 @@ def test_search_history(tmp_path):
     assert not r["ok"]
     bad = t.call("search_history", {"sort": "x"}, ctx, 1, 0)
     assert not bad["ok"]
-    t0 = ChatTools(lambda tag, ctx: sandbox.ToolAPI({}), history=SearchHistory({}))     # E_t: this step only
+    t0 = ChatTools(lambda tag, ctx: sandbox.ToolAPI({}), history=SearchHistory({}))     # generation 1: this step only
     r = json.loads(t0.call("search_history", {}, ctx, 1, 0)["content"])
     assert [x["cid"] for x in r["rows"]] == ["g02_t0_s00"] and "generations" not in r
 

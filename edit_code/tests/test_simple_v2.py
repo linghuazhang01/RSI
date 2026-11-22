@@ -3,7 +3,7 @@
     python3 -I -m pytest -q edit_code/tests/test_simple_v2.py
 
 - search_settings: the code defaults reproduce the old accounting; program_evaluate_calls null does not crash;
-- the real base.yaml simple profile resolves to 8 threads x 1 step, 8 candidates, unscreened candidates with one gate
+- the real base.yaml (the folded simple profile, 2026-11-22) resolves to 8 threads x 1 step, 8 candidates, unscreened candidates with one gate
   evaluation each, no api.evaluate, top_full 0, thinking decoding (screen / gate / held-out n 4), candidate servers at
   32768 tokens and a persistent exploration session (FINAL flow, 2026-11-21);
 - make_tool_api(free_repeats=True): an already-evaluated config is free, the per-program cap and the pool hold,
@@ -64,11 +64,11 @@ def test_search_settings_defaults():
 
 
 def test_simple_profile_resolution(tmp_path):
-    """The real base.yaml simple profile (no mock overrides): 8 x 1, decoding, servers; train_gate unchanged."""
+    """The real base.yaml (no mock overrides): 8 x 1, decoding, servers; the search knobs still switch flows."""
     from rsicore.config import stage_decoding
     from edit_code.common import search_settings
     from edit_code.run import server_args
-    cfg, eff = _load(tmp_path, ["objective=simple"])
+    cfg, eff = _load(tmp_path, [])
     # FINAL flow (2026-11-21): candidates not screened, one gate evaluation each, no api.evaluate
     assert search_settings(cfg["search"]) == {"threads": 8, "steps": 1, "max_candidates": 8, "charge_screens": False,
                                               "per_program": 0, "eval_budget": 0, "top_full": 0, "rerun_seeds": 0,
@@ -82,26 +82,25 @@ def test_simple_profile_resolution(tmp_path):
     assert {k: hd[k] for k in ("temperature", "top_p", "top_k", "thinking", "max_tokens", "n", "seed")} == \
         dict(THINK, n=4, seed=42)
     assert not hd.get("n_by_task") and cfg["heldout"]["enabled"] is True
-    assert cfg["data_roles"]["eval"] == "eval:simple_math_test" and cfg["editor"]["tool_rounds"] == 20
+    assert "data_roles" not in cfg and cfg["editor"]["tool_rounds"] == 20
     assert _mml(server_args(cfg, "candidate_args")) == 32768
     assert _mml(server_args(cfg, "editor_args")) == 131072
     for hw in ("h20", "h20_80"):                                   # the hardware profiles' candidate args too
-        c, _ = _load(tmp_path / hw, ["objective=simple", f"hardware={hw}"])
+        c, _ = _load(tmp_path / hw, [f"hardware={hw}"])
         args = server_args(c, "candidate_args")
         assert _mml(args) == 32768 and args.count("--max-model-len") == 1
         assert _mml(server_args(c, "editor_args")) >= 32768
-    # --mock: mock_overrides win over the profile, mock_objective_overrides restore the simple layout (3 x 1)
+    # --mock: mock_overrides (the small layout, 3 x 1) win over the profile
     ms = search_settings(eff["search"])
     assert (ms["threads"], ms["steps"], ms["max_candidates"], ms["charge_screens"], ms["per_program"],
             ms["eval_budget"], ms["top_full"], ms["screen_candidates"], ms["gate_every_candidate"],
             ms["evaluate_tool"]) == (3, 1, 3, False, 0, 0, 0, False, True, False)
-    # other objectives keep the old behaviour: greedy (decoding null), charged screens, 20480-token candidates
-    tg, tg_eff = _load(tmp_path / "tg", [])
-    assert stage_decoding(tg, "screen", 42) is None and stage_decoding(tg, "gate", 42) is None
-    assert search_settings(tg["search"])["charge_screens"] is True
+    # the search knobs (kept, 2026-11-22): charged screens cap the candidates at max_evaluate
+    tg, _ = _load(tmp_path / "tg", ["search.charge_screens=true", "search.screen_candidates=true",
+                                    "search.max_candidates=null", "search.threads=4", "search.steps=6",
+                                    "search.program_evaluate_calls=2", "decoding.screen=null"])
+    assert stage_decoding(tg, "screen", 42) is None
     assert search_settings(tg["search"])["max_candidates"] == search_settings(tg["search"])["eval_budget"] == 24
-    assert _mml(server_args(tg, "candidate_args")) == 20480
-    assert search_settings(tg_eff["search"])["max_candidates"] == 4                       # mock 2 x 2, max_evaluate 4
 
 
 # ---------------------------------------------------------------------------------- free screens + program pool
@@ -188,10 +187,11 @@ def test_programs_run_when_screens_are_free(tmp_path, monkeypatch):
     monkeypatch.setattr(RUN, "make_render_context", lambda *a, **k: (lambda h, t: "CTX"))
     cfg = {"sandbox": {"timeout_s": 10, "mem_gb": 1}, "editor": {"tool_rounds": 0}, "feedback": {}}
     runner = SimpleNamespace(rc=SimpleNamespace(mock=True, seed=42), cfg=cfg, chat_tools=None,
-                             search_history=lambda g, t: None)
+                             search_history=lambda g: None)
     for charge, want_run in ((True, False), (False, True)):
-        scfg = {"threads": 2, "steps": 1, "max_evaluate": 0, "charge_screens": charge, "program_evaluate_calls": 2}
-        fns = RUN.Runner.search_fns(runner, prob, tmp_path / f"g{charge}", None, task="main", archive="", scfg=scfg)
+        cfg["search"] = {"threads": 2, "steps": 1, "max_evaluate": 0, "charge_screens": charge,
+                         "program_evaluate_calls": 2}
+        fns = RUN.Runner.search_fns(runner, prob, tmp_path / f"g{charge}", None, archive="")
         art, err = fns["build_fn"]("def main(api): pass", f"x{charge}")
         assert (art is not None) == want_run, err
         if want_run:
@@ -234,7 +234,7 @@ def _real_problem(tmp_path, monkeypatch, cfg, captured):
 
 
 def test_decoding_passed_and_incumbent_shared(tmp_path, monkeypatch):
-    _, cfg = _load(tmp_path / "cfg", ["objective=simple"])
+    _, cfg = _load(tmp_path / "cfg", [])
     captured = []
     prob = _real_problem(tmp_path, monkeypatch, cfg, captured)
     screen, gate = dict(THINK, n=4, seed=42), dict(THINK, n=4, seed=42)
@@ -272,8 +272,8 @@ def test_decoding_passed_and_incumbent_shared(tmp_path, monkeypatch):
 
 
 def test_greedy_records_unchanged(tmp_path, monkeypatch):
-    """decoding null (every objective but simple): score() gets decoding=None and records carry no "decoding"."""
-    _, cfg = _load(tmp_path / "cfg", [])
+    """decoding null (decoding.<stage>: null): score() gets decoding=None and records carry no "decoding"."""
+    _, cfg = _load(tmp_path / "cfg", ["decoding.screen=null", "decoding.gate=null"])
     captured = []
     prob = _real_problem(tmp_path, monkeypatch, cfg, captured)
     assert prob.decoding == {"screen": None, "full": None, "gate": None}

@@ -1,6 +1,8 @@
 """End-to-end Paper A orchestration in mock mode (no weights, no GPU), against the real rsicore.
 Fixed-size design (2026-11-19): frozen editor (M_0), every candidate quantizes M_0 to one budget,
-a generation is accepted only if it beats the incumbent on the gate.
+a generation is accepted only if it beats the incumbent on the gate. One flow (2026-11-22): train role
+simple_<d>_pool, gate simple_<d>_eval, held-out simple_<d>_test, gate per candidate (base.yaml; the mock runs
+3 threads x 1 step).
 
 Run with the eval interpreter (needs pyyaml; torch / transformers are NOT needed in mock mode):
     eval/.venv/bin/python -I -m pytest edit_code/tests/test_mock_flow.py -q      (or run the file)
@@ -58,21 +60,22 @@ class TestMockFlow(unittest.TestCase):
         # W3 reference (the default is W4 since 2026-11-20): at W4 the mock damage is too small for the mock
         # editor's bit exchange to clear the gate, and this test checks the accept / export / resume path
         r, dt = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_test",
-                     "--set", "budget.reference.default.bits=3"], self.runs)
+                     "--set", "budget.reference.default.bits=3", "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_test"
         st = json.loads((rd / "state.json").read_text())
         for k in ("baseline/gate", "baseline/noise", "baseline/heldout", "baseline/prep", "baseline/budget",
-                  "baseline/q0", "baseline/q0_heldout", "gen01/refs", "gen01/search", "gen01/gate", "gen01/export",
+                  "baseline/q0", "baseline/q0_heldout", "gen01/search", "gen01/gate", "gen01/export",
                   "gen01/heldout", "gen01/done", "gen02/done"):
             self.assertIn(k, st)
+        self.assertFalse([k for k in st if k.endswith("/mark_shown") or k.startswith("e_t/")])
         # one budget for every generation = packed size of the reference config (Q_0)
         budget = json.loads((rd / "baseline" / "budget.json").read_text())
         self.assertEqual(budget["source"], "budget.reference")
         self.assertAlmostEqual(budget["gib"], budget["reference_gib"], places=3)
         self.assertLess(budget["fraction_of_bf16"], 0.3)
         # greedy noise (default since 2026-11-20): nothing re-run, band 0
-        self.assertEqual(json.loads((rd / "baseline" / "noise.json").read_text()), {"dapo_math": 0.0})
+        self.assertEqual(json.loads((rd / "baseline" / "noise.json").read_text()), {"simple_math_pool": 0.0})
         self.assertFalse((rd / "baseline" / "noise").exists())
         q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
         self.assertEqual(q0["gen"], 0)
@@ -91,45 +94,38 @@ class TestMockFlow(unittest.TestCase):
         for g in (1, 2):
             gd = rd / f"gen_{g:02d}"
             cands = jl(gd / "candidates.jsonl")
-            self.assertGreaterEqual(len(cands), 3)
+            self.assertEqual(len(cands), 3)
             for c in cands:
                 if not c["error"]:
                     self.assertLessEqual(c["artifact"]["bytes_gib"], budget["gib"] + 1e-9)
                     self.assertEqual(c["artifact"]["budget_gib"], budget["gib"])
             inc_scores = json.loads((gd / "incumbent_scores.json").read_text())
             self.assertIsNotNone(inc_scores["screen"])
-            # M_0 is only the KL reference: not scored on the items; candidates are compared with the incumbent
-            self.assertFalse((gd / "refs" / "screen").exists())
+            # M_0 is not scored on the items and (kl_weight 0) computes no KL reference
+            self.assertFalse((gd / "refs").exists())
             ok = [c for c in cands if not c["error"] and c.get("screen")]
             self.assertTrue(ok)
-            for c in ok:
-                pr = c["screen"]["feedback"]["probes"]["math"]
-                self.assertIn("vs_incumbent", pr)
-                self.assertNotIn("parent", pr)
-                self.assertTrue(c["screen"]["feedback"]["error_top_groups"])
-                self.assertNotIn("per_text", c["screen"]["feedback"]["kl"])          # kept on disk instead
-                edir = gd / "evals" / c["cid"] / "screen"
-                if not edir.exists():                       # identical config: shares an earlier cid's records
-                    continue
-                self.assertEqual(len(json.loads((edir / "kl_per_text.json").read_text())), 400)
-                ge = json.loads((edir / "group_error.json").read_text())
-                self.assertAlmostEqual(sum(v["share"] for v in ge["groups"].values()), 1.0, places=2)
-            self.assertTrue(any("group_error top" in (c["artifact"] or {}).get("stdout_tail", "")
-                                and "compare vs incumbent" in (c["artifact"] or {}).get("stdout_tail", "")
-                                for c in ok), "the mock editor's analysis tool calls")
+            for c in ok:                                   # unscreened: the screen slot holds the gate feedback
+                fb = c["screen"]["feedback"]
+                self.assertEqual(fb["stage"], "gate")
+                self.assertIn("gain", fb["gate"])
+                self.assertTrue(fb["error_top_groups"])
+            self.assertTrue(any("group_error top" in (c["artifact"] or {}).get("stdout_tail", "") for c in ok),
+                            "the mock editor's analysis tool calls")
             ie = [e for e in evals_of(gd) if e["origin"] == "incumbent" and e["stage"] == "screen"]
             self.assertEqual(ie[0]["feedback"]["retention"], 1.0)
+            self.assertIsNone(ie[0]["feedback"]["kl"])
             self.assertTrue((gd / "editor" / "thread_0.jsonl").exists())
             evals = jl(gd / "evals.jsonl")
-            self.assertLessEqual(sum(1 for e in evals if e["stage"] == "screen" and e["charged"]), 4)
+            self.assertFalse([e for e in evals if e["charged"]])
             self.assertTrue(any(e["origin"] == "incumbent" for e in evals))
-        # generation 1: the mock editor's bit exchange beats the uniform W4 incumbent on the gate
+        # generation 1: the mock editor's bit exchange beats the uniform W3 incumbent on the gate
         acc = json.loads((rd / "gen_01" / "accepted.json").read_text())
         self.assertTrue(acc["accepted"], acc)
-        self.assertIn("beats the incumbent", acc["gate_reason"])
+        self.assertEqual(acc["rule"], "largest passing gate gain of the generation")
         inc1 = json.loads((rd / "gen_01" / "incumbent.json").read_text())
         self.assertEqual(inc1["gen"], 1)
-        self.assertGreater(inc1["gate_scores"]["dapo_math"], q0["gate_scores"]["dapo_math"])
+        self.assertGreater(inc1["gate_scores"]["simple_math_eval"], q0["gate_scores"]["simple_math_eval"])
         self.assertTrue((rd / "gen_01" / "model" / "mock_model.json").exists())
         # the editor is frozen: always M_0
         self.assertIn("[gen 2] budget", r.stdout)
@@ -141,15 +137,16 @@ class TestMockFlow(unittest.TestCase):
         self.assertGreater(f["gain_vs_q0"], 0)
         self.assertGreater(f["gap_closed"], 0)
         for g in ("0", "1", "2"):
-            self.assertIn("heldout_by_domain", summ["gens"][g])
+            hb = summ["gens"][g]["heldout_by_domain"]      # the former keys; the test set under eval_target
+            self.assertEqual(list(hb), ["math", "code", "knowledge", "instruction_following", "tool_calling",
+                                        "eval_target"])
+            self.assertIsNotNone(hb["eval_target"])
             self.assertIn("gate_mean", summ["gens"][g])
-        led = json.loads((rd / "draws" / "ledger.json").read_text())
-        shown = sum(1 for v in led["items"].get("dapo_math", {}).values() for e in v if e[1] == "shown")
-        self.assertGreater(shown, 0)
+            self.assertNotIn("E", summ["gens"][g])
         # resume: everything is skipped
         before = (rd / "state.json").read_text()
         r2, dt2 = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_test",
-                       "--set", "budget.reference.default.bits=3"], self.runs)
+                       "--set", "budget.reference.default.bits=3", "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r2.returncode, 0, r2.stderr[-3000:])
         self.assertLess(dt2, 30)
         self.assertEqual(json.loads(before).keys(), json.loads((rd / "state.json").read_text()).keys())
@@ -158,7 +155,7 @@ class TestMockFlow(unittest.TestCase):
         # loop.editor=current (ablation): the incumbent writes; patience 1: the first generation without a
         # new incumbent stops the loop
         r, _ = run(["--domain", "math", "--gens", "4", "--run-id", "A_mock_stop", "--set", "loop.editor=current",
-                    "--set", "loop.patience=1", "--set", "heldout.limit=2"], self.runs)
+                    "--set", "loop.patience=1", "--set", "heldout.limit=2", "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_stop"
         st = json.loads((rd / "state.json").read_text())
@@ -173,134 +170,51 @@ class TestMockFlow(unittest.TestCase):
         self.assertEqual(inc["config_hash"], prev["config_hash"])          # the incumbent stays
         self.assertEqual(json.loads((rd / "summary.json").read_text())["final"]["editor"], "current")
 
-    def test_noise_subset_fixed_band_and_data_sizes(self):
-        # data.* overrides the draw sizes for the run; noise.n scores a subset of the screen items;
+    def test_noise_subset_fixed_band_and_screen_size(self):
+        # simple.screen_n sets the per-generation screen size; noise.n scores a subset of the screen items;
         # noise.fixed replaces the re-runs
         # (noise.temperature=0.6: the sampled re-runs; the default is greedy, which re-runs nothing)
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_sizes", "--set", "noise.n=12",
-                    "--set", "noise.temperature=0.6",
-                    "--set", "data.n=120", "--set", "data.screen_n=40", "--set", "heldout.limit=2"], self.runs)
+                    "--set", "noise.temperature=0.6", "--set", "simple.screen_n=40", "--set", "heldout.limit=2"],
+                   self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_sizes"
         ids = rd / "draws" / "gen_00" / "ids"
-        self.assertEqual(len(json.loads((ids / "dapo_math.signal.json").read_text())), 120)
-        self.assertEqual(len(json.loads((ids / "dapo_math.screen.json").read_text())), 40)
-        det = json.loads((rd / "baseline" / "noise_detail.json").read_text())["dapo_math"]
+        self.assertEqual(len(json.loads((ids / "simple_math_pool.screen.json").read_text())), 40)
+        det = json.loads((rd / "baseline" / "noise_detail.json").read_text())["simple_math_pool"]
         self.assertEqual((det["n"], det["source"]), (12, "measured"))
-        # single-domain: every one of the kl_contexts (default 400) KL / calibration texts is a math text
-        self.assertEqual(len(json.loads((ids / "dapo_math.kl.json").read_text())), 400)
-        self.assertEqual(sorted(p.name for p in ids.glob("*.kl.json")), ["dapo_math.kl.json"])
-        # kl.self_generated (default): one cached M_0 response per KL text and generation
+        # every one of the 400 KL / calibration texts is from the run's pool
+        self.assertEqual(len(json.loads((ids / "simple_math_pool.kl.json").read_text())), 400)
+        self.assertEqual(sorted(p.name for p in ids.glob("*.kl.json")), ["simple_math_pool.kl.json"])
+        # kl.self_generated (default): one cached M_0 response per KL text (generation 0: the calibration texts)
         sg = (rd / "kl_selfgen" / "gen_00.jsonl").read_text().splitlines()
         self.assertEqual(len(sg), 400)
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_fixed", "--set", "noise.fixed={math: 0.04}",
-                    "--set", "heldout.limit=2"], self.runs)
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_fixed", "--set", "simple.screen_n=20",
+                    "--set", "noise.fixed={simple_math_pool: 0.04}", "--set", "heldout.limit=2"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_fixed"
-        self.assertEqual(json.loads((rd / "baseline" / "noise.json").read_text()), {"dapo_math": 0.04})
+        self.assertEqual(json.loads((rd / "baseline" / "noise.json").read_text()), {"simple_math_pool": 0.04})
         self.assertFalse((rd / "baseline" / "noise").exists())              # no sampled re-runs
 
     def test_four_gpus_all_used(self):
-        """4 GPUs (2026-11-20): M_0's generation-0 gate scoring split over 4 replicas, held-out tasks spread over
-        the GPU groups, the editor's GPU lent as a 4th candidate slot while it sleeps, gate submissions at once."""
+        """4 GPUs (2026-11-20): M_0's generation-0 gate scoring split over 4 replicas, the held-out task split over
+        the GPU groups, the editor's GPU lent as a 4th candidate slot while it sleeps."""
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_4gpu", "--gpus", "0,1,2,3",
-                    "--set", "hardware=h20", "--set", "heldout.limit=2"], self.runs)
+                    "--set", "hardware=h20", "--set", "heldout.limit=2", "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_4gpu"
         self.assertEqual(len(list((rd / "baseline" / "gate").glob("_part*"))), 4)
-        self.assertEqual({p.name for p in (rd / "baseline" / "heldout" / "_par").iterdir()},
-                         {"math500", "gsm8k", "aime24", "aime25"})
-        self.assertTrue((rd / "baseline" / "q0" / "heldout" / "_par").exists())
+        self.assertEqual(set(json.loads((rd / "baseline" / "heldout.json").read_text())), {"simple_math_test"})
         self.assertIn("serve as candidate slot 3 (4 slots)", r.stdout)
         self.assertEqual(len(jl(rd / "kl_selfgen" / "gen_00.jsonl")), 400)
 
-    def test_eval_overfit(self):
-        """objective eval_overfit: optimise directly on math_eval (MATH-500 + GSM8K test); no draws, no KL, gate /
-        full reuse the screen records (same items)."""
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_evalfit", "--set", "objective=eval_overfit",
-                    "--set", "heldout.limit=2"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        rd = self.runs / "A_mock_evalfit"
-        self.assertIn("datasets=['math_eval']", r.stdout)
-        self.assertFalse((rd / "draws").exists())
-        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"math_eval"})
-        # held-out = the same 1819 items (greedy), for M_0 and Q_0
-        self.assertEqual(set(json.loads((rd / "baseline" / "heldout.json").read_text())), {"math_eval"})
-        self.assertEqual(set(json.loads((rd / "baseline" / "q0" / "heldout.json").read_text())), {"math_eval"})
-        ev = jl(rd / "gen_01" / "evals.jsonl")
-        scr = [e for e in ev if e["stage"] == "screen" and e["origin"] == "candidate"]
-        self.assertTrue(scr)
-        pr = scr[0]["feedback"]["probes"]["math_eval"]
-        self.assertEqual(pr["n"], 1819)
-        self.assertIsNone(scr[0]["feedback"]["kl"])                                   # kl_weight 0: not computed
-        for e in ev:
-            if e["stage"] in ("full", "gate"):                                        # reused, not re-scored
-                self.assertFalse((rd / "gen_01" / "evals" / e["cid"] / e["stage"] / "summary.json").exists())
-
-    def test_data_roles_eval_set_gate(self):
-        """data_roles: train stays the dapo_math draws, the gate is every item of math500_eval (really scored, not
-        reused from screen), the held-out report is math500 alone."""
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_roles_gate",
-                    "--set", "data_roles.gate=math500", "--set", "data_roles.eval=math500"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        rd = self.runs / "A_mock_roles_gate"
-        self.assertIn("datasets=['dapo_math'] gate_datasets=['math500_eval']", r.stdout)
-        self.assertTrue((rd / "draws" / "gen_01" / "ids" / "dapo_math.screen.json").exists())
-        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"math500_eval"})
-        self.assertEqual(set(json.loads((rd / "baseline" / "heldout.json").read_text())), {"math500"})
-        q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
-        self.assertEqual(set(q0["gate_scores"]), {"math500_eval"})
-        q0e = [e for e in jl(rd / "baseline" / "q0" / "evals.jsonl") if e["stage"] == "gate"]
-        self.assertEqual(q0e[0]["feedback"]["probes"]["math500_eval"]["n"], 500)
-        ev = jl(rd / "gen_01" / "evals.jsonl")
-        scr = [e for e in ev if e["stage"] == "screen" and e["origin"] == "candidate"]
-        self.assertTrue(scr)
-        self.assertEqual(set(scr[0]["feedback"]["probes"]), {"math"})            # dapo_math -> domain math
-        self.assertEqual(scr[0]["feedback"]["probes"]["math"]["dataset"], "dapo_math")
-        for e in ev:
-            if e["stage"] == "gate":                                              # scored on all of math500_eval
-                pr = e["feedback"]["probes"]["math500_eval"]
-                self.assertEqual(pr["n"], 500)
-                self.assertTrue((rd / "gen_01" / "evals" / e["cid"] / "gate" / "math500_eval.jsonl").exists())
-        inc = json.loads((rd / "gen_01" / "incumbent.json").read_text())
-        self.assertEqual(set(inc["gate_scores"]), {"math500_eval"})
-        summ = json.loads((rd / "summary.json").read_text())
-        self.assertIsNotNone(summ["gens"]["0"]["m0_heldout_by_domain"]["math"])
-
-    def test_data_roles_eval_set_train(self):
-        """data_roles: the editor works from all of math500_eval (screen n 500), the gate is the fixed dapo_math
-        split; feedback examples show the reference answer (eval-set train)."""
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_roles_train",
-                    "--set", "data_roles.train=math500", "--set", "data_roles.gate=dapo_math",
-                    "--set", "heldout.limit=2"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        rd = self.runs / "A_mock_roles_train"
-        self.assertIn("datasets=['math500_eval'] gate_datasets=['dapo_math'] kl_datasets=['math500_eval']", r.stdout)
-        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"dapo_math"})
-        self.assertEqual(json.loads((rd / "baseline" / "noise.json").read_text()), {"math500_eval": 0.0})
-        ev = jl(rd / "gen_01" / "evals.jsonl")
-        scr = [e for e in ev if e["stage"] == "screen" and e["origin"] == "candidate"]
-        self.assertTrue(scr)
-        pr = scr[0]["feedback"]["probes"]["math500_eval"]
-        self.assertEqual(pr["n"], 500)
-        gates = [e for e in ev if e["stage"] == "gate"]
-        self.assertTrue(gates)
-        for e in gates:
-            self.assertEqual(set(e["feedback"]["probes"]), {"math"})
-            self.assertEqual(e["feedback"]["probes"]["math"]["dataset"], "dapo_math")
-            self.assertTrue((rd / "gen_01" / "evals" / e["cid"] / "gate" / "dapo_math.jsonl").exists())
-        regs = [x for e in ev for x in (e["feedback"].get("regressions") or [])]
-        self.assertTrue(all("reference" in x for x in regs))
-        led = json.loads((rd / "draws" / "ledger.json").read_text())
-        self.assertNotIn("math500_eval", led.get("items") or {})                  # eval sets: nothing marked shown
-
-    def test_simple_objective(self):
-        """objective simple, FINAL flow (2026-11-21): train role simple_math_pool with a fresh per-generation screen
+    def test_simple_flow(self):
+        """The one flow (FINAL, 2026-11-21; formerly objective simple): train role simple_math_pool with a fresh per-generation screen
         (simple.screen_n), gate on simple_math_eval (500 items, thinking n 4), held-out = simple_math_test (avg@4).
         The incumbent answers the screen items once (n 4; shared, shown via the context summary and screen_results /
         screen_output); candidates are not screened, have no api.evaluate and get ONE gate evaluation each
-        (gen_XX/gate.json, one entry per candidate); the largest passing gain is accepted. The mock keeps the simple
-        layout (mock_objective_overrides: 3 threads x 1 step)."""
+        (gen_XX/gate.json, one entry per candidate); the largest passing gain is accepted. The mock runs the layout
+        small (mock_overrides: 3 threads x 1 step). `--set objective=simple` is still accepted (a no-op)."""
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_simple", "--set", "objective=simple",
                     "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
@@ -373,17 +287,18 @@ class TestMockFlow(unittest.TestCase):
     def test_search_history_tool(self):
         """search_history (2026-11-21): generation 2's editor gets the tool (system prompt) and it lists generation
         1's candidates with a config description plus generation 2's visible ones; read_record opens generation 1's
-        records; the E_t session sees no earlier generation; editor.history_tool=false removes it."""
+        records; editor.history_tool=false removes it."""
         from types import SimpleNamespace
         from rsicore.chat_tools import ChatTools
         from rsicore.sandbox import ToolAPI
         from edit_code import run as RUN
-        r, _ = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_hist", "--set", "heldout.limit=2"], self.runs)
+        r, _ = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_hist", "--set", "heldout.limit=2",
+                    "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_hist"
         sysmsg = jl(rd / "gen_02" / "editor" / "thread_0.jsonl")[0]["content"]
         self.assertIn("search_history(gen, sort, offset)", sysmsg)
-        h = RUN.Runner.search_history(SimpleNamespace(rc=SimpleNamespace(run_dir=rd)), 2, "main")
+        h = RUN.Runner.search_history(SimpleNamespace(rc=SimpleNamespace(run_dir=rd)), 2)
         self.assertEqual(sorted(h.past), [1])
         t = ChatTools(lambda tag, ctx: ToolAPI({}), history=h)
         vis = [c["cid"] for c in jl(rd / "gen_02" / "candidates.jsonl")][:4]
@@ -402,8 +317,6 @@ class TestMockFlow(unittest.TestCase):
         c1 = jl(rd / "gen_01" / "candidates.jsonl")[0]["cid"]
         rr = json.loads(t.call("read_record", {"cid": c1, "part": "feedback"}, ctx, 1, 0)["content"])
         self.assertTrue(rr["ok"] and '"config"' in rr["text"])
-        he = RUN.Runner.search_history(SimpleNamespace(rc=SimpleNamespace(run_dir=rd)), 2, "e")
-        self.assertEqual(he.past, {})
         cfg = load_cfg(["editor.history_tool=false"], self.runs)
         from rsicore.editor import editor_settings
         self.assertFalse(editor_settings(cfg)["history_tool"])
@@ -417,7 +330,7 @@ class TestMockFlow(unittest.TestCase):
         self.assertIn("no significance test", t)
         self.assertNotIn("significant gain", t)
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_nosig_prompt", "--set", "heldout.limit=2",
-                    "--set", "gate.require_significant=false"], self.runs)
+                    "--set", "gate.require_significant=false", "--set", "simple.screen_n=20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         sysmsg = jl(self.runs / "A_mock_nosig_prompt" / "gen_01" / "editor" / "thread_0.jsonl")[0]["content"]
         self.assertIn("there is no significance test", sysmsg)
@@ -431,8 +344,8 @@ class TestMockFlow(unittest.TestCase):
         runs = {}
         for rid, sets in (("A_mock_tools", []), ("A_mock_notools", ["--set", "editor.tool_rounds=0"]),
                           ("A_mock_cap", ["--set", "editor.tool_rounds=1", "--set", "editor.mock_tool_rounds=3"])):
-            r, _ = run(["--domain", "math", "--gens", "1", "--run-id", rid, "--set", "heldout.limit=2"] + sets,
-                       self.runs)
+            r, _ = run(["--domain", "math", "--gens", "1", "--run-id", rid, "--set", "heldout.limit=2",
+                        "--set", "simple.screen_n=20"] + sets, self.runs)
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
             runs[rid] = self.runs / rid / "gen_01"
         gd, g0, gc = runs["A_mock_tools"], runs["A_mock_notools"], runs["A_mock_cap"]
@@ -442,8 +355,8 @@ class TestMockFlow(unittest.TestCase):
             self.assertGreaterEqual(c["cost"]["editor_rounds"], 1)
             self.assertEqual(c["cost"]["editor_tool_calls"], 1)
             self.assertEqual(c["cost"]["editor_stop"], "answer")
-            self.assertTrue((gd / "explore" / c["cid"] / "r01_0" / "stdout.txt").exists())
-            self.assertTrue((gd / "explore" / c["cid"] / "r01_0" / "result.json").exists())
+            # editor.explore.persistent (base.yaml): one session per proposal, call outputs under session/
+            self.assertTrue((gd / "explore" / c["cid"] / "session" / "r01_0" / "result.json").exists())
         for tr in sorted((gd / "editor").glob("thread_*.jsonl")):
             lines = jl(tr)
             self.assertEqual(lines[0].get("format"), 2)
@@ -475,7 +388,7 @@ class TestMockFlow(unittest.TestCase):
             self.assertFalse([x for x in jl(tr) if x.get("role") == "tool" or x.get("tool_calls")])
         sys_tools = jl(gd / "editor" / "thread_0.jsonl")[0]["content"]
         sys_plain = jl(g0 / "editor" / "thread_0.jsonl")[0]["content"]
-        self.assertIn("for up to 50 rounds", sys_tools)
+        self.assertIn("for up to 20 rounds", sys_tools)
         self.assertNotIn("run_python", sys_plain)
         self.assertTrue(sys_plain.endswith("exactly one ```python code block containing the full program."))
         # tool_rounds 1 with a mock that wants 3 rounds: 1 round, then the forced final turn
@@ -528,7 +441,7 @@ class TestEditorConfig(unittest.TestCase):
             ea = server_args(cfg, "editor_args")
             self.assertEqual(mml(ea), want, sets)
             self.assertEqual(ea.count("--max-model-len"), 1)
-            self.assertEqual(mml(server_args(cfg, "candidate_args")), 20480, sets)    # candidates keep theirs
+            self.assertEqual(mml(server_args(cfg, "candidate_args")), 32768, sets)    # candidate_max_model_len
             kw = editor_kwargs(cfg, server_args=ea)
             self.assertEqual(kw["context_tokens"], want)
         cfg = load_cfg(["editor.tool_rounds=7", "editor.context_tokens=null"], self.runs)

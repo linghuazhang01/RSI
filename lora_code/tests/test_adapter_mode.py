@@ -15,6 +15,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -134,9 +135,10 @@ def _ev(tmp_path, store, mock, registry=None, parent_quality=None):
             pass
 
     s = Srv()
-    return Evaluator(None, {"lora": {"save_dtype": "float32"}}, out_dir=tmp_path, endpoint=s.endpoint, served="m0",
-                     server=s, ids={}, target_dataset="dapo_math", kl_texts=[], store=store, mock=mock,
-                     registry=registry, parent_quality=parent_quality)
+    rc = SimpleNamespace(domain="math", seed=42)    # the mock quality's target key = the run's domain
+    return Evaluator(rc, {"lora": {"save_dtype": "float32"}}, out_dir=tmp_path, endpoint=s.endpoint, served="m0",
+                     server=s, ids={}, target_dataset="simple_math_pool", gate_dataset="simple_math_eval", store=store,
+                     mock=mock, registry=registry, parent_quality=parent_quality)
 
 
 def test_evaluator_composes_deltas_real(store, tmp_path):
