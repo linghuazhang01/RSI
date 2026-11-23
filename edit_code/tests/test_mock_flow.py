@@ -197,34 +197,57 @@ class TestMockFlow(unittest.TestCase):
             self.assertFalse((self.runs / "A_mock_removed").exists())
 
     def test_baselines_still_run(self):
-        """Non-LLM baselines (baselines.methods; mock_overrides keeps them off, so they are switched on there) keep
-        their own screen evaluations (score = retention vs the incumbent) after the hard-wired search; they are not
-        gated and do not change the acceptance."""
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_baselines", "--set", "heldout.limit=2",
-                    "--set", "simple.screen_n=20", "--set", "budget.reference.default.bits=3",
-                    "--set", "mock_overrides.baselines.methods=[uniform,kl_greedy]"], self.runs)
+        """Classic baselines (2026-11-23; baselines.methods, mock_overrides keeps them off, so they are switched on
+        there): run once after the generations, each gated on the gate set paired with Q_0's records (over every GPU
+        group) and held-out evaluated; they never touch the search or the acceptance. The block is lock-ignored: a
+        finished run resumes with them switched on, and with the same command again they are not redone."""
+        base = ["--domain", "math", "--gens", "1", "--run-id", "A_mock_baselines", "--set", "heldout.limit=2",
+                "--set", "simple.screen_n=20", "--gpus", "0,1,2,3"]
+        r, _ = run(base, self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        gd = self.runs / "A_mock_baselines" / "gen_01"
-        summ = json.loads((gd / "baselines" / "summary.json").read_text())
-        self.assertEqual(set(summ), {"uniform", "kl_greedy"})
-        for m, v in summ.items():
-            self.assertNotIn("error", v, m)
-            self.assertIsNotNone(v["score"], m)
-            self.assertGreater(v["bytes_gib"], 0)
-            res = json.loads((gd / "baselines" / f"{m}.json").read_text())
-            fb = res["screen"]["feedback"]
-            self.assertEqual(fb["stage"], "screen")
-            self.assertEqual(res["screen"]["score"], round(fb["retention"], 5) if fb["retention"] is not None
-                             else None)
-            self.assertNotIn("kl", fb)
-            self.assertFalse([p for p in fb["probes"].values() if "noise_band" in p])
-        ev = jl(gd / "evals.jsonl")
-        self.assertEqual(sorted(e["cid"] for e in ev if e["origin"] == "baseline"), ["base_kl_greedy", "base_uniform"])
-        subs = json.loads((gd / "gate.json").read_text())["submissions"]
-        self.assertFalse([s_ for s_ in subs if str(s_["cid"]).startswith("base_")])   # baselines are not gated
-        acc = json.loads((gd / "accepted.json").read_text())
-        self.assertTrue(acc["accepted"] is False or not str(acc["cid"]).startswith("base_"))
-        self.assertFalse((self.runs / "A_mock_baselines" / "kl_selfgen" / "gen_01.jsonl").exists())
+        rd = self.runs / "A_mock_baselines"
+        self.assertFalse((rd / "baselines").exists())
+        acc0 = (rd / "gen_01" / "accepted.json").read_text()
+        methods = ["uniform_rtn", "uniform_awq", "hawq", "kl_greedy", "evopress"]
+        on = base + ["--set", "mock_overrides.baselines.methods=[" + ",".join(methods) + "]",
+                     "--set", "mock_overrides.baselines.evopress={generations: 3, offspring: 4}"]
+        r, _ = run(on, self.runs)                       # the lock ignores the baselines block
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertEqual((rd / "gen_01" / "accepted.json").read_text(), acc0)
+        summ = json.loads((rd / "baselines" / "summary.json").read_text())
+        self.assertEqual(set(summ), set(methods) | {"uniform_gptq (Q_0)"})
+        q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
+        for m in methods:
+            res = json.loads((rd / "baselines" / f"{m}.json").read_text())
+            self.assertNotIn("error", res, m)
+            self.assertIsNotNone(res["gate_mean"], m)
+            self.assertIsNotNone(res["gain_vs_q0"], m)
+            self.assertIsNotNone(res["heldout_accuracy"], m)
+            self.assertEqual(res["over_budget_mib"] > 0, m == "uniform_awq", (m, res["over_budget_mib"]))
+            gsum = json.loads((rd / "baselines" / "evals" / f"base_{m}" / "gate" / "summary.json").read_text())
+            self.assertEqual(gsum["simple_math_eval"]["split_over_replicas"], 4, m)   # 3 slots + the editor GPU
+        self.assertEqual(json.loads((rd / "baselines" / "uniform_rtn.json").read_text())["bytes_gib"], q0["bytes_gib"])
+        evo = json.loads((rd / "baselines" / "evopress.json").read_text())["search"]
+        self.assertEqual(evo["trace"][-1]["gen"], 3)
+        self.assertLessEqual(evo["fitness"], evo["trace"][0]["fitness"])
+        for m in methods:
+            self.assertFalse([s_ for g in (1,) for s_ in json.loads((rd / f"gen_0{g}" / "gate.json").read_text())
+                              ["submissions"] if str(s_["cid"]).startswith("base_")], m)
+        final = json.loads((rd / "summary.json").read_text())["final"]
+        self.assertEqual(set(final["baselines"]), set(summ))
+        before = (rd / "baselines" / "summary.json").stat().st_mtime_ns, sorted(
+            p.name for p in (rd / "baselines" / "evals").iterdir())
+        r, _ = run(on, self.runs)                       # resumed again: nothing is redone
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertEqual(sorted(p.name for p in (rd / "baselines" / "evals").iterdir()), before[1])
+        self.assertNotIn("evopress gen", r.stdout)
+        r, _ = run(base + ["--set", "mock_overrides.baselines.methods=[kl_greedy]"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertEqual(set(json.loads((rd / "baselines" / "summary.json").read_text())), set(summ))   # rows kept
+        r, _ = run(base + ["--set", "mock_overrides.baselines.methods=[evo]"], self.runs)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unknown", r.stdout + r.stderr)
+        self.assertNotIn("[gen 1]", r.stdout)            # refused at startup, before any work
 
     def test_four_gpus_all_used(self):
         """4 GPUs (2026-11-20): M_0's generation-0 gate scoring split over 4 replicas, the held-out task split over

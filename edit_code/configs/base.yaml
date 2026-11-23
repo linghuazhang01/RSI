@@ -24,8 +24,8 @@ simple:
 
 # Scoring decoding per stage (2026-11-21): a dict {temperature, top_p, top_k, min_p, n, thinking, max_tokens, seed} for
 # rsicore.evaluate.score(decoding=...), the same for the incumbent / Q_0 / M_0, every candidate and the baselines (seed
-# null = the run's --seed); null = each task's eval/configs/tasks.yaml decoding (greedy). full (the incumbent's and
-# baselines.full) falls back to screen. n > 1:
+# null = the run's --seed); null = each task's eval/configs/tasks.yaml decoding (greedy). full (the incumbent's) falls
+# back to screen; the classic baselines get the gate decoding (and heldout.decoding on the test set). n > 1:
 # each item's score is the mean of its n samples. Cached evaluations are reused only under the same decoding.
 decoding:
   screen: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
@@ -214,11 +214,19 @@ heldout:                              # held-out report = simple_<domain>_test (
     max_tokens: 16384
   enabled: true                       # false: no held-out report (M_0, Q_0, new incumbents)
 
-baselines:
-  methods: []                         # e.g. [uniform, kl_greedy, evo]; run after the search each generation (own
-                                      # screen evaluations, edit_code/baselines.py; not gated)
-  full: false
-  evo_evaluations: 24
+baselines:                            # (2026-11-23) classic baselines, run ONCE after the generations and scored like
+                                      # the method: same budget, gate set (paired with Q_0's records) and held-out set
+                                      # (edit_code/baselines.py, run.Runner.run_baselines). Report-only: the run lock
+                                      # ignores this block, so a finished run can be resumed with them switched on.
+  methods: []                         # any of [uniform_rtn, uniform_awq, hawq, kl_greedy, evopress] (uniform GPTQ = Q_0,
+                                      # always reported); all five: about 5 gate + held-out runs and the search
+  keep_models: false                  # keep each baseline's fake-quant checkpoint (~54 GB) after its held-out run
+  evopress:                           # EvoPress-style search (KL to M_0 on the calibration contexts, one HF model per GPU)
+    generations: 40
+    offspring: 16                     # children per generation, scored on a quarter of the contexts
+    survivors: 2                      # best children re-scored on all contexts; the best replaces the parent if better
+    max_mutations: 3                  # level switches per child (1..max)
+    contexts: null                    # null = diagnostics.profile_contexts
 
 vllm:                                 # editor_args' --max-model-len is replaced by editor.context_tokens (see editor:)
   editor_args: [--gpu-memory-utilization, "0.90", --max-model-len, "131072", --max-logprobs, "20"]

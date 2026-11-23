@@ -8,15 +8,15 @@ structured L1 feedback (RSI_LOOP_DESIGN §2.2).
 
 References (2026-11-20): every evaluation is compared with the INCUMBENT on the same items (it is what a
 candidate must beat): the gate pairs a candidate's gate records with the incumbent's per item (2026-11-23: the only
-evaluation a search candidate gets, run.gate_candidate). Screen / full evaluations score the incumbent itself on the
-generation's items (the editor reads them) and the non-LLM baselines (edit_code.baselines), whose screen score is
-retention = accuracy / the incumbent's on the same items, with paired deltas and regression examples (incumbent
-right, baseline wrong); their per-group Hessian-weighted error is kept (group_error.json). M_0 is not scored on the
+evaluation a search candidate gets, run.gate_candidate; the classic baselines get the same gate, paired with Q_0,
+run.Runner.run_baselines). Screen / full evaluations score the incumbent itself on the generation's items (the
+editor reads them); their per-group Hessian-weighted error is kept (group_error.json). M_0 is not scored on the
 items, and there is no KL term (2026-11-23).
 
 Candidate serving (2026-11-19): the candidate GPUs are split into groups (common.candidate_groups); each
 group is one slot of a pool. serve() takes a free slot, exports the candidate's fake-quant checkpoint into
-that slot's directory on the slot's own GPU (exports are serialized: one shared layer cache), starts vLLM
+that slot's directory on the slot's own GPU (2026-11-23: exports of different slots run in parallel, one layer
+cache per slot), starts vLLM
 on the slot's GPUs, and gives the slot back afterwards. So with N groups, N candidates are evaluated at
 the same time (rsicore.search.inner_search(parallel=N)). evaluate() is thread-safe: an identical config
 being evaluated by another thread is waited for (evaluated once).
@@ -493,11 +493,12 @@ class QuantProblem:
         fq = read_json(self.source_dir / "fake_quant.json") if self.source_dir else None
         return schema.compress(fq["config"], self.spec) if fq else None
 
-    def build(self, config, cid: str) -> dict:
-        """Validate + size a config -> artifact dict (raises schema.ConfigError / ValueError)."""
+    def build(self, config, cid: str, *, check_budget: bool = True) -> dict:
+        """Validate + size a config -> artifact dict (raises schema.ConfigError / ValueError). check_budget False:
+        no size check (the uniform AWQ baseline, whose channel scales overshoot the budget by a few MiB)."""
         norm = self.normalize(config)
         b = sizes.config_bytes(norm, self.spec)
-        if b["gib"] > self.budget_gib + 1e-9:
+        if check_budget and b["gib"] > self.budget_gib + 1e-9:
             raise ValueError(f"config is {b['gib']:.3f} GiB > budget {self.budget_gib:.3f} GiB "
                              f"(linear avg {b['linear_avg_bits']:.2f} bits; by group GiB: "
                              + ", ".join(f"{g}={v:.2f}" for g, v in b["by_group_gib"].items()) + ")")
@@ -702,7 +703,8 @@ class QuantProblem:
         # (2026-11-22) the incumbent's screen / full run (once per generation, before the search; nothing else holds a
         # slot then) is split over every free candidate slot, like Paper B's parent screen over all main replicas.
         # (2026-11-23) so is Q_0's gate (origin "reference", generation 0, nothing else running): it was on ONE GPU
-        split = not reuse and (origin == "reference" or (origin == "incumbent" and stage != "gate"))
+        # (2026-11-23) and so are the classic baselines' gates (run.Runner.run_baselines, after the generations)
+        split = not reuse and (origin in ("reference", "baseline") or (origin == "incumbent" and stage != "gate"))
         with (nullcontext() if reuse else self.serve_all(art, name) if split else self.serve(art, name)) as srv:
             srvs = srv if isinstance(srv, list) else [srv]
             srv = srvs[0]

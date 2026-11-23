@@ -26,7 +26,7 @@
 - **搜索**：8 个线程 × 1 步（`search.threads` / `search.steps` 都可配置，提示词用配置的数字）。1 步时提示"你是本轮 N 个会话中的第 k 个、彼此独立"，并让它用 `search_history` / 存档避开往期思路；多步时保留"改进本线程最好的配置"。
 - **改造者**：每个候选最多 `editor.tool_rounds` 轮工具调用（20，可配置，提示词里的轮数跟着配置走；上下文 `editor.context_tokens` 131072）。`editor.explore.persistent: true`：run_python 每个提案一个持久会话，变量跨轮保留（超时则重启、变量丢失；最终程序仍须自包含）。
 - 五个领域都可以用。各领域合并后的配置见 `plan/configs/A_<领域>_simple.yaml`（由协调方更新）。服务器上需要先有 `simple_data/<领域>/` 的 `eval.jsonl`、`test.jsonl`、`pool_ids.json`，以及 `data/processed/` 里对应的训练集。
-- **mock**：`mock_overrides`（在 `--set` 之后合并，优先于 `--set`）把布局缩小到 3 线程 × 1 步、3 个候选。验收规则和真实运行一样（`gate.min_delta: 0.0`），不跑 baselines（要跑：`--set 'mock_overrides.baselines.methods=[uniform,kl_greedy]'`）。快速筛题数用 `--set simple.screen_n=20` 缩小。
+- **mock**：`mock_overrides`（在 `--set` 之后合并，优先于 `--set`）把布局缩小到 3 线程 × 1 步、3 个候选。验收规则和真实运行一样（`gate.min_delta: 0.0`），不跑 baselines（要跑：`--set 'mock_overrides.baselines.methods=[uniform_rtn,hawq]'`）。快速筛题数用 `--set simple.screen_n=20` 缩小。
 
 ## 每一步的数据量（2026-11-20）
 
@@ -40,6 +40,20 @@
 | 校准文本 / 诊断表 / 留出评测 | `calibration.max_texts`、`diagnostics.profile_contexts`、`heldout.limit` | |
 
 噪声带（`noise:` 块、`baseline/noise.json`）2026-11-23 起删除：验收用逐题配对的 CI。
+
+## 经典基线（2026-11-23）
+
+`baselines.methods` 里的方法在所有代跑完之后**各跑一次**，评法和本方法完全一样：同一个体积上限；在同一个验收集上评测（500 × 4，同样的解码和种子，和 Q_0 存下的逐题记录配对，分到所有卡上）；在测试集上做留出评测。结果在 `run_dir/baselines/<方法>.json`、`baselines/summary.json` 和 `summary.json` 的 `final.baselines`（列出验收均分、相对 Q_0 的增益和 CI、gap closed、留出准确率、大小）。
+
+| 方法 | 做法 |
+|---|---|
+| 统一 GPTQ | 就是 Q_0，总会列出 |
+| `uniform_rtn` / `uniform_awq` | 参照配置（统一 W4 g128，词嵌入 / 输出层 8 bit）换成 RTN / AWQ。AWQ 的每输入通道缩放让它比上限多几 MiB，照样评测并报告 `over_budget_mib` |
+| `hawq` | HAWQ 式混合精度：敏感度 = Hessian 表（只把这一组用 GPTQ 量化时的 tr(dW H dW^T) / token），多选背包分配比特 |
+| `kl_greedy` | 敏感度 = 敏感度表（只把这一组 RTN 量化时整个模型相对 M_0 的 KL），同样的背包 |
+| `evopress` | EvoPress 式进化搜索：从 Q_0 出发，在上限内做"一组升一档、其他组降档"的变异（GPTQ g128，档位 = 动作空间的 bits），适应度 = 校准上下文上相对 M_0 的 KL（每张卡一个 HF 模型进程，权重和导出的 fake-quant 检查点相同），两阶段选择（先用 1/4 上下文筛，再用全部）。**不用验收集挑选**。`baselines.evopress`：`generations` 40、`offspring` 16、`survivors` 2、`max_mutations` 3 |
+
+背包和搜索类基线的词嵌入 / 输出层和 Q_0 一样用 8 bit。默认 `methods: []`。`baselines` 整块只用于报告，运行锁忽略它：跑完的运行可以加上 `--set 'baselines.methods=[uniform_rtn,uniform_awq,hawq,kl_greedy,evopress]'` 用原命令续跑，只补跑基线；已完成的基线不会重跑，失败的下次续跑时重试。每个基线的检查点（约 54 GB）评完就删（`baselines.keep_models: true` 保留）。以前每代跑一次、只在快速筛题上算保持率的 `uniform` / `evo` 已删除。
 
 ## 8 卡提速（2026-11-23，不改变结果）
 
@@ -64,7 +78,7 @@
 
 ## 打分解码与搜索规模（2026-11-21）
 
-**打分解码 `decoding: {screen, gate}`**（顶层，`full` 可选，空 = 跟 screen）：每个阶段一个 dict（temperature、top_p、top_k、min_p、n、thinking、max_tokens、seed），经 `rsicore.config.stage_decoding(cfg, stage, seed)` 传给每一次 `score` / `score_split`：incumbent 的快速筛 / 完整评测、候选和 Q_0 的验收、M_0 的验收基线（`baseline/gate.json`）、基线方法的快速筛。base.yaml 里是上面的 thinking 采样；null = `eval/configs/tasks.yaml`（贪心）。种子为空时用运行的 `--seed`。评测记录（`evals.jsonl`）里记下 `decoding`；缓存的评测（同一配置、同一阶段）以及"完整评测 / 验收复用快速筛逐题结果"都要求解码相同（n 4 的验收不会复用 n 1 的快速筛）。incumbent 在本代题上只采样一次（cid `incumbent`）。
+**打分解码 `decoding: {screen, gate}`**（顶层，`full` 可选，空 = 跟 screen）：每个阶段一个 dict（temperature、top_p、top_k、min_p、n、thinking、max_tokens、seed），经 `rsicore.config.stage_decoding(cfg, stage, seed)` 传给每一次 `score` / `score_split`：incumbent 的快速筛 / 完整评测、候选和 Q_0 的验收、M_0 的验收基线（`baseline/gate.json`）、经典基线的验收。base.yaml 里是上面的 thinking 采样；null = `eval/configs/tasks.yaml`（贪心）。种子为空时用运行的 `--seed`。评测记录（`evals.jsonl`）里记下 `decoding`；缓存的评测（同一配置、同一阶段）以及"完整评测 / 验收复用快速筛逐题结果"都要求解码相同（n 4 的验收不会复用 n 1 的快速筛）。incumbent 在本代题上只采样一次（cid `incumbent`）。
 
 **搜索规模**（`edit_code.common.search_settings`，只剩这三个键）：`search.threads`（8）、`search.steps`（1）、`search.max_candidates`（8；null = threads × steps）。每个候选验收一次。
 
@@ -129,12 +143,12 @@ steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、�
 # 等价：python -I edit_code/run.py ...；附加参数 --budget-gib 11.5（固定体积），--set key=value（覆盖 configs，写入锁定的 run_config.yaml）
 ```
 
-同一个 run-id 再运行会跳过已完成的步骤（`state.json` 的键：`baseline/{draw,gate,heldout,prep,budget,q0,q0_heldout}`、`genXX/{draw,search,baselines,gate,accepted,export,heldout,done}`、`stopped`；旧运行里的 `baseline/noise`、`genXX/refs` 留着不影响续跑）。
+同一个 run-id 再运行会跳过已完成的步骤（`state.json` 的键：`baseline/{draw,gate,heldout,prep,budget,q0,q0_heldout}`、`genXX/{draw,search,gate,accepted,export,heldout,done}`、`stopped`、`baselines/<方法>`（以及 `baselines/evopress_search`）；旧运行里的 `baseline/noise`、`genXX/refs` 留着不影响续跑）。
 
 ## 流程（run.py）
 
 - **第 0 代**（`baseline/`）：切固定验收集 → M_0 在验收集上的分数 → M_0 在测试集 `simple_<领域>_test` 上的留出评测 → 校准文本（题目 + M_0 的回答）→ 对 M_0 做一次校准（Hessian + 激活统计）、诊断表、逐层量化缓存（`prep/`，之后每代复用）→ 定体积（`budget.json`）→ Q_0 = 参照配置，在验收集上打分（第一个 incumbent，`incumbent.json`）并做留出评测。
-- **第 g 代**（`gen_XX/`）：draw → incumbent 在本代快速筛题上打分一次（`incumbent_scores.json`、`reference_screen.json`；改造者看的就是它）→ `rsicore.search.inner_search`（改造者 = M_0；8 线程 × 1 步；每个候选验收一次，写进 `gate.json`；候选服务分在各候选卡上）→ 可选基线 → 接受通过验收且增益最大的候选（`Runner.accept_best_gate`）→ 通过：导出新 incumbent（fake-quant 检查点）+ 测试集留出评测；不通过：incumbent 不变 → `summary.json`。
+- **第 g 代**（`gen_XX/`）：draw → incumbent 在本代快速筛题上打分一次（`incumbent_scores.json`、`reference_screen.json`；改造者看的就是它）→ `rsicore.search.inner_search`（改造者 = M_0；8 线程 × 1 步；每个候选验收一次，写进 `gate.json`；候选服务分在各候选卡上）→ 接受通过验收且增益最大的候选（`Runner.accept_best_gate`）→ 通过：导出新 incumbent（fake-quant 检查点）+ 测试集留出评测；不通过：incumbent 不变 → `summary.json`。
 - **主要指标**（`summary.json` 的 `final`）：验收集平均分 M_0 / Q_0 / 最终 incumbent、相对 Q_0 的提升 `gain_vs_q0`、追回的差距 `gap_closed` =（最终 − Q_0）/（M_0 − Q_0）、哪些代换了 incumbent；每代的留出分数和相对 M_0 的比例（`heldout_by_domain`：五个领域键保留为 null，测试集准确率在 `eval_target`）。
 
 ## 文件
@@ -147,7 +161,7 @@ steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、�
 | `allocation.py` | 多选背包（每组 (字节, 损伤) 下凸包 + 贪心），给 `solve_allocation`、KL 贪心基线和 mock 改造者用 |
 | `prompts.py` | 系统提示（配置 schema、工具、规则）和 `render_context(history, thread)`：incumbent 及其验收分数、incumbent 快速筛摘要、本代候选表（大小、验收结果：增益 [CI]、broken / fixed）、增益最大的配置、本线程上次的验收结果、往代档案 |
 | `diagnostics.py` | `profile_table`（只把一个模块组 RTN 到 2/3/4 bit 时整模型 ΔKL，参照 = M_0，前 64 段第 0 代校准文本做前向）、`activation_table`（校准时顺便统计的输入激活）、`bytes_table`、`hessian_table`（每组单独用 rtn/gptq/awq 量化到 2/3/4 bit 的 Hessian 加权误差，来自缓存和校准 Hessian，用到全部校准 token，不做前向）；只算一次，存在 `prep/diagnostics/` |
-| `baselines.py` | 统一量化、KL 贪心、EvoPress 式进化搜索（同一构建路径；自己的快速筛评测，分数 = 相对 incumbent 的保持率，不参加验收）；`--set 'baselines.methods=[uniform,kl_greedy,evo]'` |
+| `baselines.py` / `evopress.py` | 经典基线（见"经典基线"一节）；`evopress.py` 是 EvoPress 的 KL 适应度（每张卡一个进程） |
 | `mock.py` | mock 模式：合成"真实损伤"模型、合成诊断表、mock registry 登记候选质量、mock 改造者策略 |
 | `quant/spec.py` | 从 safetensors 头读模块名和形状（不加载张量）；Qwen3.5 dense 的分组 |
 | `quant/schema.py` | 配置 schema、校验（列出所有错误）、解析成逐组设置 |
@@ -203,6 +217,6 @@ H20 档（按每张卡 110 GB 规划，卡约 140 GB）：至少 2 张（每张�
 ## 尚未做 / 后续
 
 - 真实打包格式（compressed-tensors）导出和速度测量：llm-compressor 装不进 vLLM 0.24.0 + Transformers 5.9.0，没有依赖它。真实打包时，vLLM 的融合模块（qkv、gate_up、in_proj_qkvz、in_proj_ba）内部要求设置相同，目前 fake-quant 下不受此限制。
-- `behavior_sensitivity` 诊断表（METHOD_DESIGN §2.2）、`profile_in_context` 工具、GAMMA / HAWQ 基线。
+- `behavior_sensitivity` 诊断表（METHOD_DESIGN §2.2）、`profile_in_context` 工具、GAMMA 基线（HAWQ 式基线 2026-11-23 已加，见"经典基线"）。
 - 对照：`archive.enabled=false`（不带经验）、`loop.editor=current`（不冻结改造者）都已支持。
 - solver 里 group size 对损伤的缩放（g64 = 0.8、g32 = 0.65）是启发式，要在 A-P0 中实测。

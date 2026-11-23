@@ -18,8 +18,8 @@ Scoring decoding (2026-11-21): every screen / full / gate scoring call (candidat
 baseline gate) uses rsicore.config.stage_decoding(cfg, stage, seed) from the paper config's `decoding` block
 (thinking 0.6 / 0.95 / top_k 20, 16384 tokens, screen n 4, gate n 4; null seed = the run's --seed).
 Generation g = 1..gens (gen_XX/): draw -> incumbent scored on the generation's screen items (shown to the editor) ->
-inner search (threads x steps) -> optional baselines -> acceptance -> new incumbent exported + held-out evaluation, or
-the incumbent stays.
+inner search (threads x steps) -> acceptance -> new incumbent exported + held-out evaluation, or the incumbent stays.
+After the generations: the classic baselines once (baselines.methods; Runner.run_baselines), scored like the method.
 The flow is hard-wired (2026-11-23; no search knobs for it): the incumbent answers the generation's screen items once
 (decoding.screen n 4; shared; summary in the context, full data via screen_results / screen_output); candidates are
 never screened and have no api.evaluate; each built candidate gets ONE gate evaluation in screen_fn (gate_candidate:
@@ -58,7 +58,7 @@ from rsicore.servers import VLLMServer  # noqa: E402
 from rsicore.state import RunState  # noqa: E402
 
 from edit_code import mock as M  # noqa: E402
-from edit_code.baselines import run_baselines  # noqa: E402
+from edit_code import baselines as BL  # noqa: E402
 from edit_code.common import (candidate_args, candidate_groups, deep_merge, error_line, gpu_layout,  # noqa: E402
                               program_note, read_json, read_jsonl, scoring_concurrency, search_settings, tail,
                               write_json)
@@ -608,6 +608,145 @@ class Runner:
                 write_json(bdir / "q0" / "heldout.json", h)
         R.update_summary(rc, 0, self.gen_summary(0))
 
+    # ------------------------------------------------------------------ classic baselines (2026-11-23)
+    def run_baselines(self):
+        """Each baselines.methods entry once (edit_code.baselines), scored like the method: built at the budget,
+        gated on the gate set (500 x n, same decoding and seed) paired with Q_0's stored gate records, over every
+        GPU group; held-out evaluated on simple_<d>_test. RunState steps baselines/<method> (evopress also
+        baselines/evopress_search). The block is report-only, so the run lock ignores it: a finished run can be
+        resumed with --set 'baselines.methods=[...]' to add them. Results: run_dir/baselines/<method>.json and
+        summary.json; summary.json final.baselines."""
+        rc, cfg, st = self.rc, self.cfg, self.st
+        bc = cfg.get("baselines") or {}
+        methods = BL.check_methods(bc.get("methods"))
+        if not methods:
+            return
+        bdir = self.run_dir / "baselines"
+        q0 = self.incumbent(0)
+        budget = self.budget_gib()
+        ref = cfg["budget"]["reference"]
+        prob = self.problem(tag="base", gen=0, out_dir=bdir, budget=budget, data=self.data_for(0), show_examples=0,
+                            incumbent=q0)
+        prob.prepare()
+        g0 = (read_json(self.run_dir / "summary.json", {}) or {}).get("gens", {}).get("0") or {}
+        m0m, q0m = gate_mean(g0.get("m0_gate_scores")), g0.get("gate_mean")
+        for m in methods:
+            try:
+                self._baseline_step(prob, m, ref, budget, bdir, m0m, q0m)
+            except Exception as e:  # noqa: BLE001 - one failing baseline must not stop the others (retried on resume)
+                self.log(f"[baselines] {m} failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                write_json(bdir / f"{m}.json", {"method": m, "error": f"{type(e).__name__}: {e}"})
+        rows = {}
+        for m in [x for x in BL.METHODS if x in methods or (bdir / f"{x}.json").exists()]:   # also earlier resumes
+            r = read_json(bdir / f"{m}.json") or {}
+            rows[m] = {k: r.get(k) for k in ("gate_mean", "gain_vs_q0", "gain_ci", "gap_closed", "heldout_accuracy",
+                                             "bytes_gib", "over_budget_mib", "linear_avg_bits", "error")}
+        rows["uniform_gptq (Q_0)"] = {"gate_mean": q0m, "gain_vs_q0": 0.0, "gap_closed": 0.0,
+                                      "heldout_accuracy": _mean_acc(read_json(self.run_dir / "baseline" / "q0" /
+                                                                              "heldout.json")),
+                                      "bytes_gib": q0.get("bytes_gib"), "linear_avg_bits": q0.get("linear_avg_bits")}
+        write_json(bdir / "summary.json", rows)
+
+    def _baseline_step(self, prob: QuantProblem, m: str, ref: dict, budget: float, bdir: Path, m0m, q0m) -> None:
+        with self.st.step(f"baselines/{m}") as todo:
+            if not todo:
+                return
+            t0 = time.time()
+            res = self._one_baseline(prob, m, ref, budget, bdir)
+            gm = res.get("gate_mean")
+            if gm is not None and q0m is not None:
+                res["gain_vs_q0"] = round(gm - q0m, 5)
+                if m0m is not None and m0m > q0m:
+                    res["gap_closed"] = round((gm - q0m) / (m0m - q0m), 4)
+            res["seconds"] = round(time.time() - t0, 1)
+            write_json(bdir / f"{m}.json", res)
+            self.log(f"[baselines] {m}: gate {gm} (vs Q_0 {res.get('gain_vs_q0')}), held-out "
+                     f"{res.get('heldout_accuracy')}, {res['bytes_gib']} GiB")
+
+    def _one_baseline(self, prob: QuantProblem, m: str, ref: dict, budget: float, bdir: Path) -> dict:
+        rc, cfg = self.rc, self.cfg
+        extra = {}
+        check = True
+        if m in ("uniform_rtn", "uniform_awq"):
+            c = BL.uniform_config(ref, m.split("_", 1)[1])
+            check = False
+        elif m == "hawq":
+            c = BL.hawq_config(prob, ref, budget)
+        elif m == "kl_greedy":
+            c = BL.kl_greedy_config(prob, ref, budget)
+        else:   # evopress
+            c, extra = self._evopress(prob, ref, budget, bdir)
+        art = prob.build(c, f"base_{m}", check_budget=check)
+        gib = prob.size(prob.norm_of(art))["gib"]         # unrounded (art bytes_gib is rounded to 4 decimals)
+        over = round((gib - budget) * 1024, 3) if gib > budget + 1e-9 else 0.0
+        mdir = bdir / m / "model"
+        self.export(prob, art, mdir)
+        prob.exported[art["config_hash"]] = mdir
+        lent = prob.add_slot(self.gpu_editor) if self.editor_gpus_own else None
+        try:
+            r = prob.evaluate(art, "gate", f"base_{m}", origin="baseline")
+        finally:
+            if lent is not None:
+                prob.remove_slot(lent)
+        probes = (r.get("feedback") or {}).get("probes") or {}
+        h = None
+        if self.heldout_enabled:
+            h = self.model_heldout(mdir, f"{rc.run_id}-base-{m}", bdir / m / "heldout")
+        if not (cfg.get("baselines") or {}).get("keep_models", False) and not rc.mock:
+            shutil.rmtree(mdir, ignore_errors=True)       # ~54 GB each; the config is kept
+        return {"method": m, "config": art["config"], "config_hash": art["config_hash"], "bytes_gib": art["bytes_gib"],
+                "budget_gib": budget, "over_budget_mib": over, "linear_avg_bits": art["linear_avg_bits"],
+                "gate_scores": {p["dataset"]: p.get("score") for p in probes.values()},
+                "gate_mean": gate_mean({p["dataset"]: p.get("score") for p in probes.values()}),
+                "gain_ci": next((p.get("delta_ci") for p in probes.values()), None),
+                "heldout": h, "heldout_accuracy": _mean_acc(h), **extra}
+
+    def _evopress(self, prob: QuantProblem, ref: dict, budget: float, bdir: Path):
+        """The EvoPress-style search (resumable per generation: baselines/evopress/search.json)."""
+        rc, cfg, st = self.rc, self.cfg, self.st
+        ec = dict((cfg.get("baselines") or {}).get("evopress") or {})
+        sdir = bdir / "evopress"
+        done = read_json(sdir / "result.json")
+        if done and st.done("baselines/evopress_search"):
+            return done["config"], {"search": {k: done[k] for k in ("fitness", "evaluations", "trace")}}
+        pool = None
+        if rc.mock:
+            fitness, n_ctx = (lambda norms, stage: BL.mock_fitness(prob, norms, stage)), None
+        else:  # pragma: no cover - GPU path
+            from edit_code.evopress import KLPool
+            dcfg = cfg["diagnostics"]
+            m0 = self.m0_server()                 # started only if a self-generated answer is not cached
+            try:
+                texts = [t for _, t in self.kl_texts(0, m0)][: int(ec.get("contexts") or dcfg["profile_contexts"])]
+            finally:
+                m0.close()
+            n_ctx = len(texts)
+            devs = [f"cuda:{g[0]}" for g in self.all_groups]
+            self.log(f"[baselines] evopress: {len(texts)} calibration contexts, workers on {devs}")
+            pool = KLPool(devs, model_dir=rc.model_path, spec_path=self.prep_dir / "spec.json", prep_dir=self.prep_dir,
+                          texts=texts, dcfg=dcfg, embed=ref.get("embed", "bf16"), lm_head=ref.get("lm_head", 8),
+                          damp=cfg["cache"].get("gptq_damp", 0.01), log=self.log)
+            fitness = (lambda norms, stage: pool(prob.spec, norms, stage))
+        eff = {"offspring": int(ec.get("offspring", 16)), "survivors": int(ec.get("survivors", 2)),
+               "max_mutations": int(ec.get("max_mutations", 3)), "seed": rc.seed, "contexts": n_ctx}
+        state = read_json(sdir / "search.json")
+        if state and state.get("settings") != eff:     # the block is lock-ignored: never mix two settings
+            self.log(f"[baselines] evopress: settings changed ({state.get('settings')} -> {eff}); search restarts")
+            state = None
+        try:
+            res = BL.evopress_search(prob, ref, budget, fitness, generations=int(ec.get("generations", 40)),
+                                     offspring=eff["offspring"], survivors=eff["survivors"],
+                                     max_mutations=eff["max_mutations"], seed=rc.seed, state=state,
+                                     checkpoint=lambda s: write_json(sdir / "search.json", dict(s, settings=eff)),
+                                     log=self.log)
+        finally:
+            if pool is not None:
+                pool.close()
+        res["settings"] = dict(eff, generations=int(ec.get("generations", 40)))
+        write_json(sdir / "result.json", res)
+        st.mark("baselines/evopress_search", {"fitness": res["fitness"], "evaluations": res["evaluations"]})
+        return res["config"], {"search": {k: res[k] for k in ("fitness", "evaluations", "trace")}}
+
     def resolve_budget(self, prob: QuantProblem) -> dict:
         bc = self.cfg["budget"]
         ref = bc.get("reference")
@@ -752,12 +891,7 @@ class Runner:
             if ed is not None:
                 ed.close()
             m0.close()
-        methods = cfg["baselines"].get("methods") or []
-        with st.step(f"{p}/baselines") as todo:
-            if todo and methods:
-                out = run_baselines(prob, cfg, methods, gd / "baselines",
-                                    stage_full=cfg["baselines"].get("full", False), log=self.log)
-                write_json(gd / "baselines" / "summary.json", out)
+        # (2026-11-23) the classic baselines run once, after the generations (run_baselines), not per generation
         with st.step(f"{p}/gate") as todo:
             if todo:
                 self.accept_best_gate(prob, g, gd, ranked, inc, budget)
@@ -833,7 +967,6 @@ class Runner:
             out["accepted"] = bool((read_json(d / "accepted.json") or {}).get("accepted"))
             out["incumbent_scores_this_gen"] = read_json(d / "incumbent_scores.json")
             out["gate"] = read_json(d / "gate.json")
-            out["baselines"] = read_json(d / "baselines" / "summary.json")
             cands = read_jsonl(d / "candidates.jsonl")
             out["candidates"] = {"n": len(cands), "errors": sum(1 for c in cands if c.get("error"))}
         return out
@@ -850,7 +983,8 @@ class Runner:
                 "gate_mean": {"m0": gate_mean(g0.get("m0_gate_scores")), "q0": g0.get("gate_mean"),
                               "final": (last or {}).get("gate_mean")},
                 "gain_vs_q0": (last or {}).get("gain_vs_q0"), "gap_closed": (last or {}).get("gap_closed"),
-                "final_incumbent": (last or {}).get("incumbent")}
+                "final_incumbent": (last or {}).get("incumbent"),
+                "baselines": read_json(self.run_dir / "baselines" / "summary.json")}
 
     # ------------------------------------------------------------------ main loop
     def run(self):
@@ -860,6 +994,7 @@ class Runner:
                  f"gate_datasets={self.gate_datasets} kl_datasets={self.kl_datasets} "
                  f"heldout={heldout_domains(self.cfg, rc.domain)}")
         write_json(self.run_dir / "edit_config.json", self.cfg)
+        BL.check_methods((self.cfg.get("baselines") or {}).get("methods"))   # a bad name fails now, not after the run
         self.baseline()
         for g in range(1, rc.gens + 1):
             stop = self.st.get("stopped")
@@ -872,12 +1007,19 @@ class Runner:
                      + ("M_0 (frozen)" if self.editor_mode == "frozen" else f"incumbent from gen {self.incumbent(g - 1)['gen']}"))
             if not self.generation(g):
                 break
+        self.run_baselines()
         s = read_json(self.run_dir / "summary.json", {}) or {}
         s["final"] = self.final()
         write_json(self.run_dir / "summary.json", s)
         f = s["final"]
         self.log(f"[run] done; gate mean M_0 {f['gate_mean']['m0']} | Q_0 {f['gate_mean']['q0']} | "
                  f"final {f['gate_mean']['final']} (gap closed {f['gap_closed']})")
+
+
+def _mean_acc(h: dict | None):
+    """Mean accuracy over the tasks of a held-out result {task: {accuracy, ...}} (None when there is none)."""
+    vals = [v.get("accuracy") for v in (h or {}).values() if isinstance(v, dict) and v.get("accuracy") is not None]
+    return round(sum(vals) / len(vals), 4) if vals else None
 
 
 def _acc(records: list[dict]):

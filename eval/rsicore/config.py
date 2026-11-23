@@ -68,7 +68,9 @@ LOCK_REFUSED_KNOBS = ("search.screen_candidates", "search.gate_every_candidate",
                       "search.top_full", "search.rerun_seeds", "search.kl_weight", "noise.temperature", "noise.fixed",
                       "baseline.noise_temperature", "baseline.noise_fixed")
 _REMOVED_LOCK_PATHS = tuple(REMOVED_KNOBS) + REMOVED_BLOCKS
-LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval") + _REMOVED_LOCK_PATHS + tuple(
+# baselines (Paper A, 2026-11-23): the classic baselines are report-only (run once after the generations)
+LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval", "baselines",
+                      "mock_overrides.baselines") + _REMOVED_LOCK_PATHS + tuple(
     f"mock_overrides.{p}" for p in _REMOVED_LOCK_PATHS)
 # execution knobs that change only batching, like --gpus, ignored at this dotted path anywhere in the config (top
 # level, under mock_overrides., under hardware_profiles.<name>.): scoring.concurrency (Paper A, 2026-11-23)
