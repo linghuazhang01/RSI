@@ -234,3 +234,28 @@ def test_mock_lock_check_folds_old_objective_overrides():
     _cfg("A", "--set", "kl.top_k=20")
     with pytest.raises(SystemExit):
         _cfg("A", "--set", "kl.top_k=5")
+
+
+def test_paper_a_tools_compare_removed_paper_b_live(tmp_path, capsys):
+    """(2026-11-23) tools.compare is removed for Paper A only (PAPER_REMOVED_KNOBS): --set of either boolean is a
+    no-op and a lock still holding it resumes; another value is refused. Paper B's tools.compare is live: --set keeps
+    it and the lock still compares it."""
+    import yaml
+    assert "compare" not in (_cfg("A").paper_cfg.get("tools") or {})
+    for v in ("true", "false"):
+        assert "compare" not in (_cfg("A", "--set", f"tools.compare={v}").paper_cfg.get("tools") or {})
+    with pytest.raises(SystemExit, match="removed"):
+        _cfg("A", "--set", "tools.compare=2")
+    assert _cfg("B", "--set", "tools.compare=false").paper_cfg["tools"]["compare"] is False
+    runs = tmp_path / "runs"
+    for paper in ("A", "B"):
+        rc = _load_b(runs, f"old{paper}", paper=paper)
+        lock = rc.run_dir / "run_config.yaml"
+        d = yaml.safe_load(lock.read_text())
+        d["paper_cfg"].setdefault("tools", {})["compare"] = paper == "A"      # A: old lock value; B: changed
+        lock.write_text(yaml.safe_dump(d))
+        if paper == "A":
+            _load_b(runs, "oldA", paper="A")                                   # resumes with the same command
+        else:
+            with pytest.raises(SystemExit, match="tools.compare"):
+                _load_b(runs, "oldB", paper="B")

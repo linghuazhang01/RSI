@@ -17,7 +17,8 @@
 Invalid configs raise a tool error whose message lists every problem (schema.ConfigError).
 No tool evaluates a config (2026-11-23, the hard-wired flow): candidates are never screened, every returned config gets
 ONE gate evaluation outside the program (run.gate_candidate); there is no api.evaluate, no evaluate budget and no
-compare (candidates have no screen records).
+compare (candidates have no screen records; the tools.compare key was removed 2026-11-23, rsicore.config
+PAPER_REMOVED_KNOBS).
 
 explore=True (2026-11-21): the API of the editor's run_python chat tool (rsicore.chat_tools), used while it
 writes a candidate: the same tools, except that group_error refuses settings whose Hessian-weighted error is not

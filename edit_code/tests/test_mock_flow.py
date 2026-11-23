@@ -514,7 +514,7 @@ class TestEditorConfig(unittest.TestCase):
         from edit_code.tools import ToolError, make_tool_api
         prob = types.SimpleNamespace(spec=None, herr_missing=lambda c: ["0.down.down_proj|gptq|8|128"],
                                      group_error=lambda c, top=10: {"total_per_token": 0.0})
-        full = make_tool_api(prob, {"tools": {"compare": True}}, cid="c")
+        full = make_tool_api(prob, {}, cid="c")
         ex = make_tool_api(prob, {}, cid="c~x01_0", explore=True)
         for api in (full, ex):
             self.assertFalse({"evaluate", "compare"} & set(api.names()))

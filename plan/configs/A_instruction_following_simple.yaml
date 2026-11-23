@@ -156,7 +156,6 @@ tools:
   solve_allocation: true
   hessian_table: true
   group_error: true
-  compare: true
 solver:
   group_sizes:
   - 128

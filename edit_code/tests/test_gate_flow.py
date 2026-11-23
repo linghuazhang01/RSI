@@ -51,7 +51,7 @@ def test_screen_tools_and_no_evaluate(tmp_path, monkeypatch):
          "raw_output": ["x"] * 4, "reasoning": [None] * 4, "finish_reason": ["stop"] * 4}]))
     monkeypatch.setattr(P, "load_processed", lambda ds, ids=None: {i: {"prompt": f"Q{i}", "reference": "4"}
                                                                    for i in (ids or [])})
-    for api in (make_tool_api(prob, {}, cid="p"), make_tool_api(prob, {"tools": {"compare": True}}, cid="p~x",
+    for api in (make_tool_api(prob, {}, cid="p"), make_tool_api(prob, {}, cid="p~x",
                                                                 explore=True)):
         names = api.names()
         assert {"screen_results", "screen_output"} <= set(names)

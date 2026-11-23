@@ -134,8 +134,6 @@ tools:                                # ablations: remove tools from the editor'
   solve_allocation: true
   hessian_table: true                 # 2026-11-20: analysis tools
   group_error: true
-  compare: true                       # (unused since 2026-11-23: candidates have no screen records to compare; kept
-                                      # so runs locked with it resume)
 
 solver:
   group_sizes: [128]                  # group sizes solve_allocation chooses from by default (KL-greedy baseline)
