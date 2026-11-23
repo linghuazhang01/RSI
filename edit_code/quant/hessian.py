@@ -64,9 +64,10 @@ def load_hessian(out_dir: Path, layer: int, input_key: str, device="cpu") -> tup
 
 @torch.no_grad()
 def collect_stats(model, spec: ModelSpec, batches: list[torch.Tensor], out_dir: Path, *,
-                  layers_per_pass: int = 16, device: str | None = None, log=print) -> dict:
+                  layers_per_pass: int = 16, device: str | None = None, log=print, return_stats: bool = True) -> dict:
     """Run calibration batches through `model`, write Hessians, return activation statistics
-    {"L.input_key": {...}}."""
+    {"L.input_key": {...}} (return_stats False: {} without reading the written Hessians back; a worker's partial
+    Hessians, 2026-11-23)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = device or str(next(model.parameters()).device)
@@ -122,6 +123,8 @@ def collect_stats(model, spec: ModelSpec, batches: list[torch.Tensor], out_dir: 
         del acc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    if not return_stats:
+        return stats
     for l, ks in reps.items():
         for k in ks:
             H, n, absmax = load_hessian(out_dir, l, k)

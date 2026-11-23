@@ -76,7 +76,7 @@ def _same_decoding(prev_dec: dict | None, key: dict | None) -> bool:
 
 
 def run_heldout(endpoint, served_name, out_dir: Path, *, domains, lora=None, mock=False, limit=None,
-                decoding: dict | None = None) -> dict:
+                decoding: dict | None = None, concurrency: int | None = None) -> dict:
     """endpoint: one URL, or a list of URLs of replicas of the same model (2026-11-20). domains: heldout_domains(cfg).
     With several replicas a single task is split item-wise over all of them (score_split), so every GPU works on it;
     otherwise (one replica, or several tasks) the tasks run one after another on the first replica."""
@@ -85,11 +85,11 @@ def run_heldout(endpoint, served_name, out_dir: Path, *, domains, lora=None, moc
         tasks = heldout_tasks(domains)
         if len(tasks) == 1 and _task_ids(*tasks[0], limit) is not None:
             return _run_heldout_split(list(endpoint), served_name, Path(out_dir), tasks[0], lora=lora, mock=mock,
-                                      limit=limit, decoding=decoding)
+                                      limit=limit, decoding=decoding, concurrency=concurrency)
     if isinstance(endpoint, (list, tuple)):
         endpoint = endpoint[0]
     return _run_heldout_one(endpoint, served_name, out_dir, domains=domains, lora=lora, mock=mock, limit=limit,
-                            decoding=decoding)
+                            decoding=decoding, concurrency=concurrency)
 
 
 def _task_ids(task: str, pool: str, limit=None) -> list[str] | None:
@@ -102,7 +102,8 @@ def _task_ids(task: str, pool: str, limit=None) -> list[str] | None:
     return ids[:limit] if limit else ids
 
 
-def _run_heldout_split(endpoints, served_name, out_dir: Path, task_pool, *, lora, mock, limit, decoding) -> dict:
+def _run_heldout_split(endpoints, served_name, out_dir: Path, task_pool, *, lora, mock, limit, decoding,
+                       concurrency=None) -> dict:
     """One held-out task, its items split over the replicas (resumable like _run_heldout_one)."""
     task, pool = task_pool
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +116,7 @@ def _run_heldout_split(endpoints, served_name, out_dir: Path, task_pool, *, lora
         summ = prev
     else:
         summ = score_split(endpoints, served_name, task, pool=pool, ids=_task_ids(task, pool, limit), out_dir=out_dir,
-                           lora=lora, extra=dec["extra"], mock=mock, **dec["kw"]).summary
+                           lora=lora, extra=dec["extra"], mock=mock, concurrency=concurrency, **dec["kw"]).summary
         summ = dict(summ, limit=limit)              # ids replace --limit; keep the resume key of _run_heldout_one
         summ.pop("ids_file", None)
         allsum = json.loads(sp.read_text()) if sp.exists() else {}
@@ -125,7 +126,7 @@ def _run_heldout_split(endpoints, served_name, out_dir: Path, task_pool, *, lora
 
 
 def _run_heldout_one(endpoint, served_name, out_dir: Path, *, domains, lora=None, mock=False, limit=None,
-                     decoding: dict | None = None, tasks: list | None = None) -> dict:
+                     decoding: dict | None = None, tasks: list | None = None, concurrency: int | None = None) -> dict:
     """Evaluate every held-out task of `domains` into out_dir (run_eval layout). Tasks already present in
     out_dir/summary.json for the same served model / LoRA / limit / decoding are skipped (resumable).
     decoding: the paper config's heldout.decoding (see the module doc); None = tasks.yaml decoding.
@@ -144,6 +145,6 @@ def _run_heldout_one(endpoint, served_name, out_dir: Path, *, domains, lora=None
         else:
             extra = (["--limit", str(limit)] if limit else []) + dec["extra"]
             summ = score(endpoint, served_name, task, pool=pool, ids=None, out_dir=out_dir, lora=lora,
-                         extra=extra, mock=mock, **dec["kw"]).summary
+                         extra=extra, mock=mock, concurrency=concurrency, **dec["kw"]).summary
         res[task] = {k: summ[k] for k in _KEYS if k in summ}
     return res

@@ -131,8 +131,10 @@ def _normalise(task: str, summary: dict, recs: list[dict], thinking: bool, out_d
 def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
           lora: str | None = None, extra: list[str] = (), mock: bool = False,
           seed: int | None = None, temperature: float | None = None, top_p: float | None = None,
-          top_k: int | None = None, decoding: dict | None = None) -> EvalResult:
-    """Score `task` items `ids` (None = the whole pool) on one endpoint. decoding: see the module doc."""
+          top_k: int | None = None, decoding: dict | None = None, concurrency: int | None = None) -> EvalResult:
+    """Score `task` items `ids` (None = the whole pool) on one endpoint. decoding: see the module doc.
+    concurrency: run_eval --concurrency (requests in flight, each of n samples; None = run_eval's default 64). It
+    changes only how many requests the server batches at once, not the requests or their seeds (2026-11-23)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dec = dict(check_decoding(decoding) or {})
@@ -153,6 +155,8 @@ def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None,
     if lora:
         cmd += ["--lora", lora]
     cmd += _decoding_flags(task, dec, extra)
+    if concurrency and "--concurrency" not in [str(x) for x in extra]:
+        cmd += ["--concurrency", str(int(concurrency))]
     if mock and "--no-sandbox" not in extra:
         cmd += ["--no-sandbox"]
     cmd += [str(x) for x in extra]
@@ -171,7 +175,8 @@ def score(endpoint, served_name, task: str, *, pool: str, ids: list[str] | None,
 def score_split(endpoints: list[str], served_name, task: str, *, pool: str, ids: list[str] | None, out_dir: Path,
                 lora: str | None = None, extra: list[str] = (), mock: bool = False, seed: int | None = None,
                 temperature: float | None = None, top_p: float | None = None,
-                top_k: int | None = None, decoding: dict | None = None) -> EvalResult:
+                top_k: int | None = None, decoding: dict | None = None,
+                concurrency: int | None = None) -> EvalResult:
     """score() with the items split over several replicas of the same model (2026-11-20: data parallelism on
     every GPU). endpoints: one URL per replica. Each replica scores a contiguous chunk of the sorted ids into
     out_dir/_part<k>/; the records are merged (sorted by id) into out_dir/<task>.jsonl and a summary entry
@@ -181,7 +186,8 @@ def score_split(endpoints: list[str], served_name, task: str, *, pool: str, ids:
     eps = [e for e in endpoints if e]
     if len(eps) <= 1 or ids is None or len(set(ids)) < 2:
         return score(eps[0], served_name, task, pool=pool, ids=ids, out_dir=out_dir, lora=lora, extra=extra,
-                     mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k, decoding=decoding)
+                     mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k, decoding=decoding,
+                     concurrency=concurrency)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ids = sorted(set(ids))
@@ -192,7 +198,7 @@ def score_split(endpoints: list[str], served_name, task: str, *, pool: str, ids:
     def run(i):
         return score(eps[i], served_name, task, pool=pool, ids=chunks[i], out_dir=out_dir / f"_part{i}", lora=lora,
                      extra=extra, mock=mock, seed=seed, temperature=temperature, top_p=top_p, top_k=top_k,
-                     decoding=decoding)
+                     decoding=decoding, concurrency=concurrency)
     with ThreadPoolExecutor(max_workers=k) as ex:
         parts = list(ex.map(run, range(k)))
     recs = sorted((r for p in parts for r in p.records), key=lambda r: (str(r.get("id")), str(r.get("unit_id", ""))))

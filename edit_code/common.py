@@ -231,6 +231,15 @@ def candidate_args(cfg: dict) -> list[str]:
     return set_max_model_len(list(v.get("candidate_args") or []), None if n is None else int(n))
 
 
+def scoring_concurrency(cfg: dict) -> int | None:
+    """run_eval --concurrency of every scoring run (scoring.concurrency, 2026-11-23; null = run_eval's default 64).
+    Requests in flight per server, each of n samples. A request holds its slot until its LAST sample finishes, so
+    with n = 4 and long thinking outputs 64 requests leave a --max-num-seqs 128 server under-filled mid-run. Only
+    batching changes (same requests and seeds), so the run lock ignores it."""
+    v = (cfg.get("scoring") or {}).get("concurrency")
+    return None if v is None else int(v)
+
+
 def search_settings(scfg: dict) -> dict:
     """Shape of one inner search from a `search` block -> {threads, steps, max_candidates} (max_candidates null /
     absent = threads x steps). The flow itself is hard-wired (2026-11-23): candidates are never screened, every built

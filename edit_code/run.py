@@ -60,7 +60,8 @@ from rsicore.state import RunState  # noqa: E402
 from edit_code import mock as M  # noqa: E402
 from edit_code.baselines import run_baselines  # noqa: E402
 from edit_code.common import (candidate_args, candidate_groups, deep_merge, error_line, gpu_layout,  # noqa: E402
-                              program_note, read_json, read_jsonl, search_settings, tail, write_json)
+                              program_note, read_json, read_jsonl, scoring_concurrency, search_settings, tail,
+                              write_json)
 from edit_code.problem import QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
 from edit_code.prompts import archive_row, archive_text, history_row, make_render_context, system_prompt  # noqa: E402
 from edit_code.quant import schema, sizes  # noqa: E402
@@ -81,6 +82,27 @@ def server_args(cfg: dict, args_key: str) -> list[str]:
         return candidate_args(cfg)
     args = list((cfg.get("vllm") or {}).get(args_key) or [])
     return apply_context_tokens(args, cfg) if args_key == "editor_args" else args
+
+
+class _Background:
+    """fn() in a daemon thread; join() waits and re-raises its exception (raise_error=False: only waits)."""
+
+    def __init__(self, fn):
+        self.error = None
+
+        def run():
+            try:
+                fn()
+            except BaseException as e:   # noqa: BLE001 - re-raised in join()
+                self.error = e
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def join(self, raise_error: bool = True):
+        self.thread.join()
+        if raise_error and self.error is not None:
+            err, self.error = self.error, None
+            raise err
 
 
 class LazyServer:
@@ -263,6 +285,7 @@ class Runner:
         lay = cfg.get("gpu_layout") or {}
         # the editor's GPUs can be used for other work only when they are not shared with the candidates
         own = not (set(self.gpu_editor) & set(self.gpu_cand))
+        self.editor_gpus_own = own
         self.editor_sleep = bool(lay.get("editor_sleep", True)) and own
         self.m0_replicas = bool(lay.get("m0_replicas", True)) and own
         self.parallel_heldout = bool(lay.get("parallel_heldout", True))
@@ -339,7 +362,7 @@ class Runner:
         srvs = start_lazy(servers)
         return run_heldout([s.endpoint for s in srvs], servers[0].name, out_dir, domains=heldout_domains(cfg, self.rc.domain),
                            mock=self.rc.mock, lora=lora, limit=cfg["heldout"].get("limit"),
-                           decoding=cfg["heldout"].get("decoding"))
+                           decoding=cfg["heldout"].get("decoding"), concurrency=scoring_concurrency(cfg))
 
     def model_heldout(self, model_dir: Path, name: str, out_dir: Path) -> dict:
         """Held-out evaluation of an exported model: one server per free GPU group (gpu_layout.parallel_heldout;
@@ -405,7 +428,9 @@ class Runner:
             write_json(dst / "fake_quant.json", {"config": norm, "mock": True, "bytes_gib": art["bytes_gib"]})
         else:  # pragma: no cover - GPU path
             prob.prepare()
-            prob.materialize(art, dst)
+            # (2026-11-23) the accepted candidate's gate checkpoint is the same export: move it instead of rewriting
+            if not prob.adopt_checkpoint(art, dst):
+                prob.materialize(art, dst)
 
     def incumbent_record(self, g: int, cid: str, art: dict, gate_fb: dict, model_dir: Path, *, accepted: bool) -> dict:
         probes = gate_fb.get("probes") or {}
@@ -534,7 +559,8 @@ class Runner:
                     dec = C.stage_decoding(cfg, "gate", rc.seed)   # the candidates' gate decoding (2026-11-21)
                     for ds in self.gate_datasets:      # the gate role
                         r = score_split(eps, m0.name, ds, pool="pool", ids=D.gate_ids(rc, ds),
-                                        out_dir=bdir / "gate", mock=rc.mock, decoding=dec)
+                                        out_dir=bdir / "gate", mock=rc.mock, decoding=dec,
+                                        concurrency=scoring_concurrency(cfg))
                         res[ds] = _acc(r.records)
                     write_json(bdir / "gate.json", res)
                     self.log("[baseline] M_0 gate scores", res)
@@ -563,8 +589,16 @@ class Runner:
             if todo:
                 ref = cfg["budget"]["reference"]
                 art = prob.build(ref, "q0")
-                r = prob.evaluate(art, "gate", "q0", origin="reference")
+                # (2026-11-23) export once, then score the gate on every GPU group (it was one GPU, then a second
+                # export): every candidate slot serves the exported model, plus the free editor GPU
                 self.export(prob, art, bdir / "q0" / "model")
+                prob.exported[art["config_hash"]] = bdir / "q0" / "model"
+                lent = prob.add_slot(self.gpu_editor) if self.editor_gpus_own else None
+                try:
+                    r = prob.evaluate(art, "gate", "q0", origin="reference")
+                finally:
+                    if lent is not None:
+                        prob.remove_slot(lent)
                 inc = self.incumbent_record(0, "q0", art, r["feedback"], bdir / "q0" / "model", accepted=True)
                 write_json(bdir / "incumbent.json", inc)
                 self.log(f"[baseline] budget {budget:.3f} GiB; Q_0 (reference) gate scores {inc['gate_scores']}")
@@ -684,6 +718,11 @@ class Runner:
                 D.draw_gen(rc, g)
         m0 = self.m0_server(tasks=self.datasets)
         ed = None
+        pre = None
+        if self.editor_mode == "frozen" and self.editor_gpus_own and not st.done(f"{p}/search"):
+            # (2026-11-23) the frozen editor (M_0, on its own GPU) starts while the incumbent answers the screen
+            # items on the candidate GPUs (it used to start only afterwards); joined before the search
+            pre = _Background(m0.get)
         try:
             # (2026-11-23) no per-generation KL / calibration texts: the layer cache and the tables are built once in
             # generation 0, and there is no KL term
@@ -695,6 +734,8 @@ class Runner:
             write_json(gd / "incumbent_scores.json", prob.incumbent_scores)
             # the latest model's screen run, for later rounds (archive / history)
             write_json(gd / "reference_screen.json", prob.screen_summary(examples=0))
+            if pre is not None:
+                pre.join()                 # re-raises a failed start
             ed = self.editor_server(g, m0)
             if ed is not m0:
                 m0.close()
@@ -706,6 +747,8 @@ class Runner:
                 ranked = self.run_search(prob, g, gd, ed, archive=arch)
                 st.mark(f"{p}/search", {"candidates": len(ranked)})
         finally:
+            if pre is not None:
+                pre.join(raise_error=False)   # never close M_0 while its start is still running
             if ed is not None:
                 ed.close()
             m0.close()
@@ -732,6 +775,7 @@ class Runner:
                     write_json(gd / "heldout.json", h)
             self.log(f"[gen {g}] new incumbent {new['cid']}: gate {new['gate_scores']}")
         else:
+            shutil.rmtree(gd / "ckpt", ignore_errors=True)   # (2026-11-23) up to one 52 GB checkpoint per slot
             self.log(f"[gen {g}] incumbent stays ({inc['cid']} from gen {inc['gen']}): "
                      f"{(st.get(f'{p}/accepted') or {}).get('reasons')}")
         R.update_summary(rc, g, self.gen_summary(g))

@@ -34,7 +34,7 @@ from types import SimpleNamespace
 
 from . import mock as M
 from .common import (append_jsonl, candidate_args, candidate_groups, config_hash, free_cuda, load_processed,
-                     read_json, read_jsonl, record_text, role_gpus, tail, write_json)
+                     read_json, read_jsonl, record_text, role_gpus, scoring_concurrency, tail, write_json)
 from .diagnostics import bytes_table, load_tables, save_tables, summarize_profile
 from .quant import schema, sizes
 from .quant.spec import ModelSpec, spec_from_checkpoint, synthetic_spec
@@ -90,7 +90,11 @@ class QuantProblem:
         self.cache = None
         self.shown: dict[str, set] = {}
         self._lock = threading.RLock()
-        self._export_lock = threading.Lock()       # one export at a time (shared layer cache)
+        # (2026-11-23) exports run in parallel, one layer cache per candidate slot GPU (_slot_cache); this lock now
+        # only serialises herr_module's GPU use of self.cache
+        self._export_lock = threading.Lock()
+        self._slot_caches: dict = {}               # slot index -> (QuantCache on the slot's first GPU, its lock)
+        self.exported: dict = {}                   # config hash -> a finished fake-quant export (served by serve_all)
         self._inflight: dict = {}                  # (hash, stage) -> threading.Event
         self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
         self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
@@ -391,31 +395,40 @@ class QuantProblem:
             def calib(i):
                 b = tokenize_texts(self.source_dir, parts[i], ccfg.get("max_len", 2048))
                 collect_stats(models[i], self.spec, b, self.prep_dir / "hessians_parts" / f"w{i}",
-                              layers_per_pass=ccfg.get("layers_per_pass", 16), device=devs[i], log=self.log)
+                              layers_per_pass=ccfg.get("layers_per_pass", 16), device=devs[i], log=self.log,
+                              return_stats=False)     # (2026-11-23) the parts' stats were read back and discarded
             with ThreadPoolExecutor(max_workers=k) as ex:
                 list(ex.map(calib, range(k)))
             del models, calib
             import gc
             gc.collect()
             torch.cuda.empty_cache()
-            for (layer, key) in keys:                  # sum the workers' Hessians
+            def reduce(lk):                            # sum the workers' Hessians (always in worker order 0..k-1)
+                layer, key = lk
                 dst = hessian_path(hdir, layer, key)
-                if not dst.exists():
-                    H = absmax = None
-                    n = 0
-                    for i in range(k):
-                        h, ni, a = load_hessian(self.prep_dir / "hessians_parts" / f"w{i}", layer, key)
-                        H = h if H is None else H + h
-                        absmax = a if absmax is None else torch.maximum(absmax, a)
-                        n += ni
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    save_file({"H": H.contiguous(), "absmax": absmax.contiguous(),
-                               "n": torch.tensor([n], dtype=torch.int64)}, str(dst))
+                if dst.exists():
+                    return
+                H = absmax = None
+                n = 0
+                for i in range(k):
+                    h, ni, a = load_hessian(self.prep_dir / "hessians_parts" / f"w{i}", layer, key)
+                    H = h if H is None else H + h
+                    absmax = a if absmax is None else torch.maximum(absmax, a)
+                    n += ni
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                save_file({"H": H.contiguous(), "absmax": absmax.contiguous(),
+                           "n": torch.tensor([n], dtype=torch.int64)}, str(dst))
+                stats[f"{layer}.{key}"] = activation_summary(H, n, absmax)   # no second read of the summed file
+            # (2026-11-23) several keys at once (the reads dominate; the per-key sum order is unchanged, so the summed
+            # Hessians are bitwise the same as before)
+            with ThreadPoolExecutor(max_workers=min(k, 8)) as ex:
+                list(ex.map(reduce, keys))
             shutil.rmtree(self.prep_dir / "hessians_parts", ignore_errors=True)
             self.log(f"[prep:{self.tag}] calibration done ({len(keys)} Hessians, {time.time() - t0:.0f}s)")
-        for (layer, key) in keys:
-            H, n, absmax = load_hessian(hdir, layer, key)
-            stats[f"{layer}.{key}"] = activation_summary(H, n, absmax)
+        for (layer, key) in keys:                      # Hessians summed by an earlier (interrupted) prep
+            if f"{layer}.{key}" not in stats:
+                H, n, absmax = load_hessian(hdir, layer, key)
+                stats[f"{layer}.{key}"] = activation_summary(H, n, absmax)
         # (2) profile table: one PROCESS per GPU (2026-11-21; the threads shared one GIL and the GPUs sat ~90% idle),
         # group keys round-robin, contexts batched, each finished group saved to prep/profile_rows/<key>.json
         group_keys = self.spec.group_keys()
@@ -516,17 +529,51 @@ class QuantProblem:
             for p in sdir.glob("*"):  # bounded disk: one candidate checkpoint per slot
                 if p != dst:
                     shutil.rmtree(p, ignore_errors=True)
-        with self._export_lock:
-            dev = self.cache.device
-            if str(dev).startswith("cuda"):
-                self.cache.device = f"cuda:{self.slots[slot][0]}"
-            try:
-                export_fake_quant(self.source_dir, dst, self.norm_of(art), self.spec, self.cache,
-                                  meta={"tag": self.tag, "gen": self.gen, "budget_gib": self.budget_gib}, log=self.log)
-            finally:
-                self.cache.device = dev
+        cache, lock = self._slot_cache(slot)
+        with lock:              # (2026-11-23) per slot: the exports of different slots run at the same time
+            export_fake_quant(self.source_dir, dst, self.norm_of(art), self.spec, cache,
+                              meta={"tag": self.tag, "gen": self.gen, "budget_gib": self.budget_gib}, log=self.log)
             free_cuda()   # the candidate vLLM server starts on this GPU next (80 GB cards: every GB counts)
         return dst
+
+    def _slot_cache(self, slot: int):
+        """(QuantCache, lock) of candidate slot `slot`: the layer cache on the slot's first GPU (cache.device cuda),
+        else on cache.device. Every slot cache reads the same on-disk entries; a missing entry is computed once
+        (QuantCache._entry_lock), so the exported tensors are the same as with one shared cache."""
+        with self._lock:
+            got = self._slot_caches.get(slot)
+            if got is None:
+                dev = self._device()
+                if str(dev).startswith("cuda"):
+                    dev = f"cuda:{self.slots[slot][0]}"
+                got = self._slot_caches[slot] = (self._open_cache(device=dev), threading.Lock())
+            return got
+
+    def adopt_checkpoint(self, art: dict, dst: Path) -> bool:
+        """Move a finished candidate checkpoint of this config (out_dir/ckpt/slot<k>/<hash>, written for its gate
+        by this problem) to dst instead of exporting it again (2026-11-23). The same export_fake_quant output: same
+        source, normalized config and meta. False when there is none (a slot reused by a later candidate)."""
+        import json
+        import os
+        if self.mock:
+            return False
+        want = self.norm_of(art)
+        for d in sorted((self.out_dir / "ckpt").glob(f"slot*/{art['config_hash']}")):
+            fq = d / "fake_quant.json"
+            if not fq.exists():
+                continue
+            info = json.loads(fq.read_text())
+            if info.get("config") != want or info.get("gen") != self.gen or info.get("tag") != self.tag \
+                    or str(info.get("source")) != str(self.source_dir):
+                continue
+            dst = Path(dst)
+            if dst.exists():
+                shutil.rmtree(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(d, dst)
+            self.log(f"[export] reused the gate checkpoint {d} -> {dst}")
+            return True
+        return False
 
     @contextmanager
     def serve(self, art: dict, name: str):
@@ -556,8 +603,9 @@ class QuantProblem:
         """Serve one config on EVERY free slot of the pool at once (2026-11-22, like Paper B's parent screen over all
         main replicas): blocks for the first slot, then takes every other slot that is free right now, so it never
         waits on a running evaluation. Real mode: the checkpoint is written once (the incumbent's exported model when
-        it is there, else a shared copy under out_dir/ckpt/shared/, removed afterwards) and every slot serves it; the
-        servers start together. Yields the list of servers."""
+        it is there, else a finished export registered in self.exported, e.g. Q_0's baseline/q0/model, else a shared
+        copy under out_dir/ckpt/shared/, removed afterwards) and every slot serves it; the servers start together.
+        Yields the list of servers."""
         from rsicore.servers import VLLMServer, start_all
         slots = [self._pool.get()]
         while True:
@@ -576,6 +624,9 @@ class QuantProblem:
                 inc = self.incumbent or {}
                 ckpt = Path(inc["model_dir"]) if (inc.get("config_hash") == art["config_hash"] and inc.get("model_dir")
                                                   and (Path(inc["model_dir"]) / "fake_quant.json").exists()) else None
+                ex = self.exported.get(art["config_hash"])
+                if ckpt is None and ex and (Path(ex) / "fake_quant.json").exists():   # e.g. Q_0's exported model
+                    ckpt = Path(ex)
                 if ckpt is None:
                     tmp = self.out_dir / "ckpt" / "shared" / art["config_hash"]
                     ckpt = self.materialize(art, dst=tmp, slot=slots[0])
@@ -649,8 +700,9 @@ class QuantProblem:
                 reuse = {ds: read_jsonl(p) for ds, p in src.items()}
         from contextlib import nullcontext
         # (2026-11-22) the incumbent's screen / full run (once per generation, before the search; nothing else holds a
-        # slot then) is split over every free candidate slot, like Paper B's parent screen over all main replicas
-        split = origin == "incumbent" and stage != "gate" and not reuse
+        # slot then) is split over every free candidate slot, like Paper B's parent screen over all main replicas.
+        # (2026-11-23) so is Q_0's gate (origin "reference", generation 0, nothing else running): it was on ONE GPU
+        split = not reuse and (origin == "reference" or (origin == "incumbent" and stage != "gate"))
         with (nullcontext() if reuse else self.serve_all(art, name) if split else self.serve(art, name)) as srv:
             srvs = srv if isinstance(srv, list) else [srv]
             srv = srvs[0]
@@ -663,10 +715,10 @@ class QuantProblem:
                     res = SimpleNamespace(records=reuse[ds])
                 elif len(srvs) > 1:
                     res = score_split([s.endpoint for s in srvs], name, ds, pool="pool", ids=ids, out_dir=edir,
-                                      mock=self.mock, decoding=dec)
+                                      mock=self.mock, decoding=dec, concurrency=scoring_concurrency(self.cfg))
                 else:
                     res = score(srv.endpoint, name, ds, pool="pool", ids=ids, out_dir=edir, mock=self.mock,
-                                decoding=dec)
+                                decoding=dec, concurrency=scoring_concurrency(self.cfg))
                 acc, per, pending = _mean_per_id(res.records)
                 dom = DATASET_DOMAIN.get(ds, ds)
                 p = {"dataset": ds, "score": None if acc is None else round(acc, 4), "n": len(per), "pending": pending}

@@ -8,8 +8,9 @@ paper / domain / model / seed / mock / paper_cfg are refused. `gens` and `gpus` 
 (extending a run, moving machines); the stored values are updated. The paper_cfg comparison ignores the keys of
 removed features (LOCK_IGNORED_*, 2026-11-22: objective / scope profiles, data sizes, data roles, retention, E_t,
 eval_target, draw_config; 2026-11-23: the search / gate / noise-band / KL-score knobs of REMOVED_KNOBS, and the
-paper-only PAPER_REMOVED_KNOBS such as Paper A's tools.compare), so runs made before their removal resume with the
-same command.
+paper-only PAPER_REMOVED_KNOBS such as Paper A's tools.compare) and execution knobs that only change batching
+(LOCK_IGNORED_SUFFIXES: scoring.concurrency, at any depth), so runs made before their removal resume with the same
+command.
 
 The search flow is hard-wired (2026-11-23): candidates are never screened, every candidate gets ONE gate evaluation
 during the search (paired vs the current model), the passing candidate with the largest paired gain is accepted; no
@@ -69,6 +70,9 @@ LOCK_REFUSED_KNOBS = ("search.screen_candidates", "search.gate_every_candidate",
 _REMOVED_LOCK_PATHS = tuple(REMOVED_KNOBS) + REMOVED_BLOCKS
 LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval") + _REMOVED_LOCK_PATHS + tuple(
     f"mock_overrides.{p}" for p in _REMOVED_LOCK_PATHS)
+# execution knobs that change only batching, like --gpus, ignored at this dotted path anywhere in the config (top
+# level, under mock_overrides., under hardware_profiles.<name>.): scoring.concurrency (Paper A, 2026-11-23)
+LOCK_IGNORED_SUFFIXES = ("scoring.concurrency",)
 HARDWIRED_FLOW = ("candidates are never screened; every candidate gets one gate evaluation during the search, paired "
                   "vs the current model; the passing candidate with the largest paired gain is accepted; no "
                   "api.evaluate, full / rerun stage, gate submissions after the search, noise band or KL score term")
@@ -365,6 +369,8 @@ def _clean_removed(value, path: str, where: str, paper: str | None = None):
 
 def _lock_ignored(key: str, path: str, paper: str | None = None) -> bool:
     if key in LOCK_IGNORED_KEYS or any(t in key for t in LOCK_IGNORED_TOKENS) or path in LOCK_IGNORED_PATHS:
+        return True
+    if any(path == s or path.endswith("." + s) for s in LOCK_IGNORED_SUFFIXES):
         return True
     extra = PAPER_REMOVED_KNOBS.get(str(paper or "").upper(), {})
     return bool(extra) and (path in extra or (path.startswith("mock_overrides.")

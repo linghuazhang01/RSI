@@ -43,6 +43,19 @@ class WeightReader:
 
 
 class QuantCache:
+    # (2026-11-23) several caches (one per candidate slot GPU) may export at the same time: a missing entry is computed
+    # once, by whichever cache takes its lock first; the others wait and load the stored entry. Keyed by path.
+    _entry_locks: dict = {}
+    _entry_locks_guard = threading.Lock()
+
+    @classmethod
+    def _entry_lock(cls, path: Path) -> threading.Lock:
+        with cls._entry_locks_guard:
+            lk = cls._entry_locks.get(str(path))
+            if lk is None:
+                lk = cls._entry_locks[str(path)] = threading.Lock()
+            return lk
+
     def __init__(self, root: Path, spec: ModelSpec, model_dir: Path, *, hessian_dir: Path | None = None,
                  device: str = "cpu", damp: float = 0.01, lazy: bool = True, log=print):
         self.root = Path(root)
@@ -77,7 +90,7 @@ class QuantCache:
              "shape": torch.tensor(list(q.codes.shape) + list(q.zero.shape), dtype=torch.int64)}
         if q.col_scale is not None:
             t["col_scale"] = q.col_scale.cpu().contiguous()
-        tmp = path.with_suffix(f".tmp{os.getpid()}")
+        tmp = path.with_suffix(f".tmp{os.getpid()}_{threading.get_ident()}")   # unique per thread too
         save_file(t, str(tmp), metadata={"bits": str(q.bits), "group_size": str(q.group_size)})
         os.replace(tmp, path)
 
@@ -112,12 +125,16 @@ class QuantCache:
             return self._load(p)
         if not self.lazy:
             raise KeyError(f"cache miss {module} {quantizer} b{bits} g{gs} (lazy computation disabled)")
-        t0 = time.time()
-        q = self.compute(module, quantizer, bits, gs)
-        self._save(p, q)
-        self.stats["computed"] += 1
-        self.stats["seconds"] += time.time() - t0
-        return q
+        with self._entry_lock(p):
+            if p.exists():                 # computed by another cache (another slot) while this one waited
+                self.stats["hits"] += 1
+                return self._load(p)
+            t0 = time.time()
+            q = self.compute(module, quantizer, bits, gs)
+            self._save(p, q)
+            self.stats["computed"] += 1
+            self.stats["seconds"] += time.time() - t0
+            return q
 
     def dequant(self, module: str, setting: dict, dtype=torch.bfloat16) -> torch.Tensor:
         """Fake-quant weight for one module under a resolved setting (bits 16 = original)."""

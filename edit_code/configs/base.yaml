@@ -124,6 +124,14 @@ cache:
 
 candidates:
   keep_checkpoints: 1                 # fake-quant checkpoints kept per candidate server (~54 GB each; disk = servers x 54 GB)
+                                      # (2026-11-23: the slots export in parallel; an accepted candidate's checkpoint is
+                                      # moved to gen_XX/model, and gen_XX/ckpt is removed after every generation)
+
+scoring:                              # (2026-11-23) the scoring client (eval/run_eval.py) of every gate / screen / held-out
+  concurrency: 96                     # requests in flight per server, each of n = 4 samples; a request holds its slot
+                                      # until its LAST sample ends, so run_eval's default 64 leaves a --max-num-seqs 128
+                                      # server under-filled mid-run. Batching only (same requests and seeds): the run
+                                      # lock ignores it. null = run_eval's default 64
 
 bytes:
   count_visual: true                  # vision tower counted (BF16) in the packed size
@@ -270,6 +278,7 @@ hardware_profiles:
     vllm:
       editor_args: [--gpu-memory-utilization, "0.92", --max-model-len, "49152", --max-num-seqs, "32", --max-logprobs, "20"]
       candidate_args: [--gpu-memory-utilization, "0.92", --max-model-len, "20480", --max-num-seqs, "32", --max-logprobs, "20"]
+    scoring: {concurrency: null}      # --max-num-seqs 32: the default 64 requests already queue
     calibration:
       layers_per_pass: 4              # fp32 Hessians ~1.6 GB/layer next to the 52 GB HF model on the candidate card
       max_len: 2048
