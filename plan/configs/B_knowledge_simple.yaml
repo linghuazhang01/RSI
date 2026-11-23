@@ -60,17 +60,9 @@ budget:
 search:
   threads: 8
   steps: 1
-  max_evaluate: 32
-  top_full: 0
-  rerun_seeds: 0
   archive: true
   max_candidates: 8
-  charge_screens: false
-  program_evaluate_calls: 0
-  program_evaluate_total: 0
   parallel_builds: true
-  screen_candidates: false
-  gate_every_candidate: true
 editor:
   temperature: 0.6
   top_p: 0.95
@@ -141,14 +133,10 @@ decoding:
     n: 4
     seed: 42
 gate:
-  reference: auto
   fallback: auto
   min_gain: 0.0
   require_significant: true
-  epsilon: 0.01
   delta: 0.02
-  use_noise_band: true
-  max_submissions: 3
 eval:
   screen_limit: null
   full_limit: null
@@ -184,12 +172,6 @@ heldout:
     n: 4
     seed: 42
     n_by_task: null
-baseline:
-  noise_repeats: 3
-  noise_temperature: 0.0
-  noise_top_p: 1.0
-  noise_n: null
-  noise_fixed: null
 merge:
   gpu: true
 server:

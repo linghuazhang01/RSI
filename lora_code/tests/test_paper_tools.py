@@ -22,8 +22,7 @@ pytestmark = pytest.mark.skipif(bool(MISSING), reason=f"missing {MISSING}")
 
 DS = "simple_math_pool"
 SIMPLE = {"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}, "weights": {"norm_cap_tau": 0.05},
-          "search": {"threads": 8, "steps": 1, "charge_screens": False, "program_evaluate_calls": 0,
-                     "screen_candidates": False, "gate_every_candidate": True, "top_full": 0},
+          "search": {"threads": 8, "steps": 1},
           "tools": {"tensor_compute": True}, "editor": {"tool_rounds": 20, "explore": {"persistent": True}}}
 
 
@@ -50,7 +49,7 @@ def _ws(tmp_path, mode="scratch", cfg=None, store=None, screen=True):
     c = json.loads(json.dumps(SIMPLE))
     c.update(cfg or {})
     ws = Workspace(mock=store is None, store=store or MockStore(), train=train, cfg=c, out_dir=tmp_path,
-                   budget={"evaluate": 0, "gpu_seconds": 500}, mode=mode)
+                   budget={"gpu_seconds": 500}, mode=mode)
     ws.screen = _screen() if screen else None
     ws.build_api()
     return ws
@@ -61,14 +60,14 @@ def _call(ws, tool, **kw):
 
 
 def test_settings_and_tool_surface():
-    """base.yaml (the simple flow, folded 2026-11-22) resolves to the FINAL flow; the code defaults of the search
-    knobs (screen_candidates true, gate_every_candidate false) keep the screen / submit tool surface."""
+    """base.yaml (the simple flow, folded 2026-11-22; the only flow, no knobs since 2026-11-23) resolves to the FINAL
+    flow; absent tool keys keep the paper / screen tools on; tools.* false switches them off."""
     import yaml
     from lora_code.tools import search_settings, tools_for_mode
     simple = yaml.safe_load(open(REPO / "lora_code" / "configs" / "base.yaml"))
     ss = search_settings(simple)
     assert (ss["threads"], ss["steps"], ss["max_candidates"]) == (8, 1, 8)
-    assert not ss["screen_candidates"] and ss["gate_every_candidate"] and not ss["evaluate_tool"] and ss["pool"] == 0
+    assert set(ss) == {"threads", "steps", "max_candidates", "parallel_builds"}
     assert simple["decoding"]["screen"]["n"] == 4 and simple["decoding"]["gate"]["n"] == 4
     assert simple["editor"]["tool_rounds"] == 20 and simple["editor"]["explore"]["persistent"] is True
     new = {"screen_results", "screen_output", "save_edit", "load_edit", "list_edits", "drop_edit", "output_matrices",
@@ -77,11 +76,10 @@ def test_settings_and_tool_surface():
         t = tools_for_mode(mode, cfg=simple)
         assert new <= set(t) and "evaluate" not in t and "source='own'" in t["acts"]
         assert "vectors=None" in t["tensor_compute"] and "level='gate'" in t["compare"]
-    knobs = dict(simple, search={}, tools={"paper_tools": False})        # code defaults of the search knobs
-    old = search_settings(knobs)
-    assert old["screen_candidates"] and not old["gate_every_candidate"] and old["evaluate_tool"]
-    t = tools_for_mode("scratch", cfg=knobs)
-    assert not new & set(t) and "evaluate" in t and "source=" not in t["acts"]
+    bare = tools_for_mode("scratch", cfg=dict(simple, search={}, tools={}))   # absent keys: paper + screen tools on
+    assert new <= set(bare) and "evaluate" not in bare
+    t = tools_for_mode("scratch", cfg=dict(simple, tools={"paper_tools": False}))
+    assert not (new - {"screen_results", "screen_output"}) & set(t) and "evaluate" not in t and "source=" not in t["acts"]
     off = tools_for_mode("scratch", cfg=dict(simple, tools={"paper_tools": False, "screen_results": False}))
     assert not new & set(off)
 
@@ -250,21 +248,20 @@ def test_prompts_gate_mode_and_context():
     cfg = json.loads(json.dumps(SIMPLE))
     cfg["decoding"] = {"screen": {"n": 4, "thinking": True}, "gate": {"n": 4, "thinking": True}}
     cfg["gate"] = {"min_gain": 0.01, "require_significant": True}
-    sysmsg = system_prompt(cfg, budget={"evaluate": 0, "gpu_seconds": 300}, mode="scratch", gate_n=500)
+    sysmsg = system_prompt(cfg, budget={"gpu_seconds": 300}, mode="scratch", gate_n=500)
     assert "there is no api.evaluate" in sysmsg and "evaluated ONCE on a fixed hidden set of 500 items" in sysmsg
     assert "LARGEST gain" in sysmsg and "- evaluate(" not in sysmsg and "api.evaluate draws" not in sysmsg
     assert "source='own'" in sysmsg and "api.project_out" in sysmsg and "api.load_edit(name='best')['lora']" in sysmsg
     assert "answered by YOU (the current model) 4 time(s)" in sysmsg and "this generation's screen ids" in sysmsg
     assert "up to 20 rounds" in sysmsg and "share ONE Python session" in sysmsg
     cfg["editor"]["tool_rounds"] = 7                      # the round count is configurable (prompt follows it)
-    assert "up to 7 rounds" in system_prompt(cfg, budget={"evaluate": 0, "gpu_seconds": 300})
+    assert "up to 7 rounds" in system_prompt(cfg, budget={"gpu_seconds": 300})
     summ = {"n_items": 4, "samples_per_item": 4, "accuracy": 0.375, "correct_counts": {"0": 2, "2": 1, "4": 1},
             "truncation_rate": 0.0625, "truncated_thinking": 0, "failing": [{"id": "s/0", "gold": "0"}]}
     txt = screen_text(summ)
     assert "accuracy avg@4 0.375" in txt and '"s/0"' in txt and screen_text({}) == ""
-    ctx = ContextRenderer(task_text="T", diag_text="D", gate_mode=True, screen_text=txt, sessions=8,
-                          budget_fn=lambda: {"evaluate_tool": False, "evaluate": 0, "evaluate_left": 0,
-                                             "program_evaluate_calls": 0, "gpu_seconds": 300, "gpu_seconds_left": 300})
+    ctx = ContextRenderer(task_text="T", diag_text="D", screen_text=txt, sessions=8,
+                          budget_fn=lambda: {"gpu_seconds": 300, "gpu_seconds_left": 300})
     c = SimpleNamespace(cid="g00_t0_s00", thread=0, step=0, program="p", artifact={"strategy": "keep"}, error=None,
                         score=0.02, cost={}, full=None,
                         screen={"score": 0.02, "feedback": {"gate": {"passed": True, "gain": 0.02, "ci": [0.001, 0.04],

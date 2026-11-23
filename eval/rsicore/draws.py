@@ -15,10 +15,6 @@ from pathlib import Path
 
 from .config import ROOT
 
-# training-set names per domain (the raw datasets the simple_* sets come from); read only by gate.fixed_noise_band
-# (noise.fixed {dataset | domain: band}) and kept for older callers
-DOMAIN_TRAIN = {"math": ["dapo_math"], "code": ["taco_verified"], "knowledge": ["triviaqa_train"],
-                "instruction_following": ["ifeval_train"], "tool_calling": ["sealtool_train"]}
 ROLES = ("signal", "screen", "train", "kl")
 KL_N = 400                                          # kl role size (Paper A's generation-0 calibration texts)
 

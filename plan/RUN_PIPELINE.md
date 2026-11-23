@@ -54,7 +54,10 @@
 
 ```
 两篇相同：每代 search.threads × search.steps 个候选（默认 8 × 1），改造者每个候选最多 editor.tool_rounds 轮工具调用
-（一个持续的 Python 会话），最后写出一个程序（没有 api.evaluate）得到候选。
+（一个持续的 Python 会话），最后写出一个程序得到候选。
+这套流程是写死的，没有开关（2026-11-23 起旧的搜索开关 screen_candidates、gate_every_candidate、charge_screens、
+program_evaluate_*、max_evaluate、top_full、rerun_seeds、gate.max_submissions、噪声带、Paper A 的 kl_weight 都已删除，
+用 --set / --config 设成别的值会直接报错）：候选不筛题、没有 api.evaluate 和评测预算、搜索后不再复评或另行提交验收。
   1. 抽本代的 500 道筛题；最新模型答一次（每题 4 个样本），改造者在上下文里看到摘要，用 screen_results / screen_output
      看每道题和完整输出（含思考过程）；候选本身不做筛题
   2. 每个候选在验收集上评一次（500 × 4，和最新模型逐题配对），结果给之后的步骤 / 代看
@@ -72,7 +75,7 @@ Paper A（改造者冻结、体积固定、迭代被量化的模型）
     其余卡：候选服务池，每张卡（candidate_group_size）一个候选服务；同一步里各线程的候选同时导出、加载、评测
     第 0 代准备（校准、敏感度表、缓存、Hessian 误差表）、incumbent 的筛题和验收打分、留出评测都分到所有卡上
     1. 抽本代的筛题；incumbent（最新的量化模型）答筛题
-    2. 改造者写程序 → 量化配置 → 候选；每个候选一次验收，和 incumbent 逐题配对（search.kl_weight 0：不算 KL）
+    2. 改造者写程序 → 量化配置 → 候选；每个候选一次验收，和 incumbent 逐题配对（分数里没有 KL 项）
     3. 通过验收、增益最大的候选替换 incumbent：导出新 incumbent、做留出评测
 
 Paper B（每代 M_t 改自己，接受后成为下一代模型；method.mode，默认不训练）
@@ -82,7 +85,8 @@ Paper B（每代 M_t 改自己，接受后成为下一代模型；method.mode，
   edit         ：第 0 代训练一次 raw LoRA，之后每代编辑它（M_g = M_0 + 当前 LoRA，不合并）
   接受后（merge.mode）：merge（默认）把 LoRA 合并进权重、重启 vLLM 得 M_{t+1}；adapter 不合并，把接受过的 LoRA 按秩拼接成
                 一个累积 adapter，挂在 M_0 服务上
-  验收都和当前模型逐题配对（提升 ≥ gate.min_gain 且置信区间下界 > 0；edit 第 0 代和 raw 比）
+  验收：每个候选都和当前模型逐题配对（提升 ≥ gate.min_gain 且置信区间下界 > 0）；edit 第 0 代没有候选通过时，
+  raw LoRA 同样和当前模型验收一次，通过就接受（gate.fallback）
   main 卡：除 train 以外的所有卡，每张卡一份 M_t（数据并行副本）：所有候选 LoRA 加载到每份副本上，评测的题目分给各副本，
          改造者线程 k 用副本 k mod n；4 张卡 = 3 份副本
   train 卡（1 张）：raw LoRA 训练（edit 第 0 代）、程序里的奇异分解 / 激活统计、合并 LoRA

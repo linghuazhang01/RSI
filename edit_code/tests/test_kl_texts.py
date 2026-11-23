@@ -1,4 +1,4 @@
-"""Paper A KL / calibration texts: prompt + M_0's own response (kl.self_generated) and the per-candidate subset.
+"""Paper A calibration texts: prompt + M_0's own response (kl.self_generated; the block keeps its name `kl`).
 
   python -I -m pytest -q edit_code/tests/test_kl_texts.py
 """
@@ -9,12 +9,11 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO), str(REPO / "eval")]
 
-from edit_code.problem import QuantProblem, add_self_generated  # noqa: E402
+from edit_code.problem import add_self_generated  # noqa: E402
 
 
 class _Fake(BaseHTTPRequestHandler):
@@ -69,18 +68,6 @@ class SelfGeneratedTest(unittest.TestCase):
         again = add_self_generated(texts, endpoint, "m0", cfg, self.tmp / "c.jsonl")
         self.assertEqual(again, out)
         self.assertEqual((len(calls), len(_Fake.requests)), (1, 3))       # resume: no server, no request
-
-
-class EvalSubsetTest(unittest.TestCase):
-    def test_evenly_spaced_subset_keeps_every_domain(self):
-        texts = [(d, f"{d}{i}") for d in ("math", "code", "knowledge", "if", "tool") for i in range(50)]
-        prob = SimpleNamespace(kl_texts=texts, cfg={"kl": {"eval_texts": 25}})
-        sub = QuantProblem.kl_eval_texts(prob)
-        self.assertEqual(len(sub), 25)
-        self.assertEqual({d for d, _ in sub}, {"math", "code", "knowledge", "if", "tool"})
-        self.assertEqual(sum(d == "math" for d, _ in sub), 5)
-        prob.cfg = {"kl": {"eval_texts": None}}
-        self.assertEqual(QuantProblem.kl_eval_texts(prob), texts)
 
 
 if __name__ == "__main__":

@@ -1,15 +1,14 @@
-"""Paper A simple v2 (2026-11-21): scoring decoding, free screens + the api.evaluate pool, the 8 x 1 profile.
+"""Paper A simple v2 (2026-11-21): scoring decoding, the 8 x 1 profile, the hard-wired flow (2026-11-23).
 
     python3 -I -m pytest -q edit_code/tests/test_simple_v2.py
 
-- search_settings: the code defaults reproduce the old accounting; program_evaluate_calls null does not crash;
-- the real base.yaml (the folded simple profile, 2026-11-22) resolves to 8 threads x 1 step, 8 candidates, unscreened candidates with one gate
-  evaluation each, no api.evaluate, top_full 0, thinking decoding (screen / gate / held-out n 4), candidate servers at
-  32768 tokens and a persistent exploration session (FINAL flow, 2026-11-21);
-- make_tool_api(free_repeats=True): an already-evaluated config is free, the per-program cap and the pool hold,
-  failed calls cost nothing; without it every call costs one (as before);
+- search_settings: only the search shape (threads, steps, max_candidates; null = threads x steps);
+- the real base.yaml (the folded simple profile, 2026-11-22) resolves to 8 threads x 1 step, 8 candidates, thinking
+  decoding (screen / gate / held-out n 4), candidate servers at 32768 tokens and a persistent exploration session;
+  the removed search / gate / noise / KL knobs are absent and refused on --set (their hard-wired value is a no-op);
+- build_fn always runs the program; the tool API has no evaluate;
 - QuantProblem passes the stage decoding to every score() call, reuses records only under the same decoding, and
-  samples the incumbent's screen records once for all candidates.
+  samples the incumbent's screen records once for all evaluations.
 """
 from __future__ import annotations
 
@@ -44,36 +43,32 @@ def _mml(args):
     return int(args[args.index("--max-model-len") + 1])
 
 
+REMOVED_A = {"search": ("screen_candidates", "gate_every_candidate", "charge_screens", "program_evaluate_calls",
+                         "program_evaluate_total", "max_evaluate", "top_full", "rerun_seeds", "kl_weight"),
+             "gate": ("max_submissions",), "kl": ("eval_texts", "top_k")}
+
+
 def test_search_settings_defaults():
     from edit_code.common import search_settings
-    old = search_settings({"threads": 4, "steps": 6, "max_evaluate": 24, "program_evaluate_calls": 2, "top_full": 3})
-    assert old == {"threads": 4, "steps": 6, "max_candidates": 24, "charge_screens": True, "per_program": 2,
-                   "eval_budget": 24, "top_full": 3, "rerun_seeds": 0, "screen_candidates": True,
-                   "gate_every_candidate": False, "evaluate_tool": True}
-    # charged screens: max_evaluate still caps the candidates (the old max_candidates default)
-    assert search_settings({"threads": 4, "steps": 6, "max_evaluate": 12})["max_candidates"] == 12
-    assert search_settings({"threads": 2, "steps": 2, "max_evaluate": 4, "max_candidates": None})["max_candidates"] == 4
-    free = search_settings({"threads": 8, "steps": 1, "max_evaluate": 24, "charge_screens": False,
-                            "program_evaluate_calls": 2})
-    assert (free["max_candidates"], free["eval_budget"], free["per_program"]) == (8, 16, 2)   # 8 x 2
-    nocap = search_settings({"threads": 8, "steps": 1, "max_evaluate": 24, "charge_screens": False,
-                             "program_evaluate_calls": None})
-    assert (nocap["per_program"], nocap["eval_budget"]) == (None, 24)                          # no crash
-    assert search_settings({"threads": 3, "steps": 1, "max_evaluate": 4, "charge_screens": False,
-                            "program_evaluate_calls": None, "program_evaluate_total": 5})["eval_budget"] == 5
+    assert search_settings({"threads": 4, "steps": 6}) == {"threads": 4, "steps": 6, "max_candidates": 24}
+    assert search_settings({"threads": 2, "steps": 2, "max_candidates": None})["max_candidates"] == 4
+    assert search_settings({"threads": 8, "steps": 1, "max_candidates": 5})["max_candidates"] == 5
+    # a stale key of a removed knob is ignored here (rsicore.config refuses it on --set / --config)
+    assert search_settings({"threads": 3, "steps": 1, "max_evaluate": 1}) == {"threads": 3, "steps": 1,
+                                                                             "max_candidates": 3}
 
 
 def test_simple_profile_resolution(tmp_path):
-    """The real base.yaml (no mock overrides): 8 x 1, decoding, servers; the search knobs still switch flows."""
+    """The real base.yaml (no mock overrides): 8 x 1, decoding, servers; the removed knobs are gone."""
     from rsicore.config import stage_decoding
     from edit_code.common import search_settings
     from edit_code.run import server_args
     cfg, eff = _load(tmp_path, [])
-    # FINAL flow (2026-11-21): candidates not screened, one gate evaluation each, no api.evaluate
-    assert search_settings(cfg["search"]) == {"threads": 8, "steps": 1, "max_candidates": 8, "charge_screens": False,
-                                              "per_program": 0, "eval_budget": 0, "top_full": 0, "rerun_seeds": 0,
-                                              "screen_candidates": False, "gate_every_candidate": True,
-                                              "evaluate_tool": False}
+    # the hard-wired flow (2026-11-23): only the search shape is configured
+    assert search_settings(cfg["search"]) == {"threads": 8, "steps": 1, "max_candidates": 8}
+    for block, keys in REMOVED_A.items():
+        assert not set(keys) & set(cfg[block]), block
+    assert "noise" not in cfg and "noise" not in cfg["mock_overrides"]
     assert cfg["editor"]["explore"]["persistent"] is True
     assert stage_decoding(cfg, "screen", 42) == dict(THINK, n=4, seed=42)                   # the incumbent's screen
     assert stage_decoding(cfg, "full", 42) == dict(THINK, n=4, seed=42)                      # full = screen
@@ -91,114 +86,64 @@ def test_simple_profile_resolution(tmp_path):
         assert _mml(args) == 32768 and args.count("--max-model-len") == 1
         assert _mml(server_args(c, "editor_args")) >= 32768
     # --mock: mock_overrides (the small layout, 3 x 1) win over the profile
-    ms = search_settings(eff["search"])
-    assert (ms["threads"], ms["steps"], ms["max_candidates"], ms["charge_screens"], ms["per_program"],
-            ms["eval_budget"], ms["top_full"], ms["screen_candidates"], ms["gate_every_candidate"],
-            ms["evaluate_tool"]) == (3, 1, 3, False, 0, 0, 0, False, True, False)
-    # the search knobs (kept, 2026-11-22): charged screens cap the candidates at max_evaluate
-    tg, _ = _load(tmp_path / "tg", ["search.charge_screens=true", "search.screen_candidates=true",
-                                    "search.max_candidates=null", "search.threads=4", "search.steps=6",
-                                    "search.program_evaluate_calls=2", "decoding.screen=null"])
+    assert search_settings(eff["search"]) == {"threads": 3, "steps": 1, "max_candidates": 3}
+    tg, _ = _load(tmp_path / "tg", ["search.max_candidates=null", "search.threads=4", "search.steps=6",
+                                    "decoding.screen=null"])
     assert stage_decoding(tg, "screen", 42) is None
-    assert search_settings(tg["search"])["max_candidates"] == search_settings(tg["search"])["eval_budget"] == 24
+    assert search_settings(tg["search"])["max_candidates"] == 24
 
 
-# ---------------------------------------------------------------------------------- free screens + program pool
-def _problem(tmp, budget, cfg=None, n_gpus=2):
+@pytest.mark.parametrize("sets", [["search.screen_candidates=true"], ["search.gate_every_candidate=false"],
+                                  ["search.program_evaluate_calls=2"], ["search.max_evaluate=12"],
+                                  ["search.top_full=3"], ["search.kl_weight=0.1"], ["gate.max_submissions=3"],
+                                  ["noise.temperature=0.6"], ["noise.fixed=0.03"], ["kl.eval_texts=64"]])
+def test_removed_knobs_refused(tmp_path, sets):
+    with pytest.raises(SystemExit, match="removed"):
+        _load(tmp_path, sets)
+
+
+def test_removed_knobs_hardwired_value_is_noop(tmp_path):
+    from edit_code.common import search_settings
+    cfg, _ = _load(tmp_path, ["search.screen_candidates=false", "search.gate_every_candidate=true",
+                              "search.program_evaluate_calls=0", "search.top_full=0", "search.kl_weight=0",
+                              "noise.temperature=0"])
+    assert search_settings(cfg["search"]) == {"threads": 8, "steps": 1, "max_candidates": 8}
+    assert "noise" not in cfg and not set(REMOVED_A["search"]) & set(cfg["search"])
+
+
+# ---------------------------------------------------------------------------------- build_fn, tool API
+def _problem(tmp, budget=0, cfg=None, n_gpus=2):
     from edit_code.problem import QuantProblem
     rc = SimpleNamespace(mock=True, run_dir=tmp, run_id="t", seed=42, gpus=list(range(n_gpus)))
     base = {"gpu_layout": {"candidate_group_size": 1}, "candidates": {"keep_checkpoints": 1}}
     return QuantProblem(rc, dict(base, **(cfg or {})), tag="t", gen=1, out_dir=tmp / "p", prep_dir=tmp / "prep",
                         source_dir=None, source_state=None, budget_gib=10.0, datasets=["dapo_math"], data={},
-                        kl_texts=[], refs_dir=tmp / "refs", eval_budget=budget)
+                        kl_texts=[])
 
 
-def _fake_evaluate(prob, calls):
-    def fake(art, stage, cid, key, charged, origin):
-        calls.append((art["config_hash"], stage, charged))
-        rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "score": 0.5, "feedback": {},
-               "charged": charged}
-        with prob._lock:
-            prob._evals[key] = rec
-        return dict(rec)
-    return fake
-
-
-def test_free_screens_program_pool_and_cap(tmp_path, monkeypatch):
-    from rsicore.sandbox import BudgetExceeded
-    from edit_code.tools import ToolError, make_tool_api
-    prob = _problem(tmp_path, budget=3)                            # the generation's api.evaluate pool: 3
-    calls = []
-    monkeypatch.setattr(prob, "_evaluate", _fake_evaluate(prob, calls))
-
-    def ev(api, h):
-        return api.call("evaluate", {"config": {"config_hash": h}})
-    late = make_tool_api(prob, {}, cid="p4", per_program_evaluate=2, free_repeats=True)   # cap 2, made early
-    # automatic screens (charge=False) never spend the pool
-    for h in ("a", "b"):
-        prob.evaluate({"config_hash": h}, "screen", f"c{h}", charge=False)
-    assert prob.evals_used == 0 and prob.evals_left == 3
-    p1 = make_tool_api(prob, {}, cid="p1", per_program_evaluate=2, free_repeats=True)
-    assert ev(p1, "a")["cached"] is True and p1.spent["evaluate"] == 0      # already screened: free
-    assert ev(p1, "c")["cached"] is False and p1.spent["evaluate"] == 1
-    assert ev(p1, "c")["cached"] is True and p1.spent["evaluate"] == 1      # the same config again: free
-    ev(p1, "d")
-    with pytest.raises(BudgetExceeded):                                      # per-program cap 2
-        ev(p1, "e")
-    assert ("e", "screen", True) not in calls and prob.evals_used == 2
-    p2 = make_tool_api(prob, {}, cid="p2", per_program_evaluate=2, free_repeats=True)
-    assert p2.budget["evaluate"] == 1                                        # min(cap, pool left)
-    ev(p2, "e")
-    assert prob.evals_used == 3 and prob.evals_left == 0
-    p3 = make_tool_api(prob, {}, cid="p3", per_program_evaluate=2, free_repeats=True)
-    assert ev(p3, "a")["cached"] is True                                     # cached stays free with an empty pool
-    with pytest.raises(BudgetExceeded):
-        ev(p3, "f")
-    with pytest.raises(ToolError, match="exhausted"):                        # the pool is empty: refused, no charge
-        ev(late, "g")
-    assert late.spent["evaluate"] == 0 and prob.evals_used == 3
-    assert {h for h, st, ch in calls if ch} == {"c", "d", "e"}
-    # without free_repeats (charged screens, the old behaviour) every call costs one, cached or not
-    old = _problem(tmp_path / "old", budget=5)
-    monkeypatch.setattr(old, "_evaluate", _fake_evaluate(old, []))
-    api = make_tool_api(old, {}, cid="q", per_program_evaluate=2)
-    ev(api, "a")
-    ev(api, "a")
-    assert api.spent["evaluate"] == 2
-    with pytest.raises(BudgetExceeded):
-        ev(api, "a")
-    nocap = make_tool_api(old, {}, cid="r", per_program_evaluate=None, free_repeats=True)
-    assert nocap.budget["evaluate"] == old.evals_left                         # null per-program cap: the pool
-
-
-def test_programs_run_when_screens_are_free(tmp_path, monkeypatch):
-    """build_fn: with charged screens an empty budget refuses to run the program (as before); with free screens
-    the program always runs and its returned config is screened without charge."""
+def test_programs_always_run_no_evaluate_tool(tmp_path, monkeypatch):
+    """build_fn always runs the program (there is no evaluate budget) with an API that has no evaluate / compare; the
+    artifact's cost has no evaluate count."""
     from edit_code import run as RUN
-    prob = _problem(tmp_path, budget=0)
-    calls = []
-    monkeypatch.setattr(prob, "_evaluate", _fake_evaluate(prob, calls))
+    prob = _problem(tmp_path)
     monkeypatch.setattr(prob, "build", lambda result, cid: {"config_hash": f"h{cid}", "bytes_gib": 1.0})
+    apis = []
 
     class Res:
         ok, result, stdout, stderr, error, seconds, info = True, {"default": {"bits": 4}}, "", "", None, 0.1, {}
-    monkeypatch.setattr(RUN, "run_program", lambda *a, **k: Res())
+    monkeypatch.setattr(RUN, "run_program", lambda program, api, **k: apis.append(api) or Res())
     monkeypatch.setattr(RUN, "system_prompt", lambda *a, **k: "SYS")
     monkeypatch.setattr(RUN, "make_render_context", lambda *a, **k: (lambda h, t: "CTX"))
-    cfg = {"sandbox": {"timeout_s": 10, "mem_gb": 1}, "editor": {"tool_rounds": 0}, "feedback": {}}
+    cfg = {"sandbox": {"timeout_s": 10, "mem_gb": 1}, "editor": {"tool_rounds": 0}, "feedback": {},
+           "search": {"threads": 2, "steps": 1}}
     runner = SimpleNamespace(rc=SimpleNamespace(mock=True, seed=42), cfg=cfg, chat_tools=None,
                              search_history=lambda g: None)
-    for charge, want_run in ((True, False), (False, True)):
-        cfg["search"] = {"threads": 2, "steps": 1, "max_evaluate": 0, "charge_screens": charge,
-                         "program_evaluate_calls": 2}
-        fns = RUN.Runner.search_fns(runner, prob, tmp_path / f"g{charge}", None, archive="")
-        art, err = fns["build_fn"]("def main(api): pass", f"x{charge}")
-        assert (art is not None) == want_run, err
-        if want_run:
-            sc, fb = fns["screen_fn"](art, f"x{charge}")
-            assert sc == 0.5 and calls[-1] == (f"hx{charge}", "screen", False)
-        else:
-            assert "program not run" in err
+    fns = RUN.Runner.search_fns(runner, prob, tmp_path / "g", None, archive="")
+    assert set(fns) == {"editor_factory", "render_context", "build_fn", "screen_fn"}     # no full_fn
+    art, err = fns["build_fn"]("def main(api): pass", "x")
+    assert err is None and art is not None and "tool_evaluate" not in art["cost"]
+    assert not {"evaluate", "compare"} & set(apis[-1].names()) and apis[-1].budget == {}
+    assert not hasattr(prob, "evals_left") and not hasattr(prob, "screen_tools")
 
 
 # ---------------------------------------------------------------------------------- decoding + shared incumbent
@@ -212,7 +157,7 @@ def _real_problem(tmp_path, monkeypatch, cfg, captured):
                         source_dir=None, source_state=M.fresh_state(0.8), budget_gib=float("inf"),
                         datasets=["simple_math_pool"], gate_datasets=["simple_math_eval"],
                         data={"simple_math_pool": {"screen": ["a", "b"], "signal": ["a", "b"]}}, kl_texts=[],
-                        refs_dir=tmp_path / "refs", eval_budget=0, show_examples=0)
+                        show_examples=0)
     prob.prepare()
     monkeypatch.setattr(prob, "_ids", lambda ds, stage: ["a", "b"])
 
@@ -247,7 +192,7 @@ def test_decoding_passed_and_incumbent_shared(tmp_path, monkeypatch):
     cands = [dict(ref, lm_head=4), dict(ref, embed=4), dict(ref, embed="bf16")]   # ref: embed 8, lm_head 8
     scores = []
     for i, c in enumerate(cands):
-        r = prob.evaluate(c, "screen", f"g01_t{i}_s00", charge=False)
+        r = prob.evaluate(c, "screen", f"base_{i}", origin="baseline")
         scores.append(r["feedback"]["probes"]["math"]["incumbent"])
     assert len(captured) == 1 + len(cands)                         # the incumbent was not re-sampled
     assert [h for h, _, _ in captured].count(inc_hash) == 1
@@ -255,20 +200,22 @@ def test_decoding_passed_and_incumbent_shared(tmp_path, monkeypatch):
     inc_recs = (tmp_path / "gen" / "evals" / "incumbent" / "screen" / "simple_math_pool.jsonl").read_text()
     assert len(inc_recs.splitlines()) == 2 and set(scores) == {0.5}  # every candidate paired with the same records
     # gate: another dataset (simple_math_eval) -> scored, not reused; full -> reused
-    prob.evaluate(cands[0], "full", "g01_t0_s00", charge=False)
+    prob.evaluate(cands[0], "full", "base_0", origin="baseline")
     assert len(captured) == 1 + len(cands)
-    prob.evaluate(cands[0], "gate", "g01_t0_s00", charge=False, origin="gate")
+    prob.evaluate(cands[0], "gate", "g01_t0_s00", origin="gate")
     assert captured[-1][1:] == ("simple_math_eval", gate)
     recs = [json.loads(x) for x in (tmp_path / "gen" / "evals.jsonl").read_text().splitlines()]
     assert {json.loads(r["decoding"])["n"] for r in recs if r["stage"] == "gate"} == {4}
     assert {json.loads(r["decoding"])["n"] for r in recs if r["stage"] != "gate"} == {4}
+    assert not [r for r in recs if "charged" in r or "kl" in r["feedback"]]       # no evaluate budget, no KL
     # a reopened problem reuses the cached records only under the same decoding
+    h0 = prob.build(cands[0], "x")["config_hash"]
     again = _real_problem(tmp_path, monkeypatch, cfg, [])
-    assert again.evaluated(cands[0], "screen") and again.evaluated(cands[0], "gate")
+    assert (h0, "screen") in again._evals and (h0, "gate") in again._evals
     other = json.loads(json.dumps(cfg))
     other["decoding"]["screen"]["n"] = 2
     changed = _real_problem(tmp_path, monkeypatch, other, [])
-    assert not changed.evaluated(cands[0], "screen") and changed.evaluated(cands[0], "gate")
+    assert (h0, "screen") not in changed._evals and (h0, "gate") in changed._evals
 
 
 def test_greedy_records_unchanged(tmp_path, monkeypatch):
@@ -277,7 +224,7 @@ def test_greedy_records_unchanged(tmp_path, monkeypatch):
     captured = []
     prob = _real_problem(tmp_path, monkeypatch, cfg, captured)
     assert prob.decoding == {"screen": None, "full": None, "gate": None}
-    prob.evaluate(cfg["budget"]["reference"], "screen", "c0", charge=False)
+    prob.evaluate(cfg["budget"]["reference"], "screen", "c0", origin="baseline")
     assert captured[0][2] is None
     rec = json.loads((tmp_path / "gen" / "evals.jsonl").read_text().splitlines()[0])
     assert "decoding" not in rec

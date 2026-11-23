@@ -340,6 +340,7 @@ def test_search_history(tmp_path):
     assert rows["g01_t1_s00"]["gate"] == {"passed": False, "reason": "delta below min_delta"}
     assert rows["g01_t2_s00"]["error"] == "program failed: boom" and "what" not in rows["g01_t2_s00"]
     assert rows["g01_t0_s00"]["what"] == "A"
+    assert not any("full" in x for x in r["rows"])            # 2026-11-23: no full column (no full / rerun stage)
     r = json.loads(t.call("search_history", {"gen": 1, "sort": "order"}, ctx, 1, 0)["content"])
     assert [x["cid"] for x in r["rows"]] == ["g01_t0_s00", "g01_t1_s00", "g01_t2_s00"]
     small = ChatTools(lambda tag, ctx: sandbox.ToolAPI({}), result_chars=400, history=h)
@@ -537,7 +538,7 @@ def test_search_records_editor_reply_error(tmp_path, fake, monkeypatch):
                   transcript=tmp_path / "run" / "gen_01" / "editor" / f"thread_{th}.jsonl")
     out = search.inner_search(rc, 1, editor_factory=factory, render_context=lambda h, th: f"thread {th}",
                               build_fn=lambda prog, cid: ({"q": 0.5}, None), screen_fn=lambda a, cid: (0.5, {}),
-                              full_fn=lambda a, cid: (0.5, {}), threads=2, steps=2, max_candidates=4, top_full=0)
+                              threads=2, steps=2, max_candidates=4)
     by = {c.cid: c for c in out}
     assert by["g01_t0_s00"].error.startswith("editor failed") and by["g01_t0_s00"].program == ""
     assert by["g01_t1_s00"].error is None and by["g01_t1_s00"].cost["editor_stop"] == "answer"
@@ -744,8 +745,7 @@ def test_search_resume_keeps_editor_history(tmp_path, monkeypatch):
     def run(steps):
         return search.inner_search(rc, 1, editor_factory=factory, build_fn=lambda prog, cid: ({"q": 0.5}, None),
                                    render_context=lambda h, th: f"step {sum(c.thread == th for c in h)}",
-                                   screen_fn=screen, full_fn=lambda a, cid: (0.5, {}), threads=1, steps=steps,
-                                   max_candidates=10, top_full=0)
+                                   screen_fn=screen, threads=1, steps=steps, max_candidates=10)
     with pytest.raises(Crash):           # proposal 2 is in the transcript, its candidate is not recorded
         run(4)
     crash.update(screen=None, propose="step 3")

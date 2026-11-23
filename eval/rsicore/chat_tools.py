@@ -33,7 +33,7 @@ tag = f"{cid}~x{r:02d}_{i}" (r = round, i = index of the call in that turn). It 
   * (ToolAPI, cleanup, before_call) (2026-11-21): before_call(timeout_s) is called before every run (cleanup may
     be None),
   * a context manager whose __enter__ returns the ToolAPI.
-The factory must not register evaluate (or anything that spends a generation budget).
+The factory must not register anything that spends a generation budget.
 
 Persistent session (2026-11-21, persistent=True <- editor.explore.persistent; default False = the per-call mode
 above): ONE rsicore.sandbox.Kernel per proposal (keyed by ctx["cid"]), started lazily by the first run_python call;
@@ -74,7 +74,7 @@ from .sandbox import RESTARTED, Kernel, ToolAPI, run_program
 RUN_PYTHON_DOC = (
     "Run exploratory Python in the program sandbox (new process, no network, no files outside its own "
     "workdir). The same `api` object as in your final program is available as a global (call tools by "
-    "keyword: api.<tool>(...)); api.evaluate and other budget-spending tools are NOT available here. Write "
+    "keyword: api.<tool>(...)); budget-spending tools are NOT available here. Write "
     "top-level code: print() what you need, or set `result = ...` to get a JSON value back (defining "
     "main(api) also works). Filter big tables inside the code instead of printing them whole. Output is "
     "cut to a few thousand characters. Nothing persists between calls or into your final program.")
@@ -82,7 +82,7 @@ RUN_PYTHON_DOC_PERSISTENT = (
     "Run exploratory Python in a persistent sandbox session (no network, no files outside its own workdir), like a "
     "notebook kernel: variables, imports and functions you define stay available in your later run_python calls of "
     "this candidate. The same `api` object as in your final program is a global (call tools by keyword: "
-    "api.<tool>(...)); api.evaluate and other budget-spending tools are NOT available here. Write top-level code: "
+    "api.<tool>(...)); budget-spending tools are NOT available here. Write top-level code: "
     "print() what you need, or set `result = ...` to get a JSON value back (`result` is cleared before every call). "
     "Filter big tables inside the code instead of printing them whole. Output is cut to a few thousand characters. "
     "A call that runs past the time limit or crashes restarts the session (the reply says 'session restarted: "
@@ -163,7 +163,7 @@ class SearchHistory:
     """Earlier generations for the search_history / read_record chat tools (2026-11-21).
     past: {gen: directory} of the earlier generations' searches (candidates.jsonl, programs/, feedback/,
     gate.json); row_fn(record) -> dict: the paper's short summary of one candidates.jsonl record (artifact,
-    screen, full, score, error); key_fn(record) -> str | None: identity of the result (e.g. a config hash),
+    screen, score, error); key_fn(record) -> str | None: identity of the result (e.g. a config hash),
     used for same_as; gen_fn(gen, directory) -> dict: the paper's outcome of an earlier generation.
     SearchHistory({}) = no earlier generations (e.g. Paper A's generation 1): search_history then lists this
     step's candidates only."""
@@ -180,7 +180,7 @@ GATE_STATS = ("gain", "ci", "accuracy", "reference_accuracy", "broken", "fixed",
 
 def _gate_outcomes(d: Path, cids=None) -> dict:
     """cid -> {"passed": bool, "reason": str, + GATE_STATS present in info} from <d>/gate.json
-    (rsicore.search.submit_to_gate, or a paper's gate-per-candidate records); cids: only these."""
+    (a paper's gate-per-candidate records); cids: only these."""
     out = {}
     for sub in (read_json(Path(d) / "gate.json", None) or {}).get("submissions") or []:
         if cids is not None and str(sub.get("cid")) not in cids:
@@ -452,16 +452,15 @@ class ChatTools:
         gd = ctx.get("gen_dir")
         if gd and visible:
             recs = {r.get("cid"): r for r in read_jsonl(Path(gd) / "candidates.jsonl")}
-            # gate results of this generation's visible (earlier-step) candidates, when a paper gates every
-            # candidate during the search (2026-11-21); empty otherwise (gate.json is written after the search)
+            # gate results of this generation's visible (earlier-step) candidates: the papers gate every
+            # candidate during the search (2026-11-21; the only flow since 2026-11-23)
             groups.append((cur, [recs[c] for c in visible if c in recs], _gate_outcomes(Path(gd), set(visible))))
         seen, rows = {}, []
         for g, recs, gate in groups:           # oldest first, so same_as names the first one tried
             for r in recs:
                 cid = str(r.get("cid"))
-                sc, fu = r.get("screen") or {}, r.get("full") or {}
-                row = {"cid": cid, "gen": g, "score": _num(r.get("score")), "screen": _num(sc.get("score")),
-                       "full": _num(fu.get("score"))}
+                sc = r.get("screen") or {}      # (2026-11-23) no "full" column: the full / rerun stage was removed
+                row = {"cid": cid, "gen": g, "score": _num(r.get("score")), "screen": _num(sc.get("score"))}
                 err = (r.get("error") or "").strip()
                 if err:
                     row["error"] = cut(err.splitlines()[0], 140, head=1.0)

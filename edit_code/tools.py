@@ -8,32 +8,26 @@
     activation_table()    rows {layer, group, module, input, rms_mean, rms_max_over_median, absmax_over_median,
                                 outlier_frac, red_flag}
     group_error(config)   per-group Hessian-weighted error of a config + the groups with the largest share
-    compare(cid, other)   item-level comparison of two evaluated candidates (default other = the incumbent):
-                          flips with ids, by output length, truncation; no item content
     bytes_table()         rows {key, layer, group, params, modules, mib: {"b4_g128": ..., "bf16": ...}}
     bytes(config)         packed size of a config {gib, total_bytes, linear_avg_bits, by_group_gib, fits_budget}
-    evaluate(config)      build the candidate and run the screen evaluation -> L1 feedback   [cost: evaluate=1]
-                          (free_repeats, 2026-11-21: free for a config already evaluated; see make_tool_api)
     solve_allocation(...) knapsack over the profile table -> config (removable: tools.solve_allocation=false)
-Invalid configs raise a tool error whose message lists every problem (schema.ConfigError).
-
-Reference screen + gate per candidate (2026-11-21, base.yaml default: search.screen_candidates false):
     screen_results(ids, filter, limit, offset)  the incumbent's (latest model's) answers to this round's screen items:
                           prompt, gold, per-sample scores / extracted answers / finish / lengths (rsicore.screen_view)
     screen_output(id, sample, offset)            one sample's full output text (thinking + answer) in pages
-compare is then not registered (candidates have no screen records) and evaluate_tool=False
-(search.program_evaluate_calls 0) removes evaluate from the program API, its docs and the prompt.
+Invalid configs raise a tool error whose message lists every problem (schema.ConfigError).
+No tool evaluates a config (2026-11-23, the hard-wired flow): candidates are never screened, every returned config gets
+ONE gate evaluation outside the program (run.gate_candidate); there is no api.evaluate, no evaluate budget and no
+compare (candidates have no screen records).
 
 explore=True (2026-11-21): the API of the editor's run_python chat tool (rsicore.chat_tools), used while it
-writes a candidate. evaluate is NOT registered (it would take a candidate slot and spend the generation's
-evaluate budget; describe() does not list it), and group_error refuses settings whose Hessian-weighted error
-is not cached yet (lazy GPTQ / AWQ on the GPU) unless editor.explore.gpu_tools is true.
+writes a candidate: the same tools, except that group_error refuses settings whose Hessian-weighted error is not
+cached yet (lazy GPTQ / AWQ on the GPU) unless editor.explore.gpu_tools is true.
 """
 from __future__ import annotations
 
 from .allocation import solve_allocation as _solve
 from .diagnostics import summarize_profile
-from .problem import EvalBudgetExhausted, QuantProblem
+from .problem import QuantProblem
 from .quant import schema
 
 
@@ -41,26 +35,15 @@ class ToolError(RuntimeError):
     pass
 
 
-def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_evaluate: int | None,
-                  explore: bool = False, free_repeats: bool = False, evaluate_tool: bool = True):
-    """The program's API. Its evaluate budget = min(per_program_evaluate, the problem's evaluate budget left);
-    per_program_evaluate None = no per-program cap. free_repeats (2026-11-21, search.charge_screens false: the
-    automatic screens are free and problem.evals_left is the generation's api.evaluate pool): an api.evaluate of a
-    config already evaluated in this generation is free (no pool, no per-program charge), and a call that fails
-    (invalid config, empty pool) costs nothing. Without free_repeats every call costs one (as before).
-    evaluate_tool False (2026-11-21, search.program_evaluate_calls 0 with uncharged screens): no evaluate tool.
-    problem.screen_tools (search.screen_candidates false): screen_results / screen_output are registered (also when
-    exploring) and compare is not."""
-    from rsicore.sandbox import BudgetExceeded, ToolAPI
+def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, explore: bool = False):
+    """The program's API (cid: the candidate id, or the exploration tag). No tool spends a budget. explore (the
+    editor's run_python): group_error only on cached settings unless editor.explore.gpu_tools."""
+    from rsicore.sandbox import ToolAPI
     tcfg = cfg.get("tools", {})
     gpu_tools = bool(((cfg.get("editor") or {}).get("explore") or {}).get("gpu_tools", False))
-    cap = problem.evals_left if per_program_evaluate is None else min(int(per_program_evaluate), problem.evals_left)
-    evaluate_tool = bool(evaluate_tool) and not explore
-    api = ToolAPI({"evaluate": max(0, cap)} if evaluate_tool else {})
-    screen_tools = bool(getattr(problem, "screen_tools", False))
+    api = ToolAPI({})
     out_chars = int(tcfg.get("screen_output_chars", 4000))
     spec = problem.spec
-    calls = {"evaluate": 0}
 
     def model_info():
         """Architecture, budget, action space, the incumbent config (best so far) and tool list."""
@@ -76,8 +59,7 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
                 "allowed_bits": problem.space["bits"], "group_sizes": problem.space["group_sizes"],
                 "quantizers": problem.space["quantizers"], "embed_options": problem.space["embed"],
                 "incumbent_config": (problem.incumbent or {}).get("config"),
-                "incumbent_scores": problem.incumbent_scores,
-                **({"evaluate_left": problem.evals_left} if evaluate_tool else {}), "tools": api.names()}
+                "incumbent_scores": problem.incumbent_scores, "tools": api.names()}
 
     def profile_table():
         """Whole-model DeltaKL when ONLY this module group is RTN-quantized (original model = reference)."""
@@ -112,19 +94,6 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         except schema.ConfigError as e:
             raise ToolError(str(e)) from None
 
-    def compare(cid: str, other: str = "incumbent", stage: str = "screen"):
-        """Compare two evaluated candidates item by item on the same items (default other = the incumbent;
-        stage screen | full): per dataset accuracy of both, broken (other right, cid wrong) / fixed counts and
-        ids, flips by the other's output length (short / medium / long), truncation rate, mean output length.
-        Ids and statistics only (no item content). cid = a candidate id from the table, or '<cid>_e<k>' for
-        api.evaluate calls."""
-        if stage not in ("screen", "full"):
-            raise ToolError("stage must be 'screen' or 'full'")
-        try:
-            return problem.compare(str(cid), str(other), stage)
-        except ValueError as e:
-            raise ToolError(str(e)) from None
-
     def bytes_table():
         """Packed MiB of every group key for each (bits, group size)."""
         return problem.tables["bytes"]
@@ -138,32 +107,6 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         return {"gib": round(b["gib"], 4), "total_bytes": b["total_bytes"], "linear_avg_bits": round(b["linear_avg_bits"], 3),
                 "by_group_gib": {k: round(v, 4) for k, v in b["by_group_gib"].items()},
                 "budget_gib": problem.budget_gib, "fits_budget": b["gib"] <= problem.budget_gib + 1e-9}
-
-    def evaluate(config):
-        """Build this config as a candidate and run the screen evaluation (KL + screen items); returns
-        the same structured feedback you get for submitted programs. Uses one evaluate."""
-        calls["evaluate"] += 1
-        if free_repeats and not problem.evaluated(config, "screen"):
-            left = api.remaining().get("evaluate", 0)
-            if left < 1:
-                raise BudgetExceeded(f"budget 'evaluate' exhausted for this program: {api.spent.get('evaluate', 0):g} "
-                                     f"of {api.budget.get('evaluate', 0):g} api.evaluate calls used (a config "
-                                     "already evaluated stays free)")
-        try:
-            r = problem.evaluate(config, "screen", f"{cid}_e{calls['evaluate']}", origin=f"tool:{cid}")
-        except schema.ConfigError as e:
-            raise ToolError(str(e)) from None
-        except (ValueError, EvalBudgetExhausted) as e:
-            raise ToolError(str(e)) from None
-        if free_repeats and not r.get("cached"):
-            api.charge("evaluate", 1)
-        return {"score": r["score"], "cached": bool(r.get("cached")), **r["feedback"]}
-
-    if free_repeats:
-        evaluate.__doc__ = ("Build this config as a candidate and run the screen evaluation (KL + screen items); "
-                            "returns the same structured feedback your returned config gets. Uses one api.evaluate "
-                            "of this program's allowance and of the round's pool; a config already evaluated this "
-                            "round (by anyone, incl. returned candidates) is free and returns its cached result.")
 
     def screen_results(ids: list = None, filter: str = "all", limit: int = 50, offset: int = 0, gen: int = None):
         """The incumbent's (latest model's) answers to this round's screen items (held-back TRAINING items, k sampled
@@ -231,15 +174,10 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, per_program_eva
         api.register("hessian_table", hessian_table)
     if tcfg.get("group_error", True):
         api.register("group_error", group_error)
-    if tcfg.get("compare", True) and not screen_tools:
-        api.register("compare", compare)
-    if screen_tools:
-        api.register("screen_results", screen_results)
-        api.register("screen_output", screen_output)
+    api.register("screen_results", screen_results)
+    api.register("screen_output", screen_output)
     api.register("bytes_table", bytes_table)
     api.register("bytes", bytes)
-    if evaluate_tool:
-        api.register("evaluate", evaluate, cost={} if free_repeats else {"evaluate": 1})
     if tcfg.get("solve_allocation", True):
         api.register("solve_allocation", solve_allocation)
     return api

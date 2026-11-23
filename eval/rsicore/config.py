@@ -7,7 +7,14 @@ run_config.yaml is written on the first run of a run-id and locked: later runs w
 paper / domain / model / seed / mock / paper_cfg are refused. `gens` and `gpus` may change
 (extending a run, moving machines); the stored values are updated. The paper_cfg comparison ignores the keys of
 removed features (LOCK_IGNORED_*, 2026-11-22: objective / scope profiles, data sizes, data roles, retention, E_t,
-eval_target, draw_config), so runs made before their removal resume with the same command.
+eval_target, draw_config; 2026-11-23: the search / gate / noise-band / KL-score knobs of REMOVED_KNOBS), so runs made
+before their removal resume with the same command.
+
+The search flow is hard-wired (2026-11-23): candidates are never screened, every candidate gets ONE gate evaluation
+during the search (paired vs the current model), the passing candidate with the largest paired gain is accepted; no
+api.evaluate, no full / rerun stage, no submissions after the search, no noise band, no KL score term. The knobs of
+the removed variants (REMOVED_KNOBS) are refused on --set / --config unless given their hard-wired value (a no-op),
+and a lock that used another value cannot be resumed.
 
 One flow (2026-11-22, formerly `objective: simple` + `scope: single`): train role simple_<d>_pool, gate
 simple_<d>_eval, held-out simple_<d>_test (rsicore.draws / rsicore.heldout). The default run id keeps the old
@@ -15,6 +22,7 @@ suffix: <paper>_<domain>_s<seed>_single_simple[_mock].
 """
 import argparse
 import copy
+import json
 import os
 import sys
 import time
@@ -36,7 +44,30 @@ LOCK_IGNORED_KEYS = frozenset({
     "objective", "objective_profiles", "scope", "scope_profiles", "mock_objective_overrides", "data", "data_roles",
     "eval_target", "draw_config", "e_t", "e_task", "e_ref", "e_branch", "kl_contexts", "lambda_kl", "kl_limit"})
 LOCK_IGNORED_TOKENS = ("retention", "theta0", "regmean")
-LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval")
+# 2026-11-23: knobs of the removed search / gate variants, the noise band and Paper A's KL score term, by dotted path
+# (also matched under mock_overrides.) -> the values equal to the hard-wired flow. --set / --config of such a key is
+# dropped as a no-op when its value is one of these and refused otherwise (an empty tuple: always refused). Whole
+# removed blocks: REMOVED_BLOCKS (any key under them is a removed knob; the block given as null is a no-op).
+REMOVED_KNOBS = {
+    "search.screen_candidates": (False,), "search.gate_every_candidate": (True,), "search.charge_screens": (False,),
+    "search.program_evaluate_calls": (0,), "search.program_evaluate_total": (0, None), "search.max_evaluate": (),
+    "search.top_full": (0,), "search.rerun_seeds": (0,), "gate.max_submissions": (),
+    "search.kl_weight": (0,), "kl.eval_texts": (), "kl.top_k": (20,),                # Paper A KL score term
+    "noise.repeats": (), "noise.temperature": (0,), "noise.top_p": (), "noise.n": (), "noise.fixed": (None,),
+    "baseline.noise_repeats": (), "baseline.noise_temperature": (0,), "baseline.noise_top_p": (),
+    "baseline.noise_n": (), "baseline.noise_fixed": (None,),                         # Paper B noise band
+    "gate.use_noise_band": (), "gate.reference": ("auto", "parent"), "gate.epsilon": ()}   # Paper B raw reference
+REMOVED_BLOCKS = ("noise",)                                                          # Paper A's noise: block
+# removed knobs whose locked value is checked (_removed_features_used): another explicit value changed the search
+LOCK_REFUSED_KNOBS = ("search.screen_candidates", "search.gate_every_candidate", "search.program_evaluate_calls",
+                      "search.top_full", "search.rerun_seeds", "search.kl_weight", "noise.temperature", "noise.fixed",
+                      "baseline.noise_temperature", "baseline.noise_fixed")
+_REMOVED_LOCK_PATHS = tuple(REMOVED_KNOBS) + REMOVED_BLOCKS
+LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval") + _REMOVED_LOCK_PATHS + tuple(
+    f"mock_overrides.{p}" for p in _REMOVED_LOCK_PATHS)
+HARDWIRED_FLOW = ("candidates are never screened; every candidate gets one gate evaluation during the search, paired "
+                  "vs the current model; the passing candidate with the largest paired gain is accepted; no "
+                  "api.evaluate, full / rerun stage, gate submissions after the search, noise band or KL score term")
 LOCK_DEFAULTS = {"simple.screen_n": 500}
 # --set / --config values of the removed selectors that are accepted as no-ops (the one remaining flow)
 LEGACY_SELECTORS = {"objective": "simple", "scope": "single"}
@@ -278,6 +309,51 @@ def _check_removed(key: str, where: str) -> None:
                          f"simple_<domain>_pool / _eval / _test)" + (f"; use {alt}" if alt else ""))
 
 
+def _removed_knob(path: str) -> str | None:
+    """The REMOVED_KNOBS path (or a path under a REMOVED_BLOCKS block) that dotted `path` names, also under
+    mock_overrides.; None for a live key."""
+    p = path[len("mock_overrides."):] if path.startswith("mock_overrides.") else path
+    return p if (p in REMOVED_KNOBS or p.split(".")[0] in REMOVED_BLOCKS) else None
+
+
+def _is_noop(rp: str, value) -> bool:
+    """value is a hard-wired value of removed knob rp (booleans only match booleans, None only None, numbers by
+    value: 0 == 0.0)."""
+    for v in REMOVED_KNOBS.get(rp, (None,) if rp in REMOVED_BLOCKS else ()):
+        if isinstance(v, bool) or isinstance(value, bool) or v is None or value is None:
+            if type(v) is type(value) and v == value:
+                return True
+        elif value == v:
+            return True
+    return False
+
+
+def _clean_removed(value, path: str, where: str):
+    """(keep, value) for a --set / --config value at dotted `path` (2026-11-23): a removed knob with its hard-wired
+    value -> (False, None) (a no-op, dropped); with another value -> SystemExit; mappings are cleaned key by key."""
+    rp = _removed_knob(path) if path else None
+    if rp is not None:
+        if rp in REMOVED_BLOCKS and isinstance(value, dict):
+            for k, v in value.items():
+                _clean_removed(v, f"{path}.{k}", where)
+            return False, None
+        if _is_noop(rp, value):
+            print(f"[rsicore] note: {where} {path}={value!r} is the hard-wired value of a removed knob (2026-11-23); "
+                  "ignored", file=sys.stderr)
+            return False, None
+        noop = REMOVED_KNOBS.get(rp, ())
+        raise SystemExit(f"{where}: {path}={value!r}: this knob was removed (2026-11-23; {HARDWIRED_FLOW})"
+                         + (f"; only {noop[0]!r} is accepted (a no-op)" if noop else "") + ". Drop the setting.")
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            keep, nv = _clean_removed(v, f"{path}.{k}" if path else str(k), where)
+            if keep:
+                out[k] = nv
+        return True, out
+    return True, value
+
+
 def _lock_ignored(key: str, path: str) -> bool:
     return key in LOCK_IGNORED_KEYS or any(t in key for t in LOCK_IGNORED_TOKENS) or path in LOCK_IGNORED_PATHS
 
@@ -322,10 +398,39 @@ def lock_view(cfg: dict | None) -> dict:
     return _strip_ignored(c)
 
 
-def _removed_features_used(ocfg: dict, domain: str) -> list[str]:
-    """Removed features (2026-11-22) a locked paper_cfg actually used: E_t on, retention domains, data_roles other
-    than the fixed simple sets. The lock view ignores these keys, so they are checked by value here."""
+_ABSENT = object()
+
+
+def _get_path(cfg: dict, path: str):
+    d = cfg
+    for part in path.split("."):
+        if not isinstance(d, dict) or part not in d:
+            return _ABSENT
+        d = d[part]
+    return d
+
+
+def _removed_features_used(ocfg: dict, domain: str, mock: bool = False) -> list[str]:
+    """Removed features a locked paper_cfg actually used: E_t on, retention domains, data_roles other than the fixed
+    simple sets (2026-11-22); an explicit LOCK_REFUSED_KNOBS value other than the hard-wired flow's (2026-11-23:
+    screened candidates, no gate per candidate, api.evaluate, a full / rerun stage, a KL score term, a sampled or
+    fixed noise band), read with mock_overrides applied when the lock is a mock run. Absent knobs are not refused
+    (every lock made since they were added to base.yaml has them). The lock view ignores these keys, so they are
+    checked by value here."""
     out = []
+    eff = ocfg
+    if mock:        # the effective mock values: mock_overrides, then the former mock_objective_overrides.simple
+        mo = ocfg.get("mock_overrides") if isinstance(ocfg.get("mock_overrides"), dict) else {}
+        moo = ocfg.get("mock_objective_overrides")
+        moo = moo.get("simple") if isinstance(moo, dict) else None
+        if isinstance(moo, dict):
+            mo = _deep_merge(mo, moo)
+        if mo:
+            eff = _deep_merge(ocfg, mo)
+    for path in LOCK_REFUSED_KNOBS:
+        v = _get_path(eff, path)
+        if v is not _ABSENT and not _is_noop(path, v):
+            out.append(f"{path} {v!r}")
     for k in ("e_t", "e_task"):
         if isinstance(ocfg.get(k), dict) and ocfg[k].get("enabled"):
             out.append(f"{k}.enabled true")
@@ -366,11 +471,19 @@ def load_run_config(paper: str, args) -> RunConfig:
                 sets.append(f"simple.screen_n={v}")
                 continue
             _check_removed(k.strip(), "--set")
+            if eq:                                      # removed search / gate / noise / KL knobs (2026-11-23)
+                val = yaml.safe_load(v)
+                keep, nv = _clean_removed(val, k.strip(), "--set")
+                if not keep:
+                    continue
+                if nv != val:
+                    it = f"{k.strip()}={json.dumps(nv)}"
             sets.append(it)
     files = _load_config_files(getattr(args, "config", None))
     for f in files:
         for k in f:
             _check_removed(k, "--config")
+    files = [_clean_removed(f, "", "--config")[1] for f in files]
     for f in files:                              # a config file's hardware selects the profile
         cfg.update({k: f[k] for k in PROFILE_KEYS if f.get(k) is not None})   # (--set key=... still wins)
     cfg = _apply_hardware(cfg, sets)
@@ -401,10 +514,10 @@ def load_run_config(paper: str, args) -> RunConfig:
             if ocfg.get(k) not in (None, want):
                 raise SystemExit(f"{lock} was made with {k} {ocfg[k]!r}, which was removed (2026-11-22); "
                                  "it cannot be resumed. Use a new --run-id.")
-        used = _removed_features_used(ocfg, rc.domain)
+        used = _removed_features_used(ocfg, rc.domain, mock=bool(old.get("mock")))
         if used:
-            raise SystemExit(f"{lock} was made with {', '.join(used)}, removed 2026-11-22; it cannot be resumed. "
-                             "Use a new --run-id.")
+            raise SystemExit(f"{lock} was made with {', '.join(used)}, removed (2026-11-22 / 2026-11-23); it cannot "
+                             "be resumed. Use a new --run-id.")
         lines = [f"  {k}: locked={old.get(k)!r} now={new[k]!r}" for k in LOCKED
                  if k != "paper_cfg" and old.get(k) != new[k]]
         lines += [f"  paper_cfg.{d}" for d in _diff_paths(lock_view(ocfg), lock_view(cfg))]

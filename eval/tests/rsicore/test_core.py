@@ -4,10 +4,11 @@
 
 Covers: RunState resume, ToolAPI budgets (fixed, measured cost_fn, dedupe), sandbox (tool round trip, timeout kill, budget exceeded,
 error propagation, environment isolation, file/subprocess/network denial), Editor with mock_policy
-(transcript + replay), inner_search / submit_to_gate with toy functions (resume, out_dir), the per-generation draws
-of simple_<d>_pool in a temp run dir, evaluate.score / paired_delta / token_kl / run_heldout (simple_<d>_test) against
-the mock server, per-domain mock quality (target up, other domain down), measure_noise_band (greedy: nothing re-run,
-band 0; > 0 sampled), gate helpers, and the end-to-end toy paper (twice: the second run must skip everything).
+(transcript + replay), inner_search with toy functions (resume, out_dir), the per-generation draws
+of simple_<d>_pool in a temp run dir, evaluate.score / paired_delta / run_heldout (simple_<d>_test) and the mock
+server's prompt_logprobs (Paper B's train_loss) against the mock server, per-domain mock quality (target up, other
+domain down), sampled mock answers depending on the seed, gate helpers, and the end-to-end toy paper (twice: the
+second run must skip everything).
 """
 import argparse
 import json
@@ -189,7 +190,7 @@ def test_editor_mock():
 
 def test_inner_search_resume():
     rc = make_rc("search")
-    calls = {"build": 0, "screen": 0, "full": 0}
+    calls = {"build": 0, "screen": 0}
     crash = {"at": "g00_t1_s01"}
 
     def factory(th):
@@ -212,12 +213,8 @@ def test_inner_search_resume():
             raise RuntimeError("simulated crash")
         return art["q"], {"note": "screen " + cid}
 
-    def full(art, cid):
-        calls["full"] += 1
-        return art["q"] + 0.01, {"note": "full " + cid}
-
-    kw = dict(editor_factory=factory, render_context=render, build_fn=build, screen_fn=screen, full_fn=full,
-              threads=2, steps=3, max_candidates=5, top_full=2, rerun_seeds=1)
+    kw = dict(editor_factory=factory, render_context=render, build_fn=build, screen_fn=screen,
+              threads=2, steps=3, max_candidates=5)
     try:
         search.inner_search(rc, 0, **kw)
         raise AssertionError("crash not propagated")
@@ -226,30 +223,31 @@ def test_inner_search_resume():
     n_before = len(records.read_jsonl(records.gen_dir(rc, 0) / "candidates.jsonl"))
     check(n_before == 3, f"expected 3 recorded before crash, got {n_before}")
     crash["at"] = None
-    calls.update(build=0, screen=0, full=0)
+    calls.update(build=0, screen=0)
     out = search.inner_search(rc, 0, **kw)
-    check(len(out) == 5 and calls["build"] == 2, f"resume rebuilt: {calls}, n={len(out)}")
-    check(calls["full"] == 4, f"full + rerun calls: {calls}")
+    check(len(out) == 5 and calls["build"] == 2 and calls["screen"] == 2, f"resume rebuilt: {calls}, n={len(out)}")
     gd = records.gen_dir(rc, 0)
     check(all((gd / "programs" / f"{c.cid}.py").exists() and (gd / "feedback" / f"{c.cid}.json").exists() for c in out),
           "programs/feedback files")
-    check(out[0].full is not None and out[0].score == out[0].full["score"], "ranking by full score")
+    check(all(c.full is None and c.score == (c.screen or {}).get("score") for c in out), "score = screen score")
+    check([c.cid for c in out] == [c.cid for c in search.ranked(out)] and out[0].score == max(
+        c.score for c in out if c.score is not None), "ranking by score")
+    rec = records.read_jsonl(gd / "candidates.jsonl")[0]
+    check(set(rec) == {"cid", "thread", "step", "program", "artifact", "error", "screen", "full", "score", "cost"},
+          f"record keys {sorted(rec)}")
+    import inspect
+    check(not {"full_fn", "top_full", "rerun_seeds"} & set(inspect.signature(search.inner_search).parameters)
+          and not hasattr(search, "submit_to_gate"), "removed search API")
     err = [c for c in out if c.error]
     check(len(err) == 1 and err[0].screen is None, "error candidate")
-    calls.update(build=0, screen=0, full=0)
+    calls.update(build=0, screen=0)
     out2 = search.inner_search(rc, 0, **kw)
     check(sum(calls.values()) == 0 and [c.cid for c in out2] == [c.cid for c in out], f"third run did work: {calls}")
-    seen = []
-
-    def gate_fn(c):
-        seen.append(c.cid)
-        return len(seen) == 2, {"n": len(seen)}
-
-    acc = search.submit_to_gate(rc, 0, out, gate_fn, max_submissions=3)
-    check(acc is not None and acc.cid == seen[1], "gate acceptance")
-    acc2 = search.submit_to_gate(rc, 0, out, gate_fn, max_submissions=3)
-    check(acc2.cid == acc.cid and len(seen) == 2, "gate resume resubmitted")
-    return f"5 candidates, resume skipped {n_before}, top={out[0].cid} score={out[0].score:.3f}, accepted={acc.cid}"
+    calls.update(build=0, screen=0)
+    rc2 = make_rc("search_default_max")
+    out3 = search.inner_search(rc2, 0, **dict(kw, max_candidates=None, steps=2))     # None = threads x steps
+    check(len(out3) == 4, f"max_candidates None: {len(out3)} candidates")
+    return f"5 candidates, resume skipped {n_before}, top={out[0].cid} score={out[0].score:.3f}"
 
 
 def test_draws():
@@ -292,16 +290,15 @@ def test_evaluate_mock():
         check(0.2 <= b.accuracy <= 0.4, f"weak accuracy {b.accuracy}")
         d = evaluate.paired_delta(a.records, b.records)
         check(d["n"] == 400 and d["ci"][0] <= d["delta"] <= d["ci"][1] < 0, f"paired delta {d}")
-        texts = ["Compute 2+2 and explain.", "The capital of France is Paris, isn't it?", "def f(x): return x * 2"]
-        cache = evaluate.reference_logprobs(srv.endpoint, "base", texts, rc.run_dir / "kl" / "ref.jsonl")
-        k_self = evaluate.token_kl(cache, srv.endpoint, "base", texts)
-        k_weak = evaluate.token_kl(cache, srv.endpoint, "base", texts, lora="weak")
-        records.write_json(reg, {"base": 0.8, "weak": 0.3, "mid": 0.6})
-        (rc.run_dir / "mid_lora").mkdir(exist_ok=True)
-        srv.load_lora("mid", rc.run_dir / "mid_lora")
-        k_mid = evaluate.token_kl(cache, srv.endpoint, "base", texts, lora="mid")
-        check(k_self["mean"] < 1e-9 < k_mid["mean"] < k_weak["mean"], f"KL order {k_self['mean']} {k_mid['mean']} {k_weak['mean']}")
-        srv.unload_lora("mid")
+        # prompt_logprobs on /v1/completions (Paper B's train_loss reads them; rsicore has no token KL since 2026-11-23)
+        from rsicore import _net
+        plp = {}
+        for name in ("base", "weak"):
+            r = _net.post_json(srv.endpoint.rstrip("/") + "/completions", {"model": name, "prompt": "Compute 2+2 now.",
+                               "max_tokens": 1, "temperature": 0.0, "prompt_logprobs": 1}, timeout=60)
+            plp[name] = r["choices"][0]["prompt_logprobs"]
+        check(plp["base"][0] is None and len(plp["base"]) > 3 and all(isinstance(x, dict) and x for x in plp["base"][1:])
+              and plp["base"] != plp["weak"], "mock prompt_logprobs")
         dom = heldout.heldout_domains(rc.paper_cfg, rc.domain)
         check(dom == "eval:simple_math_test", dom)
         h = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout", domains=dom, mock=True, limit=5)
@@ -312,12 +309,9 @@ def test_evaluate_mock():
         hc = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout_code", domains="eval:simple_code_test",
                                  mock=True, limit=3)
         check(hc["simple_code_test"]["n_pending"] == 3, f"code pending {hc}")
-    runs = [a.records, b.records]
-    check(abs(gate.noise_band(runs) - (a.accuracy - b.accuracy)) < 1e-9, "noise band")
     check(gate.relative_pass(0.8, 1.0, 0.8) and not gate.relative_pass(0.79, 1.0, 0.8), "relative_pass")
     return (f"simple_math_pool screen acc base={a.accuracy:.3f} weak={b.accuracy:.3f} delta={d['delta']:.3f} "
-            f"ci=[{d['ci'][0]:.3f},{d['ci'][1]:.3f}]; KL self={k_self['mean']:.3g} mid={k_mid['mean']:.3f} "
-            f"weak={k_weak['mean']:.3f}; heldout acc={ {k: v['accuracy'] for k, v in h.items()} }")
+            f"ci=[{d['ci'][0]:.3f},{d['ci'][1]:.3f}]; heldout acc={ {k: v['accuracy'] for k, v in h.items()} }")
 
 
 def test_toolapi_cost_fn_dedupe():
@@ -381,8 +375,7 @@ def test_search_out_dir():
         return {"q": 0.1 * (1 + int(cid[-1]))}, None
 
     kw = dict(editor_factory=factory, render_context=lambda h, th: f"t{th} n{len(h)}", build_fn=build,
-              screen_fn=lambda a, cid: (a["q"], {}), full_fn=lambda a, cid: (a["q"], {}),
-              threads=1, steps=2, max_candidates=2, top_full=1)
+              screen_fn=lambda a, cid: (a["q"], {}), threads=1, steps=2, max_candidates=2)
     r1 = search.inner_search(rc, 1, out_dir=out, **kw)
     check((out / "candidates.jsonl").exists() and (out / "programs").is_dir(), "records not in out_dir")
     check(not (rc.run_dir / "gen_01" / "candidates.jsonl").exists(), "main gen dir written")
@@ -391,13 +384,10 @@ def test_search_out_dir():
     check(calls["build"] == 2 and [c.cid for c in r2] == [c.cid for c in r1], "out_dir resume")
     check(set(search.load_candidates(rc, 1, out)) == {c.cid for c in r1}, "load_candidates(out_dir)")
     check(search.load_candidates(rc, 1) == {}, "default dir should be empty")
-    acc = search.submit_to_gate(rc, 1, r1, lambda c: (True, {}), out_dir=out)
-    check(acc is not None and (out / "gate.json").exists() and not (rc.run_dir / "gen_01" / "gate.json").exists(),
-          "gate.json location")
     return f"records under {out.relative_to(rc.run_dir)}: {sorted(p.name for p in out.iterdir())}"
 
 
-def test_mock_domain_quality_and_noise():
+def test_mock_domain_quality_and_seeds():
     from rsicore import mock_quality as MQ
     check(MQ.resolve({"default": 0.5, "math": 0.8, "dapo_math": 0.9}, task="dapo_math", domain="math") == 0.9, "task key")
     check(MQ.resolve({"default": 0.5, "math": 0.8}, task="gsm8k", domain="math") == 0.8, "domain key")
@@ -420,20 +410,21 @@ def test_mock_domain_quality_and_noise():
         check(acc[("cand", "simple_math_test")] > acc[("base", "simple_math_test")] + 0.15, f"target did not rise {acc}")
         check(acc[("cand", "simple_knowledge_test")] < acc[("base", "simple_knowledge_test")] - 0.15,
               f"other domain did not fall {acc}")
+        # sampled mock answers depend on the request seed (deterministic per seed); greedy ones do not
         ds, ids = "simple_math_test", draws.build_eval_set("simple_math_test")[:300]
-        g0 = gate.measure_noise_band(srv.endpoint, "base", ds, ids, rc.run_dir / "nb_greedy", repeats=3,
-                                     temperature=0.0, base_seed=rc.seed, mock=True)
-        g1 = gate.measure_noise_band(srv.endpoint, "base", ds, ids, rc.run_dir / "nb_t06", repeats=3,
-                                     temperature=0.6, base_seed=rc.seed, mock=True)
-        g1b = gate.measure_noise_band(srv.endpoint, "base", ds, ids, rc.run_dir / "nb_t06b", repeats=3,
-                                      temperature=0.6, base_seed=rc.seed, mock=True)
-    check(g0["band"] == 0.0 and g0["scores"] == [] and g0["source"].startswith("greedy"), f"greedy band {g0}")   # nothing re-run
-    check(g1["band"] > 0 and g1["se"] > 0 and g1["seeds"] == [rc.seed, rc.seed + 1, rc.seed + 2], f"sampled band {g1}")
-    check(g1b["scores"] == g1["scores"], "sampled repeats not deterministic per seed")
-    s = json.loads((rc.run_dir / "nb_t06" / f"seed{rc.seed + 1}" / "summary.json").read_text())[ds]
+
+        def run(tag, seed, temperature):
+            return evaluate.score(srv.endpoint, "base", ds, pool="pool", ids=ids, mock=True, seed=seed,
+                                  temperature=temperature, out_dir=rc.run_dir / "seeds" / tag).accuracy
+        greedy = [run(f"g{k}", rc.seed + k, 0.0) for k in range(2)]
+        sampled = [run(f"t{k}", rc.seed + k, 0.6) for k in range(3)]
+        again = run("t1b", rc.seed + 1, 0.6)
+    check(greedy[0] == greedy[1], f"greedy repeats differ {greedy}")
+    check(len(set(sampled)) > 1 and again == sampled[1], f"sampled repeats {sampled} / {again}")
+    s = json.loads((rc.run_dir / "seeds" / "t1" / "summary.json").read_text())[ds]
     check(s["decoding"]["seed"] == rc.seed + 1 and s["decoding"]["temperature"] == 0.6, f"decoding {s['decoding']}")
-    return (f"acc {{{', '.join(f'{k[0]}/{k[1]}={v:.2f}' for k, v in acc.items())}}}; band greedy={g0['band']:.3f} "
-            f"t=0.6 band={g1['band']:.3f} se={g1['se']:.3f} scores={[round(x, 3) for x in g1['scores']]}")
+    return (f"acc {{{', '.join(f'{k[0]}/{k[1]}={v:.2f}' for k, v in acc.items())}}}; greedy={greedy} "
+            f"t=0.6 scores={[round(x, 3) for x in sampled]}")
 
 
 def test_vllm_command():
@@ -472,7 +463,7 @@ def test_toy_paper():
 
 
 TESTS = [test_config_and_state, test_toolapi_budget, test_toolapi_cost_fn_dedupe, test_sandbox, test_editor_mock,
-         test_inner_search_resume, test_search_out_dir, test_draws, test_evaluate_mock, test_mock_domain_quality_and_noise,
+         test_inner_search_resume, test_search_out_dir, test_draws, test_evaluate_mock, test_mock_domain_quality_and_seeds,
          test_vllm_command, test_toy_paper]
 
 

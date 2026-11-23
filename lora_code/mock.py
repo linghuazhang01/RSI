@@ -529,7 +529,6 @@ def mock_diagnostics(store: MockStore, stack: list, seed: int = 42) -> dict:
                 "relchange_q": {"q50": round(v["rel"] * 0.5, 5), "q90": round(v["rel"] * 1.8, 5),
                                 "q99": round(v["rel"] * 4.0, 5)},
                 "act_ratio_target": round(v["rel"] * (1.2 + rr.random()), 5),
-                "act_ratio_retention": round(v["rel"] * (0.6 + rr.random()), 5),
             })
         rows.append(row)
     return {"model": "mock", "n_modules": len(rows), "rows": rows, "stack_gens": [g for g, _ in stack]}
@@ -543,12 +542,12 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
     hyper-parameters and protective operators more often. mode (method.mode): edit = edits of the raw LoRA
     (EDIT_PROGRAM); scratch = gradient-free constructions from zero (SCRATCH_PROGRAM); weights = structured edits
     of the dense weights returned as {"edit": handle} (WEIGHTS_PROGRAM). tensor_compute (2026-11-21, scratch, the
-    tool is on): thread 1 writes TENSOR_PROGRAM instead (api.evaluate x2 + api.tensor_compute vectors / LoRA
-    factors); every other choice is unchanged. paper (2026-11-21, paper and screen tools on, no api.evaluate;
-    scratch / weights): thread 1 writes PAPER_PROGRAM instead (screen_results / screen_output, acts on
+    tool is on): thread 1 writes TENSOR_PROGRAM instead (api.tensor_compute vectors / LoRA factors); every other
+    choice is unchanged. paper (2026-11-21, paper and screen tools on; scratch / weights): thread 1 writes PAPER_PROGRAM instead (screen_results / screen_output, acts on
     its own screen answers, direction / unit / tensor_compute(vectors=...), project_out, save_edit / load_edit).
     There is no regmean_preserve tool (2026-11-22): the recipes "regmean" / "singular_regmean" are written as
-    "intruder" / "singular_scale" (the recipe lists keep their length, so the other choices are unchanged)."""
+    "intruder" / "singular_scale" (the recipe lists keep their length, so the other choices are unchanged; the
+    templates have no branch for them, 2026-11-23)."""
 
     def policy(history):
         last = ""
@@ -599,8 +598,8 @@ def make_mock_policy(seed: int, skill: float = 0.7, tag: str = "main", mode: str
     return policy
 
 
-# The "regmean" / "singular_regmean" branches of the two templates below never run (make_mock_policy rewrites those
-# recipes); they stay so the mock program text of every other recipe is unchanged (2026-11-22).
+# "regmean" / "singular_regmean" are never written (make_mock_policy rewrites those recipes); they stay in the lists
+# so the other recipe choices are unchanged (2026-11-22).
 EDIT_RECIPES = ["trunc_scale", "intruder", "regmean", "prune_orth", "drop_attn", "layer_scale", "trunc_intruder",
                 "boost", "boost"]
 
@@ -614,8 +613,6 @@ def main(api):
         lora = api.truncate_rank(lora=lora, k={k})["lora"]
     if recipe in ("intruder", "trunc_intruder"):
         lora = api.intruder_scale(lora=lora, lam={lam})["lora"]
-    if recipe == "regmean":
-        lora = api.regmean_preserve(lora=lora, alpha={alpha})["lora"]
     if recipe == "prune_orth":
         lora = api.relchange_prune(lora=lora, frac=0.03)["lora"]
         lora = api.orthogonalize(lora=lora)["lora"]
@@ -644,8 +641,6 @@ def main(api):
     for m in mods:
         s = api.svd(module=m, k=4)
         lora = api.scale_singular(lora=lora, module=m, svd=s["handle"], idx=[0, 1], factors=[{f}, {f}])["lora"]
-    if recipe == "singular_regmean":
-        lora = api.regmean_preserve(lora=lora, alpha={alpha})["lora"]
     if recipe == "singular_scale":
         lora = api.scale(lora=lora, s=0.8)["lora"]
     try:                                    # cheap screening + item flips vs the current model (free tools)
@@ -658,8 +653,8 @@ def main(api):
 '''
 
 
-# (2026-11-21) scratch with the tensor tool: two api.evaluate calls (the program pool) and one tensor_compute call
-# whose vectors feed rank1 and whose LoRA factors are combined in
+# (2026-11-21) scratch with the tensor tool: one tensor_compute call whose vectors feed rank1 and whose LoRA factors
+# are combined in
 TENSOR_PROGRAM = '''\
 # mock editor program (mode=scratch): thread {th} step {st}, recipe tensor_compute
 def main(api):
@@ -668,7 +663,6 @@ def main(api):
     for m in mods:
         s = api.svd(module=m, k=4)
         lora = api.scale_singular(lora=lora, module=m, svd=s["handle"], idx=[0, 1], factors=[{f}, {f}])["lora"]
-    print("singular only", api.evaluate(lora=lora).get("score"))
     small = [m["module"] for m in api.modules() if m["leaf"] == "in_proj_b"][0]
     code = ("U, S, V = torch.svd_lowrank(T[%r], q=4)\\n"
             "vectors = {{'u': U[:, 0], 'v': V[:, 0]}}\\n"
@@ -678,12 +672,11 @@ def main(api):
     print("top singular values", tc.get("json"), "sizes", tc.get("vector_sizes"), "lora", tc.get("lora_check"))
     lora = api.rank1(lora=lora, module=small, u=tc["vectors"]["u"], v=tc["vectors"]["v"], s=0.5)["lora"]
     lora = api.combine(loras=[lora, tc["lora"]], weights=[1.0, 1.0])["lora"]
-    print("combined", api.evaluate(lora=lora).get("score"))
     return {{"lora": lora}}
 '''
 
 
-# (2026-11-21) the simple flow: the paper-style recipe on the current model's own screen answers (no api.evaluate)
+# (2026-11-21) the simple flow: the paper-style recipe on the current model's own screen answers
 PAPER_PROGRAM = '''\
 # mock editor program (mode={mode}): thread {th} step {st}, recipe paper
 def main(api):

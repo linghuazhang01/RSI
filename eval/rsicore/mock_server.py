@@ -11,7 +11,7 @@
   with higher quality is right on a superset of the items a lower-quality model gets right, and scores
   move monotonically with quality (2026-11-19). Greedy requests
   (temperature 0 / absent) ignore the request seed; sampled requests (temperature > 0) also hash the
-  request's `seed` and `temperature`, so repeated evaluations with different seeds differ (noise band)
+  request's `seed` and `temperature`, so repeated evaluations with different seeds differ
   while each (seed, temperature, prompt) stays deterministic. ifeval_train gets a
   constructed reply satisfying its single constraint (rsicore/_mock_answers.py). The default index covers the
   five training sets, whose prompts the simple_<domain>_* eval sets reuse (same requests); other tasks need --tasks.
@@ -22,8 +22,9 @@
   configs/tasks.yaml), optionally wrapped as {"quality": value, ...} (rsicore/mock_quality.py).
 * /v1/completions with `prompt_logprobs: k`: deterministic fake vLLM-format prompt logprobs over a
   word/punctuation "tokenisation"; logits = base + 3 * (1 - q) * noise with q = mock_quality.scalar
-  (mean over the five domains; = the float / "default" when nothing else is given), so KL between two names
-  is 0 for equal quality and grows with the quality gap (KL to the 0.7 default grows as quality falls).
+  (mean over the five domains; = the float / "default" when nothing else is given), so the distributions of two
+  names are equal for equal quality and drift apart with the quality gap. Read by Paper B's train_loss
+  (lora_code tools.vllm_answer_nll); rsicore no longer has a token KL (2026-11-23).
 * /v1/load_lora_adapter, /v1/unload_lora_adapter (only with --enable-lora, like vLLM), /v1/models,
   /health, /stats. Unknown model names get vLLM's 404. Binds 127.0.0.1 only.
 """

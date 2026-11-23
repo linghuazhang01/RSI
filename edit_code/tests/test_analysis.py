@@ -1,9 +1,8 @@
 """Paper A analysis tools (2026-11-20): Hessian-weighted error (real path, with a fake layer cache and real
-Hessian files), group_error, the hessian table and compare (ids / statistics only).
+Hessian files), group_error and the hessian table (compare was removed 2026-11-23: candidates have no screen records).
 
   python -I -m pytest -q edit_code/tests/test_analysis.py      (needs torch + safetensors; no transformers)
 """
-import json
 import sys
 import tempfile
 import threading
@@ -117,29 +116,6 @@ class TestHessianError(unittest.TestCase):
         r2 = {(r["key"], r["bits"]): r["herr_rel"] for r in rows}
         for k in self.p.spec.group_keys():
             self.assertGreater(r2[(k, 2)], r2[(k, 4)])
-
-
-class TestCompare(unittest.TestCase):
-    def test_flips_ids_only(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = _problem(Path(d), mock=True)
-
-            def write(cid, scores, outs, fin):
-                f = p.records_path(cid, "screen", "dapo_math")
-                f.parent.mkdir(parents=True, exist_ok=True)
-                f.write_text("\n".join(json.dumps({"id": f"x/{i}", "score": s, "raw_output": o, "finish_reason": [fr]})
-                                       for i, (s, o, fr) in enumerate(zip(scores, outs, fin))))
-            write("incumbent", [1, 1, 0, 0, 1, 1], ["a" * 10, "b" * 200, "c" * 50, "d" * 5, "e" * 80, "f" * 30],
-                  ["stop"] * 6)
-            write("g01_t0_s00", [1, 0, 1, 0, 0, 1], ["a"] * 6, ["stop", "length", "stop", "stop", "length", "stop"])
-            c = p.compare("g01_t0_s00")["datasets"]["dapo_math"]
-            self.assertEqual((c["broken"], c["fixed"], c["net"]), (2, 1, -1))
-            self.assertEqual((c["broken_ids"], c["fixed_ids"]), (["x/1", "x/4"], ["x/2"]))
-            self.assertEqual(c["truncated"], round(2 / 6, 4))
-            self.assertEqual(sum(b["n"] for b in c["by_reference_length"].values()), 6)
-            self.assertNotIn("raw_output", json.dumps(c))                           # no item content
-            with self.assertRaises(ValueError):
-                p.compare("g09_t9_s09")
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ def _ws(tmp_path, mode="scratch", cfg=None, store=None):
     for k, v in (cfg or {}).items():
         c[k] = {**c.get(k, {}), **v} if isinstance(v, dict) else v
     ws = Workspace(mock=store is None, store=store or MockStore(), train=train, cfg=c, out_dir=tmp_path,
-                   budget={"evaluate": 4, "gpu_seconds": 500}, mode=mode)
+                   budget={"gpu_seconds": 500}, mode=mode)
     ws.build_api()
     return ws
 

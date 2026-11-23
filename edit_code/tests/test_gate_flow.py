@@ -1,11 +1,12 @@
-"""Paper A FINAL simple flow (2026-11-21): the incumbent's screen run + one gate evaluation per candidate.
+"""Paper A flow (2026-11-21; hard-wired since 2026-11-23): the incumbent's screen run + one gate evaluation per
+candidate.
 
     python3 -I -m pytest -q edit_code/tests/test_gate_flow.py
 
 - screen_results / screen_output show the incumbent's screen records (filters, pages, thinking text); evaluate and
   compare are not registered (program and exploration API);
 - gate_stats: accuracy, paired gain, CI, broken / fixed counts and ids (no item content);
-- screen_fn of the gate flow: no screen, ONE gate evaluation, gen_XX/gate.json entry, over-budget refused unevaluated;
+- screen_fn: no screen, ONE gate evaluation, gen_XX/gate.json entry, over-budget refused unevaluated;
 - accept_best_gate: the passing candidate with the largest gain; failed candidates get a 'not evaluated' entry;
   none passes -> keep;
 - prompts: no api.evaluate text, configured tool rounds / threads / steps, persistent session text, gate table,
@@ -23,8 +24,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_simple_v2 as V  # noqa: E402
 
-GATE_SCFG = {"threads": 2, "steps": 1, "max_evaluate": 0, "charge_screens": False, "program_evaluate_calls": 0,
-             "screen_candidates": False, "gate_every_candidate": True, "top_full": 0}
+GATE_SCFG = {"threads": 2, "steps": 1}
 
 
 def _jl(recs):
@@ -33,11 +33,7 @@ def _jl(recs):
 
 def test_search_settings_gate_flow():
     from edit_code.common import search_settings
-    ss = search_settings(GATE_SCFG)
-    assert (ss["screen_candidates"], ss["gate_every_candidate"], ss["evaluate_tool"], ss["eval_budget"]) == \
-        (False, True, False, 0)
-    with pytest.raises(ValueError):
-        search_settings(dict(GATE_SCFG, gate_every_candidate=False))
+    assert search_settings(GATE_SCFG) == {"threads": 2, "steps": 1, "max_candidates": 2}
 
 
 def test_screen_tools_and_no_evaluate(tmp_path, monkeypatch):
@@ -55,9 +51,8 @@ def test_screen_tools_and_no_evaluate(tmp_path, monkeypatch):
          "raw_output": ["x"] * 4, "reasoning": [None] * 4, "finish_reason": ["stop"] * 4}]))
     monkeypatch.setattr(P, "load_processed", lambda ds, ids=None: {i: {"prompt": f"Q{i}", "reference": "4"}
                                                                    for i in (ids or [])})
-    assert prob.screen_tools
-    for api in (make_tool_api(prob, {}, cid="p", per_program_evaluate=0, free_repeats=True, evaluate_tool=False),
-                make_tool_api(prob, {}, cid="p~x", per_program_evaluate=0, explore=True)):
+    for api in (make_tool_api(prob, {}, cid="p"), make_tool_api(prob, {"tools": {"compare": True}}, cid="p~x",
+                                                                explore=True)):
         names = api.names()
         assert {"screen_results", "screen_output"} <= set(names)
         assert "evaluate" not in names and "compare" not in names
@@ -71,9 +66,7 @@ def test_screen_tools_and_no_evaluate(tmp_path, monkeypatch):
     assert nxt["offset"] == out["next_offset"]
     s = prob.screen_summary()
     assert s["n_items"] == 2 and s["samples_per_item"] == 4 and s["correct_counts"]["0"] == 1
-    # the program API of the old flow keeps evaluate and compare
-    old = V._problem(tmp_path / "old", budget=2)
-    assert {"evaluate", "compare"} <= set(make_tool_api(old, {}, cid="q", per_program_evaluate=2).names())
+    assert not hasattr(prob, "compare")                         # the compare tool is gone (no candidate screens)
 
 
 def test_gate_stats(tmp_path):
@@ -114,7 +107,7 @@ def test_screen_fn_gates_once(tmp_path, monkeypatch):
     prob = V._problem(tmp_path, budget=0, cfg={"search": GATE_SCFG})
     calls = []
 
-    def fake(art, stage, cid, key, charged, origin):
+    def fake(art, stage, cid, key, origin):
         calls.append((art["config_hash"], stage, origin))
         rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "score": 1.0, "feedback": {
             "stage": stage, "gate": {"passed": True, "reason": "beats the incumbent"},
@@ -181,8 +174,8 @@ def _fake_problem():
     return SimpleNamespace(space={"bits": [2, 4, 16], "group_sizes": [128], "quantizers": ["rtn", "gptq"]},
                            data={"simple_math_pool": {"screen": ["i"] * 20}}, datasets=["simple_math_pool"],
                            gate_datasets=["simple_math_eval"], _ids=lambda ds, st: ["x"] * 500,
-                           decoding={"screen": {"n": 4}, "gate": {"n": 4}}, budget_gib=10.0, gen=2, evals_left=0,
-                           noise={}, incumbent=None, domains=["math"],
+                           decoding={"screen": {"n": 4}, "gate": {"n": 4}}, budget_gib=10.0, gen=2,
+                           incumbent=None, domains=["math"],
                            screen_summary=lambda examples=3: {"n_items": 20, "samples_per_item": 4, "accuracy": 0.6,
                                                               "correct_counts": {"0": 5, "4": 15},
                                                               "truncation_rate": 0.1, "truncated_thinking": 2,
@@ -191,21 +184,20 @@ def _fake_problem():
 
 @pytest.mark.parametrize("rounds", [20, 7])
 def test_system_prompt_gate_flow(rounds):
-    from edit_code.common import search_settings
     from edit_code.prompts import system_prompt
     cfg = {"gate": {"min_delta": 0.005, "require_significant": True}, "tools": {},
            "editor": {"tool_rounds": rounds, "explore": {"persistent": True}}}
-    text = system_prompt(_fake_problem(), "- bytes(config)", cfg, history=True, search=search_settings(GATE_SCFG))
+    text = system_prompt(_fake_problem(), "- bytes(config)", cfg, history=True)
     assert "api.evaluate(" not in text and "evaluate(config)" not in text
     assert "There is no api.evaluate." in text and "compare(cid)" not in text
     assert f"for up to {rounds} rounds" in text
     assert "20 items x 4 sampled answers" in text and "500 items x 4 sampled answers" in text
     assert "LARGEST gain" in text and "persist between your run_python calls" in text
-    assert "so you do not repeat a config" in text
-    # the old flow keeps its text (evaluate, compare, nothing persists)
-    old = system_prompt(_fake_problem(), "- bytes(config)", dict(cfg, editor={"tool_rounds": rounds}), history=True,
-                        search=search_settings({"threads": 4, "steps": 6, "max_evaluate": 24}))
-    assert "api.evaluate(config=cfg)" in old and "compare(cid)" in old and "Nothing persists" in old
+    assert "so you do not repeat a config" in text and "its size, scores and gate outcome" in text
+    for stale in ("retention", "KL vs", "its size, KL", "regmean", "evaluate budget", "noise band", "Noise band"):
+        assert stale not in text, stale
+    assert "Nothing persists" in system_prompt(_fake_problem(), "- bytes(config)",
+                                               dict(cfg, editor={"tool_rounds": rounds}), history=True)
 
 
 def test_render_gate_table_and_archive():
@@ -231,7 +223,7 @@ def test_render_gate_table_and_archive():
         "config": {"default": {"bits": 4, "group_size": 128, "quantizer": "gptq"},
                    "groups": {"0.down": {"bits": 8}, "1.down": {"bits": 8}, "3.down": {"bits": 8}}}},
         error=None, screen=None, full=None, score=0.004)
-    ent = {"gen": 1, "accepted": False, "gate_reason": ["x"], "n": 2, "gate_every": True, "best": [(c1.cid, 0.004)],
+    ent = {"gen": 1, "accepted": False, "gate_reason": ["x"], "n": 2, "best": [(c1.cid, 0.004)],
            "reference_screen": {"accuracy": 0.5, "correct_counts": {"0": 1}, "truncation_rate": 0.0, "n_items": 500,
                                 "samples_per_item": 4},
            "rows": [archive_row(c1, g), archive_row(bad, {"passed": False, "reason": "not evaluated: program failed"})],
@@ -239,6 +231,7 @@ def test_render_gate_table_and_archive():
     arch = archive_text([ent])
     assert arch.startswith(ARCHIVE_HEAD) and arch.endswith(ARCHIVE_READ)
     assert "screen_results(gen=1)" in arch and "over 500 items x 4 samples" in arch
+    assert "largest paired gate gains g01_t0_s00=+0.0040" in arch
     assert '"gain": 0.004' in arch and '"ci": [-0.01, 0.02]' in arch and "8 bit down 0-3: largest herr" in arch
     assert "down L0-1,3 x3" in arch                                    # config_brief with layer ranges
     assert '"error": "program failed: boom"' in arch and "not evaluated" not in arch   # failures listed, one line

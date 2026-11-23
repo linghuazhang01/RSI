@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|
 | `scratch`（**默认**） | 从零写一个 LoRA（低秩 ΔW） | SVD、激活统计、秩 1 / 方向 / 奇异方向构造、编辑算子、`compare`、`train_loss` | 热加载到 main 副本上 | 和当前模型逐题配对：平均提升 ≥ `gate.min_gain` 且 95% 置信区间下界 > 0 | 保持原样 |
 | `weights` | **直接编辑权重**（任意秩的结构化修改） | 同上（用来构造低秩部分）+ `new_edit`、`w_scale`（整个模块缩放）、`w_scale_rows` / `w_scale_cols`（输出 / 输入通道缩放）、`w_add_lora`（把构造出的低秩 ΔW 稠密地加进权重）、`w_toward_original`（往原模型的权重拉回）、`inspect_edit`；每个模块 ‖W'−W‖/‖W‖ ≤ `weights.norm_cap_tau`（0.05） | 写出改动后的权重（只重写被改的分片，其余硬链接），在一个空闲候选槽上起一个 vLLM 服务评测，评完删除；同一轮的候选同时在各槽上评测 | 同上 | 保持原样 |
-| `edit`（保留，非默认） | 第 0 代训练一次 raw LoRA，之后每代编辑它（M_g = M_0 + 当前 LoRA，不合并） | 同 scratch，另有 `raw_lora` | 热加载 | 第 0 代：目标 ≥ raw − ε；之后同上 | 第 0 代合并 raw；之后保留当前 LoRA |
+| `edit`（保留，非默认） | 第 0 代训练一次 raw LoRA，之后每代编辑它（M_g = M_0 + 当前 LoRA，不合并） | 同 scratch，另有 `raw_lora` | 热加载 | 同上（每个候选都和当前模型比） | 第 0 代：raw LoRA 过同样的验收就用它；之后保留当前 LoRA |
 
 **weights 模式的卡**（4 张卡）：卡 0 是改造者（当前模型，vLLM 睡眠模式）；卡 1、2 是候选槽；卡 3 是 train（导出改动后的权重、SVD、激活统计、`train_loss`）。改造者写完这一轮的程序就睡眠，卡 0 临时当第 3 个候选槽，所以一轮里 3 个候选同时导出、加载、评测。每个候选要写出改动的分片并启动一个 vLLM 服务，比热加载 LoRA 多几分钟。接受后改动直接写进权重，得到 M_{t+1}。非 LLM 分支是随机的权重编辑（通道 / 模块缩放）。
 
@@ -47,7 +47,7 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 
 训练答案（`train_data`：拒绝采样 M_g 自己答对的回答；4 个都错的题**跳过**，不用金标，`train_data.mode: self_correct`，2026-11-20）只在训练 raw LoRA 时（edit 第 0 代）采样。训练样本的题目部分就是评测时发给模型的那条请求：评测任务自己生成的聊天消息 + Qwen 对话模板、关闭思考，和 vLLM 评测时完全一致，只在回答部分算损失；其余情况 train 题直接用金标答案、不采样，只给激活统计和 `train_example` 用。
 
-`gate.reference` / `gate.fallback` 可以覆盖上表的默认值（`raw` | `parent`，`raw` | `keep`）。非 LLM 分支随模式变化：edit = 对 raw LoRA 随机组合编辑规则（截断 / 剪枝 / intruder / 正交化 / 缩放），scratch = 随机的无梯度构造（奇异方向缩放），weights = 随机的权重编辑。
+`gate.fallback` 可以覆盖上表的默认值（`raw` | `keep`）；验收参照没有开关（2026-11-23 删掉了 `gate.reference` / `gate.epsilon`：每个候选都和当前模型配对比较）。非 LLM 分支随模式变化：edit = 对 raw LoRA 随机组合编辑规则（截断 / 剪枝 / intruder / 正交化 / 缩放），scratch = 随机的无梯度构造（奇异方向缩放），weights = 随机的权重编辑。
 
 ## 唯一的流程：simple v2（2026-11-21；2026-11-22 起是唯一的流程，已并进 `configs/base.yaml`）
 
@@ -55,16 +55,16 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 
 用 `simple_data/<领域>/`（`data/scripts/make_simple_data.py`，从去污染、去重后的训练集池子里抽）。数据集名：训练池 `simple_<领域>_pool`（`pool_ids.json` 里的全部题）、验收 `simple_<领域>_eval`（500）、留出 `simple_<领域>_test`（500），三者两两不相交；运行名带 `_single_simple`。
 - **每代重新抽题**（`rsicore.draws.simple_draw`，没有 draw.py）：候选 = 池子 − 验收 500 − 测试 500；快速筛 = signal = 从候选里随机抽 500（`simple.screen_n`，种子 `<seed>:simple:<领域>:<轮次>`，不含运行名和论文，A 的第 g 代和 B 的第 g−1 代是同一轮，两篇论文筛同样的题）；train = 候选里剩下的全部（数学 13,238，知识约 72k；`train_example` / `acts` / `train_loss` 只接受这些题号，看得到标准答案）。抽题写在 `draws/gen_XX/ids/simple_<领域>_pool.<role>.json`。各代的快速筛独立抽，可能和前几代的 train / 快速筛重叠（不标记 shown）。`gen_XX/train_data.json` 就是这一代的 train（gold 模式，不采样；数学约 8 MB，知识约 26 MB，构建 1–2 秒，本代内存里直接复用，不再读回）。
-- **打分用 thinking 采样**（`decoding` 块，`rsicore.config.stage_decoding`）：temperature 0.6、top_p 0.95、top_k 20、thinking、max_tokens 16384，种子 = 运行的 `--seed`，当前模型和所有候选用同一个解码字典（同一种子）。当前模型的快速筛（只筛当前模型，见下）、验收和留出评测都是 n 4（avg@4：每题分数是 4 个样本的平均，在 [0,1] 里；配对验收按每题平均配对）。完整评测 = 快速筛（`search.top_full: 0`）。缓存目录带解码标签：`evals/<name>/<level>@<hash>/`（贪心时仍是 `<level>/`）；只有题目和解码都相同的级别才共享快速筛结果。当前模型（`__parent__`）在一代里的快速筛 / 验收结果只采样一次（每个 (模型, 级别) 一把锁，同时筛多个候选时也只算一次），所有候选共用；M_0 的基线验收和 weights 模式候选槽打分也用同一解码。压缩记录在 n > 1 时记 `ns`（样本数）、`len`（平均长度）、`trunc`（截断比例）；反馈里的错题 = 平均分 ≤ 0.5（当前模型答对的排在前面）。打分服务器都是 main 副本 / weights 候选槽，`--max-model-len` = `editor.context_tokens`（131072；h20_80 是 49152），提示 + 16384 放得下。启动时 `run.context_shortfall` 检查（max_tokens + 4096 > 某个打分服务器的 `--max-model-len` 就直接退出）。
-- **最终流程（FINAL，2026-11-21）**：每代 (1) **当前模型**答本代 500 道快速筛题一次（`decoding.screen`：thinking，n 4；`Run.reference_screen`，评测器的父模型缓存按解码区分，所有会话共用），**候选不做快速筛**（`search.screen_candidates: false`）；(2) 改造者在每步上下文里看到这次作答的摘要（avg@4、每题答对样本数的分布、截断率、几道错题的题面 / 标准答案 / 抽取答案），完整数据用免费工具读：`api.screen_results(ids, filter='all'|'wrong'|'unstable'|'right', limit, offset)` 和 `api.screen_output(id, sample, offset)`（整段输出分页，**含 thinking**；记录里的 `reasoning`）；摘要写进 `gen_XX/reference_screen.json`，后几代的 `search_history`（每代一行的 `reference_screen`）和存档里也看得到；(3) 每个候选（`search.threads × search.steps` 个，这里 8 × 1）建好后**只做一次验收评测**（`search.gate_every_candidate: true`；`decoding.gate`，500 × 4，与当前模型同种子配对；当前模型的验收记录每代只算一次），结果立即写进 `gen_XX/gate.json`（submissions 形状，每个候选一条），候选的 feedback 里是 `gate`（accuracy、reference_accuracy、配对 gain、CI、passed / reasons、broken / fixed 个数和题号，没有题目内容），候选分数 = 配对 gain；后面的步骤和后几代都看得到（上下文表格、`search_history`、`read_record`、存档）；(4) 代末在通过验收规则（`gate.min_gain`，`require_significant` 时还要 CI 下界 > 0）的候选里**取配对 gain 最大的**（并列：快速筛分高、cid 早），没有就 keep（raw 回退规则不变）；`gate.json` 里标 `accepted`；然后测试集 500 × 4 出报告。**没有 `api.evaluate`**（`search.program_evaluate_calls: 0`：程序、探索 api、工具说明和提示里都去掉）。代价：每代 8 × 500 × 4 个 thinking 样本在验收集上。线程数 × 步数是参数，提示按配置的数字写（1 步时"你是第 k 个会话（共 N 个）"，多步时"改进本线程最好的程序"）。`search.parallel_builds: true`：有多个 main 副本时，最多副本数个候选同时构建 + 验收。
+- **打分用 thinking 采样**（`decoding` 块，`rsicore.config.stage_decoding`）：temperature 0.6、top_p 0.95、top_k 20、thinking、max_tokens 16384，种子 = 运行的 `--seed`，当前模型和所有候选用同一个解码字典（同一种子）。当前模型的快速筛（只筛当前模型，见下）、验收和留出评测都是 n 4（avg@4：每题分数是 4 个样本的平均，在 [0,1] 里；配对验收按每题平均配对）。完整评测级别（full = 快速筛的同一批题）只给 raw LoRA 和非 LLM 分支用，主搜索没有 full / 重评阶段。缓存目录带解码标签：`evals/<name>/<level>@<hash>/`（贪心时仍是 `<level>/`）；只有题目和解码都相同的级别才共享快速筛结果。当前模型（`__parent__`）在一代里的快速筛 / 验收结果只采样一次（每个 (模型, 级别) 一把锁，同时筛多个候选时也只算一次），所有候选共用；M_0 的基线验收和 weights 模式候选槽打分也用同一解码。压缩记录在 n > 1 时记 `ns`（样本数）、`len`（平均长度）、`trunc`（截断比例）；反馈里的错题 = 平均分 ≤ 0.5（当前模型答对的排在前面）。打分服务器都是 main 副本 / weights 候选槽，`--max-model-len` = `editor.context_tokens`（131072；h20_80 是 49152），提示 + 16384 放得下。启动时 `run.context_shortfall` 检查（max_tokens + 4096 > 某个打分服务器的 `--max-model-len` 就直接退出）。
+- **最终流程（FINAL，2026-11-21）**：每代 (1) **当前模型**答本代 500 道快速筛题一次（`decoding.screen`：thinking，n 4；`Run.reference_screen`，评测器的父模型缓存按解码区分，所有会话共用），**候选不做快速筛**；(2) 改造者在每步上下文里看到这次作答的摘要（avg@4、每题答对样本数的分布、截断率、几道错题的题面 / 标准答案 / 抽取答案），完整数据用免费工具读：`api.screen_results(ids, filter='all'|'wrong'|'unstable'|'right', limit, offset)` 和 `api.screen_output(id, sample, offset)`（整段输出分页，**含 thinking**；记录里的 `reasoning`）；摘要写进 `gen_XX/reference_screen.json`，后几代的 `search_history`（每代一行的 `reference_screen`）和存档里也看得到；(3) 每个候选（`search.threads × search.steps` 个，这里 8 × 1）建好后**只做一次验收评测**（`decoding.gate`，500 × 4，与当前模型同种子配对；当前模型的验收记录每代只算一次），结果立即写进 `gen_XX/gate.json`（submissions 形状，每个候选一条），候选的 feedback 里是 `gate`（accuracy、reference_accuracy、配对 gain、CI、passed / reasons、broken / fixed 个数和题号，没有题目内容），候选分数 = 配对 gain；后面的步骤和后几代都看得到（上下文表格、`search_history`、`read_record`、存档）；(4) 代末在通过验收规则（`gate.min_gain`，`require_significant` 时还要 CI 下界 > 0）的候选里**取配对 gain 最大的**（并列：cid 早），没有就 keep（edit 第 0 代先试 raw LoRA：过同样的验收就用它）；`gate.json` 里标 `accepted`；然后测试集 500 × 4 出报告。**没有 `api.evaluate`**（程序、探索 api、工具说明和提示里都没有）。代价：每代 8 × 500 × 4 个 thinking 样本在验收集上。线程数 × 步数是参数，提示按配置的数字写（1 步时"你是第 k 个会话（共 N 个）"，多步时"改进本线程最好的程序"）。`search.parallel_builds: true`：有多个 main 副本时，最多副本数个候选同时构建 + 验收。
 - **论文式工具**（`tools.paper_tools`，base.yaml 设为 true，不设也是开；程序和探索 api 都有）：`save_edit(handle, name)` / `load_edit(name)` / `list_edits()` / `drop_edit(name)`（按候选 cid 隔离，存在 `gen_XX/saved/<cid>/`，探索结束、构建和续跑后都还在；最终程序可以直接 `return {"lora": api.load_edit(name="best")["lora"]}`；载入时把构建它用到的工具记进程序的工具日志，`classify()` 照常分类）；`output_matrices(layer)`（o_proj / out_proj / down_proj）；`unit(ref)`、`direction(a, b)` = (a−b)/‖a−b‖（S / A / T 向量引用，返回 T 句柄）；`tensor_compute(..., vectors=[refs])` 把向量作为 `V` 传进代码；`acts(module, ids, k, source='own', sample=0|'all')` 在当前模型**自己的**快速筛作答上（题面 + 整段输出，含 thinking）算激活统计（只收快速筛题号，花 gpu_seconds；HF 模型按 max_len 截断长输出），`source='prompt'` 也接受快速筛题号；`project_out(target, module, u, alpha)`：W ← W − α u uᵀ W（u 是输出侧向量，归一化；W = 当前权重加上 target 在该模块上的改动），LoRA 目标加秩 1 项 B = −αu、A = uᵀW，weights 模式的 edit 目标加一个 lowrank op，照常检查上限；`classify()`：LoRA 上的 project_out 算 construct，edit 上的算 weights op。提示里给了论文式做法的提示（两组自答 → direction → project_out）。
 - **探索会话常驻**（`editor.explore.persistent: true`）：rsicore.chat_tools 每个候选保留一个 Python 会话，变量 / import / 句柄跨 `run_python` 调用保留；Paper B 的工厂返回 `(api, cleanup, before_call)`，每个候选只建一个探索 api，`before_call(timeout_s)` 设 tensor_compute 的截止时间，每次工具调用先绑定这个 tag 的线程状态（不管哪个线程在服务）；候选结束时 `cleanup` 释放句柄。`editor.explore.gpu_tools: true`（探索里也能用 `acts` / `train_loss`，每个会话单独的 600 GPU 秒预算）。
-- 非 LLM 分支同样 8 个候选（`nonllm.evaluate: 8`，仍按快速筛分数选）；`method.mode` 仍是 scratch；改造者每个候选最多 `editor.tool_rounds` 轮工具调用（20，可配置，提示里写的是配置的数字）；`api.tensors` / `api.tensor_compute` 默认开（见下）。
-- 搜索开关仍是参数（`tools.search_settings`，代码默认值 = 2026-11-21 以前的行为：候选自动快速筛并花一次 evaluate，候选上限 = `max_evaluate`，串行构建，`submit_to_gate`）；base.yaml 写的是上面的值。`search.screen_candidates` / `gate_every_candidate` / `charge_screens` / `program_evaluate_calls` / `top_full` / `rerun_seeds`、`gate.epsilon` / `max_submissions`、`gate.reference=raw` 这些路径都还在。改了 base.yaml 的实际值后旧运行锁会拒绝续跑，要用新的运行名 / `--tag`。
+- 非 LLM 分支同样 8 个候选（`nonllm.evaluate: 8`，按快速筛分数选、前 3 个再在 full 级别上比，代码内部固定）；`method.mode` 仍是 scratch；改造者每个候选最多 `editor.tool_rounds` 轮工具调用（20，可配置，提示里写的是配置的数字）；`api.tensors` / `api.tensor_compute` 默认开（见下）。
+- **这个流程是写死的**（2026-11-23）：`search.screen_candidates` / `gate_every_candidate` / `charge_screens` / `program_evaluate_calls` / `program_evaluate_total` / `max_evaluate` / `top_full` / `rerun_seeds`、`gate.max_submissions` / `reference` / `epsilon` / `use_noise_band`、`baseline.noise_*`、`submit_to_gate`、`api.evaluate` 及其预算都删了。`--set` / `--config` 这些键会报错（给的正好是现在写死的值时只提示一句、不生效；`rsicore.config.REMOVED_KNOBS`）。以前的 `*_single_simple` 运行用同样的命令照常续跑（锁比较时忽略这些键）；旧锁里这些键的值和写死的流程不同时拒绝续跑。`tools.search_settings` 只剩 threads、steps、`max_candidates`（空 = threads × steps）、`parallel_builds`。
 - mock：`mock_overrides`（在 `--set` 之后生效）保持 3 × 1、候选不筛、每个候选一次验收、没有 `api.evaluate`；mock 改造者的 1 号线程走论文式流程（`screen_results` / `screen_output`、`acts(source='own')` 两组、`direction` / `unit`、`tensor_compute(vectors=...)`、`project_out`、`save_edit` / `load_edit`）。测试：`python3 -I -m pytest -q lora_code/tests/test_paper_tools.py`，`lora_code/tests/test_mock_flow.py -k mock_simple_flow`。
 - 服务器上需要 `simple_data/<领域>/train.jsonl`、`eval.jsonl`、`test.jsonl`、`pool_ids.json` 和对应的 `data/processed/` 源数据（`rsicore.draws.build_eval_set` 首次运行时构建 `simple_<领域>_pool / _eval / _test`）。各领域合并后的配置见 `plan/configs/B_<领域>_simple.yaml`。
 
-## 每一步的数据量和固定噪声带
+## 每一步的数据量
 
 每一步用多少题都可以在 config 里设（`--set` 或 `configs/base.yaml`）。
 
@@ -72,28 +72,18 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 |---|---|---|
 | 每代快速筛的题数 | `simple.screen_n` | 500 |
 | edit 的 raw LoRA 训练题数 | `raw.n_train` | 空 = 第 0 代全部 train 题 |
-| 噪声重评用的题数 | `baseline.noise_n` | 空 = 全部验收题 |
 | 每个任务的最大生成长度（没有自己 max_tokens 的调用） | `max_tokens.<任务>`（覆盖 `eval/configs/tasks.yaml`） | dapo_math 4096、taco_verified 4096、ifeval_train 2048、sealtool_train 1024、triviaqa_train 1024 |
 | 训练答案的采样参数 | `train_data.temperature` / `top_p` / `top_k` / `samples` | 0.7 / 0.8 / 20 / 4（指令遵循 8） |
-| 噪声重评的解码参数 | `baseline.noise_temperature` / `noise_top_p` | 0.0 / 1.0（贪心：不重跑，噪声带 = 0） |
 | 快速筛 / 验收 / 留出评测的解码 | `decoding.screen` / `decoding.gate` / `heldout.decoding` | thinking，0.6 / 0.95 / 20，max_tokens 16384，n 4，种子 = `--seed` |
 | 训练序列长度 | `train.max_len` | 4608 |
-| 每个候选实际评测的题数上限 | `eval.screen_limit` / `full_limit` / `gate_limit` | 空 = 不截 |
+| 实际评测的题数上限（当前模型的快速筛 / raw 和非 LLM 分支的 full / 每个候选的验收） | `eval.screen_limit` / `full_limit` / `gate_limit` | 空 = 不截 |
 | 留出评测 | `heldout.limit` | 空 = 全部 500 |
 
 `raw.n_train` 用固定种子抽子集。
 
-**固定噪声带**：`baseline.noise_fixed` 给了值就不再做第 0 代的采样重评，直接用这个数当噪声带（原样使用，不再和 2×SE 取大）：
+M_0 的验收分和标准误在 `baseline/gate_scores.json`（`score`、`se`、`n`）里，只记录。噪声带（`baseline.noise_*`，2026-11-23）已删除。
 
-```bash
---set baseline.noise_fixed=0.03                     # 所有数据集
---set 'baseline.noise_fixed={math: 0.03}'           # 按领域 / 数据集名 / default；没给值的数据集照常测
---set baseline.noise_n=200                          # 照常测，但只用 200 道验收题重评（更省；题少噪声带偏大，偏保守）
-```
-
-测出来的值在 `baseline/gate_scores.json`（`score`、`se`、`noise_band`、`noise_source`）里。噪声带只记录，不参与 Paper B 的验收（以前它只放宽保留领域的容差）；`gate.use_noise_band` 已没有读取者，留在 base.yaml 里只是为了旧运行能续跑。
-
-**解码**：快速筛、验收、留出评测都用 thinking 采样（见上表）；噪声重评用贪心时结果完全一样，所以不重跑，噪声带 = 0。训练答案（只在 edit 第 0 代）用 0.7 / 0.8 / top_k 20，每题采 4 个，取第一个判对的，4 个都错就跳过这道题。改造者写程序时用自己的采样参数（thinking 模式：`editor.temperature` 0.6、top_p 0.95、top_k 20）。训练序列长度 `train.max_len` = 4608（回答最多 4096 + 题目留 512）。
+**解码**：快速筛、验收、留出评测都用 thinking 采样（见上表）。训练答案（只在 edit 第 0 代）用 0.7 / 0.8 / top_k 20，每题采 4 个，取第一个判对的，4 个都错就跳过这道题。改造者写程序时用自己的采样参数（thinking 模式：`editor.temperature` 0.6、top_p 0.95、top_k 20）。训练序列长度 `train.max_len` = 4608（回答最多 4096 + 题目留 512）。
 
 ## 启动
 
@@ -101,7 +91,7 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 ./run_rsi.sh --paper B --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id B_math_s42
 ./run_rsi.sh --paper B --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1,2 --run-id B_math_s42 --set hardware=h20   # H20（按每张卡 110 GB 规划）
 ./run_rsi.sh --paper B --domain math --gens 2 --mock          # 本机 mock，约 5 分钟
-# 改配置：--set search.max_evaluate=16 --set gate.delta=0.03（写进 run_config.yaml 并锁定）
+# 改配置：--set search.threads=4 --set gate.delta=0.03（写进 run_config.yaml 并锁定）
 ```
 
 同一个 run-id 再运行会跳过已完成的步骤（`state.json`）。**提前停止**（2026-11-20）：连续 `loop.patience` = 3 代验收都保留当前模型（`accepted.json` 的 source 为 keep）就停（`state.json` 的 `stopped`）；null = 总是跑满 `--gens` 代。产物在 `experiment_records/<run-id>/`。
@@ -110,16 +100,16 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 
 | 步骤（state key） | 内容 | 产物 |
 |---|---|---|
-| `baseline/gate` | M_0 在固定验收集（`simple_<领域>_eval`）上评测（`decoding.gate`），噪声带 = max(重复评测波动, 2×SE)，只记录 | `baseline/gate_scores.json` |
+| `baseline/gate` | M_0 在固定验收集（`simple_<领域>_eval`）上评测（`decoding.gate`），分数和标准误只记录 | `baseline/gate_scores.json` |
 | `baseline/heldout` | M_0 留出评测（`simple_<领域>_test`） | `baseline/heldout.json` |
 | `genXX/draw` | `rsicore.draws.simple_draw`：本代快速筛（= signal）500 题和 train（池子里剩下的） | `draws/gen_XX/` |
 | `genXX/train_data` | train 题的训练目标：edit 第 0 代拒绝采样 M_g 自己答对的回答，4 个都错的题没有训练目标、不参与训练（`train_data.mode: self_correct`）；其余情况只用金标、不采样 | `train_data.json` |
-| `genXX/diagnostics` | 固定诊断表（每个 (层, 模块)：范数、奇异值、已合并 adapter 的范数 / 有效秩 / intruder / 相对变化分位 / 激活比） | `diagnostics.json` |
+| `genXX/diagnostics` | 固定诊断表（每个 (层, 模块)：范数、奇异值、已合并 adapter 的范数 / 有效秩 / intruder / 相对变化分位；行里另有目标题上的激活比，不进提示） | `diagnostics.json` |
 | `genXX/raw` | 仅 `edit`：第 0 代按 `raw` 配方训练 raw LoRA（整个运行唯一的训练），screen / full / gate 评测；之后各代记录改造者出发的 LoRA = 当前 LoRA，不训练 | `baselines/raw.json`、`baselines/raw_lora.*` |
 | `genXX/search` | `rsicore.search.inner_search`：8 线程 × 1 步；改造者 = main 副本上的 M_g（vLLM 多 LoRA），候选 LoRA 在 train 卡上构建后热加载，每个候选做一次验收评测（`gate.json`） | `candidates.jsonl`、`programs/`、`loras/`、`gate.json`、`reference_screen.json` |
-| `genXX/gate` | 代末在通过验收的候选里取配对提升最大的（`accept_best_gate`）。验收：在验收集上和当前模型逐题配对，平均提升 ≥ `gate.min_gain`（0 = 严格为正），`require_significant` 时置信区间下界 > 0；已学目标（上次接受时的验收分）≥ 学完时 − δ；沙箱检查。都不过 → edit 第 0 代兜底合并 raw LoRA（要能过验收）→ 否则保留 M_g。`search.gate_every_candidate: false` 时走 `submit_to_gate`（≤ `gate.max_submissions`，只送信号题上赢了当前模型的候选；edit 第 0 代参照 raw − ε） | `gate.json`、`accepted.json`、`accepted_lora.*`、`parent_gate.json` |
+| `genXX/gate` | 代末在通过验收的候选里取配对提升最大的（`accept_best_gate`）。验收：在验收集上和当前模型逐题配对，平均提升 ≥ `gate.min_gain`（0 = 严格为正），`require_significant` 时置信区间下界 > 0；已学目标（上次接受时的验收分）≥ 学完时 − δ；沙箱检查。都不过 → edit 第 0 代兜底合并 raw LoRA（要能过同样的验收）→ 否则保留 M_g | `gate.json`、`accepted.json`、`accepted_lora.*`、`parent_gate.json` |
 | `genXX/merge` | LoRA 合并进权重 → M_{g+1}（mock：更新 registry 中 `m{g+1}` 的 quality）；`edit` 模式和 `merge.mode adapter` 不合并，`model.json` 记录 M_{g+1} = M_0 + 哪个 adapter（adapter 模式另存 `cumulative_lora`） | `model/`、`model.json`、`cumulative_lora` |
-| `genXX/nonllm` | 非 LLM 分支（同 evaluate 预算，按模式）：edit 随机编辑规则作用于 raw；scratch 随机无梯度构造。2026-11-21：`--set nonllm.enabled=false` 完全不跑；`nonllm.skip_if_rejected`（默认 true）在验收保留当前模型（`accepted.json` source keep）的那一代跳过（没有被接受的 LoRA 可比）。两个键不写在 base.yaml 里（只在注释里），按默认读取，这样之前锁定的运行配置还能续跑；跳过时 `nonllm.json` 里有 `skipped` | `baselines/nonllm.json` |
+| `genXX/nonllm` | 非 LLM 分支（候选数同改造者，按模式）：edit 随机编辑规则作用于 raw；scratch 随机无梯度构造。2026-11-21：`--set nonllm.enabled=false` 完全不跑；`nonllm.skip_if_rejected`（默认 true）在验收保留当前模型（`accepted.json` source keep）的那一代跳过（没有被接受的 LoRA 可比）。两个键不写在 base.yaml 里（只在注释里），按默认读取，这样之前锁定的运行配置还能续跑；跳过时 `nonllm.json` 里有 `skipped` | `baselines/nonllm.json` |
 | `genXX/heldout` | M_{g+1} 的留出评测（`simple_<领域>_test`）。2026-11-21：验收保留当前模型时 M_{g+1} = M_g，直接复用上一代（第 0 代：baseline）的结果，不再重测（`state.json` 里记 `reused_from`） | `heldout.json` |
 | `genXX/summary` | 记录反馈里展示过的错例（`shown.json`，只是记录：快速筛每代从干净的池子里重抽）；汇总这一代（接受了谁、验收结果、非 LLM 分支、raw、留出评测） | `summary.json` |
 
@@ -135,7 +125,7 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 | `primitives/construct.py` | `rank1`、`from_direction`、`scale_singular` |
 | `primitives/ops.py` | `scale`、`interpolate`、`combine`、`drop`、`truncate_rank`、`intruder_scale`、`relchange_prune`、`orthogonalize`、`ties` |
 | `primitives/train.py` | `TrainData`（只允许本代 train 题）、`HFModel`（transformers + peft：loss / sgd（只用于 raw LoRA）/ acts / act_ratio） |
-| `tools.py` | `Workspace`：把原语注册成 `ToolAPI` 工具（句柄、预算、train 限制、evaluate），`program_build`（沙箱执行 → 检查 → 保存候选） |
+| `tools.py` | `Workspace`：把原语注册成 `ToolAPI` 工具（句柄、GPU 预算、train 限制；`evaluate_lora` 只给 raw LoRA 和非 LLM 分支打分），`program_build`（沙箱执行 → 检查 → 保存候选） |
 | `evaluator.py` | 候选评测（screen / full / gate、配对差、错例、行为统计、分数 = 目标领域的配对提升） |
 | `diagnostics.py` | 诊断表计算与渲染 |
 | `prompts.py` | 改造者 system prompt、`ContextRenderer`（候选表、本线程最佳程序、最近反馈、档案） |
@@ -145,19 +135,17 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 ## 改造者看到的工具
 
 程序形如 `def main(api): ...; return {"lora": handle}`（`{"lora": None}` = 保持原样），工具只能用关键字参数调用：
-`modules`、`diagnostics`、`train_ids`、`train_example`、`svd`、`acts`、`new_lora`、`rank1`、`from_direction`、`scale_singular`、`scale`、`interpolate`、`combine`、`drop`、`truncate_rank`、`intruder_scale`、`relchange_prune`、`orthogonalize`、`ties`、`inspect`、`stack`、`raw_lora`、`candidate`、`evaluate`、`budget`（说明见 `tools.py` 的 `TOOL_DOCS`）。
+`modules`、`diagnostics`、`train_ids`、`train_example`、`svd`、`acts`、`new_lora`、`rank1`、`from_direction`、`scale_singular`、`scale`、`interpolate`、`combine`、`drop`、`truncate_rank`、`intruder_scale`、`relchange_prune`、`orthogonalize`、`ties`、`inspect`、`stack`、`raw_lora`、`candidate`、`budget`（说明见 `tools.py` 的 `TOOL_DOCS`）。
 
 按模式过滤（`tools.tools_for_mode`）：`edit` 有 `raw_lora`，`scratch` 没有。任何模式都没有训练 / 梯度工具（`sgd` / `grad` / `from_grad` 已删除）。没注册的工具调用会被 ToolAPI 拒绝。
 
 2026-11-20 新增两个工具（`tools.compare` / `tools.train_loss` 可关掉）：
-- `compare(cid, other='parent', level='screen')`：两个**已评测过**的模型逐题对比（坏掉 / 修好的题数和题号、按输出长度分组、截断率），只给题号和统计，不给题目内容，免费，从不触发评测。
-- `train_loss(lora, ids=None, n=64)`：在 train 题上算当前模型 + 这个 LoRA 下答案的平均 NLL，并和不加 LoRA 比（只做前向，不训练，消耗 gpu_seconds）。scratch 里改造者可以先用它便宜地筛掉明显变差的构造，再花 evaluate。
+- `compare(cid, other='parent', level='screen')`（工具说明里写 level='gate'：主搜索里候选只有验收结果）：两个**已评测过**的模型逐题对比（坏掉 / 修好的题数和题号、按输出长度分组、截断率），只给题号和统计，不给题目内容，免费，从不触发评测。
+- `train_loss(lora, ids=None, n=64)`：在 train 题上算当前模型 + 这个 LoRA 下答案的平均 NLL，并和不加 LoRA 比（只做前向，不训练，消耗 gpu_seconds）。scratch 里改造者可以先用它便宜地筛掉明显变差的构造，再交候选。
 
 - `acts` / `train_example` 只接受本代 `train` 题号，其他题号抛 `PermissionError`。
-- 预算：evaluate（相同 LoRA 只计一次）、gpu_seconds（`acts` / `train_loss`，实测；mock 中估计）。`search.charge_screens: false` 时自动快速筛不花 evaluate，evaluate 只是程序里 `api.evaluate` 的池子（`program_evaluate_total`）。
-- 每个程序自己调用 `api.evaluate` 最多 `search.program_evaluate_calls` 次新评测（2026-11-21，代码默认 2，`null` = 不限；
-  已评测过的相同 LoRA 不算；返回候选后的自动评测不算），超了抛 `BudgetExceeded`。`api.budget()` 在程序里还返回
-  `program_seconds_left`（离 `sandbox.timeout_s` 还剩几秒）和 `program_evaluate_calls_left`。
+- 预算：gpu_seconds（`acts` / `train_loss`，实测；mock 中估计）。没有 evaluate 预算（2026-11-23：没有 `api.evaluate`，每个返回的候选在程序外做一次验收评测）。`api.budget()` 在程序里还返回
+  `program_seconds_left`（离 `sandbox.timeout_s` 还剩几秒）。
 
 ### 张量工具 `api.tensors` / `api.tensor_compute`（2026-11-21）
 
@@ -169,20 +157,20 @@ raw LoRA 的配方和大小在 `raw` 里设置（默认 rank 16、lr 1e-4、1 �
 - 系统提示（工具开着时）：向量引用规则里加上 `T` 句柄；模块名规则说明 `api.modules()` 只列线性模块，其他张量用 `api.tensors()` 看、用 `api.tensor_compute` 读（只有 weights 模式能写）；策略里加上 tensor_compute（`svd_lowrank`、CPU、时限）；weights 模式的上限里加上 1 维张量上限、零中心说明和不可改的张量。
 
 系统提示与每步上下文（2026-11-21，根据 nosig 实验的失败候选改写）：
-- 验收规则按配置生成（`gate.min_gain`、`gate.require_significant`、本代参照 raw / parent、验收题数换算成"约多对几题"），
+- 验收规则按配置生成（`gate.min_gain`、`gate.require_significant`、验收题数换算成"约多对几题"；edit 第 0 代另写"都不过时 raw 过同样的验收就用它"），
   不再写死"95% CI"；不提保留领域（只有目标领域）。
 - 新增规则：程序里 `api` 只是 `main(api)` 的参数（run_python 里是全局变量），辅助函数要显式传入；模块名只能取自
   `api.modules()`（各层类型不规则）；rank1 / from_direction 的 u、direction 是输出侧向量（长度 out），v、key 是输入侧
   （长度 in），取自同一模块的 svd / acts；工具结果可能为空，索引前检查，可选步骤用 try/except 回退；墙钟时限包含所有工具调用。
-- 每步上下文第一行附预算：本代还剩几次 evaluate / GPU 秒、每个程序的评测上限、程序时限、已有程序的运行时间中位数和
-  最大值、超时次数、一次评测大约几秒；剩余 evaluate ≤ 4 时提醒不要在程序里评测。
+- 每步上下文第一行附预算：没有 `api.evaluate`、每个候选一次验收，本代还剩几 GPU 秒、程序时限、已有程序的运行时间中位数和
+  最大值、超时次数、一次评测大约几秒。
 - 工具说明：`modules` 是唯一合法的模块名来源；`diagnostics` 可能返回空列表；`rank1` / `from_direction` 写明向量所在侧。
 
 ## 改造者：thinking + 工具轮次（2026-11-21）
 
 改造者写每个候选时开 Qwen3 thinking（`editor.extra_body: {chat_template_kwargs: {enable_thinking: true}, top_k: 20, min_p: 0.0}`，temperature 0.6、top_p 0.95），并且可以先调用函数再交程序：
 - 一轮 = 模型的一次回复里带了函数调用（同一回复里的多个调用算一轮）。最多 `editor.tool_rounds` = 20 轮（base.yaml），之后强制一次不带工具的最终回复（tool_choice none）。回复里**不带函数调用**、含一个 ```python 块，就是这次的程序。空回复、写到长度上限、把调用写成文本时最多提醒 2 次；最后还没有程序就用循环里写过的最后一个代码块（`stop: fallback`）。
-- 两个函数：`run_python(code)` 在同一个沙盒里跑探索代码，`api` 是 `Workspace.explore_api`：和程序的工具一样，但没有 `evaluate`、`raw_lora`（句柄 `RAW` 照样能用），GPU 工具 `acts` / `train_loss` 只在 `editor.explore.gpu_tools: true`（base.yaml 是 true）时可用，记在单独的探索预算 `explore.gpu_seconds`（每个会话 600）上。探索**不花本代的 evaluate / gpu_seconds 预算**，句柄每次调用后释放，工具记录在 `<cid>~xRR_i` 下（不影响 `classify`），完整输出在 `gen_XX/explore/<cid>/rRR_i/`。`read_record(cid, part)` 读本步候选表里某个候选的完整程序或反馈；`search_history(gen, sort, offset)`（2026-11-21，默认开，`editor.history_tool=false` 关）列出所有试过的候选（本代可见的 + 往期所有代），每个一行：strategy、modules、max_rank、用过的工具、target_gain、分数、验收结果，`same_as` = LoRA digest 与更早候选相同；`read_record` 也能打开往期候选。（系统提示里这个工具的说明仍写着 "worst retention change, KL"：为了提示逐字不变没有改，这两列现在总是空的。）
+- 两个函数：`run_python(code)` 在同一个沙盒里跑探索代码，`api` 是 `Workspace.explore_api`：和程序的工具一样，但没有 `raw_lora`（句柄 `RAW` 照样能用），GPU 工具 `acts` / `train_loss` 只在 `editor.explore.gpu_tools: true`（base.yaml 是 true）时可用，记在单独的探索预算 `explore.gpu_seconds`（每个会话 600）上。探索**不花本代的 gpu_seconds 预算**，句柄每次调用后释放，工具记录在 `<cid>~xRR_i` 下（不影响 `classify`），完整输出在 `gen_XX/explore/<cid>/rRR_i/`。`read_record(cid, part)` 读本步候选表里某个候选的完整程序或反馈；`search_history(gen, sort, offset)`（2026-11-21，默认开，`editor.history_tool=false` 关）列出所有试过的候选（本代可见的 + 往期所有代），每个一行：strategy、modules、max_rank、用过的工具、target_gain、分数、验收结果，`same_as` = LoRA digest 与更早候选相同；`read_record` 也能打开往期候选。
 - 上限（都可配置，`editor:` 块）：`tool_rounds` 20、`max_tool_calls` 100、`turn_max_tokens` 8192（每个工具轮）、`max_tokens` 16384（最终轮，原来 8192）、`proposal_tokens` 160000、`proposal_wall_s` 2400、`tool_result_chars` 6000、`history_keep` 2，压缩 `compact_at` / `keep_tool_rounds` / `keep_reasoning_rounds` = 0.6 / 8 / 2，探索沙盒 `explore.timeout_s` 300、`mem_gb` 8。
 - **上下文长度只看 `editor.context_tokens`**：客户端用它截每轮 max_tokens、决定何时压缩，同时写成 main 副本（改造者就在上面；weights 模式下候选槽的临时服务器也一样，保证所有打分服务器上下文相同）的 `--max-model-len`，覆盖 `server.main_args` 里写的值（`lora_code.common.main_server_args`）。b300 / h20 = 131072，h20_80 = 49152。设成 null 就按 `main_args` 原样。真实服务器上若模型的 `max_position_embeddings` 更小，`rsicore.servers` 会截到它并警告，不加 YaRN。
 - `--set editor.tool_rounds=0`：回到每个候选一次请求，请求里没有 tools，system prompt 和以前逐字相同。

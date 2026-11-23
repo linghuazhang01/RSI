@@ -5,24 +5,27 @@
 # One flow (2026-11-22; formerly `objective: simple` + `scope: single`, now the only behaviour): simple_data/<domain>
 # (data/scripts/make_simple_data.py, sampled from the decontaminated training pool). Train role simple_<d>_pool: every
 # generation draws a fresh screen of simple.screen_n (default 500) items from the pool minus the eval / test items
-# (rsicore.draws; the same items in Paper A's generation g and Paper B's g-1), KL / calibration texts = 400 other pool
-# items of that generation. Gate = simple_<d>_eval (500 items, the usual paired gate); held-out report =
+# (rsicore.draws; the same items in Paper A's generation g and Paper B's g-1), calibration texts = 400 other pool
+# items (generation 0's are used, once). Gate = simple_<d>_eval (500 items, the usual paired gate); held-out report =
 # simple_<d>_test (500 other items). Every score is sampled in Qwen3 thinking mode (0.6 / 0.95 / top_k 20, 16384
-# tokens, the run seed for the incumbent and every candidate). The incumbent (latest model) answers the generation's
-# screen items ONCE (n 4; shared by every thread / step; full = screen, top_full 0); candidates are NOT screened
-# (search.screen_candidates false): the editor reads the incumbent's results (context summary + screen_results /
-# screen_output tools, full outputs incl. thinking). There is no api.evaluate (program_evaluate_calls 0). Every
-# candidate gets ONE gate evaluation (search.gate_every_candidate: 500 x 4, paired vs the incumbent's gate records;
-# recorded in gen_XX/gate.json, visible to later steps / generations); the passing candidate with the largest gain is
-# accepted. Cost: threads x steps x 500 x 4 thinking samples per generation on the gate set; the held-out test set
-# (500 x 4) is the only unbiased number. Run ids end in _single_simple (rsicore.config.RUN_SUFFIX); a changed config
-# needs a new --run-id / --tag.
+# tokens, the run seed for the incumbent and every candidate). The flow is hard-wired (2026-11-23; the former search
+# knobs screen_candidates / gate_every_candidate / charge_screens / program_evaluate_* / max_evaluate / top_full /
+# rerun_seeds / kl_weight, gate.max_submissions and the noise: block are gone; --set of them is refused unless it gives
+# the hard-wired value). The incumbent (latest model) answers the generation's screen items ONCE (n 4; shared by every
+# thread / step); candidates are NEVER screened: the editor reads the incumbent's results (context summary +
+# screen_results / screen_output tools, full outputs incl. thinking). There is no api.evaluate. Every candidate gets
+# ONE gate evaluation (500 x 4, paired vs the incumbent's gate records; recorded in gen_XX/gate.json, visible to later
+# steps / generations); the passing candidate with the largest gain is accepted. No noise band, no KL term. Cost:
+# threads x steps x 500 x 4 thinking samples per generation on the gate set; the held-out test set (500 x 4) is the
+# only unbiased number. Run ids end in _single_simple (rsicore.config.RUN_SUFFIX); a changed config needs a new
+# --run-id / --tag.
 simple:
   screen_n: 500                       # screen items drawn per generation from simple_<d>_pool (rsicore.draws)
 
 # Scoring decoding per stage (2026-11-21): a dict {temperature, top_p, top_k, min_p, n, thinking, max_tokens, seed} for
-# rsicore.evaluate.score(decoding=...), the same for the incumbent / Q_0 / M_0 and every candidate (seed null = the
-# run's --seed); null = each task's eval/configs/tasks.yaml decoding (greedy). full falls back to screen. n > 1:
+# rsicore.evaluate.score(decoding=...), the same for the incumbent / Q_0 / M_0, every candidate and the baselines (seed
+# null = the run's --seed); null = each task's eval/configs/tasks.yaml decoding (greedy). full (the incumbent's and
+# baselines.full) falls back to screen. n > 1:
 # each item's score is the mean of its n samples. Cached evaluations are reused only under the same decoding.
 decoding:
   screen: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
@@ -63,63 +66,27 @@ action_space:                         # what a config may use
 search:                               # inner search (RSI_LOOP_DESIGN §1.2; edit_code.common.search_settings)
   threads: 8                          # independent editor sessions per generation (prompts use the configured numbers)
   steps: 1
-  max_evaluate: 24                    # evaluations per generation while screens are charged: candidates + api.evaluate
-  program_evaluate_calls: 0           # max api.evaluate calls inside one program (0 = no api.evaluate; null = no cap)
-  max_candidates: 8                   # candidates per generation (null = threads x steps, at most max_evaluate
-                                      # while screens are charged)
-  charge_screens: false               # true: every returned config's screen spends max_evaluate (shared with
-                                      # api.evaluate). false: screens are free, programs always run, api.evaluate
-                                      # draws on program_evaluate_total and a config already evaluated is free
-  program_evaluate_total: 0           # api.evaluate pool per generation when screens are free (null = threads x
-                                      # program_evaluate_calls)
-  screen_candidates: false            # false: candidates are not screened; the incumbent's screen is computed once
-                                      # per generation and shown (screen_results / screen_output). true: every
-                                      # candidate is screened (compare / api.evaluate tools, KL score)
-  gate_every_candidate: true          # true: ONE gate evaluation per candidate during the search (gen_XX/gate.json);
-                                      # the largest passing gain is accepted. false: submit_to_gate (gate.max_submissions)
-  top_full: 0                         # best screened candidates re-evaluated on the full signal set
-  rerun_seeds: 0
-  kl_weight: 0.0                      # score = retention (candidate acc / incumbent acc) - kl_weight * KL vs BF16;
-                                      # 0 (2026-11-22): acceptance is the paired gate gain alone, so no per-generation
-                                      # KL work (M_0's self-generated KL texts, reference logprobs, the incumbent's KL),
-                                      # as in Paper B; generation 0 still builds the calibration texts with M_0's
-                                      # responses
+  max_candidates: 8                   # candidates per generation (null = threads x steps); each gets ONE gate evaluation
 
 gate:                                 # L2: beat the incumbent on the fixed gate set (paired per item)
   min_delta: 0.0                      # mean paired gain over gate datasets (2026-11-21: 0 = any strictly positive
                                       # paired gate gain)
   require_significant: true           # some dataset 95% CI lower bound > 0, none with upper bound < 0
-  max_submissions: 3
   allow_unscored: false               # true lets a gate with no scored items pass (code w/o Docker)
 
-feedback:                             # every candidate is compared with the INCUMBENT on the same items (2026-11-20;
-                                      # M_0 is not scored on the items, it is only the KL reference)
-  examples: 2                         # regression examples per dataset in a candidate's screen feedback (incumbent
-                                      # right, candidate wrong; search.screen_candidates true); the incumbent's screen
-                                      # summary in the context shows max(3, examples) failing items
+feedback:                             # evaluations are compared with the INCUMBENT on the same items (2026-11-20;
+                                      # M_0 is not scored on the items)
+  examples: 2                         # the incumbent's screen summary in the context shows max(3, examples) failing
+                                      # items; regression examples per dataset in a baseline's screen feedback
 
-noise:
-  repeats: 3                          # M_0 screen re-runs for the noise band (only when temperature > 0)
-  temperature: 0.0                    # 2026-11-20: greedy -> re-runs would be identical, so none is run and the
-                                      # band is 0 (the gate uses paired CIs anyway); > 0 = sampled re-runs (seeds
-                                      # seed, seed+1, ...)
-  top_p: 1.0
-  n: null                             # screen items the re-runs score (deterministic subset; null = all screen items)
-  fixed: null                         # a fixed band instead of the re-runs: 0.03, or {math: 0.03, default: 0.02}
-                                      # (keys: dataset, domain or default); datasets without a value are still measured
-
-kl:
-  top_k: 20                           # vLLM prompt_logprobs top-k (<= --max-logprobs)
+kl:                                   # calibration texts (generation 0, built once; the block keeps its name: there
+                                      # is no KL term since 2026-11-23): GPTQ / AWQ calibration and profile contexts
   max_chars: 8000                     # the prompt part (question in chat format) is cut at this many characters
-  self_generated: true                # prompt + M_0's own greedy response (cached per generation in kl_selfgen/):
-                                      # KL and the GPTQ / AWQ calibration also cover the answer tokens; false =
-                                      # the question alone
+  self_generated: true                # prompt + M_0's own greedy response (cached in kl_selfgen/gen_00.jsonl): the
+                                      # GPTQ / AWQ calibration and the profile table also cover the answer tokens;
+                                      # false = the question alone
   self_generated_max_tokens: 2048     # response length cap (a cut response gets no <|im_end|>)
-  self_generated_batch: 64            # prompts per /completions request
-  eval_texts: 400                     # KL texts scored for every candidate when search.kl_weight > 0 (evenly
-                                      # spaced subset; null = all);
-                                      # = the screen size (2026-11-20; was 64). Per-text KL is kept on disk
-                                      # (evals/<cid>/<stage>/kl_per_text.json). Calibration: calibration.max_texts
+  self_generated_batch: 64            # prompts per /completions request (calibration: calibration.max_texts)
 
 calibration:                          # Hessians for GPTQ / AWQ (original model, generation-0 kl texts, once)
   max_texts: 256
@@ -167,7 +134,8 @@ tools:                                # ablations: remove tools from the editor'
   solve_allocation: true
   hessian_table: true                 # 2026-11-20: analysis tools
   group_error: true
-  compare: true
+  compare: true                       # (unused since 2026-11-23: candidates have no screen records to compare; kept
+                                      # so runs locked with it resume)
 
 solver:
   group_sizes: [128]                  # group sizes solve_allocation chooses from by default (KL-greedy baseline)
@@ -175,14 +143,13 @@ solver:
 
 # The editor (2026-11-21): Qwen3 thinking mode + a tool loop while it writes each candidate (rsicore.editor /
 # rsicore.chat_tools). One round = one model turn with tool calls (run_python: exploratory code with the program's
-# api minus evaluate; read_record: an earlier candidate's full program / feedback). After tool_rounds rounds (or a
+# api; read_record: an earlier candidate's full program / feedback). After tool_rounds rounds (or a
 # guard) one forced final turn with tool_choice "none"; the proposal is the reply without tool calls that holds a
 # ```python block. tool_rounds 0 = the single call of before (same payload and prompt text; history_keep is then
-# ignored = full history). Exploration never
-# spends the generation's evaluate budget. search_history (2026-11-21, on by default; code default
+# ignored = full history). search_history (2026-11-21, on by default; code default
 # history_tool: true, set --set editor.history_tool=false to remove it): every candidate already tried (this
-# generation's visible ones and all earlier generations'), one row each with a config description, GiB, KL,
-# scores, gate outcome, same_as = identical config hash; read_record then also opens earlier generations' records. Changing any key here changes the locked config: use a new --run-id.
+# generation's visible ones and all earlier generations'), one row each with a config description, GiB,
+# gate deltas, gate outcome, same_as = identical config hash; read_record then also opens earlier generations' records. Changing any key here changes the locked config: use a new --run-id.
 editor:
   temperature: 0.6                    # Qwen3 thinking-mode sampling: 0.6 / 0.95 / top_k 20 / min_p 0
   top_p: 0.95
@@ -216,7 +183,7 @@ editor:
     gpu_seconds: 300                  # (Paper B only; kept for a shared editor block)
 
 sandbox:
-  timeout_s: 1800                     # includes time inside api.evaluate calls
+  timeout_s: 1800                     # a program's wall clock, every tool call included
   mem_gb: 16
 
 archive:
@@ -242,7 +209,8 @@ heldout:                              # held-out report = simple_<domain>_test (
   enabled: true                       # false: no held-out report (M_0, Q_0, new incumbents)
 
 baselines:
-  methods: []                         # e.g. [uniform, kl_greedy, evo]; run after the search each generation
+  methods: []                         # e.g. [uniform, kl_greedy, evo]; run after the search each generation (own
+                                      # screen evaluations, edit_code/baselines.py; not gated)
   full: false
   evo_evaluations: 24
 
@@ -268,7 +236,7 @@ gpu_layout:
   editor_sleep: true                  # the editor (vLLM sleep mode: weights -> CPU RAM, ~52 GB) sleeps while the
                                       # candidates of a search step are evaluated; its GPUs serve as one more
                                       # candidate slot (4 GPUs: 4 candidates at once instead of 3)
-  m0_replicas: true                   # M_0 batch jobs (generation 0 gate / held-out, KL self-generated answers) on
+  m0_replicas: true                   # M_0 batch jobs (generation 0 gate / held-out, self-generated calibration answers) on
                                       # every GPU group, items / tasks split over the replicas
   parallel_heldout: true              # held-out evaluation of an exported model on every free GPU group (tasks split)
   prep_all_gpus: true                 # generation-0 calibration / profile table / cache / hessian table on every GPU
@@ -316,10 +284,9 @@ mock:
   lam: 1.2                            # quality = base * exp(-lam * accumulated damage)
 
 mock_overrides:                       # applied in --mock runs only, after --set (fast local end-to-end check):
-                                      # the real layout small (3 threads x 1 step, gate per candidate, no evaluate),
-                                      # the real gate rule, no baselines (mock_overrides win over --set)
-  search: {threads: 3, steps: 1, max_evaluate: 4, top_full: 0, program_evaluate_calls: 0, max_candidates: 3}
-  noise: {repeats: 3}
+                                      # the real layout small (3 threads x 1 step), the real gate rule, no baselines
+                                      # (mock_overrides win over --set)
+  search: {threads: 3, steps: 1, max_candidates: 3}
   heldout: {limit: 20}
   gate: {allow_unscored: true, min_delta: 0.0}
   baselines: {methods: []}

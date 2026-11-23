@@ -56,7 +56,7 @@ def _ws(tmp_path, mode="weights", budget=None, cfg=None, stack=None, evaluator=N
     c = {"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}, "weights": {"norm_cap_tau": 0.05}}
     c.update(cfg or {})
     ws = Workspace(mock=True, store=MockStore(), train=train, cfg=c, out_dir=tmp_path,
-                   budget=budget or {"evaluate": 4, "gpu_seconds": 500}, mode=mode, stack=stack,
+                   budget=budget or {"gpu_seconds": 500}, mode=mode, stack=stack,
                    evaluator=evaluator or _Ev())
     ws.build_api()
     return ws
@@ -71,13 +71,13 @@ def test_tool_surface_per_mode(tmp_path):
     assert set(WEIGHT_TOOLS) == W_TOOLS and W_TOOLS <= set(TOOL_DOCS)
     w = tools_for_mode("weights")
     assert W_TOOLS <= set(w) and "raw_lora" not in w
-    assert {"new_lora", "scale_singular", "svd", "acts", "evaluate", "train_loss", "compare"} <= set(w)
-    assert "edit" in w["evaluate"] and "edit" in w["train_loss"]
+    assert {"new_lora", "scale_singular", "svd", "acts", "train_loss", "compare"} <= set(w)
+    assert "evaluate" not in w and "edit" in w["train_loss"]                 # no evaluate tool (2026-11-23)
     for mode in ("scratch", "edit"):
         t = tools_for_mode(mode)
         assert not (W_TOOLS & set(t))
         assert ("raw_lora" in t) == (mode == "edit")
-        assert "edit=" not in t["evaluate"]
+        assert "evaluate" not in t and "edit=" not in t["train_loss"]
     off = tools_for_mode("weights", cfg={"tools": {"w_toward_original": False, "train_loss": False}})
     assert "w_toward_original" not in off and "train_loss" not in off and "regmean_preserve" not in off
     ws = _ws(tmp_path)
@@ -256,7 +256,7 @@ def test_save_load_candidate_edit(tmp_path):
 def test_program_build_weights(tmp_path):
     from lora_code.mock import make_mock_policy
     from lora_code.tools import classify, program_build
-    ws = _ws(tmp_path, budget={"evaluate": 4, "gpu_seconds": 5000})
+    ws = _ws(tmp_path, budget={"gpu_seconds": 5000})
     pol = make_mock_policy(42, skill=1.0, mode="weights")
     progs = {pol([{"role": "user", "content": f"[thread={t} step={s}]"}]) for t in range(3) for s in range(3)}
     assert len(progs) > 3 and all('return {"edit": e}' in p for p in progs)
@@ -292,29 +292,28 @@ def test_program_build_weights(tmp_path):
     assert classify(["tensor_compute", "tensor_compute.lora", "tensor_compute.writes"]) == "weights+construct"
 
 
-def test_evaluate_tool_with_edits(tmp_path):
+def test_evaluate_lora_with_edits(tmp_path):
+    """Workspace.evaluate_lora (the non-LLM branch's points) on weight edits: identical edits are scored once, a LoRA
+    is scored as the edit that adds it, a capped edit fails the checks; there is no evaluate tool (2026-11-23)."""
     from lora_code.mock import m_construct
     ev = _Ev()
-    ws = _ws(tmp_path, evaluator=ev, budget={"evaluate": 2, "gpu_seconds": 500})
+    ws = _ws(tmp_path, evaluator=ev, budget={"gpu_seconds": 500})
+    assert "evaluate" not in ws.api.names()
     mod = _down(ws)[0]
     e = ws.api.call("w_scale", {"edit": ws.api.call("new_edit", {})["edit"], "modules": [mod], "s": 1.01})["edit"]
-    fb = ws.api.call("evaluate", {"edit": e})
-    assert fb["score"] is not None and ws.spent["evaluate"] == 1
-    ws.api.call("evaluate", {"edit": e})                          # identical edit: free
-    assert ws.spent["evaluate"] == 1
-    ws.api.call("evaluate", {"edit": ws.api.call("new_edit", {})["edit"]})   # keep: free
-    assert ws.spent["evaluate"] == 1
+    sc, fb = ws.evaluate_lora(ws._get(e), "screen")
+    assert sc is not None and fb["score"] == sc
+    n = len(ev.calls)
+    assert ws.evaluate_lora(ws._get(e), "screen")[0] == sc and len(ev.calls) == n     # identical edit: cached
     lo = m_construct(ws._empty(), mod, 0.5, "rank1")
     hl = ws._new("L", lo)
-    ws.api.call("evaluate", {"lora": hl})                         # a LoRA is evaluated as the edit that adds it
-    assert ws.spent["evaluate"] == 2
+    ws.evaluate_lora(ws.resolve_result({"lora": hl}), "screen")    # a LoRA is scored as the edit that adds it
     assert ws.lora_name(ws.resolve_result({"lora": hl})) in ev.reg
-    sc, fb2 = ws.evaluate_lora(ws._get(e), "screen", charge=True)   # charged path dedupes with the tool
-    assert sc == fb["score"] and ws.spent["evaluate"] == 2
+    assert ws.spent.get("evaluate") is None
     r = ws.api.call("train_loss", {"edit": e, "n": 8})
     assert r["n"] == 8 and r["parent_loss"] == 1.2
     big = ws._get(ws.api.call("w_scale", {"edit": e, "modules": [mod], "s": 1.3})["edit"])
-    sc, fb3 = ws.evaluate_lora(big, "full", charge=False)
+    sc, fb3 = ws.evaluate_lora(big, "full")
     assert sc is None and "edit failed the sandbox checks" in fb3["error"]
 
 
@@ -323,7 +322,7 @@ def test_system_prompt_modes():
     for mode in ("edit", "scratch", "weights"):
         assert {"action", "goal", "strategies", "what", "return_line", "limits", "objects", "unit"} <= set(MODE_TEXT[mode])
     cfg = {"lora": {}, "sandbox": {}, "weights": {"norm_cap_tau": 0.03}}
-    b = {"evaluate": 4, "gpu_seconds": 10}
+    b = {"gpu_seconds": 10}
     pw = system_prompt(cfg, budget=b, mode="weights")
     ps = system_prompt(cfg, budget=b, mode="scratch")
     pe = system_prompt(cfg, budget=b, mode="edit")

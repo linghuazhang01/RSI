@@ -4,8 +4,8 @@
 raw LoRA of mode=edit: the fixed `raw` recipe (rank 16 by default, all attention / MLP projections except
 in_proj_a/b), trained once in generation 0 on raw.n_train of that generation's train items; the editor edits
 it in every generation.
-Non-LLM search (the 4th branch), same evaluate budget as the editor, by method.mode: edit = random rule-based
-edits of the raw LoRA (random_edit_search); scratch = random gradient-free constructions
+Non-LLM search (the 4th branch), as many candidates as the editor (nonllm.evaluate), by method.mode: edit = random
+rule-based edits of the raw LoRA (random_edit_search); scratch = random gradient-free constructions
 (random_construct_search); weights = random structured edits of the dense weights (random_weight_search).
 Best by screen, top-3 re-scored on the full signal.
 All points report the target gain vs the current model.
@@ -85,7 +85,7 @@ def train_lora(ws, rec: dict, gpu_budget_s: float, *, seed: int = 42, modules=No
 
 def point(ws, lo, label: str, level: str = "screen") -> dict:
     """Evaluate one LoRA (not charged to the editor budget) and summarise the trade-off."""
-    sc, fb = ws.evaluate_lora(lo, level, charge=False)
+    sc, fb = ws.evaluate_lora(lo, level)
     tgt = fb.get("target") or {}
     return {"label": label, "score": sc, "target_gain": (tgt.get("vs_parent") or {}).get("delta"),
             "check_error": fb.get("error"), "name": ws.lora_name(lo) if lo.modules() else None}
@@ -102,7 +102,7 @@ def random_edit_search(ws, raw, *, evals: int, seed: int, top_full: int = 3,
                        scales=(0.5, 0.75, 1.0, 1.25)) -> tuple[object, dict]:
     """mode=edit non-LLM branch: random rule-based edits of the raw LoRA (the operators the editor has,
     without an LLM): truncate_rank -> relchange_prune -> intruder_scale -> orthogonalize (against the stack) ->
-    global scale. Same evaluate budget as the editor. Returns (best LoRA, log)."""
+    global scale. As many evaluations as the editor has candidates. Returns (best LoRA, log)."""
     rng = random.Random(f"{seed}:nonllm-edit")
     tried, seen = [], set()
     for _ in range(evals * 4):
@@ -226,7 +226,7 @@ def _pick_best(ws, tried, top_full: int) -> tuple[object, dict]:
     ok.sort(key=lambda x: -x[0]["score"])
     best, best_full = None, -1e9
     for p, lo in ok[:top_full]:
-        sc, _ = ws.evaluate_lora(lo, "full", charge=False)
+        sc, _ = ws.evaluate_lora(lo, "full")
         p["full_score"] = sc
         if sc is not None and sc > best_full:
             best, best_full = (p, lo), sc

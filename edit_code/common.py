@@ -232,50 +232,14 @@ def candidate_args(cfg: dict) -> list[str]:
 
 
 def search_settings(scfg: dict) -> dict:
-    """Shape and evaluate accounting of one inner search from a `search` block (2026-11-21, simple v2). The code
-    defaults reproduce the old behaviour:
-      charge_screens (default true): the automatic screen of every returned config spends the generation's evaluate
-        budget max_evaluate, shared with the programs' api.evaluate calls (a program is not run once it is empty).
-        false: automatic screens are free, programs always run, and api.evaluate draws on a separate per-generation
-        pool program_evaluate_total (null = threads x program_evaluate_calls; with no per-program cap: max_evaluate);
-        an api.evaluate of a config already evaluated is then free.
-      program_evaluate_calls (default 2): api.evaluate calls per program (null = no per-program cap).
-      max_candidates (null / absent = threads x steps; with charged screens also at most max_evaluate, the old cap).
-    Gate-per-candidate flow (2026-11-21, the base.yaml values; code defaults = the flow above):
-      screen_candidates (default true): false = candidates are NOT screened (the incumbent's screen is still computed
-        once per generation and shown to the editor); screens are then never charged.
-      gate_every_candidate (default false): true = every built candidate gets ONE gate evaluation (paired vs the
-        incumbent) during the search, recorded in gen_XX/gate.json; the end of the generation accepts the passing
-        candidate with the largest paired gain (Runner.accept_best_gate) instead of submit_to_gate.
-      program_evaluate_calls 0 with uncharged screens: no api.evaluate at all (evaluate_tool false: the tool, its docs
-        and the prompt text about it are removed).
-    -> {threads, steps, max_candidates, charge_screens, per_program, eval_budget, top_full, rerun_seeds,
-    screen_candidates, gate_every_candidate, evaluate_tool}; eval_budget is QuantProblem's evaluate budget (charged
-    screens + api.evaluate, or the api.evaluate pool alone)."""
+    """Shape of one inner search from a `search` block -> {threads, steps, max_candidates} (max_candidates null /
+    absent = threads x steps). The flow itself is hard-wired (2026-11-23): candidates are never screened, every built
+    candidate gets ONE gate evaluation during the search (paired vs the incumbent, gen_XX/gate.json), the passing
+    candidate with the largest paired gain is accepted (run.Runner.accept_best_gate); there is no api.evaluate and no
+    evaluate budget."""
     threads, steps = int(scfg["threads"]), int(scfg["steps"])
-    screen_c = bool(scfg.get("screen_candidates", True))
-    if not screen_c and not scfg.get("gate_every_candidate", False):
-        raise ValueError("search.screen_candidates false needs search.gate_every_candidate true (an unscreened "
-                         "candidate is only scored by its gate evaluation)")
-    charge = bool(scfg.get("charge_screens", True)) and screen_c
-    pp = scfg.get("program_evaluate_calls", 2)
-    pp = None if pp is None else int(pp)
-    evaluate_tool = charge or pp != 0
-    if charge:
-        budget = int(scfg["max_evaluate"])
-    elif not evaluate_tool:
-        budget = 0
-    elif scfg.get("program_evaluate_total") is not None:
-        budget = int(scfg["program_evaluate_total"])
-    else:
-        budget = threads * pp if pp is not None else int(scfg.get("max_evaluate") or threads * steps)
     mc = scfg.get("max_candidates")
-    if mc is None:
-        mc = threads * steps if not charge else min(threads * steps, int(scfg["max_evaluate"]))
-    return {"threads": threads, "steps": steps, "max_candidates": int(mc), "charge_screens": charge,
-            "per_program": pp, "eval_budget": max(0, budget), "top_full": int(scfg.get("top_full", 3)),
-            "rerun_seeds": int(scfg.get("rerun_seeds", 0) or 0), "screen_candidates": screen_c,
-            "gate_every_candidate": bool(scfg.get("gate_every_candidate", False)), "evaluate_tool": evaluate_tool}
+    return {"threads": threads, "steps": steps, "max_candidates": int(threads * steps if mc is None else mc)}
 
 
 def free_cuda():

@@ -219,7 +219,7 @@ def test_workspace_refuses_non_train_ids(store, tmp_path):
     from lora_code.tools import Workspace
     hf = HFModel(store.model_dir, store, device="cpu", dtype="float32", max_len=64)
     ws = Workspace(mock=False, store=store, train=TrainData(_examples(4)), cfg={"lora": {"rank_cap": 16, "norm_cap_tau": 5}},
-                   out_dir=tmp_path, hf=hf, budget={"evaluate": 2, "gpu_seconds": 600})
+                   out_dir=tmp_path, hf=hf, budget={"gpu_seconds": 600})
     ws.build_api()                                   # gpu seconds are charged by the rsicore ToolAPI
     assert not set(ws.api.names()) & {"sgd", "grad", "from_grad"}
     with pytest.raises(PermissionError):

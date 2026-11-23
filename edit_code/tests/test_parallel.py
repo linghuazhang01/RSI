@@ -5,8 +5,8 @@
 - the Paper A GPU layout (editor 1 GPU, candidate groups);
 - rsicore.search.inner_search(parallel=N) really runs a step's threads at the same time, records them in
   thread order, and parallel=1 keeps the old sequential behaviour;
-- QuantProblem.evaluate is thread-safe: an identical config is evaluated once, charged screen evaluations
-  reserve the budget before they start (never more than eval_budget), and serve() hands out distinct slots.
+- QuantProblem.evaluate is thread-safe: an identical config is evaluated once (the others wait for it), and serve()
+  hands out distinct slots.
 """
 from __future__ import annotations
 
@@ -74,8 +74,7 @@ def _search(tmp, parallel, delay=0.2):
     t0 = time.time()
     out = inner_search(rc, 1, editor_factory=_Editor, render_context=render,
                        build_fn=lambda prog, cid: ({"v": int(cid[5]) / 10}, None), screen_fn=screen,
-                       full_fn=lambda art, cid: screen(art, cid), threads=4, steps=2, max_candidates=8,
-                       top_full=3, out_dir=tmp, parallel=parallel)
+                       threads=4, steps=2, max_candidates=8, out_dir=tmp, parallel=parallel)
     return out, peak[0], time.time() - t0, seen
 
 
@@ -92,13 +91,12 @@ def test_inner_search_parallel(tmp_path):
     assert [c.cid for c in out] == [c.cid for c in out1]           # same ranking either way
 
 
-def _problem(tmp, n_gpus=4, budget=3):
+def _problem(tmp, n_gpus=4):
     from edit_code.problem import QuantProblem
     rc = SimpleNamespace(mock=True, run_dir=tmp, run_id="t", seed=42, gpus=list(range(n_gpus)))
     cfg = {"gpu_layout": {"candidate_group_size": 1}, "candidates": {"keep_checkpoints": 1}}
     return QuantProblem(rc, cfg, tag="t", gen=1, out_dir=tmp / "p", prep_dir=tmp / "prep", source_dir=None,
-                        source_state=None, budget_gib=10.0, datasets=["dapo_math"], data={}, kl_texts=[],
-                        refs_dir=tmp / "refs", eval_budget=budget)
+                        source_state=None, budget_gib=10.0, datasets=["dapo_math"], data={}, kl_texts=[])
 
 
 def test_evaluate_thread_safe(tmp_path, monkeypatch):
@@ -106,11 +104,11 @@ def test_evaluate_thread_safe(tmp_path, monkeypatch):
     assert prob.slots == [[1], [2], [3]]
     calls, lock = [], threading.Lock()
 
-    def fake(art, stage, cid, key, charged, origin):
+    def fake(art, stage, cid, key, origin):
         with lock:
             calls.append(art["config_hash"])
         time.sleep(0.2)
-        rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "score": 0.5, "feedback": {}, "charged": charged}
+        rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "score": 0.5, "feedback": {}}
         with prob._lock:
             prob._evals[key] = rec
         return dict(rec)
@@ -128,8 +126,7 @@ def test_evaluate_thread_safe(tmp_path, monkeypatch):
     for t in ts:
         t.join()
     assert calls.count("a") == 1                                   # identical config evaluated once
-    assert len(set(calls)) == 3 and prob.evals_used == 3           # budget 3: exactly 3 distinct evaluations
-    assert errs.count("EvalBudgetExhausted") == 2
+    assert sorted(set(calls)) == ["a", "b", "c", "d", "e"] and not errs   # no evaluate budget: all evaluated
     assert sum(1 for r in res if r.get("cached")) == 2             # the two waiting "a" threads
 
 

@@ -1,4 +1,4 @@
-"""Scoring (via eval/run_eval.py), paired bootstrap, and prompt-logprob token KL.
+"""Scoring (via eval/run_eval.py) and paired bootstrap.
 
 score() runs eval/run_eval.py in a subprocess with the eval interpreter (config.eval_python()),
 --ids-file (temp file under out_dir/_ids), --no-cache and --quiet. Use one out_dir per (model, stage):
@@ -19,22 +19,17 @@ thinking: run_eval --thinking on (chat_template_kwargs enable_thinking); only th
 servers' reasoning parser moves the thinking out of `content`; run_eval strips any <think> block left in it), and a
 sample cut at max_tokens while still thinking (finish_reason length, no reasoning_content, no </think>) scores 0.
 
-Token KL uses vLLM's /v1/completions with `prompt_logprobs=k` (an extra sampling param that vLLM's
-OpenAI server accepts in the request body); the response's choices[0].prompt_logprobs is a list
-(first entry null) of {token_id: {"logprob", "rank", "decoded_token"}} with the top-k tokens plus the
-actual prompt token. Server must allow k <= --max-logprobs (vLLM default 20).
+(2026-11-23) The prompt-logprob token KL (reference_logprobs / token_kl, Paper A's KL score term) was removed.
 """
 import hashlib
 import json
 import math
 import random
 import subprocess
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import _net
 from .config import EVAL_DIR, check_decoding, eval_python
 
 RUN_EVAL = EVAL_DIR / "run_eval.py"
@@ -246,110 +241,3 @@ def paired_delta(a: list[dict], b: list[dict], seed: int = 42, n_boot: int = 100
     boots = sorted(sum(d[rng.randrange(n)] for _ in range(n)) / n for _ in range(n_boot))
     lo, hi = boots[int(0.025 * (n_boot - 1))], boots[int(math.ceil(0.975 * (n_boot - 1)))]
     return {"delta": sum(d) / n, "ci": [lo, hi], "n": n}
-
-
-# ----------------------------------------------------------------------------- prompt logprobs / KL
-def _sha(t: str) -> str:
-    return hashlib.sha256(t.encode("utf-8")).hexdigest()
-
-
-def _prompt_logprobs(endpoint: str, model: str, text: str, top_k: int) -> list:
-    """-> list over positions of [ids], [logprobs] (position 0 has none)."""
-    url = endpoint.rstrip("/") + "/completions"
-    payload = {"model": model, "prompt": text, "max_tokens": 1, "temperature": 0.0, "prompt_logprobs": top_k}
-    last = None
-    for attempt in range(4):
-        try:
-            resp = _net.post_json(url, payload, timeout=1800)
-            break
-        except (_net.HTTPError, OSError) as e:
-            last = e
-            if isinstance(e, _net.HTTPError) and e.status < 500:
-                raise
-            time.sleep(2 ** attempt)
-    else:
-        raise RuntimeError(f"prompt_logprobs request failed: {last}")
-    ch = (resp.get("choices") or [{}])[0]
-    plp = ch.get("prompt_logprobs") if ch.get("prompt_logprobs") is not None else resp.get("prompt_logprobs")
-    if plp is None:
-        raise RuntimeError("server returned no prompt_logprobs (is this vLLM >= 0.6 / the mock server?)")
-    out = []
-    for pos in plp:
-        if not pos:
-            out.append([[], []])
-            continue
-        items = sorted(pos.items(), key=lambda kv: kv[1].get("rank") or 10 ** 9)
-        out.append([[int(k) for k, _ in items], [round(float(v["logprob"]), 5) for _, v in items]])
-    return out
-
-
-def _fetch_many(endpoint, model, texts, top_k, workers=8):
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        return list(ex.map(lambda t: _prompt_logprobs(endpoint, model, t, top_k), texts))
-
-
-def _load_cache(cache: Path) -> dict:
-    d = {}
-    if Path(cache).exists():
-        for line in Path(cache).read_text().splitlines():
-            if line.strip():
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                d[(r["sha"], r["top_k"])] = r["pos"]
-    return d
-
-
-def reference_logprobs(endpoint, served_name, texts: list[str], cache: Path, top_k: int = 20) -> Path:
-    """Fetch (once) the reference model's prompt logprobs for `texts`; cached in `cache` (jsonl of
-    {"sha", "top_k", "pos": [[ids], [logprobs]] per position})."""
-    cache = Path(cache)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    have = _load_cache(cache)
-    todo = [t for t in dict.fromkeys(texts) if (_sha(t), top_k) not in have]
-    if todo:
-        res = _fetch_many(endpoint, served_name, todo, top_k)
-        with open(cache, "a") as f:
-            for t, pos in zip(todo, res):
-                f.write(json.dumps({"sha": _sha(t), "top_k": top_k, "model": served_name, "pos": pos}) + "\n")
-    return cache
-
-
-def _kl_position(ref_ids, ref_lps, cand: dict) -> float:
-    """KL(ref || cand) on the partition {each ref-reported token} + {rest}. Tokens missing from the
-    candidate's list get the candidate's smallest reported logprob (an upper bound on their prob)."""
-    if not ref_ids:
-        return 0.0
-    floor = min(cand.values()) if cand else -30.0
-    kl, P, Q = 0.0, 0.0, 0.0
-    for i, lp in zip(ref_ids, ref_lps):
-        p, q_lp = math.exp(lp), cand.get(i, floor)
-        kl += p * (lp - q_lp)
-        P += p
-        Q += math.exp(q_lp)
-    rp, rq = max(0.0, 1.0 - P), max(1e-12, 1.0 - min(Q, 1.0 - 1e-9))
-    if rp > 1e-12:
-        kl += rp * (math.log(rp) - math.log(rq))
-    return max(0.0, kl)
-
-
-def token_kl(ref_cache: Path, endpoint, served_name, texts: list[str], lora: str | None = None,
-             top_k: int = 20) -> dict:
-    """Top-k approximate token KL(ref || cand) per text (mean over positions); "mean" = mean over texts,
-    "token_mean" = mean over all positions. Candidate = `lora` if given, else `served_name`."""
-    ref = _load_cache(ref_cache)
-    missing = [t for t in texts if (_sha(t), top_k) not in ref]
-    if missing:
-        raise KeyError(f"{len(missing)} texts not in reference cache {ref_cache}; call reference_logprobs first")
-    cand_all = _fetch_many(endpoint, lora or served_name, texts, top_k)
-    per_text, tot, ntok = [], 0.0, 0
-    for t, cpos in zip(texts, cand_all):
-        rpos = ref[(_sha(t), top_k)]
-        L = min(len(rpos), len(cpos))
-        kls = [_kl_position(rpos[j][0], rpos[j][1], dict(zip(cpos[j][0], cpos[j][1]))) for j in range(L) if rpos[j][0]]
-        per_text.append(sum(kls) / len(kls) if kls else 0.0)
-        tot += sum(kls)
-        ntok += len(kls)
-    return {"mean": sum(per_text) / len(per_text) if per_text else 0.0, "token_mean": tot / ntok if ntok else 0.0,
-            "per_text": per_text, "n_texts": len(texts), "n_tokens": ntok, "top_k": top_k}

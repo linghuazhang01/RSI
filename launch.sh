@@ -18,14 +18,19 @@
 #               spreads its GPUs over its roles (more tensor parallelism / a split training model; see
 #               gpu_layout in edit_code/common.py and lora_code/common.py). Runs get consecutive groups.
 #   --per-run   fixed GPUs per run instead (the rest stay idle)
-#   --set       passed to every run.py (repeatable), e.g. --set search.max_evaluate=12, --set method.mode=weights
+#   --set       passed to every run.py (repeatable), e.g. --set search.threads=4, --set method.mode=weights
 #               (Paper B: scratch | weights | edit), --set merge.mode=adapter (Paper B: merge | adapter), or a manual
 #               GPU split --set 'gpu_roles.train=[2,3]' (indices into the run's GPUs; overrides the automatic one)
 #   What every run does (the only flow; 2026-11-22): each run uses ONLY its own domain's simple_data/<domain>/.
 #               Every generation screens a fresh 500 items drawn from the domain's clean pool minus its eval and test
 #               items (same items for Papers A and B; the rest of the pool is the train data), accepts on the 500 eval
 #               items simple_<domain>_eval (the usual paired gate) and reports held-out on the 500 test items
-#               simple_<domain>_test. Decoding per the paper config's decoding / heldout.decoding blocks.
+#               simple_<domain>_test. Hard-wired, no knobs: candidates are never screened; each candidate gets ONE gate
+#               evaluation during the search (paired vs the current model); the passing candidate with the largest
+#               paired gain is accepted. There is no api.evaluate / evaluate budget, no top_full re-scoring, no noise
+#               band and no KL term; --set / --config of those removed keys (search.screen_candidates, max_evaluate,
+#               top_full, kl_weight, noise.*, ...) is refused unless it gives the hard-wired value.
+#               Decoding per the paper config's decoding / heldout.decoding blocks.
 #               simple_data/ (pool_ids.json, eval.jsonl, test.jsonl) comes from data/scripts/make_simple_data.py.
 #               Merged configs: plan/configs/{A,B}_<domain>_simple.yaml. A changed config cannot resume an older
 #               run (locked config): use --tag / --run-id.

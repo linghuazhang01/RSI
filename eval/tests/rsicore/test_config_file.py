@@ -3,6 +3,7 @@ from the file, the removed objective / scope selectors (simple / single: no-ops)
 equivalent --set command for the shipped plan/configs/run files.
     python -I -m pytest -q eval/tests/rsicore/test_config_file.py
 """
+import copy
 import sys
 import tempfile
 from pathlib import Path
@@ -93,9 +94,143 @@ def test_removed_feature_locks_and_legacy_screen_n(tmp_path):
         load("ok", "--set", "feedback.mark_shown=false")
 
 
-def test_fixed_noise_band_domain_keys():
-    from rsicore.gate import fixed_noise_band
-    assert fixed_noise_band({"math": 0.03}, "simple_math_eval") == 0.03
-    assert fixed_noise_band({"instruction_following": 0.04}, "simple_instruction_following_pool") == 0.04
-    assert fixed_noise_band({"simple_code_eval": 0.05, "code": 0.01}, "simple_code_eval") == 0.05   # dataset first
-    assert fixed_noise_band({"math": 0.03}, "simple_code_eval") is None
+def _load_b(runs, run_id, *extra, paper="B"):
+    ap = build_arg_parser(paper)
+    if paper == "A":
+        ap.add_argument("--budget-gib", type=float, default=None)
+    return load_run_config(paper, ap.parse_args(["--domain", "math", "--runs-dir", str(runs), "--mock",
+                                                 "--run-id", run_id, *extra]))
+
+
+def test_removed_knobs_set_and_config(tmp_path, capsys):
+    """(2026-11-23) the search / gate / noise / KL knobs of the removed flows: --set / --config with the hard-wired
+    value is a no-op (dropped, noted), any other value is refused, also under mock_overrides. and inside a block."""
+    import yaml
+    base = _cfg("A").paper_cfg
+    for kv in ("search.top_full=0", "search.screen_candidates=false", "search.gate_every_candidate=true",
+               "search.program_evaluate_calls=0", "search.kl_weight=0.0", "noise.temperature=0", "noise=null",
+               "mock_overrides.search.top_full=0", "search.program_evaluate_total=null"):
+        assert _cfg("A", "--set", kv).paper_cfg == base, kv
+    assert "hard-wired value" in capsys.readouterr().err
+    for kv in ("search.top_full=3", "search.screen_candidates=true", "search.gate_every_candidate=false",
+               "search.program_evaluate_calls=2", "search.program_evaluate_calls=null", "search.max_evaluate=12",
+               "search.rerun_seeds=1", "gate.max_submissions=3", "search.kl_weight=0.5", "kl.eval_texts=100",
+               "noise.repeats=3", "noise.fixed=0.03", "noise={temperature: 0.6}", "mock_overrides.search.top_full=2",
+               "search={threads: 2, top_full: 1}", "search.top_full=false"):
+        with pytest.raises(SystemExit, match="removed"):
+            _cfg("A", "--set", kv)
+    for kv in ("baseline.noise_temperature=0.6", "baseline.noise_fixed=0.05", "gate.use_noise_band=true",
+               "gate.epsilon=0.01", "gate.reference=raw"):
+        with pytest.raises(SystemExit, match="removed"):
+            _cfg("B", "--set", kv)
+    assert _cfg("B", "--set", "gate.reference=parent").paper_cfg == _cfg("B").paper_cfg
+    c = _cfg("B", "--set", "search={threads: 2, top_full: 0}").paper_cfg       # a no-op leaf dropped from a block
+    assert c["search"] == {"threads": 2}
+    f = tmp_path / "exp.yaml"
+    f.write_text(yaml.safe_dump({"search": {"threads": 2, "top_full": 0, "gate_every_candidate": True},
+                                 "baseline": {"noise_temperature": 0.0}}))
+    c = _cfg("B", "--config", str(f)).paper_cfg
+    assert c["search"]["threads"] == 2 and c["search"] == dict(_cfg("B").paper_cfg["search"], threads=2)
+    f.write_text(yaml.safe_dump({"search": {"rerun_seeds": 2}}))
+    with pytest.raises(SystemExit, match="removed"):
+        _cfg("B", "--config", str(f))
+    f.write_text(yaml.safe_dump({"mock_overrides": {"baseline": {"noise_fixed": 0.02}}}))
+    with pytest.raises(SystemExit, match="removed"):
+        _cfg("B", "--config", str(f))
+    assert _cfg("B", "--set", "search.threads=3").paper_cfg["search"]["threads"] == 3      # live keys untouched
+
+
+@pytest.mark.parametrize("paper", ["A", "B"])
+def test_removed_knob_lock_continuity(tmp_path, paper):
+    """(2026-11-23) an old *_single_simple lock still holding the removed knobs at their hard-wired values resumes with
+    the same command (the knobs are ignored by dotted path, also under mock_overrides., even when base.yaml no longer
+    has them); one whose locked value differs from the hard-wired flow is refused; a live key of the same name
+    elsewhere (decoding.*.top_k, editor.extra_body.top_k) stays locked."""
+    import yaml
+    from rsicore import config as C
+    runs = tmp_path / "runs"
+    rc = _load_b(runs, "old", paper=paper)
+    lock = rc.run_dir / "run_config.yaml"
+    d = yaml.safe_load(lock.read_text())
+    pc = d["paper_cfg"]
+    old_search = {"screen_candidates": False, "gate_every_candidate": True, "charge_screens": False,
+                  "program_evaluate_calls": 0, "program_evaluate_total": 0, "max_evaluate": 24, "top_full": 0,
+                  "rerun_seeds": 0}
+    pc.setdefault("search", {}).update(old_search)
+    pc.setdefault("gate", {})["max_submissions"] = 3
+    pc.setdefault("mock_overrides", {}).setdefault("search", {}).update(max_evaluate=4, top_full=0)
+    if paper == "A":
+        pc["search"]["kl_weight"] = 0.0
+        pc["noise"] = {"repeats": 3, "temperature": 0.0, "top_p": 1.0, "n": None, "fixed": None}
+        pc.setdefault("kl", {}).update(eval_texts=400, top_k=20)
+        pc["mock_overrides"]["noise"] = {"repeats": 3}
+    else:
+        pc["gate"].update(reference="auto", epsilon=0.01, use_noise_band=True)
+        pc.setdefault("baseline", {}).update(noise_repeats=3, noise_temperature=0.0, noise_top_p=1.0, noise_n=None,
+                                             noise_fixed=None)
+        pc["mock_overrides"].setdefault("baseline", {})["noise_repeats"] = 3
+    lock.write_text(yaml.safe_dump(d))
+    _load_b(runs, "old", paper=paper)                                          # resumes with the same command
+    # the same lock compared with a paper config that no longer has the knobs (what base.yaml will look like)
+    stripped = copy.deepcopy(pc)
+    for k in old_search:
+        stripped["search"].pop(k)
+    stripped["gate"].pop("max_submissions")
+    for k in old_search:
+        stripped["mock_overrides"]["search"].pop(k, None)
+    stripped.pop("noise", None)
+    stripped["mock_overrides"].pop("noise", None)
+    stripped["search"].pop("kl_weight", None)
+    if paper == "A":
+        stripped["kl"].pop("eval_texts")
+        stripped["kl"].pop("top_k")
+    else:
+        for k in ("reference", "epsilon", "use_noise_band"):
+            stripped["gate"].pop(k)
+        for k in list(stripped["baseline"]):
+            if k.startswith("noise_"):
+                stripped["baseline"].pop(k)
+        stripped["mock_overrides"]["baseline"].pop("noise_repeats")
+    for d_ in (stripped["mock_overrides"], stripped):                       # a block left empty is deleted
+        for blk in [k for k, v in d_.items() if v == {}]:
+            d_.pop(blk)
+    assert C.lock_view(pc) == C.lock_view(stripped)
+    changed = copy.deepcopy(pc)
+    changed.setdefault("decoding", {}).setdefault("gate", {})["top_k"] = 7     # same leaf name, live path
+    assert C.lock_view(changed) != C.lock_view(pc)
+    bad = [("search", "screen_candidates", True), ("search", "gate_every_candidate", False),
+           ("search", "program_evaluate_calls", 2), ("search", "program_evaluate_calls", None),
+           ("search", "top_full", 3), ("search", "rerun_seeds", 1)]
+    bad += ([("search", "kl_weight", 0.1), ("noise", "temperature", 0.6), ("noise", "fixed", 0.03)] if paper == "A"
+            else [("baseline", "noise_temperature", 0.6), ("baseline", "noise_fixed", {"math": 0.03})])
+    for i, (blk, k, v) in enumerate(bad):
+        rc = _load_b(runs, f"bad{i}", paper=paper)
+        lock = rc.run_dir / "run_config.yaml"
+        d = yaml.safe_load(lock.read_text())
+        d["paper_cfg"].setdefault(blk, {})[k] = v
+        mo = (d["paper_cfg"].get("mock_overrides") or {}).get(blk)
+        if isinstance(mo, dict) and k in mo:                                 # a mock lock: the override wins
+            mo.pop(k)
+        lock.write_text(yaml.safe_dump(d))
+        with pytest.raises(SystemExit, match="cannot"):
+            _load_b(runs, f"bad{i}", paper=paper)
+    rc = _load_b(runs, "mockbad", paper=paper)                                # a mock lock: mock_overrides applied
+    lock = rc.run_dir / "run_config.yaml"
+    d = yaml.safe_load(lock.read_text())
+    d["paper_cfg"].setdefault("mock_overrides", {}).setdefault("search", {})["top_full"] = 2
+    lock.write_text(yaml.safe_dump(d))
+    with pytest.raises(SystemExit, match="top_full"):
+        _load_b(runs, "mockbad", paper=paper)
+
+
+def test_mock_lock_check_folds_old_objective_overrides():
+    """(2026-11-23 review) an old mock lock's mock_objective_overrides.simple won over mock_overrides: its effective
+    top_full 0 is the hard-wired flow, so the lock is not refused; kl.top_k 20 is a no-op, other values refused."""
+    from rsicore.config import _removed_features_used
+    old = {"search": {"top_full": 0}, "mock_overrides": {"search": {"top_full": 1}},
+           "mock_objective_overrides": {"simple": {"search": {"top_full": 0}}}}
+    assert _removed_features_used(old, "math", mock=True) == []
+    assert _removed_features_used(dict(old, mock_objective_overrides={}), "math", mock=True) == ["search.top_full 1"]
+    _cfg("A", "--set", "kl.top_k=20")
+    with pytest.raises(SystemExit):
+        _cfg("A", "--set", "kl.top_k=5")

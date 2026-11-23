@@ -156,11 +156,9 @@ class ConfigTest(unittest.TestCase):
         cfg = self.rc().paper_cfg
         m = deep_merge(cfg, cfg["mock_overrides"])
         self.assertEqual(m["search"]["threads"], 3)
-        self.assertEqual(search_settings(m), {"threads": 3, "steps": 1, "charge_screens": False, "pool": 0,
-                                              "program_cap": 0, "max_candidates": 3, "parallel_builds": True,
-                                              "screen_candidates": False, "gate_every_candidate": True,
-                                              "evaluate_tool": False})
-        self.assertEqual((m["search"]["top_full"], m["eval"]["gate_limit"], m["nonllm"]["evaluate"]), (0, 30, 2))
+        self.assertEqual(search_settings(m), {"threads": 3, "steps": 1, "max_candidates": 3, "parallel_builds": True})
+        self.assertEqual((m["eval"]["gate_limit"], m["nonllm"]["evaluate"]), (30, 2))
+        self.assertNotIn("baseline", m)
 
     def test_simple_flow(self):
         """The simple flow v2 (2026-11-21, base.yaml since 2026-11-22): thinking-mode sampled reference screen, gate
@@ -181,13 +179,11 @@ class ConfigTest(unittest.TestCase):
         hd = cfg["heldout"]["decoding"]
         self.assertEqual({k: hd[k] for k in samp}, samp)
         self.assertEqual((hd["n"], hd.get("n_by_task"), cfg["heldout"]["enabled"]), (4, None, True))
-        self.assertEqual(search_settings(cfg), {"threads": 8, "steps": 1, "charge_screens": False, "pool": 0,
-                                                "program_cap": 0, "max_candidates": 8, "parallel_builds": True,
-                                                "screen_candidates": False, "gate_every_candidate": True,
-                                                "evaluate_tool": False})
-        self.assertEqual((cfg["search"]["top_full"], cfg["gate"]["min_gain"]), (0, 0.0))
+        self.assertEqual(search_settings(cfg), {"threads": 8, "steps": 1, "max_candidates": 8, "parallel_builds": True})
+        self.assertEqual(search_settings({"search": {"threads": 2, "steps": 3}})["max_candidates"], 6)   # null: t x s
+        self.assertEqual(cfg["gate"]["min_gain"], 0.0)
         self.assertTrue(tensor_compute_enabled(cfg) and paper_tools_enabled(cfg) and screen_tools_enabled(cfg))
-        self.assertTrue(tensor_compute_enabled({}) and paper_tools_enabled({}))     # absent keys: on
+        self.assertTrue(tensor_compute_enabled({}) and paper_tools_enabled({}) and screen_tools_enabled({}))   # on
         self.assertTrue(cfg["editor"]["explore"]["persistent"] and cfg["editor"]["explore"]["gpu_tools"])
         self.assertEqual((cfg["nonllm"]["evaluate"], cfg["editor"]["tool_rounds"]), (8, 20))
         self.assertEqual(cfg["tools"]["train_loss_backend"], "vllm")
@@ -199,19 +195,60 @@ class ConfigTest(unittest.TestCase):
             self.assertIsNone(context_shortfall(self.rc(f"hardware={hw}").paper_cfg))
 
 
-class NoiseAndDecodingTest(unittest.TestCase):
-    """The noise band (rsicore.gate; baseline.noise_*) and decoding helpers."""
+class RemovedKnobsTest(unittest.TestCase):
+    """2026-11-23: the search / gate variants and the noise band are hard-wired away (rsicore.config.REMOVED_KNOBS):
+    base.yaml has none of their keys, --set of one is refused unless it is the hard-wired value (a no-op)."""
 
-    def test_greedy_noise_band_runs_nothing(self):
-        from rsicore.gate import measure_noise_band
-        with patch("rsicore.evaluate.score", side_effect=AssertionError("greedy must not re-run")):
-            nb = measure_noise_band("http://x", "m", "dapo_math", ["a", "b"], Path(tempfile.mkdtemp()), temperature=0.0)
-        self.assertEqual((nb["band"], nb["n"]), (0.0, 0))
-        self.assertTrue(nb["source"].startswith("greedy"))
+    KEYS = ("search.screen_candidates", "search.gate_every_candidate", "search.charge_screens",
+            "search.program_evaluate_calls", "search.program_evaluate_total", "search.max_evaluate", "search.top_full",
+            "search.rerun_seeds", "gate.max_submissions", "gate.reference", "gate.epsilon", "gate.use_noise_band",
+            "baseline.noise_repeats", "baseline.noise_temperature", "baseline.noise_top_p", "baseline.noise_n",
+            "baseline.noise_fixed")
+
+    def rc(self, *sets):
+        return ConfigTest.rc(self, *sets)
+
+    def test_base_has_no_removed_keys(self):
+        import yaml
+        b = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())
+        for k in self.KEYS:
+            top, leaf = k.split(".")
+            self.assertNotIn(leaf, b.get(top) or {}, k)
+            self.assertNotIn(leaf, (b["mock_overrides"].get(top) or {}), k)
+        self.assertNotIn("baseline", b)
+        self.assertEqual(b["eval"]["full_limit"], None)                  # still read (raw / non-LLM full level)
+        cfg = self.rc().paper_cfg
+        self.assertFalse({"max_evaluate", "top_full", "screen_candidates"} & set(cfg["search"]))
+
+    def test_set_removed_knob(self):
+        base = self.rc().paper_cfg
+        for ok in ("search.screen_candidates=false", "search.gate_every_candidate=true", "search.top_full=0",
+                   "baseline.noise_temperature=0", "gate.reference=parent"):
+            self.assertEqual(self.rc(ok).paper_cfg, base, ok)            # the hard-wired value: a no-op
+        for bad in ("search.screen_candidates=true", "search.max_evaluate=12", "search.top_full=3",
+                    "baseline.noise_fixed=0.05", "gate.reference=raw", "gate.epsilon=0.01",
+                    "gate.max_submissions=3", "search.program_evaluate_calls=2"):
+            with self.assertRaises(SystemExit, msg=bad) as e:
+                self.rc(bad)
+            self.assertIn("removed", str(e.exception), bad)
+
+    def test_gate_fallback(self):
+        from lora_code.common import gate_fallback
+        self.assertEqual(gate_fallback({"method": {"mode": "edit"}}), "raw")
+        self.assertEqual(gate_fallback({"method": {"mode": "scratch"}}), "keep")
+        self.assertEqual(gate_fallback({"method": {"mode": "weights"}}), "keep")
+        self.assertEqual(gate_fallback({"method": {"mode": "edit"}, "gate": {"fallback": "keep"}}), "keep")
+        for bad in ({"method": {"mode": "scratch"}, "gate": {"fallback": "raw"}}, {"gate": {"fallback": "sft"}}):
+            with self.assertRaises(SystemExit):
+                gate_fallback(bad)
+
+
+class DecodingTest(unittest.TestCase):
+    """Decoding helpers."""
 
     def test_tasks_greedy_scoring_sampled(self):
         """tasks.yaml decoding is greedy; Paper B scores and evaluates the held-out set with the thinking-mode
-        sampling of its config (decoding.*, heldout.decoding), the noise re-runs stay greedy."""
+        sampling of its config (decoding.*, heldout.decoding)."""
         import yaml
         from rsicore.heldout import decoding_args
         tasks = yaml.safe_load((ROOT / "eval" / "configs" / "tasks.yaml").read_text())
@@ -220,7 +257,6 @@ class NoiseAndDecodingTest(unittest.TestCase):
             self.assertEqual(t.get("temperature", 0.0), 0.0, name)
             self.assertEqual(t.get("n", 1), 1, name)
         b = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())
-        self.assertEqual(b["baseline"]["noise_temperature"], 0.0)
         dec = dict(b["heldout"]["decoding"], seed=42)                # resolved to the run's --seed at load time
         self.assertEqual((dec["temperature"], dec["top_p"], dec["top_k"], dec["n"]), (0.6, 0.95, 20, 4))
         d = decoding_args(dec, "simple_math_test")
@@ -244,24 +280,6 @@ class NoiseAndDecodingTest(unittest.TestCase):
         self.assertNotIn("top_k", p)
         self.assertNotIn("seed", p)
 
-    def test_fixed_noise_band_and_subset(self):
-        from rsicore.gate import fixed_noise_band, noise_ids
-        self.assertIsNone(fixed_noise_band(None, "dapo_math"))
-        self.assertEqual(fixed_noise_band(0.03, "dapo_math"), 0.03)
-        spec = {"math": 0.04, "taco_verified": 0.05, "default": 0.02}
-        self.assertEqual(fixed_noise_band(spec, "dapo_math"), 0.04)       # by domain
-        self.assertEqual(fixed_noise_band(spec, "taco_verified"), 0.05)   # by dataset
-        self.assertEqual(fixed_noise_band(spec, "ifeval_train"), 0.02)    # default
-        self.assertIsNone(fixed_noise_band({"math": 0.04}, "ifeval_train"))
-        with self.assertRaises(ValueError):
-            fixed_noise_band(True, "dapo_math")
-        ids = [f"x/{i}" for i in range(100)]
-        sub = noise_ids(ids, 20, 42)
-        self.assertEqual(len(sub), 20)
-        self.assertEqual(sub, noise_ids(list(reversed(ids)), 20, 42))
-        self.assertEqual(noise_ids(ids, None, 42), ids)
-        self.assertEqual(noise_ids(ids, 500, 42), ids)
-
     def test_raw_train_size(self):
         from lora_code import baselines as BL
         r, n, gb = BL.raw_recipe({})
@@ -273,7 +291,7 @@ class NoiseAndDecodingTest(unittest.TestCase):
 
 
 class SamplingParamsTest(unittest.TestCase):
-    """Training answers use train_data (2026-11-20: 4 samples at 0.7 / 0.8 / top_k 20, the run seed); noise is greedy."""
+    """Training answers use train_data (2026-11-20: 4 samples at 0.7 / 0.8 / top_k 20, the run seed)."""
 
     def test_train_data_sampling_uses_configured_temperature_and_top_p(self):
         tmp = tempfile.TemporaryDirectory()
@@ -289,7 +307,6 @@ class SamplingParamsTest(unittest.TestCase):
         base = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())
         td = base["train_data"]
         self.assertEqual((td["temperature"], td["top_p"], td["top_k"], td["samples"]), (0.7, 0.8, 20, 4))
-        self.assertEqual((base["baseline"]["noise_temperature"], base["baseline"]["noise_top_p"]), (0.0, 1.0))
         run = Run(rc, {"train_data": base["train_data"]})
         with patch("rsicore.evaluate.score", side_effect=fake_score), \
                 patch("lora_code.run.load_records", return_value={}):

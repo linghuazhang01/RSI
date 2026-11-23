@@ -6,7 +6,7 @@
 * the profile table reports the incremental damage (+-10% deterministic noise) relative to the
   CURRENT model, with the same schema as the real table;
 * candidate quality is registered in the mock registry so the rsicore mock server answers with
-  that accuracy; KL feedback is computed from the same damage.
+  that accuracy.
 
 Also provides the mock editor policy: a program that reads model_info/profile_table and fits the
 budget, varying its strategy across threads and steps.
@@ -28,7 +28,6 @@ BITS_DAMAGE = {16: 0.0, 8: 0.0005, 4: 0.01, 3: 0.04, 2: 0.25}
 GS_FACTOR = {0: 1.0, 128: 1.0, 64: 0.8, 32: 0.65}
 QZ_FACTOR = {"none": 0.0, "rtn": 1.0, "awq": 0.8, "gptq": 0.7}
 EMBED_DAMAGE = {"bf16": 0.0, 8: 0.001, 4: 0.03}
-DOMAIN_KL = {"math": 1.2, "code": 1.1, "knowledge": 0.8, "instruction_following": 0.9, "tool_calling": 1.1}
 SCALE = 0.011
 REQUANT = 0.1
 
@@ -105,15 +104,6 @@ def _prec_rank(p) -> int:
 
 def _min_prec(a, b):
     return a if _prec_rank(a) <= _prec_rank(b) else b
-
-
-def candidate_kl(spec: ModelSpec, parent: dict, norm: dict, domains: list[str]) -> dict:
-    st = apply_config(spec, parent, norm)
-    inc = st["kl_vs_parent"]
-    out = {"overall": round(inc, 5), "vs_original": round(st["kl_vs_original"], 5)}
-    for d in domains:
-        out[d] = round(inc * DOMAIN_KL.get(d, 1.0), 5)
-    return out
 
 
 # ------------------------------------------------------------------------------ diagnostics
@@ -205,7 +195,6 @@ def main(api):
             else:
                 dmg[(best[0], choice[best[0]])] = 0.0   # cannot afford: skip this group
                 improved = True
-    {maybe_eval}
     if "screen_results" in tools:           # the incumbent's screen run (objective simple, 2026-11-21)
         rows = api.screen_results(filter="wrong", limit=2) or api.screen_results(limit=1)
         print("screen_results", [(r["id"], r["scores"]) for r in rows])
@@ -215,27 +204,8 @@ def main(api):
     if "group_error" in tools:              # analysis tools (free): where the error concentrates
         ge = api.group_error(config=cfg_of(choice), top=3)
         print("group_error top", ge["top"])
-    if "compare" in tools:                  # item flips vs the incumbent (ids only)
-        cmp = api.compare(cid="incumbent")
-        print("compare vs incumbent", {{k: v["net"] for k, v in cmp["datasets"].items()}})
     return cfg_of(choice)
 '''
-
-
-PROBE_EVAL = """try:
-        if "evaluate" not in tools:         # program_evaluate_calls 0 (gate per candidate): no evaluate tool
-            raise api.ToolError("no evaluate tool")
-        fb = api.evaluate(config=cfg_of(choice))
-        print("probe evaluate:", fb.get("score"))
-        again = api.evaluate(config=cfg_of(choice))
-        print("probe again cached:", again.get("cached"))
-        other = dict(cfg_of(choice), lm_head=4)
-        api.evaluate(config=other)
-        print("probe second config evaluated")
-    except api.BudgetExceeded as e:
-        print("probe cap:", str(e)[:120])
-    except api.ToolError as e:
-        print("probe tool error:", str(e)[:120])"""
 
 
 REFINE_TEMPLATE = """
@@ -313,9 +283,6 @@ def main(api):
         return inc
     if "group_error" in info["tools"]:      # analysis tools (free): where the error concentrates
         print("group_error top", api.group_error(config=cfg, top=3)["top"])
-    if "compare" in info["tools"]:          # item flips vs the incumbent (ids only)
-        cmp = api.compare(cid="incumbent")
-        print("compare vs incumbent", {k: v["net"] for k, v in cmp["datasets"].items()})
     return cfg
 """
 
@@ -331,17 +298,8 @@ def mock_program(thread: int, step: int, gen: int = 0) -> str:
     protect = [0, 4, 2, 0][(thread + step + gen) % 4]
     quantizer = ["gptq", "gptq", "awq", "rtn"][(thread + 2 * step + gen) % 4]
     gs = [128, 128, 64, 128][(step + thread + gen) % 4]
-    maybe_eval = ""
-    if strategy == "greedy" and step == 1:
-        maybe_eval = ('if "evaluate" in tools:\n        fb = api.evaluate(config=cfg_of(choice))\n'
-                      '        print("probe evaluate:", fb.get("score"))')
-    elif strategy == "greedy" and step == 0 and thread >= 2:
-        # 2026-11-21: the k x 1 layout with api.evaluate (never reached by the default mock): evaluate, the same
-        # config again (free with free screens: cached) and a second config (over a per-program cap of 1)
-        maybe_eval = PROBE_EVAL
     return PROGRAM_TEMPLATE.format(strategy=strategy, margin=margin, protect=protect, quantizer=quantizer,
-                                   gs=gs, down_w=1.0 + 0.5 * step, embed=repr("bf16" if step % 2 == 0 else 8),
-                                   maybe_eval=maybe_eval)
+                                   gs=gs, down_w=1.0 + 0.5 * step, embed=repr("bf16" if step % 2 == 0 else 8))
 
 
 def mock_policy(history: list[dict]) -> str:

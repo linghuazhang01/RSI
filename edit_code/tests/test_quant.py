@@ -427,7 +427,7 @@ class TestRealPrepPathOnCPU(unittest.TestCase):
             prob = QuantProblem(rc, cfg, tag="g01", gen=1, out_dir=td / "run" / "gen_01", prep_dir=td / "run" / "gen_01" / "prep",
                                 source_dir=src, source_state=None, budget_gib=1.0, datasets=["dapo_math"],
                                 data={"dapo_math": {"screen": [], "signal": []}}, kl_texts=texts,
-                                refs_dir=td / "run" / "gen_01" / "refs", log=lambda *a: None)
+                                log=lambda *a: None)
             prob.prepare()
             n_groups = len(prob.spec.group_keys())
             self.assertEqual(len(prob.tables["profile"]), n_groups * 3)
@@ -435,7 +435,7 @@ class TestRealPrepPathOnCPU(unittest.TestCase):
             self.assertTrue((prob.prep_dir / "hessians" / "L3.down_in.safetensors").exists())
             self.assertGreater(prob.cache.disk_bytes(), 0)
             # tools: bytes / solve_allocation / validation errors, as the sandboxed program sees them
-            api = make_tool_api(prob, cfg, cid="t0", per_program_evaluate=0)
+            api = make_tool_api(prob, cfg, cid="t0")
             bf = api.call("model_info", {})["bf16_gib"]
             budget = 0.55 * bf
             prob.budget_gib = budget
@@ -446,7 +446,7 @@ class TestRealPrepPathOnCPU(unittest.TestCase):
             with self.assertRaises(Exception):
                 api.call("bytes", {"config": {"default": {"bits": 7}}})
             with self.assertRaises(Exception):
-                api.call("evaluate", {"config": sol})    # per-program evaluate budget is 0
+                api.call("evaluate", {"config": sol})    # no evaluate tool (2026-11-23)
             # build -> artifact -> fake-quant checkpoint -> transformers reload
             art = prob.build(sol, "t0")
             self.assertLessEqual(art["bytes_gib"], budget + 1e-9)
@@ -463,7 +463,7 @@ class TestRealPrepPathOnCPU(unittest.TestCase):
             prob2 = QuantProblem(rc, cfg, tag="g02", gen=2, out_dir=td / "run" / "gen_02", prep_dir=td / "run" / "gen_02" / "prep",
                                  source_dir=ck, source_state=None, budget_gib=budget, datasets=["dapo_math"],
                                  data={"dapo_math": {"screen": [], "signal": []}}, kl_texts=texts,
-                                 refs_dir=td / "run" / "gen_02" / "refs", log=lambda *a: None)
+                                 log=lambda *a: None)
             prob2.prepare()
             self.assertIsNotNone(prob2.parent_config())
             prof2 = {(r["key"], r["bits"]): r["dkl_mean"] for r in prob2.tables["profile"]}

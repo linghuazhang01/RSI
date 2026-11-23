@@ -7,10 +7,10 @@
 - test_mode_tool_surface / test_raw_recipe: method.mode (scratch default / weights / edit) tool sets, the raw LoRA handle,
   no training / gradient tool in any mode (2026-11-20), and the raw recipe (size) resolution.
 - test_mock_run_end_to_end: lora_code/run.py --mock (mode=edit) for 1 generation in a temp runs dir (only the
-  run's domain: simple_math_pool / simple_math_eval / simple_math_test; screen size, raw size, fixed noise band),
+  run's domain: simple_math_pool / simple_math_eval / simple_math_test; screen size, raw size; no noise band),
   then a second invocation of the same run-id must skip everything.
 - test_mock_simple_flow: the default (simple) flow on 4 GPUs, scratch; weights / edit chain / merge.mode adapter runs.
-- editor tool loop (2026-11-21): test_explore_api_surface_and_budgets (Workspace.explore_api: no evaluate / raw_lora /
+- editor tool loop (2026-11-21): test_explore_api_surface_and_budgets (Workspace.explore_api: no raw_lora /
   GPU tools, no generation budget spent, handles freed, gpu_tools budget), test_editor_context_tokens_sets_main_max_model_len
   (editor.context_tokens -> main servers' --max-model-len), test_mock_tool_loop_scratch (one run_python round per
   proposal; same programs / scores / evaluations as editor.tool_rounds=0).
@@ -43,7 +43,7 @@ def _ws(tmp_path, budget=None, mode="scratch", raw=None):
     train = TrainData({f"t/{i}": {"messages": [{"role": "user", "content": "q"}], "target": "a", "source": "gold"}
                        for i in range(10)})
     ws = Workspace(mock=True, store=MockStore(), train=train, cfg={"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}},
-                   out_dir=tmp_path, budget=budget or {"evaluate": 2, "gpu_seconds": 100}, mode=mode, raw=raw,
+                   out_dir=tmp_path, budget=budget or {"gpu_seconds": 100}, mode=mode, raw=raw,
                    raw_info={"n_train": 10, "rank": 16} if raw is not None else None)
     ws.build_api()
     return ws
@@ -56,7 +56,7 @@ def test_mode_tool_surface(tmp_path):
     store = MockStore()
     mods = [m for m in store.modules() if m.endswith("down_proj")][:8]
     raw = m_sgd(None, mods, [f"t/{i}" for i in range(10)], 40, 2e-4, 16)
-    ed = _ws(tmp_path / "e", {"evaluate": 2, "gpu_seconds": 500}, mode="edit", raw=raw)
+    ed = _ws(tmp_path / "e", {"gpu_seconds": 500}, mode="edit", raw=raw)
     names = set(ed.api.names())
     assert "raw_lora" in names and not names & {"sgd", "grad", "from_grad"}
     assert ed.api.call("raw_lora", {})["lora"] == "RAW"
@@ -81,8 +81,8 @@ def test_mode_tool_surface(tmp_path):
         from lora_code.common import method_mode
         method_mode({"method": {"mode": "free"}})                   # free mode was removed
     cfg = {"lora": {}, "sandbox": {}}
-    p_edit = system_prompt(cfg, budget={"evaluate": 4, "gpu_seconds": 10}, mode="edit")
-    p_scr = system_prompt(cfg, budget={"evaluate": 4, "gpu_seconds": 10}, mode="scratch")
+    p_edit = system_prompt(cfg, budget={"gpu_seconds": 10}, mode="edit")
+    p_scr = system_prompt(cfg, budget={"gpu_seconds": 10}, mode="scratch")
     assert "- sgd(" not in p_edit and "- raw_lora(" in p_edit and "RAW" in p_edit
     assert "- sgd(" not in p_scr and "- raw_lora(" not in p_scr and "from zero" in p_scr
     assert "SFT" not in p_edit + p_scr and "- grad(" not in p_edit + p_scr
@@ -90,7 +90,7 @@ def test_mode_tool_surface(tmp_path):
 
 def test_raw_recipe():
     from lora_code import baselines as BL
-    from lora_code.common import gate_policy
+    from lora_code.common import gate_fallback
     r, n, gb = BL.raw_recipe({})
     assert r == BL.DEFAULT_RAW and n is None and gb == 7200.0
     r, n, gb = BL.raw_recipe({"raw": {"n_train": 200, "rank": 8, "steps": 30, "gpu_seconds": 900}})
@@ -99,12 +99,12 @@ def test_raw_recipe():
     a, b = BL.subset_ids(ids, 50, 42), BL.subset_ids(list(reversed(ids)), 50, 42)
     assert a == b and len(a) == 50 and set(a) <= set(ids)
     assert BL.subset_ids(ids, None, 42) == sorted(ids)
-    assert gate_policy({"method": {"mode": "edit"}}) == ("raw", "raw")
-    assert gate_policy({"method": {"mode": "scratch"}}) == ("parent", "keep")
+    assert gate_fallback({"method": {"mode": "edit"}}) == "raw"         # the gate itself: always vs the current model
+    assert gate_fallback({"method": {"mode": "scratch"}}) == "keep"
     for bad in ({"method": {"mode": "scratch"}, "gate": {"fallback": "raw"}},
-                {"method": {"mode": "edit"}, "gate": {"reference": "sft"}}):
+                {"method": {"mode": "edit"}, "gate": {"fallback": "sft"}}):
         with pytest.raises(SystemExit):
-            gate_policy(bad)
+            gate_fallback(bad)
 
 
 def test_compare_and_train_loss_tools(tmp_path):
@@ -124,7 +124,7 @@ def test_compare_and_train_loss_tools(tmp_path):
     train = TrainData({f"t/{i}": {"messages": [{"role": "user", "content": "q"}], "target": "a", "source": "gold"}
                        for i in range(10)})
     ws = Workspace(mock=True, store=MockStore(), train=train, cfg={"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}},
-                   out_dir=tmp_path, evaluator=ev, budget={"evaluate": 2, "gpu_seconds": 100}, mode="scratch")
+                   out_dir=tmp_path, evaluator=ev, budget={"gpu_seconds": 100}, mode="scratch")
     ws.build_api()
     assert {"compare", "train_loss"} <= set(ws.api.names())
     mod = [m for m in ws.store.modules() if m.endswith("down_proj")][0]
@@ -135,8 +135,8 @@ def test_compare_and_train_loss_tools(tmp_path):
     def recs(scores):
         return {"dapo_math": {"records": [{"id": f"x/{i}", "score": s, "len": 10 * (i + 1), "finish": "stop"}
                                           for i, s in enumerate(scores)]}}
-    ev.res[(None, "screen")] = recs([1, 1, 0, 0])
-    ev.res[(ws.lora_name(lo), "screen")] = recs([1, 0, 1, 1])
+    ev.res[(None, "gate")] = recs([1, 1, 0, 0])          # (2026-11-23) candidates are only gate-evaluated: compare
+    ev.res[(ws.lora_name(lo), "gate")] = recs([1, 0, 1, 1])   # without level reads the gate results
     c = ws.api.call("compare", {"cid": "g00_t0_s00"})["datasets"]["dapo_math"]
     assert (c["broken"], c["fixed"], c["net"], c["broken_ids"]) == (1, 2, 1, ["x/1"])
     assert "out" not in json.dumps(c) and "prompt" not in json.dumps(c)   # no item content
@@ -189,7 +189,7 @@ def test_mock_workspace_restriction_and_budget(tmp_path):
 def test_mock_program_through_sandbox(tmp_path):
     from lora_code.mock import make_mock_policy
     from lora_code.tools import program_build
-    ws = _ws(tmp_path, {"evaluate": 2, "gpu_seconds": 5000})
+    ws = _ws(tmp_path, {"gpu_seconds": 5000})
     pol = make_mock_policy(42, skill=1.0)
     progs = {pol([{"role": "user", "content": f"[thread={t} step={s}]"}]) for t in range(3) for s in range(3)}
     assert len(progs) > 3                                     # programs vary across threads / steps
@@ -216,13 +216,13 @@ def test_mock_run_end_to_end(tmp_path):
     """mode=edit, 1 generation, the one (simple) flow: the raw LoRA is trained in generation 0 (raw.n_train), every
     candidate is gated during the search (reference = the current model, so the summary says 'parent'), only the
     run's domain is drawn / scored (simple.screen_n screen items, the simple_math_eval gate, the simple_math_test
-    held-out), baseline.noise_fixed is used as is; no E_t / theta0 / retention anywhere; a rerun skips everything."""
+    held-out), M_0's gate score without a noise band; no E_t / theta0 / retention anywhere; the generation-0 prompt
+    describes the real gate (per candidate vs the current model, RAW as the fallback); a rerun skips everything."""
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
            "--runs-dir", str(tmp_path), "--run-id", "B_test_mock", "--set", "method.mode=edit",
-           "--set", "simple.screen_n=30", "--set", "raw.n_train=40", "--set", "baseline.noise_fixed=0.05",
-           "--set", "heldout.limit=4"]
+           "--set", "simple.screen_n=30", "--set", "raw.n_train=40", "--set", "heldout.limit=4"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     assert "roles {'main': [0], 'train': [1]}" in r.stdout and "theta0" not in r.stdout
@@ -237,8 +237,8 @@ def test_mock_run_end_to_end(tmp_path):
     assert len(json.loads((run / "draws" / "gen_00" / "ids" / "simple_math_pool.screen.json").read_text())) == 30
     gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
     assert list(gate) == ["simple_math_eval"] and gate["simple_math_eval"]["n"] == 30          # gate_limit 30 (mock)
-    assert gate["simple_math_eval"]["noise_band"] == 0.05 and gate["simple_math_eval"]["noise_source"].startswith("fixed")
-    assert not (run / "baseline" / "noise").exists()
+    assert set(gate["simple_math_eval"]) == {"score", "n", "n_scored", "se", "records"}           # no noise band
+    assert not (run / "baseline" / "noise").exists() and set(state["baseline/gate"]["simple_math_eval"]) == {"score"}
     summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
     assert summ["search"]["candidates"] >= 1 and summ["accepted"]["source"] in ("llm", "raw_fallback", "keep")
     assert summ["method"] == "edit" and summ["gate_reference"] == "parent" and summ["raw"]["source"] == "trained"
@@ -259,9 +259,13 @@ def test_mock_run_end_to_end(tmp_path):
     reg = json.loads((run / "mock_registry.json").read_text())
     model = json.loads((run / "gen_00" / "model.json").read_text())   # mode=edit: M_1 = M_0 + a LoRA, no merge
     assert "m0" in reg and "theta0" not in reg and (model["lora"] is None or model["lora"] in reg) and "m1" not in reg
-    prompt = (run / "gen_00" / "editor" / "thread_0.jsonl").read_text()
-    assert "Single-domain run" in prompt and "- regmean_preserve(" not in prompt
+    tr = [json.loads(x) for x in (run / "gen_00" / "editor" / "thread_0.jsonl").read_text().splitlines() if x.strip()]
+    prompt = "\n".join(str(x.get("content")) for x in tr if x.get("role") in ("system", "user"))   # what it reads
+    assert "Single-domain run" in prompt and "regmean_preserve" not in prompt and "retention" not in prompt
     assert "The gate accepts a candidate on simple_math_eval" in prompt
+    assert "evaluated ONCE on a fixed hidden set of 30 items" in prompt and "raw LoRA's by more than" not in prompt
+    assert "RAW itself is accepted if it passes the same gate" in prompt and "token-KL" not in prompt
+    assert "act ratio" not in prompt and "after the search, not visible" not in prompt
     n_cand = len((run / "gen_00" / "candidates.jsonl").read_text().splitlines())
     t0 = time.time()
     r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -435,6 +439,8 @@ def test_mock_simple_flow(tmp_path):
     rs = json.loads((gd / "reference_screen.json").read_text())["summary"]
     assert rs["n_items"] == 20 and rs["samples_per_item"] == 4 and sum(rs["correct_counts"].values()) == 20
     # candidates: k x 1, never screened (only gate@ caches), one gate result each, recorded in gate.json
+    non = json.loads((gd / "baselines" / "nonllm.json").read_text())
+    nonllm = {p.get("name") for p in (non.get("random_search") or {}).get("points") or []}
     cands = [json.loads(x) for x in (gd / "candidates.jsonl").read_text().splitlines() if x.strip()]
     assert sorted(c["cid"] for c in cands) == [f"g00_t{t}_s00" for t in range(3)]
     for c in cands:
@@ -444,7 +450,7 @@ def test_mock_simple_flow(tmp_path):
         assert "target" not in fb and fb["gate"]["n"] == 30 and c["screen"]["score"] == fb["gate"]["gain"]
         assert {"passed", "accuracy", "reference_accuracy", "gain", "ci", "broken", "fixed"} <= set(fb["gate"])
     for d in (gd / "evals").iterdir():
-        if d.name != "__parent__":
+        if d.name != "__parent__" and d.name not in nonllm:            # the non-LLM branch screens its own points
             assert all(x.name.startswith("gate@") for x in d.iterdir()), list(d.iterdir())
     glog = json.loads((gd / "gate.json").read_text())
     assert glog["rule"].startswith("gate_every_candidate")
@@ -457,7 +463,7 @@ def test_mock_simple_flow(tmp_path):
     else:
         assert acc["source"] == "keep" and glog["accepted"] is None
     st = json.loads((run / "state.json").read_text())["gen00/search"]
-    assert st["evaluate_budget"] == 0 and not st["evaluate_spent"]
+    assert "evaluate_budget" not in st and "evaluate_spent" not in st
     t1 = next(c for c in cands if c["cid"] == "g00_t1_s00")
     tools = t1["artifact"]["tools_used"]
     assert "evaluate" not in tools and t1["artifact"]["strategy"] == "pure_construct", t1
@@ -472,6 +478,7 @@ def test_mock_simple_flow(tmp_path):
     assert "share ONE Python session" in sysmsg and "up to 20 rounds" in sysmsg
     assert "You are session 1 of 3 in this generation" in user and "Your own answers on this generation's 20" in user
     assert "No api.evaluate this generation" in user
+    assert "worst_retention_delta" not in user and "full_score" not in user and "act ratio" not in user
 
 
 # ============================================================================ editor tool loop (2026-11-21)
@@ -483,7 +490,7 @@ def _explore(ws, code, tmp_path, cid="g00_t0_s00", r=1, i=0, cfg=None):
 
 
 def test_explore_api_surface_and_budgets(tmp_path):
-    """Workspace.explore_api (2026-11-21): no evaluate / raw_lora / GPU tools, nothing charged to the generation's
+    """Workspace.explore_api (2026-11-21): no raw_lora / GPU tools, nothing charged to the generation's
     budgets, handles freed after each call, tool log under '~x' tags, in scratch / edit / weights mode; with
     editor.explore.gpu_tools the GPU tools are charged to their own exploration budget."""
     from lora_code.mock import MockStore, m_sgd
@@ -492,7 +499,7 @@ def test_explore_api_surface_and_budgets(tmp_path):
     raw = m_sgd(None, [m for m in store.modules() if m.endswith("down_proj")][:4], [f"t/{i}" for i in range(10)],
                 20, 2e-4, 16)
     for mode in ("scratch", "edit", "weights"):
-        ws = _ws(tmp_path / mode, {"evaluate": 2, "gpu_seconds": 100}, mode=mode, raw=raw if mode == "edit" else None)
+        ws = _ws(tmp_path / mode, {"gpu_seconds": 100}, mode=mode, raw=raw if mode == "edit" else None)
         api, cleanup = ws.explore_api("g00_t0_s00~x01_0")
         names = set(api.names())
         cleanup()
@@ -508,13 +515,13 @@ def test_explore_api_surface_and_budgets(tmp_path):
         out, res = _explore(ws, code, tmp_path / mode)
         assert out["ok"] and res["ok"], res
         assert "HAS" not in res.get("stdout", "") and res["result"]["lo"].startswith("L")
-        assert ws.api.spent == {"evaluate": 0.0, "gpu_seconds": 0.0} and ws.gpu_measured == 0.0
+        assert ws.api.spent == {"gpu_seconds": 0.0} and ws.gpu_measured == 0.0
         assert len(ws._h) == n_handles                                       # exploration handles freed
         assert list(ws.tool_log) == ["g00_t0_s00~x01_0"] and ws._cid() == "_"
         assert classify(ws.tool_log.get("g00_t0_s00", [])) == "keep"         # programs never see exploration calls
         assert (tmp_path / mode / "gd" / "explore" / "g00_t0_s00" / "r01_0" / "stdout.txt").exists()
     # gpu_tools: acts allowed, charged to the exploration budget only; exhausted -> refused in exploration
-    ws = _ws(tmp_path / "gpu", {"evaluate": 2, "gpu_seconds": 100})
+    ws = _ws(tmp_path / "gpu", {"gpu_seconds": 100})
     cfg = {"editor": {"explore": {"timeout_s": 60, "mem_gb": 4, "gpu_tools": True, "gpu_seconds": 10}}}
     assert "separate exploration budget" in editor_chat_tools(ws, cfg).run_python_doc
     out, res = _explore(ws, "result = api.acts(module='layers.3.mlp.down_proj', ids=api.train_ids()[:4])['in_norm']",
@@ -928,41 +935,47 @@ def test_edit_summary():
 
 
 def test_prompt_gate_text_and_rules():
-    """System prompt (2026-11-21): the gate rule follows the config (min_gain, require_significant, raw reference,
-    gate item count), the per-program evaluate cap, the api-scope / module-name / vector-side / robust-code rules;
-    the budget text by search.charge_screens (true: candidates cost one evaluate; false: free screens + a separate
-    api.evaluate pool); the tensor-tool rules only when the tool is on (absent key: on, 2026-11-22)."""
+    """System prompt: the gate rule follows the config (min_gain, require_significant, gate item count; every
+    candidate vs the current model, the only flow since 2026-11-23; mode=edit generation 0: RAW as the fallback), the
+    api-scope / module-name / vector-side / robust-code rules, no api.evaluate / evaluate budget, none of the removed
+    tools (regmean_preserve) or measurements (retention, KL); the tensor-tool rules only when the tool is on (absent
+    key: on, 2026-11-22)."""
     from lora_code.prompts import gate_text, system_prompt
     base = {"gate": {"min_gain": 0.01, "require_significant": True}}
-    sig = gate_text(base, kind="parent", gate_n=500)
+    sig = gate_text(base, gate_n=500)
     assert "statistically significant" in sig and "about 5 more correct items out of 500" in sig
-    nosig = gate_text({"gate": {"min_gain": 0.01, "require_significant": False}}, kind="parent", gate_n=500)
+    assert "evaluated ONCE on a fixed hidden set of 500 items" in sig and "none passes: the model stays as it is" in sig
+    nosig = gate_text({"gate": {"min_gain": 0.01, "require_significant": False}}, gate_n=500)
     assert "no significance test" in nosig and "95% CI" not in nosig and "Retention" not in nosig
-    assert "raw LoRA" in gate_text({"gate": {"epsilon": 0.01}}, kind="raw")
+    rawfb = gate_text({"gate": {"min_gain": 0.0}}, gate_n=30, raw_fallback=True)
+    assert "RAW itself is accepted if it passes the same gate" in rawfb and "must be positive" in rawfb
+    assert "raw LoRA's by more than" not in rawfb and "epsilon" not in rawfb
     cfg = {"gate": {"min_gain": 0.01, "require_significant": False}, "sandbox": {"timeout_s": 1800},
            "tools": {"tensor_compute": False}}
-    sp = system_prompt(cfg, budget={"evaluate": 32, "gpu_seconds": 7200}, mode="scratch", gate_kind="parent",
-                       gate_n=500)
-    assert "no significance test" in sp and "95% CI" not in sp
-    assert "at most 2 per program" in sp and "1800 s of wall clock" in sp
+    sp = system_prompt(cfg, budget={"gpu_seconds": 7200}, mode="scratch", gate_n=500)
+    assert "no significance test" in sp and "95% CI" not in sp and "1800 s of wall clock" in sp
     assert "NOT a global there" in sp and "api.modules()" in sp and "OUTPUT-side" in sp and "try/except" in sp
-    sp0 = system_prompt(dict(cfg, search={"program_evaluate_calls": None}), budget={"evaluate": 32}, mode="scratch")
-    assert "per program" not in sp0.split("Tools")[0].split("Budgets")[1].split("GPU-seconds")[0]
-    assert "retention domains must not get worse" not in sp and "Retention domains" not in sp
-    assert "costs one" in sp and "scored automatically on the feedback items" not in sp
+    assert "there is no api.evaluate" in sp and "- evaluate(" not in sp and "evaluate calls" not in sp
+    assert "api.evaluate" not in sp.replace("there is no api.evaluate", "")
+    for gone in ("regmean_preserve", "retention", "KL", "program_evaluate_calls_left", "per program"):
+        assert gone not in sp, gone
+    assert "(acts and\n  train_loss run the model" in sp and "(acts / train_loss)" in sp
     assert "api.tensors()" not in sp and "T5.name" not in sp and "tensor_compute" not in sp   # tool switched off
-    free = dict(cfg, search={"charge_screens": False, "program_evaluate_calls": 2}, tools={})   # absent key: on
-    fp = system_prompt(free, budget={"evaluate": 16, "gpu_seconds": 7200}, mode="scratch", gate_kind="parent",
-                       gate_n=500)
-    assert "scored automatically on the feedback items at\n  no cost" in fp and "separate pool of 16 calls" in fp
-    assert "at most 2 new ones per program" in fp and "costs one" not in fp and "already scored is free" in fp
+    noscr = system_prompt(dict(cfg, tools={"tensor_compute": False, "screen_results": False}),
+                          budget={"gpu_seconds": 7200}, mode="scratch")
+    assert "you only see each\n  candidate's gate statistics" in noscr and "- screen_results(" not in noscr
+    on = dict(cfg, tools={})                                     # absent keys: on
+    fp = system_prompt(on, budget={"gpu_seconds": 7200}, mode="scratch", gate_n=500)
     assert "api.tensors()" in fp and "T5.name" in fp and "lora = {module: (A [r, in], B [out, r])}" in fp
-    assert "at most ~300 s" in fp and "writes = " not in fp
-    wp = system_prompt(dict(free, weights={"vector_cap_tau": 0.25}), budget={"evaluate": 16}, mode="weights")
+    assert "at most ~300 s" in fp and "writes = " not in fp and "- screen_results(" in fp
+    ep = system_prompt(on, budget={"gpu_seconds": 7200}, mode="edit", gate_n=30, raw_fallback=True)
+    assert "RAW itself is accepted" in ep and "raise the target score." in ep and "token-KL" not in ep
+    assert "relchange_prune, orthogonalize" in ep
+    wp = system_prompt(dict(on, weights={"vector_cap_tau": 0.25}), budget={"gpu_seconds": 7200}, mode="weights")
     assert "rms(W'-W) <= 0.25 * max(rms(W), 1)" in wp and "zero-centred" in wp and "use w_scale" in wp
     assert "dense additions computed by api.tensor_compute" in wp and "writes = {tensor: new full tensor}" in wp
-    assert "lm_head are never editable" in wp
-    off = system_prompt(dict(free, tools={"tensor_compute": False}), budget={"evaluate": 16}, mode="weights")
+    assert "lm_head are never editable" in wp and "evaluate calls" not in wp
+    off = system_prompt(dict(on, tools={"tensor_compute": False}), budget={"gpu_seconds": 7200}, mode="weights")
     assert "rms(W'-W)" not in off and "api.tensors()" not in off and "tensor_compute" not in off
 
 
@@ -980,115 +993,68 @@ class _CountingEv:
 
     def feedback(self, name, level, lora_report=None, cost=None):
         self.n += 1
-        return 0.1, {"score": 0.1, "level": level, "lora": name}
+        return 0.1, {"score": 0.1, "level": level, "lora": name, "cost": cost}
 
 
-def _ws_ev(tmp_path, budget, charge_screens=True):
-    from lora_code.mock import MockStore
+def test_no_evaluate_tool_and_budget(tmp_path):
+    """2026-11-23: there is no evaluate tool or evaluate budget; Workspace.evaluate_lora (the raw LoRA's / non-LLM
+    branch's points) scores once per (LoRA, level), never charged; api.budget() shows the program's time left and the
+    note that every returned candidate gets one gate evaluation."""
+    from lora_code.mock import MockStore, m_sgd
     from lora_code.primitives.train import TrainData
-    from lora_code.tools import Workspace
+    from lora_code.tools import TOOL_DOCS, WEIGHTS_DOC_OVERRIDES, Workspace, tools_for_mode
+    assert "evaluate" not in TOOL_DOCS and "evaluate" not in WEIGHTS_DOC_OVERRIDES
+    assert Workspace.EXPLORE_NEVER == ("raw_lora",)
+    for mode in ("scratch", "edit", "weights"):
+        assert "evaluate" not in tools_for_mode(mode, cfg={})
+        assert "level='gate'" in tools_for_mode(mode, cfg={})["compare"]
     train = TrainData({f"t/{i}": {"messages": [{"role": "user", "content": "q"}], "target": "a", "source": "gold"}
                        for i in range(10)})
     ev = _CountingEv()
-    ws = Workspace(mock=True, store=MockStore(), train=train, out_dir=tmp_path, evaluator=ev, budget=budget,
-                   cfg={"lora": {"rank_cap": 64, "norm_cap_tau": 0.1},
-                        "search": {"program_evaluate_calls": 2, "charge_screens": charge_screens}})
-    ws.charge_screens = charge_screens
+    ws = Workspace(mock=True, store=MockStore(), train=train, out_dir=tmp_path, evaluator=ev,
+                   budget={"gpu_seconds": 100}, cfg={"lora": {"rank_cap": 64, "norm_cap_tau": 0.1}})
     ws.build_api()
-    return ws, ev
-
-
-def test_program_evaluate_cap_and_budget(tmp_path):
-    """search.program_evaluate_calls (default 2): a program's own NEW api.evaluate calls are capped (BudgetExceeded),
-    the automatic screen (no program running) is not; api.budget() shows the program's time and calls left.
-    charge_screens true (code default): the automatic screen costs one evaluate; false (2026-11-21, base.yaml): it is
-    free, `evaluate` is the programs' pool, and an api.evaluate of an already screened LoRA is free (no new scoring,
-    no per-program count) even when the pool is used up."""
-    ws = _ws(tmp_path, {"evaluate": 32, "gpu_seconds": 100})
-    ws.evaluate_lora = lambda lo, level="screen", charge=True: (0.1, {"score": 0.1})
-    from lora_code.mock import m_sgd
-    loras = [ws._new("L", m_sgd(None, [f"layers.{i}.mlp.down_proj"], ["t/1"], 5, 1e-4, 4)) for i in range(4)]
+    assert "evaluate" not in ws.api.names() and not hasattr(ws, "t_evaluate") and not hasattr(ws, "screen_candidate")
+    lo = m_sgd(None, ["layers.3.mlp.down_proj"], ["t/1"], 5, 1e-4, 4)
+    sc, fb = ws.evaluate_lora(lo, "screen")
+    assert sc == 0.1 and ev.n == 1 and "evaluate_left" not in fb["cost"] and fb["cost"]["gpu_seconds_left"] == 100
+    assert ws.evaluate_lora(lo, "screen") == (sc, fb) and ev.n == 1           # cached
+    ws.evaluate_lora(lo, "full")
+    assert ev.n == 2 and ws.spent.get("evaluate") is None
     ws.begin_program("g00_t0_s00")
     b = ws.t_budget()
-    assert 1790 < b["program_seconds_left"] <= 1800 and b["program_evaluate_calls_left"] == 2
-    ws.t_evaluate(lora=loras[0])
-    ws.t_evaluate(lora=loras[1])
-    assert ws.t_budget()["program_evaluate_calls_left"] == 0
-    with pytest.raises(Exception) as ei:
-        ws.t_evaluate(lora=loras[2])
-    assert type(ei.value).__name__ == "BudgetExceeded" and "per program" in str(ei.value)
+    assert 1790 < b["program_seconds_left"] <= 1800 and "program_evaluate_calls_left" not in b
+    assert b["spent"] == {"gpu_seconds": 0} or "evaluate" not in b["spent"]
+    assert b["note"].startswith("no api.evaluate in this run")
     ws.end_program("g00_t0_s00")
-    ws.t_evaluate(lora=loras[3])                       # the automatic screen of a returned candidate: no cap
     assert "program_seconds_left" not in ws.t_budget()
-    st = ws.budget_status()
-    assert st["evaluate"] == 32 and st["program_evaluate_calls"] == 2 and st["charge_screens"] is True
-    from lora_code.mock import m_sgd as sgd
-    for charge in (True, False):
-        ws, ev = _ws_ev(tmp_path / f"c{charge}", {"evaluate": 2, "gpu_seconds": 100}, charge_screens=charge)
-        los = [sgd(None, [f"layers.{i}.mlp.down_proj"], ["t/1"], 5, 1e-4, 4) for i in range(5)]
-        ws.save_candidate("g00_t0_s00", los[0])
-        sc, fb = ws.screen_candidate("g00_t0_s00")                 # the automatic screen of a returned candidate
-        assert sc == 0.1 and ev.n == 1 and ws.spent["evaluate"] == (1.0 if charge else 0.0)
-        ws.begin_program("g00_t1_s00")
-        h0 = ws._new("L", los[0])
-        ws.api.call("evaluate", {"lora": h0})                       # already screened: free, no new scoring
-        assert ev.n == 1 and ws.spent["evaluate"] == (1.0 if charge else 0.0)
-        assert ws.t_budget()["program_evaluate_calls_left"] == 2   # not a new evaluation
-        if charge:
-            ws.end_program("g00_t1_s00")
-            with pytest.raises(Exception) as ei:                   # charged: the screen took half the budget
-                ws.begin_program("g00_t2_s00")
-                ws.api.call("evaluate", {"lora": ws._new("L", los[1])})
-                ws.api.call("evaluate", {"lora": ws._new("L", los[2])})
-            assert type(ei.value).__name__ == "BudgetExceeded"
-            continue
-        ws.api.call("evaluate", {"lora": ws._new("L", los[1])})
-        ws.api.call("evaluate", {"lora": ws._new("L", los[2])})
-        assert ws.spent["evaluate"] == 2.0 and ev.n == 3 and ws.t_budget()["program_evaluate_calls_left"] == 0
-        assert "pool" in ws.t_budget()["note"]
-        ws.end_program("g00_t1_s00")
-        ws.begin_program("g00_t2_s00")
-        assert ws.t_budget()["program_evaluate_calls_left"] == 0   # min(per-program 2, pool left 0)
-        with pytest.raises(Exception) as ei:                       # the pool is used up
-            ws.api.call("evaluate", {"lora": ws._new("L", los[3])})
-        assert type(ei.value).__name__ == "BudgetExceeded"
-        ws.api.call("evaluate", {"lora": ws._new("L", los[0])})     # screened earlier: still free
-        ws.end_program("g00_t2_s00")
-        ws.save_candidate("g00_t3_s00", los[4])
-        sc, fb = ws.screen_candidate("g00_t3_s00")                 # screens never need the pool
-        assert sc == 0.1 and "error" not in fb and ev.n == 4 and ws.spent["evaluate"] == 2.0
-        st = ws.budget_status()
-        assert st["charge_screens"] is False and st["evaluate"] == 2 and st["evaluate_left"] == 0
+    assert ws.budget_status() == {"gpu_seconds_left": 100.0, "gpu_seconds": 100}
 
 
 def test_context_budget_line():
-    """Step context (2026-11-21): evaluate / GPU budget left, program time limit and observed timings."""
+    """Step context (2026-11-21): no api.evaluate (one gate evaluation per candidate), GPU budget left, program time
+    limit and observed timings; candidate rows without the removed keys; one step: session k of N."""
     from types import SimpleNamespace
     from lora_code.prompts import ContextRenderer
-    st = {"evaluate_left": 3, "evaluate": 32, "gpu_seconds_left": 50.0, "gpu_seconds": 7200,
-          "program_evaluate_calls": 2}
+    st = {"gpu_seconds_left": 50.0, "gpu_seconds": 7200}
     r = ContextRenderer(task_text="T", diag_text="D", budget_fn=lambda: st, timeout_s=1800)
     hist = [SimpleNamespace(cid="g00_t0_s00", thread=0, step=0, artifact={"seconds": 600.0}, cost={"screen_s": 90.0},
-                            error=None, screen={"score": 0.1, "feedback": {}}, full=None, score=0.1, program="x"),
+                            error=None, screen={"score": 0.1, "feedback": {"gate": {"passed": True, "gain": 0.1}}},
+                            full=None, score=0.1, program="x"),
             SimpleNamespace(cid="g00_t1_s00", thread=1, step=0, artifact=None, cost={}, score=None, screen=None,
                             full=None, program="y", error="program failed: timeout after 1800 s")]
     msg = r(hist, 0)
-    assert "3 of 32 evaluate calls" in msg and "at most 2 new ones" in msg and "50 of 7200 GPU-seconds" in msg
+    assert ("No api.evaluate this generation: every returned candidate gets one gate evaluation automatically, 50 of "
+            "7200 GPU-seconds.") in msg
     assert "600 s (median)" in msg and "1 program(s) were killed" in msg and "about 90 s" in msg
-    assert "Few evaluations are left" in msg
-    assert "Budget left" not in ContextRenderer(task_text="T", diag_text="D")([], 0)
+    assert "score = the paired gain in gate accuracy vs the current model" in msg
+    for gone in ("evaluate calls", "Few evaluations", "vs_raw", "worst_retention_delta", "\"kl\"", "full_score"):
+        assert gone not in msg, gone
+    assert "No api.evaluate" not in ContextRenderer(task_text="T", diag_text="D")([], 0)
     assert "You are session" not in msg
-    # charge_screens false (2026-11-21): the program pool, re-thresholded; one step: session k of N
-    free = dict(st, evaluate_left=2, evaluate=16, charge_screens=False)
     r = ContextRenderer(task_text="T", diag_text="D", archive_text="Archive of earlier generations:",
-                        budget_fn=lambda: free, timeout_s=1800, sessions=8, history_tool=True)
+                        budget_fn=lambda: st, timeout_s=1800, sessions=8, history_tool=True)
     msg = r([], 2)
-    assert "scored automatically at no cost" in msg and "2 of 16 calls" in msg and "at most 2 new ones" in msg
-    assert "Only 2 api.evaluate call(s) are left" in msg and "Few evaluations" not in msg
     assert "You are session 3 of 8 in this generation" in msg and "search_history and the archive below" in msg
-    free["evaluate_left"] = 9
-    assert "left in the pool" not in r([], 0) and "used up" not in r([], 0)
-    free["evaluate_left"] = 0
-    assert "The api.evaluate pool is used up" in r([], 0)
     r2 = ContextRenderer(task_text="T", diag_text="D", sessions=4)
     assert "You are session 4 of 4" in r2([], 3) and "search_history" not in r2([], 3)

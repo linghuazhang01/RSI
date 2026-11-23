@@ -10,7 +10,7 @@
 # Each generation (search.threads 8 x search.steps 1 candidates, editor.tool_rounds 20):
 #   1. the latest model answers the 500 screen items, 4 samples each, once; the editor sees the detailed
 #      results (summary in the context; screen_results / screen_output tools, incl. the thinking text);
-#   2. each candidate: a program (persistent run_python session while exploring; no api.evaluate) builds it; ONE gate
+#   2. each candidate: a program (persistent run_python session while exploring) builds it; ONE gate
 #      evaluation (500 x 4, paired with the latest model); its gate statistics are visible to later steps / generations;
 #   3. accept the candidate with the largest paired gate gain >= gate.min_delta 0.0 (require_significant
 #      True); then the test set (500 x 4).
@@ -79,36 +79,18 @@ action_space:
 search:
   threads: 8
   steps: 1
-  max_evaluate: 24
-  program_evaluate_calls: 0
   max_candidates: 8
-  charge_screens: false
-  program_evaluate_total: 0
-  screen_candidates: false
-  gate_every_candidate: true
-  top_full: 0
-  rerun_seeds: 0
-  kl_weight: 0.0               # 2026-11-22: no per-generation KL work (Runner.kl_used)
 gate:
   min_delta: 0.0
   require_significant: true
-  max_submissions: 3
   allow_unscored: false
 feedback:
   examples: 2
-noise:
-  repeats: 3
-  temperature: 0.0
-  top_p: 1.0
-  n: null
-  fixed: null
 kl:
-  top_k: 20
   max_chars: 8000
   self_generated: true
   self_generated_max_tokens: 2048
   self_generated_batch: 64
-  eval_texts: 400
 calibration:
   max_texts: 256
   max_len: 2560

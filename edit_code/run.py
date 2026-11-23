@@ -1,37 +1,33 @@
 """Paper A orchestration: iterative self-quantization at a FIXED size (2026-11-19).
 
     python -I edit_code/run.py --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 \
-        --run-id A_math_s42 [--budget-gib 11.5] [--mock] [--set search.max_evaluate=12]
+        --run-id A_math_s42 [--budget-gib 11.5] [--mock] [--set search.threads=4]
 
 Design: the editor's weights are frozen (loop.editor=frozen: the original BF16 model M_0 writes every
 generation; loop.editor=current is the unfrozen ablation where the incumbent writes). What is iterated
 is the quantized model: every candidate quantizes the ORIGINAL weights of M_0 to the same budget, and
 generation g tries to beat the incumbent Q_{g-1} (best accepted quantization so far).
 
-Generation 0 (baseline/): fixed gate split; M_0 scored on the gate; noise band (sampled screen runs);
-held-out evaluation of M_0; layer cache + diagnostics of M_0 (run_dir/prep/, built once, reused by every
-generation); budget = budget.gib or the packed size of budget.reference (uniform W4 GPTQ by default);
+Generation 0 (baseline/): fixed gate split; M_0 scored on the gate; held-out evaluation of M_0; calibration texts
+(prompt + M_0's own response, kl.self_generated); layer cache + diagnostics of M_0 (run_dir/prep/, built once, reused
+by every generation); budget = budget.gib or the packed size of budget.reference (uniform W4 GPTQ by default);
 Q_0 = the reference config, scored on the gate (it is the first incumbent) and on the held-out set.
-Data (rsicore.draws, 2026-11-22: the only flow): train role simple_<d>_pool (a fresh screen per generation; KL /
+Data (rsicore.draws, 2026-11-22: the only flow): train role simple_<d>_pool (a fresh screen per generation;
 calibration texts from the same pool), gate simple_<d>_eval, held-out report simple_<d>_test.
 Scoring decoding (2026-11-21): every screen / full / gate scoring call (candidates, the incumbent, Q_0, M_0's
 baseline gate) uses rsicore.config.stage_decoding(cfg, stage, seed) from the paper config's `decoding` block
 (thinking 0.6 / 0.95 / top_k 20, 16384 tokens, screen n 4, gate n 4; null seed = the run's --seed).
-Generation g = 1..gens (gen_XX/): draw -> M_0's KL reference logprobs (M_0 is not scored on the items; skipped with
-the self-generated KL texts when KL is unused, Runner.kl_used: search.kl_weight 0 and no baselines, 2026-11-22) ->
-incumbent scored on the same items (the reference of every candidate; shown to the editor) -> inner search (threads x
-steps) -> optional baselines -> gate -> new incumbent exported + held-out evaluation, or the incumbent stays.
-Gate per candidate (2026-11-21; search.screen_candidates false + gate_every_candidate true + program_evaluate_calls
-0, the base.yaml defaults): the incumbent answers the generation's screen items once (decoding.screen n 4; shared;
-summary in the context, full data via screen_results / screen_output); candidates are not screened and have no
-api.evaluate; each built candidate gets ONE gate evaluation in screen_fn (gate_candidate: paired vs the incumbent's
-gate records, recorded in gen_XX/gate.json as it finishes, so later steps and generations see the statistics); the
-end of the generation accepts the passing candidate with the largest gain (Runner.accept_best_gate).
-search.screen_candidates true (screened candidates, <= max_evaluate charged evaluations with
-search.charge_screens, edit_code.common.search_settings) and gate_every_candidate false (<= gate.max_submissions
-candidates whose score beats the incumbent's go to rsicore.search.submit_to_gate) remain as search knobs. The loop
-stops after loop.patience generations without a new incumbent. Every step is a rsicore.state.RunState key; rerunning
-the same run-id resumes (completed steps are skipped).
+Generation g = 1..gens (gen_XX/): draw -> incumbent scored on the generation's screen items (shown to the editor) ->
+inner search (threads x steps) -> optional baselines -> acceptance -> new incumbent exported + held-out evaluation, or
+the incumbent stays.
+The flow is hard-wired (2026-11-23; no search knobs for it): the incumbent answers the generation's screen items once
+(decoding.screen n 4; shared; summary in the context, full data via screen_results / screen_output); candidates are
+never screened and have no api.evaluate; each built candidate gets ONE gate evaluation in screen_fn (gate_candidate:
+paired vs the incumbent's gate records, recorded in gen_XX/gate.json as it finishes, so later steps and generations
+see the statistics); the end of the generation accepts the passing candidate with the largest gain
+(Runner.accept_best_gate). No noise band, no KL term. The loop stops after loop.patience generations without a new
+incumbent. Every step is a rsicore.state.RunState key; rerunning the same run-id resumes (completed steps are
+skipped).
 """
 from __future__ import annotations
 
@@ -56,7 +52,6 @@ from rsicore.chat_tools import (RUN_PYTHON_DOC, ChatTools, SearchHistory, chat_t
                                 with_mock_exploration)
 from rsicore.editor import Editor, apply_context_tokens, editor_kwargs, editor_settings  # noqa: E402
 from rsicore.evaluate import score, score_split  # noqa: E402
-from rsicore.gate import fixed_noise_band, measure_noise_band, noise_ids  # noqa: E402
 from rsicore.heldout import heldout_domains, run_heldout  # noqa: E402
 from rsicore.sandbox import run_program  # noqa: E402
 from rsicore.servers import VLLMServer  # noqa: E402
@@ -66,7 +61,7 @@ from edit_code import mock as M  # noqa: E402
 from edit_code.baselines import run_baselines  # noqa: E402
 from edit_code.common import (candidate_args, candidate_groups, deep_merge, error_line, gpu_layout,  # noqa: E402
                               program_note, read_json, read_jsonl, search_settings, tail, write_json)
-from edit_code.problem import EvalBudgetExhausted, QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
+from edit_code.problem import QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
 from edit_code.prompts import archive_row, archive_text, history_row, make_render_context, system_prompt  # noqa: E402
 from edit_code.quant import schema, sizes  # noqa: E402
 from edit_code.tools import make_tool_api  # noqa: E402
@@ -190,9 +185,9 @@ def gate_outcomes(d: Path) -> dict:
 
 
 class GateLog:
-    """<search dir>/gate.json of the gate-per-candidate flow (search.gate_every_candidate, 2026-11-21): the
-    submissions-list shape of rsicore.search.submit_to_gate, one entry per candidate (sorted by cid), written as each
-    gate evaluation finishes (thread-safe), so later steps' search_history rows already show the gate results."""
+    """<search dir>/gate.json (gate per candidate, 2026-11-21): {"submissions": [...]}, one entry per candidate
+    (sorted by cid), written as each gate evaluation finishes (thread-safe), so later steps' search_history rows
+    already show the gate results."""
 
     def __init__(self, path: Path):
         self.path, self.lock = Path(path), threading.Lock()
@@ -224,14 +219,14 @@ def gate_candidate(prob, art: dict, cid: str, log: GateLog) -> dict:
              "broken_ids": [], "fixed_ids": [], "bytes_gib": art["bytes_gib"]}
         log.add(cid, False, g)
         return g
-    r = prob.evaluate(art, "gate", cid, charge=False, origin="gate")
+    r = prob.evaluate(art, "gate", cid, origin="gate")
     g = prob.gate_stats(art, r)
     log.add(cid, g["passed"], dict(g, probes=r["feedback"]["probes"]))
     return g
 
 
 def gate_feedback(prob, art: dict, g: dict) -> dict:
-    """The editor's feedback of a gated, unscreened candidate: size, gate statistics and per-domain gate probes
+    """The editor's feedback of a gated candidate: size, gate statistics and per-domain gate probes
     (no item content, no record paths) and where its quantization error concentrates (group_error, free)."""
     r = prob._evals.get((art["config_hash"], "gate")) or {}
     probes = {d: {k: v for k, v in p.items() if k != "records"}
@@ -256,8 +251,8 @@ class Runner:
         self.st = RunState(rc.run_dir)
         self.run_dir = Path(rc.run_dir)
         # data roles (rsicore.draws): self.datasets = the TRAIN role simple_<d>_pool (screen / full / signal items,
-        # noise band, feedback examples; KL / calibration texts = its seeded `kl` subset), self.gate_datasets = the
-        # GATE role simple_<d>_eval (baseline gate of M_0 / Q_0, the incumbent's gate records, candidate gate scoring,
+        # baselines' feedback examples; calibration texts = its seeded `kl` subset), self.gate_datasets = the GATE
+        # role simple_<d>_eval (baseline gate of M_0 / Q_0, the incumbent's gate records, candidate gate scoring,
         # gate.json)
         tds, gds = D.train_dataset(rc), D.gate_dataset(rc)
         self.datasets, self.gate_datasets, self.kl_datasets = [tds], [gds], [tds]
@@ -363,10 +358,10 @@ class Runner:
         return self._server(name, Path(model_dir), q, gpus, args_key)
 
     def kl_texts(self, gen: int, m0: LazyServer) -> list[tuple[str, str]]:
-        """(domain, text) KL / calibration texts of generation `gen` (generation 0: the layer-cache calibration;
-        later generations only when Runner.kl_used). kl.self_generated: prompt + M_0's own greedy
-        response (cached in run_dir/kl_selfgen/gen_XX.jsonl; M_0 is started only for responses not cached yet),
-        else the prompt alone."""
+        """(domain, text) calibration texts of generation `gen` (generation 0: GPTQ / AWQ calibration of the layer
+        cache and the profile table's contexts; the block keeps its name `kl`). kl.self_generated: prompt + M_0's own
+        greedy response (cached in run_dir/kl_selfgen/gen_XX.jsonl; M_0 is started only for responses not cached
+        yet), else the prompt alone."""
         texts = kl_texts_for(self.rc, gen, self.kl_datasets, self.cfg)
         if not self.cfg["kl"].get("self_generated"):
             return texts
@@ -383,29 +378,20 @@ class Runner:
             for s in extra:                  # the candidate GPUs are needed for candidates next
                 s.close()
 
-    def kl_used(self) -> bool:
-        """Whether a search generation needs its KL texts with M_0's responses and M_0's reference logprobs
-        (2026-11-22): the score uses KL (search.kl_weight > 0) or baselines run (they may calibrate / score KL on
-        them). The generation-0 texts (calibration of the layer cache) are always built."""
-        cfg = self.cfg
-        return (float(cfg["search"].get("kl_weight", 0.0) or 0.0) > 0
-                or bool((cfg.get("baselines") or {}).get("methods") or []))
-
     def data_for(self, gen: int) -> dict:
         return {ds: {"screen": D.ids(self.rc, gen, ds, "screen"), "signal": D.ids(self.rc, gen, ds, "signal")}
                 for ds in self.datasets}
 
-    def problem(self, *, tag: str, gen: int, out_dir: Path, budget: float, data: dict, kl_texts, refs_dir: Path,
-                eval_budget: int, show_examples: int, incumbent: dict | None = None) -> QuantProblem:
+    def problem(self, *, tag: str, gen: int, out_dir: Path, budget: float, data: dict, kl_texts=None,
+                show_examples: int, incumbent: dict | None = None) -> QuantProblem:
         """Every problem quantizes the ORIGINAL model; the layer cache in run_dir/prep is shared."""
         return QuantProblem(self.rc, self.cfg, tag=tag, gen=gen, out_dir=out_dir, prep_dir=self.prep_dir,
                             source_dir=Path(self.rc.model_path) if not self.rc.mock else None,
                             source_state=self.source_state(), budget_gib=budget, datasets=self.datasets, data=data,
                             gate_datasets=self.gate_datasets,
-                            kl_texts=kl_texts, refs_dir=refs_dir,
-                            noise=read_json(self.run_dir / "baseline" / "noise.json", {}),
+                            kl_texts=kl_texts,
                             gate_baseline=read_json(self.run_dir / "baseline" / "gate.json", {}),
-                            eval_budget=eval_budget, show_examples=show_examples, incumbent=incumbent, log=self.log,
+                            show_examples=show_examples, incumbent=incumbent, log=self.log,
                             prep_gpus=[g[0] for g in self.all_groups] if self.prep_all_gpus else None)
 
     def export(self, prob: QuantProblem, art: dict, dst: Path):
@@ -432,13 +418,11 @@ class Runner:
     def search_fns(self, prob: QuantProblem, gdir: Path, ed: LazyServer, *, archive: str):
         rc, cfg = self.rc, self.cfg
         ss = search_settings(cfg["search"])
-        per_prog, free, ev_tool = ss["per_program"], not ss["charge_screens"], ss["evaluate_tool"]
-        gate_log = GateLog(gdir / "gate.json") if ss["gate_every_candidate"] else None
-        doc_api = make_tool_api(prob, cfg, cid="doc", per_program_evaluate=per_prog, free_repeats=free,
-                                evaluate_tool=ev_tool)
+        gate_log = GateLog(gdir / "gate.json")
+        doc_api = make_tool_api(prob, cfg, cid="doc")
         es = editor_settings(cfg)
         history = self.search_history(prob.gen) if es["tool_rounds"] > 0 and es.get("history_tool", True) else None
-        sys_prompt = system_prompt(prob, doc_api.describe(), cfg, history=history is not None, search=ss)
+        sys_prompt = system_prompt(prob, doc_api.describe(), cfg, history=history is not None)
         ekw = editor_kwargs(cfg, server_args=server_args(cfg, "editor_args"))
         tools = self.chat_tools(prob, history) if es["tool_rounds"] > 0 else None
         policy = None
@@ -452,10 +436,7 @@ class Runner:
                           mock_policy=policy, tools=tools, **ekw)
 
         def build_fn(program, cid):
-            if not free and prob.evals_left <= 0:      # free screens: programs always run (2026-11-21)
-                return None, "evaluate budget of this generation is exhausted; program not run"
-            api = make_tool_api(prob, cfg, cid=cid, per_program_evaluate=per_prog, free_repeats=free,
-                                evaluate_tool=ev_tool)
+            api = make_tool_api(prob, cfg, cid=cid)
             res = run_program(program, api, timeout_s=cfg["sandbox"]["timeout_s"], mem_gb=cfg["sandbox"]["mem_gb"],
                               workdir=gdir / "sandbox" / cid)
             if not res.ok:
@@ -473,34 +454,18 @@ class Runner:
             note = program_note(result)              # (2026-11-22) its own account, for search_history / the archive
             if note:
                 art["note"] = note
-            art["cost"] = {"tool_calls": res.info.get("tool_calls"), "tool_evaluate": api.spent.get("evaluate", 0),
-                           "program_s": round(res.seconds, 2)}
+            art["cost"] = {"tool_calls": res.info.get("tool_calls"), "program_s": round(res.seconds, 2)}
             art["stdout_tail"] = tail(res.stdout, 600)
             return art, None
 
         def screen_fn(art, cid):
-            """screen (search.screen_candidates) and / or ONE gate evaluation (search.gate_every_candidate, 2026-11-21:
-            an unscreened candidate's score is its paired gate gain over the incumbent)."""
-            sc, fb = None, None
-            if ss["screen_candidates"]:
-                try:                                # search.charge_screens false: the automatic screen is free
-                    r = prob.evaluate(art, "screen", cid, charge=not free)
-                except EvalBudgetExhausted as e:
-                    return None, {"error": str(e)}
-                sc, fb = r["score"], r["feedback"]
-            if gate_log is None:
-                return sc, fb
+            """The candidate's ONE evaluation: its gate evaluation (2026-11-21); score = its paired gate gain over the
+            incumbent."""
             g = gate_candidate(prob, art, cid, gate_log)
-            return (g.get("gain"), gate_feedback(prob, art, g)) if fb is None else (sc, dict(fb, gate=g))
+            return g.get("gain"), gate_feedback(prob, art, g)
 
-        def full_fn(art, cid):
-            r = prob.evaluate(art, "full", cid)
-            return r["score"], r["feedback"]
-
-        render = make_render_context(prob, cfg, archive=archive, search=ss,
-                                     history_tool=history is not None)
-        return dict(editor_factory=editor_factory, render_context=render, build_fn=build_fn, screen_fn=screen_fn,
-                    full_fn=full_fn)
+        render = make_render_context(prob, cfg, archive=archive, search=ss, history_tool=history is not None)
+        return dict(editor_factory=editor_factory, render_context=render, build_fn=build_fn, screen_fn=screen_fn)
 
     def search_history(self, g: int) -> SearchHistory:
         """Records for the search_history chat tool (editor.history_tool, default on; 2026-11-21): the search of
@@ -522,16 +487,15 @@ class Runner:
 
     def chat_tools(self, prob: QuantProblem, history: SearchHistory | None = None) -> ChatTools:
         """The editor's chat tools (editor.tool_rounds > 0): run_python with the exploration API
-        (make_tool_api(explore=True): no evaluate; group_error on cached settings only unless
-        editor.explore.gpu_tools), read_record and (history given) search_history. Each run_python call gets a
-        fresh API (thread-safe: the editor threads propose at the same time); exploration never spends the
-        generation's evaluate budget. editor.explore.persistent (2026-11-21, simple): rsicore keeps one session per
-        proposal and calls explore_api once per proposal (the API is stateless apart from its call log, so that is
-        safe); with search.screen_candidates false it also carries screen_results / screen_output."""
+        (make_tool_api(explore=True): group_error on cached settings only unless editor.explore.gpu_tools; also
+        screen_results / screen_output), read_record and (history given) search_history. Each run_python call gets a
+        fresh API (thread-safe: the editor threads propose at the same time). editor.explore.persistent (2026-11-21,
+        simple): rsicore keeps one session per proposal and calls explore_api once per proposal (the API is stateless
+        apart from its call log, so that is safe)."""
         cfg = self.cfg
 
         def explore_api(tag, ctx):
-            return make_tool_api(prob, cfg, cid=tag, per_program_evaluate=0, explore=True)
+            return make_tool_api(prob, cfg, cid=tag, explore=True)
         names = explore_api("doc~x", {}).names()
         doc = RUN_PYTHON_DOC + f" Tools on `api` here: {', '.join(names)}."
         if "group_error" in names and not editor_settings(cfg)["explore"].get("gpu_tools"):
@@ -546,8 +510,7 @@ class Runner:
         phases = EditorPhases(ed, prob, self.gpu_editor, self.editor_sleep, log=self.log)
         ss = search_settings(self.cfg["search"])
         return S.inner_search(self.rc, gen, threads=ss["threads"], steps=ss["steps"],
-                              max_candidates=ss["max_candidates"], top_full=ss["top_full"],
-                              rerun_seeds=ss["rerun_seeds"], out_dir=gdir, parallel=max(2, prob.n_slots),
+                              max_candidates=ss["max_candidates"], out_dir=gdir, parallel=max(2, prob.n_slots),
                               phases=phases, **fns)
 
     # ------------------------------------------------------------------ baseline (generation 0)
@@ -575,9 +538,6 @@ class Runner:
                         res[ds] = _acc(r.records)
                     write_json(bdir / "gate.json", res)
                     self.log("[baseline] M_0 gate scores", res)
-            with st.step("baseline/noise") as todo:
-                if todo:
-                    write_json(bdir / "noise.json", self.noise_band(m0, bdir))
             with st.step("baseline/heldout") as todo:
                 if todo and self.heldout_enabled:   # heldout.enabled false: no held-out report
                     h = self.heldout_on(reps, bdir / "heldout")
@@ -585,14 +545,13 @@ class Runner:
             # kl_texts creates its own candidate replicas; release the baseline replicas first.
             for replica in reps[1:]:
                 replica.close()
-            kl0 = self.kl_texts(0, m0)       # calibration / KL texts (prompt + M_0 response with kl.self_generated)
+            kl0 = self.kl_texts(0, m0)       # calibration texts (prompt + M_0 response with kl.self_generated)
         finally:
             for s in reps:
                 s.close()
         # layer cache + diagnostics of M_0 (once), budget, Q_0
         prob = self.problem(tag="q0", gen=0, out_dir=bdir / "q0", budget=float("inf"), data=self.data_for(0),
-                            kl_texts=kl0, refs_dir=bdir / "q0" / "refs",
-                            eval_budget=0, show_examples=0)
+                            kl_texts=kl0, show_examples=0)
         with st.step("baseline/prep") as todo:
             prob.prepare()
         with st.step("baseline/budget") as todo:
@@ -604,7 +563,7 @@ class Runner:
             if todo:
                 ref = cfg["budget"]["reference"]
                 art = prob.build(ref, "q0")
-                r = prob.evaluate(art, "gate", "q0", charge=False, origin="reference")
+                r = prob.evaluate(art, "gate", "q0", origin="reference")
                 self.export(prob, art, bdir / "q0" / "model")
                 inc = self.incumbent_record(0, "q0", art, r["feedback"], bdir / "q0" / "model", accepted=True)
                 write_json(bdir / "incumbent.json", inc)
@@ -636,29 +595,6 @@ class Runner:
         out["fraction_of_bf16"] = round(out["gib"] / bf16, 4)
         return out
 
-    def noise_band(self, ed: LazyServer, bdir: Path) -> dict:
-        """{dataset: band} (max - min of repeated sampled screen runs of M_0); details in noise_detail.json.
-        noise.fixed gives the band directly (no re-runs for those datasets); noise.n scores a subset of the
-        generation-0 screen items (null = all of them)."""
-        rc, ncfg = self.rc, self.cfg["noise"]
-        detail = {}
-        for ds in self.datasets:
-            fixed = fixed_noise_band(ncfg.get("fixed"), ds)
-            if fixed is not None:
-                detail[ds] = {"band": fixed, "source": "fixed (noise.fixed)", "task": ds}
-                continue
-            srv = ed.get()
-            ids = noise_ids(D.ids(rc, 0, ds, "screen"), ncfg.get("n"), rc.seed)
-            detail[ds] = measure_noise_band(srv.endpoint, ed.name, ds, ids, bdir / "noise" / ds,
-                                            repeats=int(ncfg.get("repeats", 3)),
-                                            temperature=float(ncfg.get("temperature", 0.0)),
-                                            top_p=float(ncfg.get("top_p", 1.0)), base_seed=rc.seed,
-                                            mock=rc.mock)   # source: measured | greedy (temperature 0: band 0)
-        write_json(bdir / "noise_detail.json", detail)
-        out = {ds: round(v["band"], 4) for ds, v in detail.items()}
-        self.log("[baseline] noise band", out)
-        return out
-
     # ------------------------------------------------------------------ editor
     def editor_server(self, g: int, m0: LazyServer) -> LazyServer:
         """frozen: M_0 (the same server as the references); current: the incumbent Q_{g-1}."""
@@ -686,10 +622,8 @@ class Runner:
             acc = read_json(gd / "accepted.json") or {}
             cands = S.ranked(S.load_candidates(self.rc, t).values())
             gates = gate_outcomes(gd)
-            ss = search_settings(self.cfg["search"])
-            gate_every = ss["gate_every_candidate"] and not ss["screen_candidates"]   # scores = paired gate gains
-            ents.append({"gen": t, "accepted": bool(acc.get("accepted")), "cid": acc.get("cid"),
-                         "gate_reason": acc.get("gate_reason"), "n": len(cands), "gate_every": gate_every,
+            ents.append({"gen": t, "accepted": bool(acc.get("accepted")), "cid": acc.get("cid"),     # scores = gate gains
+                         "gate_reason": acc.get("gate_reason"), "n": len(cands),
                          "best": [(c.cid, c.score) for c in cands if c.score is not None][:3],
                          "incumbent_score": (read_json(gd / "incumbent_scores.json") or {}),
                          "reference_screen": read_json(gd / "reference_screen.json"),
@@ -699,11 +633,10 @@ class Runner:
         return archive_text(ents, read_tools=read_tools, max_chars=int(acfg.get("max_chars", 30000)))
 
     def accept_best_gate(self, prob, g: int, gd: Path, ranked: list, inc: dict, budget: float):
-        """End of a gate-per-candidate generation (search.gate_every_candidate, 2026-11-21): every candidate has ONE
-        gate entry in gen_XX/gate.json (a built candidate missing one, e.g. after a crash, is gated now; a failed one
-        gets passed false, 'not evaluated'); among the passing ones (size, gate.min_delta, CI if required; not the
-        incumbent's own config) the LARGEST paired gain is accepted (ties: higher screen score, then the earlier
-        cid); none passes -> the incumbent stays."""
+        """End of a generation (gate per candidate, 2026-11-21): every candidate has ONE gate entry in
+        gen_XX/gate.json (a built candidate missing one, e.g. after a crash, is gated now; a failed one gets passed
+        false, 'not evaluated'); among the passing ones (size, gate.min_delta, CI if required; not the incumbent's own
+        config) the LARGEST paired gain is accepted (ties: the earlier cid); none passes -> the incumbent stays."""
         st, p = self.st, f"gen{g:02d}"
         log = GateLog(gd / "gate.json")
         outs = gate_outcomes(gd)
@@ -718,10 +651,7 @@ class Runner:
         ok = [c for c in ranked if outs.get(c.cid, {}).get("passed") and c.artifact
               and outs[c.cid].get("gain") is not None and float(outs[c.cid]["gain"]) > 0   # strictly better (min_delta 0)
               and c.artifact.get("config_hash") != inc["config_hash"]]
-        def screen_score(c):                    # an unscreened candidate's screen slot holds its gate feedback
-            sc = c.screen or {}
-            return None if (sc.get("feedback") or {}).get("stage") == "gate" else sc.get("score")
-        acc = min(ok, key=lambda c: (-outs[c.cid]["gain"], -S._sc(screen_score(c)), c.cid)) if ok else None
+        acc = min(ok, key=lambda c: (-outs[c.cid]["gain"], c.cid)) if ok else None
         if acc is None:
             reasons = [f"{cid}: {o.get('reason')}" for cid, o in sorted(outs.items())] or ["no candidate"]
             write_json(gd / "accepted.json", {"accepted": False, "gate_reason": reasons})
@@ -729,7 +659,7 @@ class Runner:
             st.mark(f"{p}/accepted", {"accepted": False, "reasons": reasons})
             return
         o = outs[acc.cid]
-        gfb = prob.evaluate(acc.artifact, "gate", acc.cid, charge=False, origin="gate")["feedback"]   # cached
+        gfb = prob.evaluate(acc.artifact, "gate", acc.cid, origin="gate")["feedback"]   # cached
         new = self.incumbent_record(g, acc.cid, acc.artifact, gfb, gd / "model", accepted=True)
         write_json(gd / "accepted.json", {"accepted": True, "cid": acc.cid, "config": acc.artifact["config"],
                                           "config_hash": acc.artifact["config_hash"],
@@ -755,25 +685,16 @@ class Runner:
         m0 = self.m0_server(tasks=self.datasets)
         ed = None
         try:
-            # (2026-11-22) KL unused (kl_weight 0, no baselines): the prompts only, without
-            # M_0's self-generated responses and reference logprobs (Paper B does no KL work under simple either)
-            kl_used = self.kl_used()
+            # (2026-11-23) no per-generation KL / calibration texts: the layer cache and the tables are built once in
+            # generation 0, and there is no KL term
             prob = self.problem(tag=f"g{g:02d}", gen=g, out_dir=gd, budget=budget, data=self.data_for(g),
-                                kl_texts=(self.kl_texts(g, m0) if kl_used
-                                          else kl_texts_for(self.rc, g, self.kl_datasets, self.cfg)),
-                                refs_dir=gd / "refs",
-                                eval_budget=search_settings(cfg["search"])["eval_budget"],
                                 show_examples=cfg["feedback"].get("examples", 2), incumbent=inc)
             prob.prepare()
-            with st.step(f"{p}/refs") as todo:
-                if todo and kl_used:                # M_0 = the KL reference only (not scored on the items)
-                    srv = m0.get()
-                    prob.compute_refs(srv.endpoint, m0.name)
-            # the incumbent on this generation's items = the reference of every candidate (uncharged; cached)
+            # the incumbent on this generation's items (the editor's screen view; the baselines' reference; cached)
             prob.evaluate_incumbent()
             write_json(gd / "incumbent_scores.json", prob.incumbent_scores)
-            if prob.screen_tools:                   # the latest model's screen run, for later rounds (archive / history)
-                write_json(gd / "reference_screen.json", prob.screen_summary(examples=0))
+            # the latest model's screen run, for later rounds (archive / history)
+            write_json(gd / "reference_screen.json", prob.screen_summary(examples=0))
             ed = self.editor_server(g, m0)
             if ed is not m0:
                 m0.close()
@@ -783,7 +704,7 @@ class Runner:
                 es = editor_settings(cfg)
                 arch = self.archive(g, read_tools=es["tool_rounds"] > 0 and es.get("history_tool", True))
                 ranked = self.run_search(prob, g, gd, ed, archive=arch)
-                st.mark(f"{p}/search", {"candidates": len(ranked), "evaluations": prob.evals_used})
+                st.mark(f"{p}/search", {"candidates": len(ranked)})
         finally:
             if ed is not None:
                 ed.close()
@@ -795,41 +716,8 @@ class Runner:
                                     stage_full=cfg["baselines"].get("full", False), log=self.log)
                 write_json(gd / "baselines" / "summary.json", out)
         with st.step(f"{p}/gate") as todo:
-            if todo and search_settings(cfg["search"])["gate_every_candidate"]:
+            if todo:
                 self.accept_best_gate(prob, g, gd, ranked, inc, budget)
-            elif todo:
-                # only candidates that beat the incumbent on this generation's items are submitted
-                def beats(c):
-                    if c.score is None or not c.artifact or c.artifact.get("config_hash") == inc["config_hash"]:
-                        return False
-                    ref = prob.incumbent_scores.get("full" if c.full else "screen")
-                    return ref is None or c.score > ref
-                subs = [c for c in ranked if beats(c)]
-
-                def gate_fn(c):
-                    r = prob.evaluate(c.artifact, "gate", c.cid, charge=False, origin="gate")
-                    gi = r["feedback"]["gate"]
-                    return gi["passed"], {"reason": gi["reason"], "bytes_gib": c.artifact["bytes_gib"],
-                                          "probes": r["feedback"]["probes"]}
-                acc = S.submit_to_gate(rc, g, subs, gate_fn, max_submissions=cfg["gate"]["max_submissions"],
-                                       parallel=prob.n_slots)   # the submissions are gate-evaluated at once
-                gl = read_json(gd / "gate.json", {"submissions": []}) or {"submissions": []}
-                if acc is None:
-                    reasons = [s["info"].get("reason") for s in gl["submissions"]] or \
-                        ["no candidate beat the incumbent on this generation's items"]
-                    write_json(gd / "accepted.json", {"accepted": False, "gate_reason": reasons})
-                    write_json(gd / "incumbent.json", dict(inc, accepted=False))
-                    st.mark(f"{p}/accepted", {"accepted": False, "reasons": reasons})
-                else:
-                    reason = next(s["info"]["reason"] for s in gl["submissions"] if s["cid"] == acc.cid)
-                    gfb = prob.evaluate(acc.artifact, "gate", acc.cid, charge=False, origin="gate")["feedback"]
-                    new = self.incumbent_record(g, acc.cid, acc.artifact, gfb, gd / "model", accepted=True)
-                    write_json(gd / "accepted.json", {"accepted": True, "cid": acc.cid, "config": acc.artifact["config"],
-                                                      "config_hash": acc.artifact["config_hash"],
-                                                      "bytes_gib": acc.artifact["bytes_gib"], "budget_gib": budget,
-                                                      "score": acc.score, "gate_reason": reason})
-                    write_json(gd / "incumbent.json", new)
-                    st.mark(f"{p}/accepted", {"accepted": True, "cid": acc.cid})
         accepted = bool((read_json(gd / "accepted.json") or {}).get("accepted"))
         new = self.incumbent(g)
         if accepted:
@@ -896,7 +784,6 @@ class Runner:
         if g == 0:
             out["m0_gate_scores"] = m0_gate
             out["m0_heldout_by_domain"] = _by_domain(read_json(bdir / "heldout.json", {}) or {})
-            out["noise_band"] = read_json(bdir / "noise.json")
             out["budget"] = read_json(bdir / "budget.json")
         else:
             out["accepted"] = bool((read_json(d / "accepted.json") or {}).get("accepted"))

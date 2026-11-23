@@ -7,7 +7,7 @@ A registry value (eval/rsicore/mock_server.py --registry JSON, {name: value}) is
                                                    tool_calling) or "default"
   {"quality": <either of the above>, ...}          extra keys are metadata (ignored)
 Resolution for a request of task T in domain D: T > D > "default" > mean of the numeric values > default.
-`scalar()` (used for fake prompt logprobs / KL and as a paper's single "skill" number) is the mean over
+`scalar()` (used for fake prompt logprobs and as a paper's single "skill" number) is the mean over
 the five domains, each resolved as above; for {"default": x} or a float it is that number.
 No imports beyond the standard library, so papers can use it without the eval environment.
 """

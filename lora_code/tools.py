@@ -9,16 +9,12 @@ evaluator.register serves a candidate (a delta on M_g) as C_g (+) delta.
 Vector references (for rank1 / from_direction): "S3.u0", "S3.v1", "A2.in_mean", "A2.out_mean", "A2.pc0", and
 "T5.<name>" (a vector returned by tensor_compute).
 
-Budgets (RSI_LOOP_DESIGN §3.3): `evaluate` calls (an identical LoRA is evaluated once and only charged
-once) and `gpu_seconds` for acts / train_loss (measured on gpu1; estimated in mock).
+Budgets (RSI_LOOP_DESIGN §3.3): `gpu_seconds` for acts / train_loss (measured on gpu1; estimated in mock). There is
+no evaluate tool (2026-11-23): every returned candidate gets one gate evaluation in run.py, outside the programs.
 All accounting is done by the workspace's rsicore.sandbox.ToolAPI (`ws.api`, created with the workspace):
-evaluate = cost_fn (1 per non-empty LoRA) + dedupe_key_fn (LoRA name = digest; identical LoRAs are free,
-also between program calls and the search's screen evaluation, which goes through the same tool);
 GPU tools = cost {"gpu_seconds": 0} (refused once exhausted) + cost_fn (measured seconds, capped at what
 was left before the call so a successful call keeps its result; the uncapped total is ws.gpu_measured).
-search.charge_screens false (2026-11-21; search_settings): the automatic screen is free
-(screen_candidate) and the `evaluate` budget is only the pool of the programs' api.evaluate calls
-(search.program_evaluate_total); an api.evaluate of a LoRA that was already evaluated (screened) is free.
+Workspace.evaluate_lora scores a LoRA directly (the raw LoRA's and the non-LLM branch's points; never charged).
 Data access: acts / train_example only accept this generation's `train` ids (TrainData).
 The editor never trains and never computes gradients (2026-11-20: no sgd / grad / from_grad tools in any
 mode). Tool set by method.mode (tools_for_mode): edit = every LoRA tool plus raw_lora (the raw LoRA under handle
@@ -34,13 +30,13 @@ reads the shard files itself). Outputs: `result` (JSON, cut to result_chars), `v
 "delta" ops on a new W handle; caps change_errors / no uniform rescale, never embed_tokens / final norm / lm_head).
 It runs WITHOUT the workspace lock (only resolving inputs / registering outputs take it), under a process-wide
 semaphore (max_concurrent), with timeout min(timeout_s, the calling program's / exploration call's time left).
-The simple flow (2026-11-21, base.yaml; search_settings / paper_tools_enabled / screen_tools_enabled): no evaluate
-tool (search.program_evaluate_calls 0); screen_results / screen_output read the current model's own answers on the
+The simple flow (2026-11-21; the only flow, 2026-11-23; paper_tools_enabled / screen_tools_enabled): no evaluate
+tool; screen_results / screen_output read the current model's own answers on the
 generation's screen items (ws.screen, set by run.py); paper tools save_edit / load_edit / list_edits / drop_edit
 (out_dir/saved/<root cid>/), output_matrices, unit, direction, project_out, acts(source='own'),
 tensor_compute(vectors=...).
 Exploration (2026-11-21): ws.explore_api(tag) is the `api` of the editor's run_python chat tool (rsicore.chat_tools)
-while it writes a candidate: a separate ToolAPI without evaluate / raw_lora and (unless editor.explore.gpu_tools)
+while it writes a candidate: a separate ToolAPI without raw_lora and (unless editor.explore.gpu_tools)
 without the GPU tools; it never charges the generation's budgets, and its handles are freed after each call.
 """
 from __future__ import annotations
@@ -80,13 +76,12 @@ TOOL_DOCS = {
     "raw_lora": "raw_lora() -> {lora: 'RAW', modules, max_rank, train}: the LoRA you start from (trained once, "
                 "in generation 0, with the fixed raw recipe; edited since)",
     "candidate": "candidate(cid) -> {lora} of an earlier candidate of this generation",
-    "evaluate": "evaluate(lora) -> structured screen feedback (costs 1 evaluate; identical LoRAs are free)",
     "compare": "compare(cid, other='parent', level='screen') -> per dataset: acc and acc_other, broken (other right, "
                "cid wrong) / fixed counts and ids, flips by output length, truncation; ids and statistics only, both "
                "must already be evaluated (free). cid / other: a candidate id or 'parent' (the current model)",
     "train_loss": "train_loss(lora, ids=None, n=64) -> {loss, parent_loss, delta, n}: mean answer NLL of train items "
                   "under the current model + lora vs without it (forward pass only, no training; costs gpu_seconds)",
-    "budget": "budget() -> {spent, left, program_seconds_left, program_evaluate_calls_left}: generation budgets, and the wall clock / evaluate calls this program has left",
+    "budget": "budget() -> {spent, left, program_seconds_left}: generation budgets, and the wall clock this program has left",
     "tensors": "tensors(layer=None, pattern=None) -> list of {name, shape, dtype, editable}: EVERY language-model "
                "tensor (not only the linear modules: input/post_attention_layernorm, self_attn.q_norm/k_norm, "
                "linear_attn.dt_bias / A_log / conv1d / norm, '<module>.weight'); pattern = substring or glob; "
@@ -129,8 +124,6 @@ WEIGHTS_DOC_OVERRIDES = {   # mode=weights: tools that also take an edit handle
                       "multiplies by 1 + w); a write that is (almost) a uniform rescale of W is refused (use "
                       "w_scale for that); embed_tokens / final norm / lm_head are never editable",
     "candidate": "candidate(cid) -> {edit} (or {lora}) of an earlier candidate of this generation",
-    "evaluate": "evaluate(edit=None, lora=None) -> structured screen feedback for an edit (a LoRA is evaluated as "
-                "the edit that adds it; costs 1 evaluate; identical edits are free)",
     "train_loss": "train_loss(edit=None, lora=None, ids=None, n=64) -> {loss, parent_loss, delta, n}: mean answer NLL "
                   "of train items under the current model + edit vs without it (forward pass only; costs gpu_seconds)",
 }
@@ -178,7 +171,7 @@ SCREEN_DOCS = {
 
 def tools_for_mode(mode: str, cfg: dict | None = None) -> dict:
     """TOOL_DOCS available to the editor in method.mode: edit = every LoRA tool incl. raw_lora; scratch = no
-    raw_lora; weights = no raw_lora, plus WEIGHT_TOOLS (and edit-aware docs of candidate / evaluate / train_loss).
+    raw_lora; weights = no raw_lora, plus WEIGHT_TOOLS (and edit-aware docs of candidate / train_loss).
     cfg["tools"][name] = false removes a switchable tool (compare, train_loss, tensor_compute: also removes tensors).
     tensor_compute / tensors are on unless tensor_compute_enabled(cfg) is false."""
     out = dict(TOOL_DOCS)
@@ -200,10 +193,7 @@ def tools_for_mode(mode: str, cfg: dict | None = None) -> dict:
     if mode == "scratch" and str(((cfg or {}).get("merge") or {}).get("mode") or "merge") == "adapter" and "stack" in out:
         out["stack"] = ("stack() -> list of {handle, gen, modules, max_rank} (adapters accepted in earlier generations, "
                         "kept as one cumulative adapter, not merged; already part of the current model)")
-    ss = search_settings(cfg or {})
-    if not ss["evaluate_tool"]:                # program_evaluate_calls 0 with uncharged screens (2026-11-21)
-        out.pop("evaluate", None)
-    if ss["gate_every_candidate"] and "compare" in out:
+    if "compare" in out:                       # every candidate is gate-evaluated (the only flow, 2026-11-23)
         out["compare"] = out["compare"].replace("level='screen') ->", "level='gate') ->") + \
             " (level 'gate': the gate evaluations of earlier candidates; ids and counts only)"
     if paper_tools_enabled(cfg):
@@ -253,50 +243,15 @@ def _tc_semaphore(n: int):
         return _TC_SEMS[n]
 
 
-def program_evaluate_cap(cfg: dict) -> int | None:
-    """search.program_evaluate_calls (2026-11-21; code default 2, null = no cap): NEW api.evaluate calls one program
-    may make (an identical, already evaluated LoRA is free; the automatic evaluation of the returned candidate is
-    not a program call)."""
-    v = (cfg.get("search") or {}).get("program_evaluate_calls", 2)
-    return None if v is None else int(v)
-
-
 def search_settings(cfg: dict) -> dict:
-    """The search keys with code defaults that reproduce the runs before 2026-11-21 (base.yaml sets the simple flow's):
-    threads, steps; charge_screens (default true: the automatic screen of a returned candidate costs one `evaluate`);
-    pool = the generation's `evaluate` budget (charge_screens: search.max_evaluate; else search.program_evaluate_total,
-    null = threads x program_evaluate_calls: the api.evaluate calls of all programs); program_cap (per program, None =
-    no cap); max_candidates (null = max_evaluate while screens are charged, else threads x steps); parallel_builds."""
+    """The search keys with code defaults (2026-11-23: the only flow, no other knobs): threads, steps; max_candidates
+    (null = threads x steps); parallel_builds."""
     sc = cfg.get("search") or {}
     threads, steps = int(sc.get("threads", 4)), int(sc.get("steps", 8))
-    charge = sc.get("charge_screens", True)
-    charge = True if charge is None else bool(charge)
-    max_ev = int(sc.get("max_evaluate", 32))
-    cap = program_evaluate_cap(cfg)
-    if charge:
-        pool = max_ev
-    elif sc.get("program_evaluate_total") is not None:
-        pool = int(sc["program_evaluate_total"])
-    else:
-        pool = threads * cap if cap is not None else max_ev
-    # gate-per-candidate flow (2026-11-21, base.yaml; code defaults = the flow above): screen_candidates false =
-    # candidates are not screened (the current model's screen is still computed once per generation and shown through
-    # api.screen_results); gate_every_candidate true = every built candidate gets ONE gate evaluation paired vs the
-    # current model and the generation accepts the passing one with the largest paired gain; program_evaluate_calls 0
-    # with uncharged screens = no api.evaluate at all (evaluate_tool false)
-    screen_c = sc.get("screen_candidates", True)
-    screen_c = True if screen_c is None else bool(screen_c)
-    charge = charge and screen_c
-    evaluate_tool = charge or cap != 0
-    if not charge:
-        pool = 0 if not evaluate_tool else (int(sc["program_evaluate_total"]) if sc.get("program_evaluate_total")
-                                            is not None else (threads * cap if cap is not None else max_ev))
     mc = sc.get("max_candidates")
-    mc = int(mc) if mc is not None else (max_ev if charge else threads * steps)
-    return {"threads": threads, "steps": steps, "charge_screens": charge, "pool": pool, "program_cap": cap,
-            "max_candidates": mc, "parallel_builds": bool(sc.get("parallel_builds", False)),
-            "screen_candidates": screen_c, "gate_every_candidate": bool(sc.get("gate_every_candidate", False)),
-            "evaluate_tool": evaluate_tool}
+    mc = int(mc) if mc is not None else threads * steps
+    return {"threads": threads, "steps": steps, "max_candidates": mc,
+            "parallel_builds": bool(sc.get("parallel_builds", False))}
 
 
 def paper_tools_enabled(cfg: dict | None) -> bool:
@@ -308,9 +263,9 @@ def paper_tools_enabled(cfg: dict | None) -> bool:
 
 def screen_tools_enabled(cfg: dict | None) -> bool:
     """tools.screen_results (2026-11-21): api.screen_results / api.screen_output over the current model's own answers
-    on this generation's screen items. Absent key: on when search.screen_candidates is false (base.yaml)."""
+    on this generation's screen items. Absent key: on (candidates are never screened, 2026-11-23)."""
     on = ((cfg or {}).get("tools") or {}).get("screen_results")
-    return bool(on) if on is not None else not search_settings(cfg or {})["screen_candidates"]
+    return bool(on) if on is not None else True
 
 
 def _budget_exc():
@@ -351,7 +306,7 @@ class Workspace:
         self.hf = hf
         self.stack = list(stack or [])          # [(gen, LoRA|MockLoRA)]
         from rsicore.sandbox import ToolAPI
-        self.api = ToolAPI(dict(budget or {"evaluate": 32, "gpu_seconds": 7200}))   # the budget accountant
+        self.api = ToolAPI(dict(budget or {"gpu_seconds": 7200}))   # the budget accountant
         self.budget = self.api.budget
         self.gpu_measured = 0.0
         self.name_prefix = name_prefix
@@ -362,12 +317,6 @@ class Workspace:
         self._n = 0
         self._lock = threading.RLock()
         self._evaluated: dict[str, tuple] = {}
-        self._prog_evals: dict[str, int] = {}     # cid -> new api.evaluate calls made by that program
-        # (2026-11-21, set by run.py for the main search) charge_screens false: screen_candidate is free and the
-        # `evaluate` budget is only the programs' api.evaluate pool; parallel_eval: candidates are built / screened
-        # concurrently, so evaluate runs without the workspace lock in every mode (like mode=weights)
-        self.charge_screens = True
-        self.parallel_eval = False
         # (2026-11-21) the current model's own answers on this generation's screen items (dict or a
         # loader; Workspace.screen_data) for screen_results / screen_output / acts(source='own'); None = not available
         self.screen = None
@@ -639,7 +588,7 @@ class Workspace:
         return {}
 
     def _eval_obj(self, kwargs):
-        """The object an evaluate / train_loss call refers to: kwargs edit (a weight edit) or lora (a LoRA; in
+        """The object a train_loss call refers to: kwargs edit (a weight edit) or lora (a LoRA; in
         mode=weights converted to the edit that adds it, so it matches the returned candidate's name)."""
         if kwargs.get("edit") is not None:
             if kwargs.get("lora") is not None:
@@ -649,27 +598,6 @@ class Workspace:
             raise ValueError("pass lora=<handle>" + (" or edit=<handle>" if self.mode == "weights" else ""))
         lo = self._get(kwargs["lora"], "lora")
         return self._as_edit(lo) if self.mode == "weights" else lo
-
-    def _eval_key(self, kwargs):
-        """dedupe_key_fn of evaluate: the LoRA's / edit's served name (digest), or "__keep__" when empty."""
-        lo = self._eval_obj(kwargs)
-        return self.lora_name(lo) if lo.modules() else "__keep__"
-
-    def _eval_cost(self, kwargs, result) -> dict:
-        """cost_fn of evaluate: 1 per non-empty LoRA (evaluating "keep" is free; so is a LoRA that was already
-        evaluated before this call, e.g. screened automatically, 2026-11-21)."""
-        cached, self._local.eval_cached = getattr(self._local, "eval_cached", False), False
-        if cached:
-            return {}
-        return {} if self._eval_key(kwargs) == "__keep__" else {"evaluate": 1}
-
-    def _note_screened(self, name: str | None, fb) -> None:
-        """A free screen-level evaluation of `name` (charge_screens false): later api.evaluate calls of the same
-        LoRA get it from the evaluate tool's dedupe cache, free and even when the pool is used up (2026-11-21)."""
-        if name is None or self.charge_screens:
-            return
-        with self.api._lock:
-            self.api._dedupe.setdefault(("evaluate", name), fb)
 
     # ------------------------------------------------------------------ registration
     GPU_TOOLS = ("acts", "train_loss")
@@ -682,10 +610,7 @@ class Workspace:
             docs.pop("raw_lora", None)
         for name, doc in docs.items():
             fn = self._wrap(name, getattr(self, "t_" + name))
-            if name == "evaluate":
-                self.api.register(name, fn, cost={"evaluate": 0}, cost_fn=self._eval_cost,
-                                  dedupe_key_fn=self._eval_key, doc=doc)
-            elif name in self.GPU_TOOLS:
+            if name in self.GPU_TOOLS:
                 self.api.register(name, fn, cost={"gpu_seconds": 0}, cost_fn=self._gpu_cost, doc=doc)
             else:
                 self.api.register(name, fn, doc=doc)
@@ -693,7 +618,7 @@ class Workspace:
         return self.api
 
     # ------------------------------------------------------------------ exploration (editor chat tools)
-    EXPLORE_NEVER = ("evaluate", "raw_lora")   # evaluate spends the generation's evaluate budget; raw_lora: the raw LoRA
+    EXPLORE_NEVER = ("raw_lora",)   # raw_lora: the raw LoRA (the handle 'RAW' still works)
 
     def explore_tool_names(self, gpu_tools: bool = False) -> list[str]:
         """Tools of explore_api: the program's tool set without EXPLORE_NEVER, and without GPU_TOOLS unless
@@ -708,7 +633,7 @@ class Workspace:
         """(ToolAPI, cleanup) for one run_python call of the editor's tool loop (rsicore.chat_tools; 2026-11-21).
 
         A separate ToolAPI over the same tensors and handles (the _wrap'ed t_* functions, serialised by ws._lock),
-        without evaluate / raw_lora (the handle 'RAW' still works) and, unless gpu_tools, without the GPU tools
+        without raw_lora (the handle 'RAW' still works) and, unless gpu_tools, without the GPU tools
         (acts / train_loss). It never charges the generation's budgets (ws.api.spent,
         gpu_measured): with gpu_tools the GPU tools are charged to a separate exploration budget of gpu_seconds per
         session (2026-11-22: each proposal / cid has its own; their parent-loss caches are shared with the
@@ -779,13 +704,11 @@ class Workspace:
             xs["gpu_seconds"] = xs.get("gpu_seconds", 0.0) + used
         return {}
 
-    UNLOCKED_TOOLS = ("evaluate",)   # mode=weights: lock only their own bookkeeping (concurrent evaluations)
     ALWAYS_UNLOCKED = ("tensor_compute",)   # every mode: a CPU subprocess of up to minutes (2026-11-21)
 
     def _wrap(self, name, fn):
         def call(**kwargs):
-            if name in self.ALWAYS_UNLOCKED or ((self.mode == "weights" or self.parallel_eval)
-                                                and name in self.UNLOCKED_TOOLS):
+            if name in self.ALWAYS_UNLOCKED:
                 with self._lock:
                     self._log(name, kwargs)
                 return fn(**kwargs)
@@ -835,24 +758,14 @@ class Workspace:
                 "target": (ex.get("target") or "")[:2000], "source": ex.get("source")}
 
     def budget_status(self) -> dict:
-        """Budgets of this generation for the step context (2026-11-21). charge_screens false: `evaluate` is the
-        programs' api.evaluate pool (the automatic screens are free)."""
-        return {"evaluate_left": self.left("evaluate"), "evaluate": self.budget.get("evaluate"),
-                "gpu_seconds_left": round(self.left("gpu_seconds"), 1), "gpu_seconds": self.budget.get("gpu_seconds"),
-                "program_evaluate_calls": program_evaluate_cap(self.cfg), "charge_screens": bool(self.charge_screens),
-                "evaluate_tool": "evaluate" in self.api.names() if self._registered else None}
+        """Budgets of this generation for the step context (2026-11-21)."""
+        return {"gpu_seconds_left": round(self.left("gpu_seconds"), 1), "gpu_seconds": self.budget.get("gpu_seconds")}
 
     def t_budget(self):
         out = {"spent": dict(self.api.spent), "left": self.api.remaining()}
         cid, t0 = getattr(self._local, "cid", None), getattr(self._local, "t0", None)
         if cid and "~x" not in str(cid) and t0:          # a candidate program (not run_python exploration)
             out["program_seconds_left"] = round(max(0.0, self.program_timeout_s - (time.time() - t0)), 1)
-            cap = program_evaluate_cap(self.cfg)
-            if cap is not None:
-                left = max(0, cap - self._prog_evals.get(cid, 0))
-                if not self.charge_screens:             # the generation's pool can be the tighter limit
-                    left = int(max(0, min(left, self.left("evaluate"))))
-                out["program_evaluate_calls_left"] = left
         if getattr(self._local, "explore", False):      # (2026-11-22) run_python: the session's own GPU budget
             xb, xs = self._xbudget()
             if xb:
@@ -860,12 +773,9 @@ class Workspace:
                                                             - xs.get("gpu_seconds", 0.0)), 1)
                 out["explore_note"] = ("GPU tools in run_python spend explore_gpu_seconds_left (this session only); "
                                        "'spent' / 'left' are your final program's budgets")
-        if not self.charge_screens and self._registered and "evaluate" not in self.api.names():
+        if self._registered:
             out["note"] = ("no api.evaluate in this run: every returned candidate gets one gate evaluation "
                            "automatically (shown to later steps / generations)")
-        elif not self.charge_screens:
-            out["note"] = ("returned candidates are scored automatically at no cost; 'evaluate' is the api.evaluate "
-                           "pool of all programs of this generation")
         return out
 
     def t_stack(self):
@@ -1772,22 +1682,11 @@ class Workspace:
     def lora_name(self, lo) -> str:
         return f"{self.name_prefix}-{lo.digest()}"
 
-    def evaluate_lora(self, lo, level: str = "screen", charge: bool = True) -> tuple[float | None, dict]:
-        """Register + score `lo` (empty LoRA = keep the model unchanged). Identical LoRAs are cached.
-        charge=True at level 'screen' goes through the `evaluate` tool of ws.api (budget + dedupe there)."""
-        if charge and level == "screen":
-            self.build_api()
-            key, prefix = self._handle_of(lo)
-            h = self._new(prefix, lo)
-            try:
-                fb = self.api.call("evaluate", {key: h})
-            finally:
-                with self._lock:
-                    self._h.pop(h, None)
-                    self._owner.pop(h, None)
-            return fb.get("score"), fb
-        # Several threads may evaluate at once (run.py, mode=weights): the lock covers only the cache and the
-        # report / check (weight store, applying an edit); evaluator.register / feedback run concurrently.
+    def evaluate_lora(self, lo, level: str = "screen") -> tuple[float | None, dict]:
+        """Register + score `lo` (empty LoRA = keep the model unchanged; never charged: the raw LoRA's and the
+        non-LLM branch's points). Identical LoRAs are cached.
+        Several threads may evaluate at once: the lock covers only the cache and the report / check (weight store,
+        applying an edit); evaluator.register / feedback run concurrently."""
         with self._lock:
             empty = not lo.modules()
             name = None if empty else self.lora_name(lo)
@@ -1800,21 +1699,21 @@ class Workspace:
                       "lora_stats": rep}
                 self._evaluated[key] = (None, fb)
                 return None, fb
-            pending = getattr(self._local, "eval_pending", 0)   # the evaluate tool charges after this returns
-            cost = {"evaluate_left": self.left("evaluate") - pending,
-                    "gpu_seconds_left": round(self.left("gpu_seconds"), 1),
+            cost = {"gpu_seconds_left": round(self.left("gpu_seconds"), 1),
                     "gpu_seconds_spent": round(self.spent.get("gpu_seconds", 0), 1)}
         if name is not None and not self.evaluator.known(name):
             self.evaluator.register(lo, name)
         score, fb = self.evaluator.feedback(name, level, lora_report=rep, cost=cost)
         with self._lock:
             self._evaluated[key] = (score, fb)
-        if level == "screen":
-            self._note_screened(name, fb)
         return score, fb
 
-    def t_compare(self, cid, other="parent", level="screen"):
-        """Item-level comparison of two already-evaluated models on the same items; ids and statistics only."""
+    def t_compare(self, cid, other="parent", level=None):
+        """Item-level comparison of two already-evaluated models on the same items; ids and statistics only.
+        level None (2026-11-23): 'gate' when a candidate is involved (candidates are only gate-evaluated), else
+        'screen' (the current model's own screen)."""
+        if level is None:
+            level = "screen" if {cid, other} <= {None, "parent"} else "gate"
         if level not in ("screen", "full", "gate"):
             raise ValueError("level must be 'screen', 'full' or 'gate'")
 
@@ -1988,36 +1887,6 @@ class Workspace:
         p = cache[key]
         return {"loss": round(float(loss), 6), "parent_loss": round(float(p), 6),
                 "delta": round(float(loss) - float(p), 6), "n": len(ex)}
-
-    def t_evaluate(self, lora=None, edit=None):
-        with self._lock:
-            lo = self._eval_obj({"lora": lora, "edit": edit})
-            cached = bool(lo.modules()) and (self.lora_name(lo), "screen") in self._evaluated
-            cid, cap = getattr(self._local, "cid", None), program_evaluate_cap(self.cfg)
-            if cid and cap is not None and lo.modules() and not cached:
-                n = self._prog_evals.get(cid, 0)       # a program's own api.evaluate calls (2026-11-21)
-                if n >= cap:
-                    raise _budget_exc()(f"api.evaluate: at most {cap} new evaluations per program "
-                                        "(search.program_evaluate_calls); return your best LoRA instead")
-                self._prog_evals[cid] = n + 1
-        # charge_screens false: already evaluated (e.g. a free automatic screen) = no charge (_eval_cost reads it
-        # after this returns); charged screens keep the accounting of before (the ToolAPI dedupe only)
-        free = cached and not self.charge_screens
-        self._local.eval_cached = free
-        self._local.eval_pending = 1 if (lo.modules() and not free) else 0
-        try:
-            _, fb = self.evaluate_lora(lo, "screen", charge=False)   # ws.api charges (cost_fn) and dedupes
-        finally:
-            self._local.eval_pending = 0
-        return fb
-
-    def screen_candidate(self, cid: str) -> tuple[float | None, dict]:
-        """screen_fn helper: screen evaluation of a saved candidate, charged on ws.api (budget exhausted -> (None,
-        error)); free when charge_screens is false (2026-11-21)."""
-        try:
-            return self.evaluate_lora(self.load_candidate(cid), "screen", charge=bool(self.charge_screens))
-        except _budget_exc() as e:
-            return None, {"error": f"not evaluated: {e}"}
 
     # ------------------------------------------------------------------ candidates
     def cand_path(self, cid: str, kind: str = "lora") -> Path:

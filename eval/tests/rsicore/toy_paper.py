@@ -6,8 +6,7 @@ Per generation g (Paper-B-like: candidates are LoRA-style JSON artifacts hot-swa
 flow): draw of simple_math_pool -> mock server serving M_g -> M_g on the gate (simple_math_eval) -> inner_search
 with a mock editor whose programs call sandboxed tools -> builders register each candidate's quality in the mock
 registry -> gate per candidate (screen_fn = the paired gate gain over M_g) -> accept the largest positive gain ->
-token KL of the accepted candidate vs M_g -> held-out (simple_math_test, --limit) of M_{g+1} -> summary. The
-accepted candidate's quality becomes M_{g+1}.
+held-out (simple_math_test, --limit) of M_{g+1} -> summary. The accepted candidate's quality becomes M_{g+1}.
 A second run with the same arguments must skip every step (prints "ALL STEPS SKIPPED").
 """
 import argparse
@@ -128,8 +127,8 @@ def main():
                         editor_factory=lambda th: editor.Editor(srv.endpoint, served, system_prompt=SYSTEM,
                                                                 seed=rc.seed + th, mock_policy=mock_policy(th),
                                                                 transcript=gd / "editor" / f"thread_{th}.jsonl"),
-                        screen_fn=gate_candidate, full_fn=None, threads=S["threads"], steps=S["steps"],
-                        max_candidates=S["max_candidates"], top_full=0)
+                        screen_fn=gate_candidate, threads=S["threads"], steps=S["steps"],
+                        max_candidates=S["max_candidates"])
                     st.mark(f"gen{g:02d}/search", {"n": len(ranked), "best": ranked[0].cid})
 
             with run(f"gen{g:02d}/accept") as todo:      # the largest positive paired gate gain
@@ -140,13 +139,6 @@ def main():
                                        {"accepted": None, "reason": "no candidate with a positive gate gain"})
             accepted = records.read_json(gd / "accepted.json")
             nxt = accepted.get("artifact") if accepted.get("cid") else None
-            with run(f"gen{g:02d}/kl") as todo:
-                if todo and nxt:
-                    texts = [f"Problem {i}: compute the sum of the first {i} odd numbers." for i in range(1, 9)]
-                    cache = evaluate.reference_logprobs(srv.endpoint, served, texts, gd / "kl" / "ref.jsonl")
-                    srv.load_lora(nxt["name"], nxt["path"])
-                    st.mark(f"gen{g:02d}/kl", {"kl": evaluate.token_kl(cache, srv.endpoint, served, texts,
-                                                                      lora=nxt["name"])["mean"]})
             with run(f"gen{g:02d}/heldout") as todo:
                 if todo:
                     if nxt:
@@ -157,10 +149,10 @@ def main():
                     st.mark(f"gen{g:02d}/heldout", {"acc": {k: v["accuracy"] for k, v in h.items()}})
         next_q = nxt["quality"] if nxt else cur_q
         info = {"accepted": accepted.get("cid"), "quality": cur_q, "next_quality": next_q,
-                "kl": (st.get(f"gen{g:02d}/kl") or {}).get("kl"), "heldout": st.get(f"gen{g:02d}/heldout")["acc"]}
+                "heldout": st.get(f"gen{g:02d}/heldout")["acc"]}
         records.update_summary(rc, g, info)
         st.mark(f"gen{g:02d}/done", info)
-        print(f"[toy] gen {g}: accepted={info['accepted']} quality {cur_q} -> {next_q} kl={info['kl']} "
+        print(f"[toy] gen {g}: accepted={info['accepted']} quality {cur_q} -> {next_q} "
               f"heldout={info['heldout']}", flush=True)
         cur_q = next_q
         work += 1

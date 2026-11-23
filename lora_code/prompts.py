@@ -7,20 +7,17 @@ trained once (generation 0) with the fixed recipe; scratch = build from zero; we
 directly with structured, any-rank operations and return {"edit": <handle>}. The editor never trains and has
 no gradient tools in any mode. The context shows the task, the fixed diagnostics (first step of a thread), every candidate
 so far (all threads), this thread's best program and its latest feedback.
-search.charge_screens false (2026-11-21): the budget text says that returned candidates are scored
-automatically at no cost and that api.evaluate draws on a separate per-generation pool; with one step per generation
-each thread is told it is session k of N working independently (ContextRenderer sessions). The tensor tools
-(api.tensors / api.tensor_compute, when on) are mentioned in the vector-reference, module-name and strategy rules.
+The one flow (2026-11-23, no knobs): there is no api.evaluate; every returned candidate gets ONE gate evaluation
+(paired vs the current model) and the passing candidate with the largest gain is accepted (gate_text). With one step
+per generation each thread is told it is session k of N working independently (ContextRenderer sessions). The tensor
+tools (api.tensors / api.tensor_compute, when on) are mentioned in the vector-reference, module-name and strategy rules.
 """
 from __future__ import annotations
 
 import json
 
-from .tools import program_evaluate_cap, search_settings, tensor_compute_enabled, tools_for_mode
+from .tools import tensor_compute_enabled, tools_for_mode
 
-# (2026-11-22) The texts below still mention regmean_preserve, retention and KL in places (system prompt, MODE_TEXT,
-# HISTORY_LINE, _raw_line). Those tools / measurements are gone, but the wording stays: the editor prompt must not
-# change (runs compare byte for byte with the earlier ones).
 SYSTEM_PROMPT = """You are {who}. You improve a language model by writing Python programs that {action} \
 ({what}). {whose}
 
@@ -35,15 +32,13 @@ Rules
   {objects} stay on the server and are referred to by string handles.
 - In your program `api` exists only as the argument of main(api) (it is NOT a global there, unlike in run_python):
   pass it to every helper function explicitly, e.g. def build(api, module): ...
-- Data access: activation tools accept ONLY the ids returned by api.train_ids() (the target task's
-  training items of this generation). Signal, gate and held-out items are never readable; their scores come
-  only from api.evaluate and from the feedback you see after each program.
+{data_access}
 - {limits}
-- Time: a program is killed after {timeout_s} s of wall clock, every tool call included (evaluate, acts,
-  train_loss and regmean_preserve run the model and take real time). Screen a few constructions, not dozens,
+- Time: a program is killed after {timeout_s} s of wall clock, every tool call included (acts and
+  train_loss run the model and take real time). Screen a few constructions, not dozens,
   and keep time to return; api.budget() shows program_seconds_left. A killed program is a lost candidate.
 - {budget_text}
-  {gpu_seconds:.0f} GPU-seconds of forward passes (acts / regmean_preserve / train_loss). There is no training
+  {gpu_seconds:.0f} GPU-seconds of forward passes (acts / train_loss). There is no training
   and no gradient tool. {goal}
 - {gate}
 - Module names: use only names returned by api.modules() (rows with module, layer, layer_type, out, in). The
@@ -70,8 +65,8 @@ Tools
 """
 
 DATA_ACCESS = """- Data access: activation tools accept ONLY the ids returned by api.train_ids() (the target task's
-  training items of this generation). Signal, gate and held-out items are never readable; their scores come
-  only from api.evaluate and from the feedback you see after each program."""
+  training items of this generation). Signal, gate and held-out items are never readable: you only see each
+  candidate's gate statistics."""
 DATA_ACCESS_SCREEN = """- Data access: activation tools accept the ids returned by api.train_ids() (the target task's
   training items of this generation) and this generation's screen ids (api.screen_results: training-pool items you
   answered yourself). Gate and held-out items are never readable: you only see each candidate's gate statistics."""
@@ -90,10 +85,9 @@ MODE_TEXT = {
         action="edit a LoRA that was trained for it",
         goal="One LoRA is trained once (generation 0) on the target task with a fixed recipe and then improved by "
              "you in every generation (handle 'RAW', api.raw_lora(): the LoRA you start from). Your LoRA replaces RAW (the next model is the original "
-             "weights + your LoRA): raise the target score and lose less on the other domains / token-KL if "
-             "they are measured.",
+             "weights + your LoRA): raise the target score.",
         strategies="Useful edits of RAW: per-module / per-layer scaling or dropping (api.scale with modules, "
-                   "api.drop),\n  truncate_rank, intruder_scale, relchange_prune, regmean_preserve, orthogonalize "
+                   "api.drop),\n  truncate_rank, intruder_scale, relchange_prune, orthogonalize "
                    "against earlier adapters\n  (api.stack()), singular-direction scaling or rank-1 / activation-"
                    "direction additions combined with RAW,\n  interpolating with earlier candidates (api.candidate(cid)). "
                    "Returning RAW unchanged is allowed but is no improvement."),
@@ -105,10 +99,10 @@ MODE_TEXT = {
              "the target score must rise.",
         strategies="Useful constructions: singular-direction scaling of the current weights (api.svd + "
                    "api.scale_singular),\n  activation directions on train items (api.acts + api.from_direction), "
-                   "rank-1 edits, combining / scaling\n  constructions, protecting retention with regmean_preserve, "
+                   "rank-1 edits, combining / scaling\n  constructions, "
                    "orthogonalize or a global scale. Screen constructions cheaply with api.train_loss (answer NLL on "
-                   "train items, no\n  evaluate) before spending evaluate calls; api.compare(cid) shows which items a "
-                   "candidate broke or fixed vs the current model."),
+                   "train items) before you return one; earlier candidates' gate results (broken / fixed ids) are in "
+                   "search_history / read_record."),
     "weights": dict(
         action="edit the model's weights directly with structured operations of any rank, without any training",
         what="an ordered list of operations on the dense weight matrices W [out, in] of the linear modules: "
@@ -128,22 +122,10 @@ MODE_TEXT = {
                    "api.from_direction, rank1) and added as a dense dW with api.w_add_lora; whole-module\n  scaling "
                    "near 1 (api.w_scale); moving some modules back toward the original weights (api.w_toward_original, "
                    "which\n  also undoes earlier merges there). Check the limits with api.inspect_edit and screen edits "
-                   "cheaply with\n  api.train_loss(edit=...) (answer NLL on train items, no evaluate) before spending "
-                   "evaluate calls;\n  api.compare(cid) shows which items a candidate broke or fixed vs the current model."),
+                   "cheaply with\n  api.train_loss(edit=...) (answer NLL on train items) before you return one;\n  "
+                   "earlier candidates' gate results (broken / fixed ids) are in search_history / read_record."),
 }
 
-
-BUDGET_CHARGED = """Budgets for this generation, shared by all threads: {evaluate} evaluate calls (each candidate you return is
-  evaluated automatically and costs one; every api.evaluate inside a program also costs one{per_program};
-  identical {unit}s are evaluated once). When they run out, later candidates are not scored at all: look at
-  the "left" numbers in the latest message and in api.budget() before calling api.evaluate."""
-
-# search.charge_screens false (2026-11-21)
-BUDGET_FREE = """Budgets for this generation: every candidate you return is scored automatically on the feedback items at
-  no cost. api.evaluate inside a program draws on a separate pool of {evaluate} calls shared by all sessions of
-  this generation{per_program}. Identical {unit}s are evaluated once, and an api.evaluate of a {unit} that
-  was already scored is free. When the pool is used up api.evaluate raises an error (your returned candidate
-  is still scored): look at the "left" numbers in the latest message and in api.budget() before calling it."""
 
 TENSOR_NAMES = """
 - api.modules() lists only the linear modules. Every other tensor (input_layernorm / post_attention_layernorm,
@@ -167,7 +149,7 @@ TENSOR_STRATEGY_W = (" api.tensor_compute(code, tensors, edit=None) runs your ow
                      "any rank on any editable tensor, also the 1-D norms / dt_bias / A_log.")
 
 
-# gate per candidate (2026-11-21: search.gate_every_candidate, no api.evaluate)
+# gate per candidate (2026-11-21; the only flow since 2026-11-23): no api.evaluate
 BUDGET_GATE = """Budgets for this generation: there is no api.evaluate. Every {unit} you return gets ONE gate evaluation
   automatically (see Gate below); nothing else is scored, so judge your constructions with the free tools."""
 
@@ -211,43 +193,38 @@ def _points(x: float) -> str:
     return f"{p:g} accuracy point" + ("" if p == 1 else "s")
 
 
-def gate_text(cfg: dict, *, kind: str = "parent", gate_n: int | None = None, every: bool = False) -> str:
-    """The gate rule as configured (2026-11-21; gate.min_gain / require_significant / epsilon), not a fixed text.
-    every (search.gate_every_candidate): each candidate is gated during the search and the largest passing gain wins."""
+def gate_text(cfg: dict, *, gate_n: int | None = None, raw_fallback: bool = False) -> str:
+    """The gate rule as configured (2026-11-21; gate.min_gain / require_significant), not a fixed text: each candidate
+    is gated during the search against the current model and the largest passing gain wins (the only flow,
+    2026-11-23). raw_fallback (method.mode edit, generation 0): when none passes, the raw LoRA is accepted if it passes
+    the same gate."""
     g = cfg.get("gate") or {}
-    if kind == "raw":
-        eps = float(g.get("epsilon", 0.01))
-        rule = (f"the target accuracy must not be worse than the raw LoRA's by more than {eps:g} "
-                f"({_points(eps)})")
+    mg = float(g.get("min_gain", 0.01))
+    if mg <= 0:                                  # (2026-11-21) threshold 0: any strictly positive gain
+        rule = "item by item against the current model, the mean gain in target accuracy must be positive"
     else:
-        mg = float(g.get("min_gain", 0.01))
-        if mg <= 0:                              # (2026-11-21) threshold 0: any strictly positive gain
-            rule = "item by item against the current model, the mean gain in target accuracy must be positive"
-        else:
-            items = f", i.e. about {max(1, round(mg * gate_n))} more correct items out of {gate_n}" if gate_n else ""
-            rule = (f"item by item against the current model, the mean gain in target accuracy must be at least {mg:g} "
-                    f"({_points(mg)}{items})")
-        rule += (" and statistically significant (paired 95% CI lower bound above 0)"
-                 if g.get("require_significant", True) else "; there is no significance test")
-    if every and kind != "raw":
-        from rsicore.config import stage_decoding
-        ns = int((stage_decoding(cfg, "gate") or {}).get("n") or 1)
-        smp = f", {ns} sampled answers per item, the current model answered the same items with the same seed" \
-            if ns > 1 else ""
-        return (f"Gate: every candidate you return is evaluated ONCE on a fixed hidden set of {gate_n or 'the gate'} "
-                f"items{smp}; {rule}. At the end of the generation the passing candidate with the LARGEST gain "
-                "is accepted (none passes: the model stays as it is). You see each earlier candidate's gate result "
-                "(accuracy, paired gain, CI, passed, broken / fixed item ids; never the items) in later steps and "
-                "generations (search_history), not your own before you return it.")
-    return (f"Gate (after the search, not visible to you): on a fixed hidden item set, {rule}. Only candidates "
-            "whose score beats the current model on your feedback items are submitted; the feedback items are a "
-            "different sample, so aim clearly above the margin.")
+        items = f", i.e. about {max(1, round(mg * gate_n))} more correct items out of {gate_n}" if gate_n else ""
+        rule = (f"item by item against the current model, the mean gain in target accuracy must be at least {mg:g} "
+                f"({_points(mg)}{items})")
+    rule += (" and statistically significant (paired 95% CI lower bound above 0)"
+             if g.get("require_significant", True) else "; there is no significance test")
+    from rsicore.config import stage_decoding
+    ns = int((stage_decoding(cfg, "gate") or {}).get("n") or 1)
+    smp = f", {ns} sampled answers per item, the current model answered the same items with the same seed" \
+        if ns > 1 else ""
+    none = ("RAW itself is accepted if it passes the same gate, otherwise the model stays as it is" if raw_fallback
+            else "the model stays as it is")
+    return (f"Gate: every candidate you return is evaluated ONCE on a fixed hidden set of {gate_n or 'the gate'} "
+            f"items{smp}; {rule}. At the end of the generation the passing candidate with the LARGEST gain "
+            f"is accepted (none passes: {none}). You see each earlier candidate's gate result "
+            "(accuracy, paired gain, CI, passed, broken / fixed item ids; never the items) in later steps and "
+            "generations (search_history), not your own before you return it.")
 
 
-def system_prompt(cfg: dict, *, budget: dict, mode: str = "scratch", gate_kind: str = "parent",
-                  gate_n: int | None = None, free_screens: bool | None = None) -> str:
-    """free_screens (2026-11-21): returned candidates are scored for free and budget["evaluate"] is the programs'
-    api.evaluate pool; None = from search.charge_screens (false -> free)."""
+def system_prompt(cfg: dict, *, budget: dict, mode: str = "scratch", gate_n: int | None = None,
+                  raw_fallback: bool = False) -> str:
+    """budget: {"gpu_seconds"}; gate_n: the gate's item count; raw_fallback: method.mode edit, generation 0 (the raw
+    LoRA is the fallback when no candidate passes, gate_text)."""
     who = ("the model being edited: the LoRA you write will be merged into YOUR OWN weights "
            "if it passes a fixed gate, and the merged model becomes the next editor")
     whose = "You are editing yourself."
@@ -280,18 +257,10 @@ def system_prompt(cfg: dict, *, budget: dict, mode: str = "scratch", gate_kind: 
     if "{tensor_what}" in text["what"]:
         text["what"] = text["what"].replace("{tensor_what}", ", dense additions computed by api.tensor_compute (any "
                                             "tensor, any rank)" if tc_on else "")
-    cap = program_evaluate_cap(cfg)
-    if free_screens is None:                 # search.charge_screens false
-        free_screens = not search_settings(cfg)["charge_screens"]
-    text["per_program"] = (f", at most {cap} " + ("new ones " if free_screens else "") + "per program") \
-        if cap is not None else ""
-    text["budget_text"] = (BUDGET_FREE if free_screens else BUDGET_CHARGED).format(
-        evaluate=int(budget.get("evaluate", 32)), per_program=text["per_program"], unit=text["unit"])
-    ss = search_settings(cfg)
-    gate_mode = ss["gate_every_candidate"]
-    text["gate"] = gate_text(cfg, kind=gate_kind, gate_n=gate_n, every=gate_mode)
-    if gate_mode and "evaluate" not in have:   # 2026-11-21: no api.evaluate, one gate evaluation per candidate
-        text["budget_text"] = BUDGET_GATE.format(unit=text["unit"])
+    text["budget_text"] = BUDGET_GATE.format(unit=text["unit"])   # no api.evaluate, one gate evaluation each
+    text["gate"] = gate_text(cfg, gate_n=gate_n, raw_fallback=raw_fallback)
+    # screen items readable when the screen tools are on (2026-11-21), gate items statistics only
+    text["data_access"] = DATA_ACCESS_SCREEN if "screen_results" in have else DATA_ACCESS
     from .tools import paper_tools_enabled, screen_tools_enabled
     if screen_tools_enabled(cfg) and "screen_results" in have:
         from rsicore.config import stage_decoding
@@ -311,27 +280,7 @@ def system_prompt(cfg: dict, *, budget: dict, mode: str = "scratch", gate_kind: 
             max_tensors=int(tcs["max_tensors"]), timeout_s=int(tcs["timeout_s"]))
     out = SYSTEM_PROMPT.format(who=who, whose=whose, timeout_s=cfg.get("sandbox", {}).get("timeout_s", 1800),
                                gpu_seconds=float(budget.get("gpu_seconds", 7200)), tools=tools, **text)
-    if "screen_results" in have:             # 2026-11-21: screen items readable, gate items statistics only
-        out = out.replace(DATA_ACCESS, DATA_ACCESS_SCREEN)
-    if "evaluate" not in have:                   # no api.evaluate (simple v2): drop the old flow's evaluate wording
-        for a, b in NO_EVALUATE_EDITS:
-            out = out.replace(a, b)
     return _with_tool_protocol(out, cfg, mode=mode)
-
-
-# (2026-11-21) wording of the evaluate flow that does not apply when programs have no api.evaluate and candidates are
-# only gate-evaluated (compare needs screened candidates; gate statistics are in search_history / read_record)
-NO_EVALUATE_EDITS = (
-    ("every tool call included (evaluate, acts,", "every tool call included (acts,"),
-    ("(answer NLL on train items, no\n  evaluate) before spending evaluate calls; api.compare(cid) shows which items a "
-     "candidate broke or fixed vs the current model.",
-     "(answer NLL on train items) before you return one; earlier candidates' gate results (broken / fixed ids) are in "
-     "search_history / read_record."),
-    ("(answer NLL on train items, no evaluate) before spending evaluate calls;\n  api.compare(cid) shows which items "
-     "a candidate broke or fixed vs the current model.",
-     "(answer NLL on train items) before you return one;\n  earlier candidates' gate results (broken / fixed ids) are "
-     "in search_history / read_record."),
-)
 
 
 REPLY_LINE = "Each turn, reply with a short plan and exactly ONE ```python code block defining"
@@ -354,8 +303,8 @@ PERSIST_SESSION = ("Your run_python calls share ONE Python session for this cand
                    "program runs separately: it must build what it returns{saved}.")
 HISTORY_READ = " or of any earlier candidate that search_history lists"
 HISTORY_LINE = ("\n- search_history(gen, sort, offset) lists every candidate already tried (this generation's and the "
-                "earlier generations') with what it changed (module types; per type the layers, rank and ||dW||/||W0||, or the weight-edit ops), its note, its target gain, worst "
-                "retention change, KL, score and gate outcome; same_as marks a result identical to an earlier one. "
+                "earlier generations') with what it changed (module types; per type the layers, rank and ||dW||/||W0||, or the weight-edit ops), its note, its target gain, "
+                "score and gate outcome; same_as marks a result identical to an earlier one. "
                 "Check it before you write a program, so you do not spend an evaluation repeating an idea that was "
                 "already tried.")
 
@@ -364,10 +313,10 @@ def history_row(rec: dict) -> dict:
     """search_history summary of one candidates.jsonl record (2026-11-21): what the candidate is and how it scored
     against that generation's current model (the summarize_candidate fields)."""
     from types import SimpleNamespace
-    c = SimpleNamespace(**{k: rec.get(k) for k in ("cid", "thread", "step", "artifact", "screen", "full", "error")})
+    c = SimpleNamespace(**{k: rec.get(k) for k in ("cid", "thread", "step", "artifact", "screen", "error")})
     row = summarize_candidate(c)
     art = rec.get("artifact") or {}
-    out = {k: row.get(k) for k in ("target_gain", "vs_raw")}
+    out = {"target_gain": row.get("target_gain")}
     out.update({"kind": art.get("kind") if art.get("kind") not in (None, "lora") else None,
                 "keep": True if art.get("keep") else None, **change_fields(art),
                 "note": art.get("note") or None})
@@ -472,17 +421,15 @@ def _num(x, nd=4):
 
 
 def summarize_candidate(c) -> dict:
-    """One row of 'Candidates so far' (json.dumps'ed into the step context). worst_retention_delta and kl are always
-    null (no retention domain or token KL since 2026-11-22); the keys stay so the rows read as before."""
+    """One row of 'Candidates so far' (json.dumps'ed into the step context). screen_score = the candidate's one
+    evaluation (its paired gate gain, 2026-11-23)."""
     fb = (c.screen or {}).get("feedback") or {}
     tgt = fb.get("target") or {}
     art = c.artifact or {}
     return {"cid": c.cid, "thread": c.thread, "step": c.step, "strategy": art.get("strategy"),
             **({"kind": "weights", "modules": art.get("modules")} if art.get("kind") == "weights" else {}),
-            "screen_score": _num((c.screen or {}).get("score")), "full_score": _num((c.full or {}).get("score")),
+            "screen_score": _num((c.screen or {}).get("score")),
             "target_gain": _num((tgt.get("vs_parent") or {}).get("delta")),
-            "vs_raw": _num((tgt.get("vs_raw") or {}).get("delta")),
-            "worst_retention_delta": None, "kl": None,
             **({"gate": _gate_row(fb["gate"])} if isinstance(fb.get("gate"), dict) else {}),
             "error": (c.error or "")[:160] or None, **({"note": art["note"]} if art.get("note") else {})}
 
@@ -498,7 +445,7 @@ class ContextRenderer:
 
     def __init__(self, *, task_text: str, diag_text: str, archive_text: str = "", max_feedback_chars: int = 6000,
                  budget_fn=None, timeout_s: int | None = None, sessions: int | None = None,
-                 history_tool: bool = False, gate_mode: bool = False, screen_text: str = ""):
+                 history_tool: bool = False, screen_text: str = ""):
         self.task_text = task_text
         self.diag_text = diag_text
         self.archive_text = archive_text
@@ -508,9 +455,8 @@ class ContextRenderer:
         # sessions (2026-11-21): one step per generation with this many threads: each is told it is session k of N
         self.sessions = sessions
         self.history_tool = history_tool    # the editor has search_history (mentioned in the sessions line)
-        # gate per candidate (2026-11-21): scores are paired gate gains; screen_text = the current model's own screen
-        # answers (prompts.screen_text), shown in every step's message
-        self.gate_mode = gate_mode
+        # scores are paired gate gains (gate per candidate, the only flow); screen_text = the current model's own
+        # screen answers (prompts.screen_text), shown in every step's message
         self.screen_text = screen_text
 
     def budget_line(self, history) -> str | None:
@@ -521,17 +467,7 @@ class ContextRenderer:
             b = self.budget_fn() or {}
         except Exception:  # noqa: BLE001
             return None
-        free = b.get("charge_screens") is False    # 2026-11-21: automatic screens free, evaluate = the program pool
-        if b.get("evaluate_tool") is False:          # gate per candidate, no api.evaluate (2026-11-21)
-            s = "No api.evaluate this generation: every returned candidate gets one gate evaluation automatically"
-            free, b = False, dict(b, evaluate_left=None, program_evaluate_calls=None)
-        elif free:
-            s = ("Returned candidates are scored automatically at no cost. api.evaluate pool left this generation "
-                 f"(shared by all sessions): {b.get('evaluate_left'):g} of {b.get('evaluate'):g} calls")
-        else:
-            s = f"Budget left this generation (shared by all threads): {b.get('evaluate_left'):g} of {b.get('evaluate'):g} evaluate calls"
-        if b.get("program_evaluate_calls") is not None:
-            s += f" (api.evaluate inside a program: at most {b['program_evaluate_calls']} new ones)"
+        s = "No api.evaluate this generation: every returned candidate gets one gate evaluation automatically"
         if b.get("gpu_seconds") is not None:
             s += f", {b.get('gpu_seconds_left'):g} of {b['gpu_seconds']:g} GPU-seconds"
         s += "."
@@ -547,15 +483,6 @@ class ContextRenderer:
             s += t + "."
         if scr:
             s += f" One evaluation of a candidate took about {scr[len(scr) // 2]:.0f} s."
-        left = b.get("evaluate_left")
-        if free and left is not None:              # re-thresholded on the program pool
-            if left <= 0:
-                s += " The api.evaluate pool is used up: do not call api.evaluate; return your best LoRA."
-            elif left <= max(1, int(b.get("program_evaluate_calls") or 2)):
-                s += (f" Only {left:g} api.evaluate call(s) are left in the pool: keep them for your strongest "
-                      "construction (your returned LoRA is scored anyway).")
-        elif left is not None and left <= 4:
-            s += " Few evaluations are left: do not call api.evaluate in your program; return your best LoRA."
         return s
 
     def sessions_line(self, thread: int) -> str | None:
@@ -590,9 +517,7 @@ class ContextRenderer:
         if history:
             rows = [summarize_candidate(c) for c in sorted(history, key=lambda c: (c.step, c.thread))]
             head = ("Candidates so far (all threads; score = the paired gain in gate accuracy vs the current model; "
-                    "gate = its gate result):\n" if self.gate_mode else
-                    "Candidates so far (all threads; score = the paired target gain vs the current model on the "
-                    "feedback items):\n")
+                    "gate = its gate result):\n")
             parts.append(head + "\n".join(json.dumps(r) for r in rows))
         if mine:
             scored = [c for c in mine if c.score is not None]
@@ -631,8 +556,8 @@ def _raw_line(raw_info: dict | None) -> str:
                 f"once, in generation 0, with a fixed recipe ({recipe}), and has been edited since; there is no new "
                 "training in this generation. Your LoRA REPLACES RAW, so start from api.raw_lora(). The gate "
                 "requires a clear improvement over the current model (= RAW).")
-    gain = (f" It changes the target screen score by {raw_info.get('target_gain')} and the worst retention screen "
-            f"score by {raw_info.get('worst_retention')}." if raw_info.get("target_gain") is not None else "")
+    gain = (f" It changes the target screen score by {raw_info.get('target_gain')}."
+            if raw_info.get("target_gain") is not None else "")
     return (f"\nRAW = the LoRA trained with the fixed recipe ({recipe}); this is the only training of the run, later "
             f"generations edit the LoRA you produce now.{gain} Your LoRA replaces RAW (the next model is the original "
             "weights + your LoRA). Start from api.raw_lora().")

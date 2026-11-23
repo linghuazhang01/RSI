@@ -7,9 +7,8 @@
 - a program's "note" (in the returned config, or {"config", "note"}) is stored in the artifact (cut to 600 chars;
   solve_allocation's automatic note dropped) and shown in search_history rows;
 - a candidate identical to the incumbent is not gate-evaluated (gain exactly 0, rejected, as Paper B's 'keep');
-- Runner.kl_used: no per-generation KL work when the score does not use KL and no baselines run; compute_refs
-  writes M_0's KL reference only with kl_weight > 0;
-- base.yaml: kl_weight 0, patience 3; the mock keeps the real gate rule and no baselines.
+- no KL term and no noise band (2026-11-23): no per-generation KL work, no M_0 reference logprobs, no noise step;
+- base.yaml: patience 3, no kl_weight; the mock keeps the real gate rule and no baselines.
 """
 from __future__ import annotations
 
@@ -71,7 +70,7 @@ def test_incumbent_screen_uses_serve_all_and_gate_one_slot(tmp_path, monkeypatch
     art = {"config_hash": "h"}
     for stage, origin in (("screen", "incumbent"), ("screen", "candidate"), ("gate", "incumbent"), ("gate", "gate")):
         with pytest.raises(Stop):
-            prob._evaluate(art, stage, "c", ("h", stage), False, origin)
+            prob._evaluate(art, stage, "c", ("h", stage), origin)
     assert used == ["all", "one", "one", "one"]
 
 
@@ -126,7 +125,7 @@ def test_prompt_states_note_time_and_calls():
     text = system_prompt(G._fake_problem(), "- bytes(config)",
                          {"gate": {"min_delta": 0.0}, "sandbox": {"timeout_s": 900},
                           "editor": {"tool_rounds": 30, "max_tool_calls": 60}},
-                         history=True, search=None)
+                         history=True)
     assert '"note" key of the returned config' in text and "killed after 900 s" in text
     assert "for up to 30 rounds" in text and "at most 60 calls in all" in text
 
@@ -145,18 +144,23 @@ def test_identical_to_incumbent_not_gated(tmp_path, monkeypatch):
     assert sub["cid"] == "g02_t0_s00" and sub["passed"] is False and sub["info"]["gain"] == 0.0
 
 
-# ------------------------------------------------------------------ KL work and the simple profile
-@pytest.mark.parametrize("klw,methods,used", [(0.0, [], False), (0.5, [], True), (0.0, ["uniform"], True)])
-def test_kl_used(klw, methods, used):
+# ------------------------------------------------------------------ no KL term / noise band (2026-11-23)
+def test_no_kl_or_noise_code():
     from edit_code import run as RUN
-    r = SimpleNamespace(cfg={"search": {"kl_weight": klw}, "baselines": {"methods": methods}})
-    assert RUN.Runner.kl_used(r) is used
+    from edit_code.problem import QuantProblem
+    for name in ("kl_used", "noise_band"):
+        assert not hasattr(RUN.Runner, name), name
+    for name in ("compute_refs", "_kl", "kl_eval_texts", "compare", "evaluated", "evals_left", "evals_used"):
+        assert not hasattr(QuantProblem, name), name
+    import edit_code.problem as P
+    assert not hasattr(P, "EvalBudgetExhausted")
 
 
 def test_base_config_and_mock():
     import yaml
     cfg = yaml.safe_load((REPO / "edit_code" / "configs" / "base.yaml").read_text())
-    assert cfg["search"]["kl_weight"] == 0.0 and cfg["loop"]["patience"] == 3
+    assert "kl_weight" not in cfg["search"] and cfg["loop"]["patience"] == 3
+    assert "noise" not in cfg and "top_k" not in cfg["kl"] and cfg["kl"]["self_generated"] is True   # calibration
     ms = cfg["mock_overrides"]
     assert ms["gate"]["min_delta"] == 0.0 and ms["baselines"]["methods"] == []
     assert (ms["search"]["threads"], ms["search"]["steps"], ms["search"]["max_candidates"]) == (3, 1, 3)
@@ -180,17 +184,3 @@ def test_error_line_and_dict_ci():
                    error=None, screen=None, full=None, score=0.01)
     row = archive_row(ok, {"passed": True, "gain": 0.01, "ci": {"a": [0.0, 0.02], "b": [0.001, 0.03]}})
     assert row["gate"]["ci"] == {"a": [0.0, 0.02], "b": [0.001, 0.03]}
-
-
-def test_refs_only_with_kl_weight(tmp_path, monkeypatch):
-    import rsicore.evaluate as E
-    prob = V._problem(tmp_path, budget=0, cfg={"search": {"kl_weight": 0.0}, "kl": {"top_k": 5}})
-    prob.mock = False
-    prob.kl_texts = [("math", "t1")]
-    wrote = []
-    monkeypatch.setattr(E, "reference_logprobs", lambda ep, name, texts, path, k: wrote.append(Path(path).name))
-    prob.compute_refs("http://x/v1", "m0")
-    assert wrote == []                              # kl_ref only with kl_weight > 0
-    prob.cfg["search"]["kl_weight"] = 0.5
-    prob.compute_refs("http://x/v1", "m0")
-    assert wrote == ["kl_ref.jsonl"]

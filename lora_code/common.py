@@ -176,22 +176,20 @@ def server_lora_rank(cfg: dict) -> int:
     return cap
 
 
-def gate_policy(cfg: dict) -> tuple[str, str]:
-    """(reference, fallback) of the gate: 'auto' resolves by method.mode (edit: raw / raw, scratch and weights:
-    parent / keep)."""
+def gate_fallback(cfg: dict) -> str:
+    """What a generation keeps when no candidate passed the gate (gate.fallback; 'auto' by method.mode: edit raw =
+    the raw LoRA if it passes the same gate as the candidates (vs the current model; generation 0 only), scratch and
+    weights keep). The gate itself has no reference choice (2026-11-23): every candidate is gated against the current
+    model."""
     mode = method_mode(cfg)
-    g = cfg.get("gate") or {}
-    ref = g.get("reference") or "auto"
-    fb = g.get("fallback") or "auto"
-    if ref == "auto":
-        ref = {"edit": "raw", "scratch": "parent", "weights": "parent"}[mode]
+    fb = (cfg.get("gate") or {}).get("fallback") or "auto"
     if fb == "auto":
         fb = {"edit": "raw", "scratch": "keep", "weights": "keep"}[mode]
-    if ref not in ("raw", "parent") or fb not in ("raw", "keep"):
-        raise SystemExit(f"gate.reference must be raw|parent and gate.fallback raw|keep, got {ref!r} / {fb!r}")
-    if mode != "edit" and "raw" in (ref, fb):
-        raise SystemExit(f"gate reference/fallback 'raw' needs method.mode=edit (mode is {mode!r})")
-    return ref, fb
+    if fb not in ("raw", "keep"):
+        raise SystemExit(f"gate.fallback must be raw|keep, got {fb!r}")
+    if mode != "edit" and fb == "raw":
+        raise SystemExit(f"gate fallback 'raw' needs method.mode=edit (mode is {mode!r})")
+    return fb
 
 
 PAPER_B_GROWTH = [("main", 2), ("train", 2), ("main", 4), ("main", 8)]

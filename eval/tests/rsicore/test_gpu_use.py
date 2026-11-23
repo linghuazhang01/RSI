@@ -1,5 +1,5 @@
 """Using every GPU (2026-11-20): split scoring over replicas, the held-out test set split over replicas, the two-phase search
-(editor phase / eval phase), parallel gate submissions, and vLLM sleep mode (mock: state; real: command / env).
+(editor phase / eval phase), and vLLM sleep mode (mock: state; real: command / env).
 
   python -I -m pytest -q eval/tests/rsicore/test_gpu_use.py      (mock servers, no GPU)
 """
@@ -98,7 +98,7 @@ class SleepModeTest(unittest.TestCase):
 
 
 class TwoPhaseSearchTest(unittest.TestCase):
-    def test_phases_and_parallel_gate(self):
+    def test_phases(self):
         rc = SimpleNamespace(run_dir=Path(tempfile.mkdtemp()))
         events, lock = [], threading.Lock()
 
@@ -128,8 +128,8 @@ class TwoPhaseSearchTest(unittest.TestCase):
         def screen(art, cid):
             return float(cid[-1]) / 10, {}
         ranked = search.inner_search(rc, 1, editor_factory=Ed, render_context=lambda h, th: "", build_fn=build,
-                                     screen_fn=screen, full_fn=lambda a, c: (0.5, {}), threads=3, steps=2,
-                                     max_candidates=6, top_full=2, parallel=2, phases=Phases(), out_dir=rc.run_dir)
+                                     screen_fn=screen, threads=3, steps=2,
+                                     max_candidates=6, parallel=2, phases=Phases(), out_dir=rc.run_dir)
         self.assertEqual(len(ranked), 6)
         kinds = [e[0] for e in events]
         # per step: editor phase, all proposals, eval phase, all builds; the search ends in the eval phase
@@ -138,19 +138,14 @@ class TwoPhaseSearchTest(unittest.TestCase):
         self.assertEqual(first.count("propose"), 3)
         self.assertEqual(kinds[-1], "eval")
         self.assertEqual(kinds.count("editor"), 2)
-        seen = []
-
-        def gate_fn(c):
-            with lock:
-                seen.append(c.cid)
-            time.sleep(0.05)
-            return c.cid == ranked[1].cid, {}
-        t0 = time.time()
-        acc = search.submit_to_gate(rc, 1, ranked, gate_fn, max_submissions=3, out_dir=rc.run_dir, parallel=3)
-        self.assertLess(time.time() - t0, 0.14)                                         # evaluated at once
-        self.assertEqual(acc.cid, ranked[1].cid)                                        # first pass in rank order
-        log = json.loads((rc.run_dir / "gate.json").read_text())
-        self.assertEqual([s["cid"] for s in log["submissions"]], [ranked[0].cid, ranked[1].cid])
+        self.assertEqual(kinds.count("eval"), 3)                 # one per step + the final one
+        self.assertEqual({c.cid for c in ranked[:3]}, {f"g01_t{t}_s01" for t in range(3)})      # by screen score
+        self.assertTrue(all(c.full is None and c.score == c.screen["score"] for c in ranked))
+        events.clear()                                           # resumed: nothing to do, still ends in the eval phase
+        again = search.inner_search(rc, 1, editor_factory=Ed, render_context=lambda h, th: "", build_fn=build,
+                                    screen_fn=screen, threads=3, steps=2, max_candidates=6, parallel=2,
+                                    phases=Phases(), out_dir=rc.run_dir)
+        self.assertEqual(([c.cid for c in again], events), ([c.cid for c in ranked], [("eval",)]))
 
 
 if __name__ == "__main__":

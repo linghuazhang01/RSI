@@ -13,15 +13,16 @@
 # through api.screen_results / api.screen_output / acts(source='own')); candidates are NOT screened; each of the
 # search.threads x search.steps candidates (8 x 1 here) gets ONE gate evaluation (500 x 4, paired vs the current
 # model's gate records, computed once per generation), shown to later steps / generations; at the end the passing
-# candidate with the largest paired gain is accepted; then the test set (500 x 4). No api.evaluate
-# (program_evaluate_calls 0). Cost: 8 candidates x 500 x 4 thinking samples on the gate set per generation. Run ids
+# candidate with the largest paired gain is accepted; then the test set (500 x 4). No api.evaluate (2026-11-23: this
+# flow is hard-wired, the knobs of the other variants are gone). Cost: 8 candidates x 500 x 4 thinking samples on the
+# gate set per generation. Run ids
 # end in _single_simple. Every Paper B scoring server is a main replica / weights slot with --max-model-len >= 32768
 # (editor.context_tokens), so prompt + 16384 fits.
 simple:
   screen_n: 500             # screen items drawn per generation (rsicore.draws.simple_screen_n)
 
 # Max generation length (tokens) per eval task, for EVERY model call of this run that does not set its own (the
-# scoring decodings below set max_tokens 16384): training-answer sampling, noise re-runs. Overrides eval/configs/tasks.yaml (passed to run_eval as --max-tokens); tasks not
+# scoring decodings below set max_tokens 16384): training-answer sampling. Overrides eval/configs/tasks.yaml (passed to run_eval as --max-tokens); tasks not
 # listed keep their tasks.yaml value. e.g. --set max_tokens.dapo_math=2048
 max_tokens:
   dapo_math: 4096
@@ -33,7 +34,7 @@ max_tokens:
 # How the editor changes the model each generation (2026-11-21). The default never trains: the editor has no
 # training or gradient tools (no sgd / grad / from_grad) in any mode.
 #   scratch (default) : write a LoRA from zero with SVD / activation statistics / constructions; candidates are
-#             hot-loaded on the main replicas. Gate reference = the current model (paired, + gate.min_gain);
+#             hot-loaded on the main replicas. Gate = vs the current model (paired, + gate.min_gain), every candidate;
 #             fallback = keep; an accepted LoRA becomes part of the model as merge.mode says (below).
 #   weights : edit the weights directly with structured, any-rank operations (row / column / module scaling,
 #             dense low-rank additions built with the LoRA tools, moving modules toward the original weights;
@@ -41,8 +42,9 @@ max_tokens:
 #             rewritten) and served on a free candidate slot: the main groups after the first (4 GPUs: editor
 #             [0], slots [1], [2] + the editor's GPU while it sleeps; train [3]). Same gate / fallback as scratch.
 #   edit    : the one mode that trains: generation 0 trains ONE raw LoRA with the fixed `raw` recipe below,
-#             later generations edit it (M_g = M_0 + L_g, adapter, never merged). Gate: generation 0 vs the raw
-#             LoRA (fallback raw); later vs the current model + gate.min_gain (fallback keep L_g).
+#             later generations edit it (M_g = M_0 + L_g, adapter, never merged). Gate: every candidate vs the
+#             current model + gate.min_gain; fallback in generation 0 = the raw LoRA if it passes the same gate, later
+#             keep L_g.
 method:
   mode: scratch             # scratch | weights | edit
 
@@ -75,33 +77,22 @@ budget:
   gpu_seconds: 7200         # [pilot] per generation: the editor's activation statistics (acts / train_loss);
                             # also the raw LoRA's training budget unless raw.gpu_seconds is set
 
-# threads x steps are parameters (the prompts use the configured numbers); screen_candidates false + gate_every_candidate
-# true = the flow above; program_evaluate_calls 0 removes api.evaluate everywhere
+# threads x steps are parameters (the prompts use the configured numbers). The flow above is hard-wired (2026-11-23):
+# candidates are never screened, each gets ONE gate evaluation during the search (paired vs the current model;
+# gen_XX/gate.json), the passing one with the largest paired gain is accepted; no api.evaluate
 search:
   threads: 8
   steps: 1
-  max_evaluate: 32          # evaluate calls per generation (every candidate costs 1, only while charge_screens is true)
-  top_full: 0               # top screened candidates re-scored on the full signal draw (with screen_candidates)
-  rerun_seeds: 0
   archive: true             # experience channel: every earlier candidate, one row each (what, gate, error, note;
                             # 2026-11-22); full programs via read_record. archive_chars (code default 30000) caps it
-  max_candidates: 8         # candidate cap per generation (null = max_evaluate while charge_screens, else threads x steps)
-  charge_screens: false     # true: the automatic screen of every returned candidate spends the evaluate budget
-                            # (false: screens are free and api.evaluate draws on program_evaluate_total)
-  program_evaluate_calls: 0 # NEW api.evaluate calls one program may make (code default 2; null = no cap); 0 = no api.evaluate
-  program_evaluate_total: 0 # charge_screens false: the generation's pool of in-program api.evaluate calls
-                            # (null = threads x program_evaluate_calls)
+  max_candidates: 8         # candidate cap per generation (null = threads x steps)
   parallel_builds: true     # with several main replicas, up to that many candidates are built at once (non-weights
                             # modes; weights mode always uses its slots)
-  screen_candidates: false  # false: candidates are not screened (the current model's screen is still scored once per
-                            # generation and shown through api.screen_results / screen_output)
-  gate_every_candidate: true  # ONE gate evaluation per candidate during the search (paired vs the current model;
-                            # gen_XX/gate.json), the passing one with the largest paired gain is accepted
 
 # The editor (2026-11-21): Qwen3 thinking mode + a tool loop while it writes each candidate (rsicore.editor /
 # rsicore.chat_tools). One round = one model turn that made function calls; after tool_rounds
 # (or a guard) one forced final turn without tools. The proposal ends with a reply WITHOUT function calls holding one
-# ```python block. Chat tools: run_python(code) (sandbox, the workspace's exploration api: no evaluate / raw_lora,
+# ```python block. Chat tools: run_python(code) (sandbox, the workspace's exploration api: no raw_lora,
 # no GPU tools unless explore.gpu_tools; spends no budget; handles freed after each call) and read_record(cid, part).
 # search_history (2026-11-21, on by default; code default history_tool: true, --set editor.history_tool=false removes
 # it): every candidate already tried (this generation's and all earlier generations'), one row each with strategy,
@@ -160,7 +151,7 @@ tools:                      # editor tools that can be switched off (ablations)
   tensor_compute: true      # (2026-11-21) api.tensor_compute / api.tensors (absent = on)
   paper_tools: true         # (2026-11-21) save_edit / load_edit / list_edits / drop_edit, output_matrices, unit,
                             # direction, project_out, acts(source='own'), tensor_compute(vectors=...) (absent = on)
-  # screen_results: (2026-11-21) absent = on when search.screen_candidates is false: screen_results / screen_output
+  # screen_results: (2026-11-21) absent = on: screen_results / screen_output
 
 # api.tensor_compute(code, tensors) (2026-11-21, every mode; on when tools.tensor_compute):
 # CPU torch code in a fresh sandbox process on fp32 copies of the CURRENT model's tensors (any language-model tensor,
@@ -184,19 +175,17 @@ decoding:
   screen: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
   gate: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: true, max_tokens: 16384, n: 4, seed: null}
 
-gate:
-  reference: auto           # auto = by method.mode (edit: raw, scratch: parent) | raw | parent
-  fallback: auto            # auto = by method.mode (edit: raw, scratch: keep) | raw | keep
-  min_gain: 0.0             # reference=parent: mean PAIRED gain on the gate items >= min_gain; 0 = any strictly
-                            # positive paired gain (2026-11-21)
-  require_significant: true # reference=parent: and the paired gain's 95% CI lower bound > 0 (like Paper A)
-  epsilon: 0.01             # [pilot] reference=raw: target gate >= raw gate - epsilon
+gate:                       # every candidate vs the current model (paired per item on the gate set; 2026-11-23: no
+                            # other reference)
+  fallback: auto            # nothing passed: auto = by method.mode (edit: raw in generation 0 = the raw LoRA if it
+                            # passes the same gate, scratch / weights: keep) | raw | keep
+  min_gain: 0.0             # mean PAIRED gain on the gate items >= min_gain; 0 = any strictly positive paired gain
+                            # (2026-11-21)
+  require_significant: true # and the paired gain's 95% CI lower bound > 0 (like Paper A)
   delta: 0.02               # [pilot] learned target: gate score >= the last accepted candidate's gate score - delta
-  use_noise_band: true      # (2026-11-22) no reader any more (it widened the retention margin); kept so locked runs resume
-  max_submissions: 3        # gate_every_candidate false: candidates submitted to the gate after the search
 
-eval:                       # items scored per candidate (null = all of the draw / gate set)
-  screen_limit: null
+eval:                       # items scored (null = all of the draw / gate set): screen = the current model's screen,
+  screen_limit: null        # full = the non-LLM branch's / raw LoRA's full level, gate = every candidate's gate
   full_limit: null
   gate_limit: null
 
@@ -216,7 +205,7 @@ train:
                             # (dapo_math / taco_verified max_tokens), +512 for the prompt so no answer is cut
   micro_batch: null         # forward at most this many sequences at once (gradient accumulation); null = whole batch
 
-nonllm:                     # 4th branch, same evaluate budget as the editor; what it searches depends on method.mode:
+nonllm:                     # 4th branch, as many candidates as the editor; what it searches depends on method.mode:
                             #   edit: random rule-based edits of the raw LoRA (scale / truncate / intruder / prune)
                             #   scratch: random gradient-free constructions (singular-direction scaling)
   evaluate: 8               # the same candidate count as the editor
@@ -242,15 +231,6 @@ heldout:                    # simple_<domain>_test (500 items never screened or 
     n: 4
     seed: null
     n_by_task: null
-
-baseline:
-  noise_repeats: 3          # sampled gate re-runs of M_0 (rsicore.gate.measure_noise_band), only when temperature > 0
-  noise_temperature: 0.0    # 2026-11-20: greedy -> nothing is re-run, band 0 (baseline/gate_scores.json reports
-                            # M_0's gate score, its SE and the band)
-  noise_top_p: 1.0
-  noise_n: null             # gate items the re-runs score (deterministic subset; null = every gate item)
-  noise_fixed: null         # fixed noise band instead of the re-runs (used as is, no 2 SE floor): 0.03, or
-                            # {math: 0.03, default: 0.02} (keys: dataset, domain or default); unlisted datasets are measured
 
 merge:
   gpu: true                 # accumulate W + dW on gpu1 (else CPU)
@@ -329,14 +309,13 @@ mock:
   sec_per_example: 0.6
 
 # Applied on top of everything (after --set) when --mock is given: small budgets so a laptop run takes minutes
-# (k sessions x 1 step, free screens, full = screen at mock size).
+# (k sessions x 1 step).
 mock_overrides:
-  search: {threads: 3, steps: 1, max_evaluate: 4, top_full: 0, max_candidates: 3}
+  search: {threads: 3, steps: 1, max_candidates: 3}
   budget: {gpu_seconds: 600}
   eval: {screen_limit: 20, full_limit: 30, gate_limit: 30}
   train_data: {mode: gold}
   nonllm: {evaluate: 2, search_scales: [0.75, 1.0]}
   heldout: {limit: 20}
-  baseline: {noise_repeats: 3}
   sandbox: {timeout_s: 120, mem_gb: 4}
   editor: {explore: {timeout_s: 60, mem_gb: 4}}   # mock_tool_rounds (1) run_python calls per proposal

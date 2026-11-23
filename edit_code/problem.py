@@ -6,19 +6,20 @@ cache + diagnostics (prepare), config validation / sizing, candidate build (arti
 fake-quant materialization, candidate serving, and staged evaluation (screen / full / gate) with
 structured L1 feedback (RSI_LOOP_DESIGN §2.2).
 
-References (2026-11-20): every candidate is compared with the INCUMBENT on the same items (it is what a
-candidate must beat): retention = candidate accuracy / incumbent accuracy, paired deltas and regression
-examples (incumbent right, candidate wrong) are vs the incumbent. M_0 is no longer scored on the signal
-items; it only provides the KL reference (prompt logprobs on the KL texts, compute_refs). Per candidate
-the per-text KL (kl_per_text.json) and the per-group Hessian-weighted error (group_error.json) are kept.
+References (2026-11-20): every evaluation is compared with the INCUMBENT on the same items (it is what a
+candidate must beat): the gate pairs a candidate's gate records with the incumbent's per item (2026-11-23: the only
+evaluation a search candidate gets, run.gate_candidate). Screen / full evaluations score the incumbent itself on the
+generation's items (the editor reads them) and the non-LLM baselines (edit_code.baselines), whose screen score is
+retention = accuracy / the incumbent's on the same items, with paired deltas and regression examples (incumbent
+right, baseline wrong); their per-group Hessian-weighted error is kept (group_error.json). M_0 is not scored on the
+items, and there is no KL term (2026-11-23).
 
 Candidate serving (2026-11-19): the candidate GPUs are split into groups (common.candidate_groups); each
 group is one slot of a pool. serve() takes a free slot, exports the candidate's fake-quant checkpoint into
 that slot's directory on the slot's own GPU (exports are serialized: one shared layer cache), starts vLLM
 on the slot's GPUs, and gives the slot back afterwards. So with N groups, N candidates are evaluated at
 the same time (rsicore.search.inner_search(parallel=N)). evaluate() is thread-safe: an identical config
-being evaluated by another thread is waited for (evaluated once), and charged screen evaluations reserve
-their budget before they start.
+being evaluated by another thread is waited for (evaluated once).
 """
 from __future__ import annotations
 
@@ -45,10 +46,6 @@ DATASET_DOMAIN.update({f"simple_{d}_{r}": d for d in ("math", "code", "knowledge
                                                        "tool_calling") for r in ("train", "pool", "eval", "test")})
 
 
-class EvalBudgetExhausted(RuntimeError):
-    pass
-
-
 def _mean_per_id(records: list[dict]) -> tuple[float | None, dict, int]:
     per, pending = {}, 0
     for r in records:
@@ -63,13 +60,13 @@ def _mean_per_id(records: list[dict]) -> tuple[float | None, dict, int]:
 class QuantProblem:
     def __init__(self, rc, cfg: dict, *, tag: str, gen: int, out_dir: Path, prep_dir: Path,
                  source_dir: Path | None, source_state: dict | None, budget_gib: float,
-                 datasets: list[str], data: dict, kl_texts: list[tuple[str, str]], refs_dir: Path, noise: dict | None = None, gate_baseline: dict | None = None,
-                 eval_budget: int = 24, show_examples: int = 2, incumbent: dict | None = None, log=print,
+                 datasets: list[str], data: dict, kl_texts: list[tuple[str, str]] | None = None,
+                 gate_baseline: dict | None = None, show_examples: int = 2, incumbent: dict | None = None, log=print,
                  prep_gpus: list[int] | None = None, gate_datasets: list[str] | None = None):
         from rsicore import evaluate as _ev  # noqa: F401  (fail early if rsicore is missing)
         self.rc, self.cfg, self.tag, self.gen = rc, cfg, tag, gen
         self.mock = bool(rc.mock)
-        self.out_dir, self.prep_dir, self.refs_dir = Path(out_dir), Path(prep_dir), Path(refs_dir)
+        self.out_dir, self.prep_dir = Path(out_dir), Path(prep_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.source_dir = Path(source_dir) if source_dir else None
         self.source_state = source_state
@@ -79,16 +76,11 @@ class QuantProblem:
         self.datasets = list(datasets)
         self.gate_datasets = list(gate_datasets) if gate_datasets else list(self.datasets)
         self.data = data                                  # {dataset: {"screen": ids, "signal": ids}}
-        self.kl_texts = list(kl_texts)                    # [(domain, text)]
-        self.noise = noise or {}
+        self.kl_texts = list(kl_texts or [])              # [(domain, text)]: calibration texts (generation 0 prep)
         self.gate_baseline = gate_baseline or {}
         # incumbent = best accepted quantization so far: {"gen", "cid", "config", "gate": {ds: {"score", "records"}}}
         self.incumbent = incumbent
         self.incumbent_scores: dict = {}                  # {"screen": x, "full": y} on this problem's items
-        self.eval_budget = int(eval_budget)
-        # search.screen_candidates false (2026-11-21, the base.yaml default): candidates are not screened; the editor sees
-        # the incumbent's screen run through screen_results / screen_output (tools.make_tool_api) instead of compare
-        self.screen_tools = not bool((cfg.get("search") or {}).get("screen_candidates", True))
         self.show_examples = int(show_examples)
         self.log = log
         self.space = dict(schema.DEFAULT_ACTION_SPACE, **(cfg.get("action_space") or {}))
@@ -100,7 +92,6 @@ class QuantProblem:
         self._lock = threading.RLock()
         self._export_lock = threading.Lock()       # one export at a time (shared layer cache)
         self._inflight: dict = {}                  # (hash, stage) -> threading.Event
-        self._reserved = 0                         # charged screen evaluations running now
         self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
         self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
         self.prep_gpus = list(prep_gpus) if prep_gpus else None   # generation-0 prep on these GPUs (one worker each)
@@ -161,25 +152,6 @@ class QuantProblem:
         import json
         dec = self.decoding.get(stage)
         return None if dec is None else json.dumps(dec, sort_keys=True)
-
-    def evaluated(self, config_or_art, stage: str = "screen") -> bool:
-        """True when this config already has (or is getting) a `stage` evaluation in this problem: evaluate() then
-        returns the cached record without charging (2026-11-21: tools.make_tool_api(free_repeats=True))."""
-        try:
-            h = config_or_art["config_hash"] if "config_hash" in config_or_art else \
-                config_hash(self.normalize(config_or_art))
-        except Exception:  # noqa: BLE001 - an invalid config is reported by evaluate()
-            return False
-        with self._lock:
-            return (h, stage) in self._evals or (h, stage) in self._inflight
-
-    @property
-    def evals_used(self) -> int:
-        return sum(1 for (h, st), r in self._evals.items() if st == "screen" and r.get("charged", True))
-
-    @property
-    def evals_left(self) -> int:
-        return max(0, self.eval_budget - self.evals_used)
 
     @property
     def domains(self) -> list[str]:
@@ -633,49 +605,12 @@ class QuantProblem:
             return gate_ids(self.rc, ds)
         return list(self.data[ds]["signal" if stage == "full" else "screen"])
 
-    def kl_eval_texts(self) -> list[tuple[str, str]]:
-        """The KL texts scored for every candidate: kl.eval_texts of them, evenly spaced over the list (so every
-        domain keeps its share); null = all. Calibration (prepare) always uses every text."""
-        n = self.cfg["kl"].get("eval_texts")
-        if n is None or int(n) >= len(self.kl_texts):
-            return self.kl_texts
-        step = len(self.kl_texts) / int(n)
-        return [self.kl_texts[int(i * step)] for i in range(int(n))]
-
-    def _kl(self, srv, art: dict, stage: str) -> dict | None:
-        texts = self.kl_eval_texts()
-        if not texts:
-            return None
-        if self.mock:
-            st = M.apply_config(self.spec, self.source_state, self.norm_of(art), self.cfg["mock"].get("lam", 1.2))
-            inc = st["kl_vs_parent"]
-            out = {"overall": round(inc, 5)}
-            for d in sorted({d for d, _ in texts}):
-                out[d] = round(inc * M.DOMAIN_KL.get(d, 1.0), 5)
-            out["vs_original"] = round(st["kl_vs_original"], 5)
-            out["per_text"] = [round(inc * M.DOMAIN_KL.get(d, 1.0) * (0.5 + M._h("klt", art["config_hash"], i)), 6)
-                               for i, (d, _) in enumerate(texts)]
-            return out
-        from rsicore.evaluate import token_kl  # pragma: no cover - GPU path
-        ref = self.refs_dir / "kl_ref.jsonl"
-        r = token_kl(ref, srv.endpoint, srv.served_name, [t for _, t in texts], top_k=self.cfg["kl"]["top_k"])
-        out = {"overall": round(r["mean"], 5), "token_mean": round(r["token_mean"], 5),
-               "per_text": [None if v is None else round(v, 6) for v in r["per_text"]]}
-        by = {}
-        for (d, _), v in zip(texts, r["per_text"]):
-            by.setdefault(d, []).append(v)
-        for d, v in by.items():
-            out[d] = round(sum(v) / len(v), 5)
-        return out
-
-    def evaluate(self, config_or_art, stage: str, cid: str, *, charge: bool = True, origin: str = "candidate") -> dict:
+    def evaluate(self, config_or_art, stage: str, cid: str, *, origin: str = "candidate") -> dict:
         """Evaluate a config at `stage` (screen | full | gate) with the stage's decoding (self.decoding). Cached by
-        (config hash, stage); a cached result is free. Returns {"score", "feedback", ...}. Charged screen
-        evaluations count against the evaluate budget (charge=False: automatic screens when search.charge_screens is
-        false, the incumbent, baselines, gates)."""
+        (config hash, stage). Returns {"score", "feedback", ...}. Search candidates only get the gate stage
+        (run.gate_candidate); screen / full score the incumbent (origin "incumbent") and the baselines."""
         art = config_or_art if "config_hash" in config_or_art else self.build(config_or_art, cid)
         key = (art["config_hash"], stage)
-        charged = bool(charge and stage == "screen")
         while True:
             with self._lock:
                 if key in self._evals:
@@ -684,25 +619,21 @@ class QuantProblem:
                     return r
                 busy = self._inflight.get(key)
                 if busy is None:   # this thread evaluates it
-                    if charged and self.evals_left - self._reserved <= 0:
-                        raise EvalBudgetExhausted(f"evaluate budget of this generation exhausted ({self.eval_budget})")
                     self._inflight[key] = threading.Event()
-                    self._reserved += int(charged)
                     break
             busy.wait()            # another thread is evaluating the same config: use its result
         try:
-            return self._evaluate(art, stage, cid, key, charged, origin)
+            return self._evaluate(art, stage, cid, key, origin)
         finally:
             with self._lock:
-                self._reserved -= int(charged)
                 self._inflight.pop(key).set()
 
-    def _evaluate(self, art: dict, stage: str, cid: str, key: tuple, charged: bool, origin: str) -> dict:
+    def _evaluate(self, art: dict, stage: str, cid: str, key: tuple, origin: str) -> dict:
         t0 = time.time()
         from rsicore.evaluate import paired_delta, score, score_split
         name = f"{self.rc.run_id}-{self.tag}-{art['config_hash']}"
         edir = self.out_dir / "evals" / f"{cid}" / stage
-        probes, regressions, scored = {}, [], {}
+        probes, regressions = {}, []
         # the same datasets AND items as an existing screen evaluation of this config (full = screen): reuse its
         # records instead of scoring them again. The gate (simple_<d>_eval, another dataset than the train role) is
         # always scored, and so is a stage with
@@ -763,29 +694,16 @@ class QuantProblem:
                         p["incumbent"] = None if pacc is None else round(pacc, 4)
                         p["vs_incumbent"] = None if d["delta"] is None else round(d["delta"], 4)
                         p["delta_ci"] = [None if x is None else round(x, 4) for x in d["ci"]]
-                        nb = self.noise.get(ds)
-                        p["noise_band"] = nb
                         if d["delta"] is not None:
                             lo, hi = d["ci"]
-                            p["significant"] = bool(abs(d["delta"]) > (nb or 0.0) and (lo > 0 or hi < 0))
+                            p["significant"] = bool(abs(d["delta"]) > 0.0 and (lo > 0 or hi < 0))
                         if self.show_examples and stage == "screen":
                             regressions += self._regressions(ds, pref, res.records)
                         if pacc:
                             p["retention"] = None if acc is None else round(acc / pacc, 4)
                 probes[dom] = p
-                scored[ds] = acc
-            klw = float(self.cfg["search"].get("kl_weight", 0.0))
-            if reuse:
-                kl = (scr.get("feedback") or {}).get("kl") if stage in ("screen", "full") else None
-            else:   # kl_weight 0 (the default): the score does not use KL, so it is not computed
-                kl = self._kl(srv, art, stage) if (stage in ("screen", "full") and klw > 0) else None
-        if kl and "per_text" in kl:                # kept on disk, not in the editor's feedback
-            kl = dict(kl)
-            per_text = kl.pop("per_text")
-            write_json(edir / "kl_per_text.json",
-                       [{"i": i, "domain": d, "kl": v} for i, ((d, _), v) in enumerate(zip(self.kl_eval_texts(), per_text))])
         fb = {"stage": stage, "bytes_gib": art["bytes_gib"], "budget_gib": art["budget_gib"],
-              "linear_avg_bits": art["linear_avg_bits"], "kl": kl, "probes": probes}
+              "linear_avg_bits": art["linear_avg_bits"], "probes": probes}
         if stage in ("screen", "full"):            # per-group Hessian-weighted error of this config
             ge = self.group_error(self.norm_of(art), top=5)
             write_json(edir / "group_error.json", ge)
@@ -802,22 +720,16 @@ class QuantProblem:
         else:
             rets = [p.get("retention") for p in probes.values() if p.get("retention") is not None]
             ret = sum(rets) / len(rets) if rets else None
-            klw = self.cfg["search"].get("kl_weight", 0.0)
-            klv = (kl or {}).get("overall") or 0.0
-            sc = None if ret is None else round(ret - klw * klv, 5)
-            if sc is None:  # nothing scored (e.g. code tasks without Docker): rank by KL only
-                sc = round(1.0 - klw * klv, 5) if kl else None
+            sc = None if ret is None else round(ret, 5)      # nothing scored (e.g. code without Docker): None
             fb["retention"] = None if ret is None else round(ret, 4)
         rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "origin": origin, "score": sc, "feedback": fb,
-               "charged": charged, "seconds": round(time.time() - t0, 1)}
+               "seconds": round(time.time() - t0, 1)}
         if self._dec_key(stage) is not None:
             rec["decoding"] = self._dec_key(stage)
         with self._lock:
             self._evals[key] = rec
             append_jsonl(self.out_dir / "evals.jsonl", rec)
-        out = dict(rec)
-        out["feedback"] = dict(fb, budget_left={"evaluate": self.evals_left})
-        return out
+        return dict(rec, feedback=dict(fb))
 
     def _gate_decision(self, art: dict, probes: dict) -> tuple[bool, str]:
         """Fixed-size gate: fits the budget AND beats the incumbent on the gate set (paired per item):
@@ -888,80 +800,19 @@ class QuantProblem:
         p = self.records_path("incumbent", stage, ds)
         return read_jsonl(p) if p.exists() else None
 
-    def compute_refs(self, endpoint: str, served_name: str) -> None:
-        """M_0 (served as the editor) is only the KL reference: cache its prompt logprobs on the KL texts
-        (real mode), kl_ref.jsonl, only when the score uses KL (search.kl_weight > 0). It is not scored on the
-        signal items (candidates are compared with the incumbent)."""
-        klw = float(self.cfg["search"].get("kl_weight", 0.0) or 0.0)
-        if self.mock or not (self.kl_texts and klw > 0):  # no KL in the score: no reference
-            return
-        from rsicore.evaluate import reference_logprobs  # pragma: no cover - GPU path
-        reference_logprobs(endpoint, served_name, [t for _, t in self.kl_eval_texts()],
-                           self.refs_dir / "kl_ref.jsonl", self.cfg["kl"]["top_k"])
-
     def evaluate_incumbent(self, stages=("screen", "full")) -> dict:
-        """Score the incumbent on this problem's items (uncharged; cid 'incumbent'): the reference of every
-        candidate's retention, paired deltas and regression examples. -> {stage: score}. Sampled ONCE per problem
+        """Score the incumbent on this problem's items (cid 'incumbent'): the editor's view of the latest model
+        (screen_results / screen_output) and the reference of the baselines' retention, paired deltas and regression
+        examples. -> {stage: score}. Sampled ONCE per problem
         (generation) with the stage's decoding and seed and cached (evals.jsonl, evals/incumbent/<stage>/): every
         candidate is paired with the same records (2026-11-21; full reuses the screen records when items and
         decoding are the same)."""
         if not self.incumbent:
             return {}
         art = self.build(self.incumbent["config"], "incumbent")
-        self.incumbent_scores = {st: self.evaluate(art, st, "incumbent", charge=False, origin="incumbent")["score"]
+        self.incumbent_scores = {st: self.evaluate(art, st, "incumbent", origin="incumbent")["score"]
                                  for st in stages}
         return self.incumbent_scores
-
-    # ------------------------------------------------------------------ analysis (editor tool)
-    def compare(self, cid: str, other: str = "incumbent", stage: str = "screen", max_ids: int = 50) -> dict:
-        """Item-level comparison of two evaluated candidates on the same items, WITHOUT item content (ids
-        and statistics only, so the signal items are not used up): per dataset, accuracy of both, flips
-        (other right -> cid wrong = broken, other wrong -> cid right = fixed) with their ids, flips by the
-        reference's output length (tercile buckets), truncation rate and mean output length of both."""
-        out = {"cid": cid, "other": other, "stage": stage, "datasets": {}}
-        for ds in self.stage_datasets(stage):
-            pa, pb = self.records_path(cid, stage, ds), self.records_path(other, stage, ds)
-            if not pa.exists() or not pb.exists():
-                missing = [c for c, q in ((cid, pa), (other, pb)) if not q.exists()]
-                raise ValueError(f"no {stage} records for {missing} on {ds} (evaluated candidate ids only; "
-                                 f"'incumbent' = the incumbent)")
-            A = {r["id"]: r for r in read_jsonl(pa) if r.get("score") is not None}
-            B = {r["id"]: r for r in read_jsonl(pb) if r.get("score") is not None}
-            ids = sorted(set(A) & set(B))
-            broken = [i for i in ids if B[i]["score"] > 0.5 >= A[i]["score"]]
-            fixed = [i for i in ids if A[i]["score"] > 0.5 >= B[i]["score"]]
-
-            def olen(r):
-                o = r.get("raw_output")
-                return len(o if isinstance(o, str) else " ".join(map(str, o or [])))
-
-            def trunc(r):
-                return any(f == "length" for f in (r.get("finish_reason") or []))
-            lens = sorted(olen(B[i]) for i in ids)
-            cut1, cut2 = (lens[len(lens) // 3], lens[2 * len(lens) // 3]) if lens else (0, 0)
-
-            def bucket(i):
-                n = olen(B[i])
-                return "short" if n <= cut1 else ("medium" if n <= cut2 else "long")
-            by = {k: {"n": 0, "broken": 0, "fixed": 0} for k in ("short", "medium", "long")}
-            for i in ids:
-                by[bucket(i)]["n"] += 1
-            for i in broken:
-                by[bucket(i)]["broken"] += 1
-            for i in fixed:
-                by[bucket(i)]["fixed"] += 1
-            n = max(len(ids), 1)
-            out["datasets"][ds] = {
-                "n": len(ids), "acc": round(sum(A[i]["score"] for i in ids) / n, 4),
-                "acc_other": round(sum(B[i]["score"] for i in ids) / n, 4),
-                "broken": len(broken), "fixed": len(fixed), "net": len(fixed) - len(broken),
-                "broken_ids": broken[:max_ids], "fixed_ids": fixed[:max_ids],
-                "by_reference_length": by,
-                "truncated": round(sum(trunc(A[i]) for i in ids) / n, 4),
-                "truncated_other": round(sum(trunc(B[i]) for i in ids) / n, 4),
-                "mean_output_chars": round(sum(olen(A[i]) for i in ids) / n, 1),
-                "mean_output_chars_other": round(sum(olen(B[i]) for i in ids) / n, 1)}
-        return out
 
     # ------------------------------------------------------------------ reference screen + gate stats (simple, 2026-11-21)
     def screen_records(self, gen: int | None = None) -> dict:
@@ -1036,7 +887,8 @@ class QuantProblem:
 
 # ---------------------------------------------------------------------------------- data helpers
 def kl_texts_for(rc, gen: int, datasets_all: list[str], cfg: dict) -> list[tuple[str, str]]:
-    """(domain, text) KL / calibration contexts from the draw's `kl` role."""
+    """(domain, text) calibration contexts from the draw's `kl` role (generation 0: GPTQ / AWQ calibration and the
+    profile table's KL contexts; the block keeps its name `kl`)."""
     from rsicore.draws import ids
     out = []
     for ds in datasets_all:
@@ -1049,8 +901,8 @@ def kl_texts_for(rc, gen: int, datasets_all: list[str], cfg: dict) -> list[tuple
 def add_self_generated(texts: list[tuple[str, str]], endpoint, served_name: str, cfg: dict,
                        cache: Path) -> list[tuple[str, str]]:
     """prompt + response: append the reference model's own greedy response to each KL / calibration prompt
-    (2504.04823: reasoning-style calibration text), so KL and the calibration statistics also cover the answer
-    tokens. endpoint: a URL or a list of URLs (replicas: the batches are spread over them, 2026-11-20), or a
+    (2504.04823: reasoning-style calibration text), so the calibration statistics and the profile table's KL also
+    cover the answer tokens. endpoint: a URL or a list of URLs (replicas: the batches are spread over them, 2026-11-20), or a
     callable returning one (called only when some response is not cached yet, so a resume needs no server).
     Requests go in batches of kl.self_generated_batch prompts. Cached as jsonl
     {sha, response, finish_reason}; <|im_end|> is appended only to responses that finished (not cut by
