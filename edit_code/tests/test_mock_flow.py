@@ -215,14 +215,25 @@ class TestMockFlow(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         self.assertEqual((rd / "gen_01" / "accepted.json").read_text(), acc0)
         summ = json.loads((rd / "baselines" / "summary.json").read_text())
-        self.assertEqual(set(summ), set(methods) | {"uniform_gptq (Q_0)"})
+        refrows = {"uniform_gptq (Q_0)", "M_0 (BF16)"}
+        self.assertEqual(set(summ) - {k for k in summ if k.startswith("method (final incumbent")}, set(methods) | refrows)
+        self.assertEqual(len(summ), len(methods) + 3)
+        for k, v in summ.items():                       # held-out avg@8 / pass@8 on every row (n 8, 2026-11-23)
+            self.assertEqual(v["heldout_n"], 8, k)
+            self.assertIsNotNone(v["heldout_avg_at_n"], k)
+            self.assertIsNotNone(v["heldout_pass_at_n"], k)
+            self.assertGreaterEqual(v["heldout_pass_at_n"], v["heldout_avg_at_n"], k)
         q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
         for m in methods:
             res = json.loads((rd / "baselines" / f"{m}.json").read_text())
             self.assertNotIn("error", res, m)
             self.assertIsNotNone(res["gate_mean"], m)
             self.assertIsNotNone(res["gain_vs_q0"], m)
-            self.assertIsNotNone(res["heldout_accuracy"], m)
+            ho = res["heldout_by_n"]["8"]
+            self.assertTrue(all(t["n"] > 0 for t in ho.values()), m)
+            self.assertTrue((rd / "baselines" / m / "model" / "fake_quant.json").exists(), m)   # kept
+            hs = json.loads((rd / "baselines" / m / "heldout_n8" / "summary.json").read_text())
+            self.assertTrue(all("pass_at_n" in v for v in hs.values()), m)
             self.assertEqual(res["over_budget_mib"] > 0, m == "uniform_awq", (m, res["over_budget_mib"]))
             gsum = json.loads((rd / "baselines" / "evals" / f"base_{m}" / "gate" / "summary.json").read_text())
             self.assertEqual(gsum["simple_math_eval"]["split_over_replicas"], 4, m)   # 3 slots + the editor GPU
@@ -241,6 +252,9 @@ class TestMockFlow(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         self.assertEqual(sorted(p.name for p in (rd / "baselines" / "evals").iterdir()), before[1])
         self.assertNotIn("evopress gen", r.stdout)
+        ref = json.loads((rd / "baselines" / "reference.json").read_text())
+        self.assertIn("8", ref["m0"])
+        self.assertIn("8", ref["q0"])
         r, _ = run(base + ["--set", "mock_overrides.baselines.methods=[kl_greedy]"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         self.assertEqual(set(json.loads((rd / "baselines" / "summary.json").read_text())), set(summ))   # rows kept

@@ -43,7 +43,7 @@
 
 ## 经典基线（2026-11-23）
 
-`baselines.methods` 里的方法在所有代跑完之后**各跑一次**，评法和本方法完全一样：同一个体积上限；在同一个验收集上评测（500 × 4，同样的解码和种子，和 Q_0 存下的逐题记录配对，分到所有卡上）；在测试集上做留出评测。结果在 `run_dir/baselines/<方法>.json`、`baselines/summary.json` 和 `summary.json` 的 `final.baselines`（列出验收均分、相对 Q_0 的增益和 CI、gap closed、留出准确率、大小）。
+`baselines.methods` 里的方法在所有代跑完之后**各跑一次**，评法和本方法完全一样：同一个体积上限；在同一个验收集上评测（500 × 4，同样的解码和种子，和 Q_0 存下的逐题记录配对，分到所有卡上）；在测试集上做留出评测，每题 `baselines.heldout_n` 个样本（默认 8），报告 **avg@8 和 pass@8**。对照行 M_0、Q_0（= 统一 GPTQ）和最终 incumbent 也用同样的 n 重新做一次留出评测（`baselines/reference.json`），所以表里每一行可以直接比。结果在 `run_dir/baselines/<方法>.json`、`baselines/summary.json` 和 `summary.json` 的 `final.baselines`（每行：验收均分、相对 Q_0 的增益和 CI、gap closed、`heldout_avg_at_n`、`heldout_pass_at_n`、大小）。本方法那一行的验收均分是挑选候选时的那次评测，偏高，比较时看留出。
 
 | 方法 | 做法 |
 |---|---|
@@ -53,7 +53,7 @@
 | `kl_greedy` | 敏感度 = 敏感度表（只把这一组 RTN 量化时整个模型相对 M_0 的 KL），同样的背包 |
 | `evopress` | EvoPress 式进化搜索：从 Q_0 出发，在上限内做"一组升一档、其他组降档"的变异（GPTQ g128，档位 = 动作空间的 bits），适应度 = 校准上下文上相对 M_0 的 KL（每张卡一个 HF 模型进程，权重和导出的 fake-quant 检查点相同），两阶段选择（先用 1/4 上下文筛，再用全部）。**不用验收集挑选**。`baselines.evopress`：`generations` 40、`offspring` 16、`survivors` 2、`max_mutations` 3 |
 
-背包和搜索类基线的词嵌入 / 输出层和 Q_0 一样用 8 bit。默认 `methods: []`。`baselines` 整块只用于报告，运行锁忽略它：跑完的运行可以加上 `--set 'baselines.methods=[uniform_rtn,uniform_awq,hawq,kl_greedy,evopress]'` 用原命令续跑，只补跑基线；已完成的基线不会重跑，失败的下次续跑时重试。每个基线的检查点（约 54 GB）评完就删（`baselines.keep_models: true` 保留）。以前每代跑一次、只在快速筛题上算保持率的 `uniform` / `evo` 已删除。
+背包和搜索类基线的词嵌入 / 输出层和 Q_0 一样用 8 bit。默认 `methods: []`。`baselines` 整块只用于报告，运行锁忽略它：跑完的运行可以加上 `--set 'baselines.methods=[uniform_rtn,uniform_awq,hawq,kl_greedy,evopress]'` 用原命令续跑，只补跑基线；已完成的基线不会重跑，失败的下次续跑时重试。每个基线的 fake-quant 检查点保留在 `baselines/<方法>/model`（约 54 GB 一个，`baselines.keep_models: false` 时留出评测后删除；之后需要时会重新导出）。换一个 `heldout_n` 续跑会补做一次留出评测（步骤 `baselines/<方法>/heldout_n<n>`、`baselines/ref_<名字>/heldout_n<n>`）。以前每代跑一次、只在快速筛题上算保持率的 `uniform` / `evo` 已删除。
 
 ## 8 卡提速（2026-11-23，不改变结果）
 

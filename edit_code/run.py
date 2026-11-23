@@ -84,6 +84,9 @@ def server_args(cfg: dict, args_key: str) -> list[str]:
     return apply_context_tokens(args, cfg) if args_key == "editor_args" else args
 
 
+_DEFAULT = object()
+
+
 class _Background:
     """fn() in a daemon thread; join() waits and re-raises its exception (raise_error=False: only waits)."""
 
@@ -356,21 +359,23 @@ class Runner:
             return [m0]
         return [m0] + [self.m0_server(tasks, gpus=g) for g in self.cand_slots]
 
-    def heldout_on(self, servers: list, out_dir: Path, *, lora=None) -> dict:
-        """Held-out evaluation with the tasks spread over the given replicas (started together)."""
+    def heldout_on(self, servers: list, out_dir: Path, *, lora=None, decoding=_DEFAULT) -> dict:
+        """Held-out evaluation with the tasks spread over the given replicas (started together). decoding: default
+        heldout.decoding (the baselines pass their own n)."""
         cfg = self.cfg
         srvs = start_lazy(servers)
         return run_heldout([s.endpoint for s in srvs], servers[0].name, out_dir, domains=heldout_domains(cfg, self.rc.domain),
                            mock=self.rc.mock, lora=lora, limit=cfg["heldout"].get("limit"),
-                           decoding=cfg["heldout"].get("decoding"), concurrency=scoring_concurrency(cfg))
+                           decoding=cfg["heldout"].get("decoding") if decoding is _DEFAULT else decoding,
+                           concurrency=scoring_concurrency(cfg))
 
-    def model_heldout(self, model_dir: Path, name: str, out_dir: Path) -> dict:
+    def model_heldout(self, model_dir: Path, name: str, out_dir: Path, *, decoding=_DEFAULT) -> dict:
         """Held-out evaluation of an exported model: one server per free GPU group (gpu_layout.parallel_heldout;
         call it when the editor GPU is free) or just the first candidate slot."""
         groups = self.all_groups if self.parallel_heldout else [self.cand_slots[0]]
         servers = [self.model_server(model_dir, name, g, "candidate_args") for g in groups]
         try:
-            return self.heldout_on(servers, out_dir)
+            return self.heldout_on(servers, out_dir, decoding=decoding)
         finally:
             for s in servers:
                 s.close()
@@ -612,11 +617,14 @@ class Runner:
     def run_baselines(self):
         """Each baselines.methods entry once (edit_code.baselines), scored like the method: built at the budget,
         gated on the gate set (500 x n, same decoding and seed) paired with Q_0's stored gate records, over every
-        GPU group; held-out evaluated on simple_<d>_test. RunState steps baselines/<method> (evopress also
-        baselines/evopress_search). The block is report-only, so the run lock ignores it: a finished run can be
-        resumed with --set 'baselines.methods=[...]' to add them. Results: run_dir/baselines/<method>.json and
-        summary.json; summary.json final.baselines."""
-        rc, cfg, st = self.rc, self.cfg, self.st
+        GPU group (step baselines/<method>; evopress also baselines/evopress_search); then held-out evaluated on
+        simple_<d>_test with baselines.heldout_n samples per item (avg@n, pass@n; step baselines/<method>/heldout_n<n>).
+        The comparison rows get the same held-out n: M_0, Q_0 (= uniform GPTQ) and the final incumbent (steps
+        baselines/ref_<name>/heldout_n<n>). The checkpoints are kept (baselines/<method>/model; baselines.keep_models).
+        The block is report-only, so the run lock ignores it: a finished run can be resumed with --set
+        'baselines.methods=[...]' (or another heldout_n) to add them. Results: run_dir/baselines/<method>.json,
+        baselines/reference.json, baselines/summary.json; summary.json final.baselines."""
+        cfg = self.cfg
         bc = cfg.get("baselines") or {}
         methods = BL.check_methods(bc.get("methods"))
         if not methods:
@@ -630,22 +638,69 @@ class Runner:
         prob.prepare()
         g0 = (read_json(self.run_dir / "summary.json", {}) or {}).get("gens", {}).get("0") or {}
         m0m, q0m = gate_mean(g0.get("m0_gate_scores")), g0.get("gate_mean")
-        for m in methods:
+        n = self.baseline_heldout_n()
+        for m in methods:          # one failing baseline must not stop the others; a failed step retries on resume
             try:
                 self._baseline_step(prob, m, ref, budget, bdir, m0m, q0m)
-            except Exception as e:  # noqa: BLE001 - one failing baseline must not stop the others (retried on resume)
+            except Exception as e:  # noqa: BLE001
                 self.log(f"[baselines] {m} failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-                write_json(bdir / f"{m}.json", {"method": m, "error": f"{type(e).__name__}: {e}"})
+                r = read_json(bdir / f"{m}.json") or {"method": m}
+                write_json(bdir / f"{m}.json", dict(r, error=f"{type(e).__name__}: {e}"))
+                continue
+            if self.heldout_enabled:
+                try:
+                    self._baseline_heldout(prob, m, bdir, n)
+                except Exception as e:  # noqa: BLE001 - recorded per n (heldout_errors), not as the gate's error
+                    self.log(f"[baselines] {m} held-out n {n} failed: {type(e).__name__}: {e}\n"
+                             f"{traceback.format_exc()}")
+                    r = read_json(bdir / f"{m}.json") or {"method": m}
+                    r.setdefault("heldout_errors", {})[str(n)] = f"{type(e).__name__}: {e}"
+                    write_json(bdir / f"{m}.json", r)
+        refs = self._reference_heldout(bdir, n) if self.heldout_enabled else {}
         rows = {}
         for m in [x for x in BL.METHODS if x in methods or (bdir / f"{x}.json").exists()]:   # also earlier resumes
             r = read_json(bdir / f"{m}.json") or {}
-            rows[m] = {k: r.get(k) for k in ("gate_mean", "gain_vs_q0", "gain_ci", "gap_closed", "heldout_accuracy",
-                                             "bytes_gib", "over_budget_mib", "linear_avg_bits", "error")}
-        rows["uniform_gptq (Q_0)"] = {"gate_mean": q0m, "gain_vs_q0": 0.0, "gap_closed": 0.0,
-                                      "heldout_accuracy": _mean_acc(read_json(self.run_dir / "baseline" / "q0" /
-                                                                              "heldout.json")),
-                                      "bytes_gib": q0.get("bytes_gib"), "linear_avg_bits": q0.get("linear_avg_bits")}
+            rows[m] = dict({k: r.get(k) for k in ("gate_mean", "gain_vs_q0", "gain_ci", "gap_closed", "bytes_gib",
+                                                  "over_budget_mib", "linear_avg_bits", "error")},
+                           heldout_error=(r.get("heldout_errors") or {}).get(str(n)),
+                           **_heldout_metrics((r.get("heldout_by_n") or {}).get(str(n)), n))
+        last = self._last_incumbent()
+        lsum = ((read_json(self.run_dir / "summary.json", {}) or {}).get("gens") or {}).get(str(last["gen"])) or {}
+        rows["uniform_gptq (Q_0)"] = dict({"gate_mean": q0m, "gain_vs_q0": 0.0, "gap_closed": 0.0,
+                                           "bytes_gib": q0.get("bytes_gib"),
+                                           "linear_avg_bits": q0.get("linear_avg_bits")},
+                                          **_heldout_metrics(refs.get("q0"), n))
+        rows["M_0 (BF16)"] = dict({"gate_mean": m0m}, **_heldout_metrics(refs.get("m0"), n))
+        rows[f"method (final incumbent {last['cid']}, gen {last['gen']})"] = dict(
+            {"gate_mean": gate_mean(last.get("gate_scores")), "gain_vs_q0": lsum.get("gain_vs_q0"),
+             "gap_closed": lsum.get("gap_closed"), "bytes_gib": last.get("bytes_gib"),
+             "linear_avg_bits": last.get("linear_avg_bits"), "gate_note": "selected on the gate set (biased upward)"},
+            **_heldout_metrics(refs.get("final"), n))
         write_json(bdir / "summary.json", rows)
+
+    def baseline_heldout_n(self) -> int:
+        """Samples per held-out item for the baselines and their comparison rows (baselines.heldout_n; null = the
+        heldout.decoding n)."""
+        if self.cfg["heldout"].get("decoding") is None:     # tasks.yaml decoding (greedy): one sample per item
+            return 1
+        v = (self.cfg.get("baselines") or {}).get("heldout_n")
+        return int(v if v is not None else self.cfg["heldout"]["decoding"].get("n", 1))
+
+    def baseline_heldout_decoding(self, n: int) -> dict | None:
+        dec = self.cfg["heldout"].get("decoding")
+        return None if dec is None else dict(dec, n=int(n), n_by_task=None)
+
+    def _last_incumbent(self) -> dict:
+        """The incumbent after the last finished generation (Q_0 when no generation ran). Scans from the highest
+        generation on disk, not --gens (which may be lowered on a resume)."""
+        top = max([self.rc.gens] + [int(p.name[4:]) for p in self.run_dir.glob("gen_[0-9][0-9]*")
+                                    if p.name[4:].isdigit()])
+        for g in range(top, -1, -1):           # (not gen_dir: it creates the directory)
+            d = self.run_dir / ("baseline" if g == 0 else f"gen_{g:02d}")
+            inc = read_json(d / "incumbent.json")
+            if inc and (g == 0 or self.st.done(f"gen{g:02d}/done")):
+                return inc
+        return self.incumbent(0)
 
     def _baseline_step(self, prob: QuantProblem, m: str, ref: dict, budget: float, bdir: Path, m0m, q0m) -> None:
         with self.st.step(f"baselines/{m}") as todo:
@@ -660,11 +715,9 @@ class Runner:
                     res["gap_closed"] = round((gm - q0m) / (m0m - q0m), 4)
             res["seconds"] = round(time.time() - t0, 1)
             write_json(bdir / f"{m}.json", res)
-            self.log(f"[baselines] {m}: gate {gm} (vs Q_0 {res.get('gain_vs_q0')}), held-out "
-                     f"{res.get('heldout_accuracy')}, {res['bytes_gib']} GiB")
+            self.log(f"[baselines] {m}: gate {gm} (vs Q_0 {res.get('gain_vs_q0')}), {res['bytes_gib']} GiB")
 
     def _one_baseline(self, prob: QuantProblem, m: str, ref: dict, budget: float, bdir: Path) -> dict:
-        rc, cfg = self.rc, self.cfg
         extra = {}
         check = True
         if m in ("uniform_rtn", "uniform_awq"):
@@ -689,17 +742,63 @@ class Runner:
             if lent is not None:
                 prob.remove_slot(lent)
         probes = (r.get("feedback") or {}).get("probes") or {}
-        h = None
-        if self.heldout_enabled:
-            h = self.model_heldout(mdir, f"{rc.run_id}-base-{m}", bdir / m / "heldout")
-        if not (cfg.get("baselines") or {}).get("keep_models", False) and not rc.mock:
-            shutil.rmtree(mdir, ignore_errors=True)       # ~54 GB each; the config is kept
         return {"method": m, "config": art["config"], "config_hash": art["config_hash"], "bytes_gib": art["bytes_gib"],
                 "budget_gib": budget, "over_budget_mib": over, "linear_avg_bits": art["linear_avg_bits"],
-                "gate_scores": {p["dataset"]: p.get("score") for p in probes.values()},
+                "model_dir": str(mdir), "gate_scores": {p["dataset"]: p.get("score") for p in probes.values()},
                 "gate_mean": gate_mean({p["dataset"]: p.get("score") for p in probes.values()}),
-                "gain_ci": next((p.get("delta_ci") for p in probes.values()), None),
-                "heldout": h, "heldout_accuracy": _mean_acc(h), **extra}
+                "gain_ci": next((p.get("delta_ci") for p in probes.values()), None), **extra}
+
+    def _baseline_heldout(self, prob: QuantProblem, m: str, bdir: Path, n: int) -> None:
+        """Held-out of baseline m with n samples per item (its kept checkpoint; re-exported if it was removed)."""
+        rc = self.rc
+        with self.st.step(f"baselines/{m}/heldout_n{n}") as todo:
+            if not todo:
+                return
+            res = read_json(bdir / f"{m}.json") or {}
+            if not res.get("config_hash"):
+                raise RuntimeError(f"baselines/{m}: no gate result to evaluate")
+            mdir = bdir / m / "model"
+            self.export(prob, {"config_hash": res["config_hash"], "bytes_gib": res["bytes_gib"]}, mdir)
+            h = self.model_heldout(mdir, f"{rc.run_id}-base-{m}", bdir / m / f"heldout_n{n}",
+                                   decoding=self.baseline_heldout_decoding(n))
+            res = read_json(bdir / f"{m}.json") or res
+            res.setdefault("heldout_by_n", {})[str(n)] = h
+            (res.get("heldout_errors") or {}).pop(str(n), None)
+            write_json(bdir / f"{m}.json", res)
+            hm = _heldout_metrics(h, n)
+            self.log(f"[baselines] {m}: held-out avg@{n} {hm['heldout_avg_at_n']}, pass@{n} {hm['heldout_pass_at_n']}")
+            if not (self.cfg.get("baselines") or {}).get("keep_models", True) and not rc.mock:
+                shutil.rmtree(mdir, ignore_errors=True)
+
+    def _reference_heldout(self, bdir: Path, n: int) -> dict:
+        """M_0, Q_0 and the final incumbent on the held-out set with the baselines' n (baselines/reference.json)."""
+        rc = self.rc
+        out = read_json(bdir / "reference.json", {}) or {}
+        last = self._last_incumbent()
+        todo = [("m0", None), ("q0", self.run_dir / "baseline" / "q0" / "model")]
+        if last["gen"] > 0:
+            todo.append((f"final_g{last['gen']:02d}", Path(last["model_dir"])))
+        dec = self.baseline_heldout_decoding(n)
+        for name, mdir in todo:
+            with self.st.step(f"baselines/ref_{name}/heldout_n{n}") as go:
+                if go:
+                    hdir = bdir / "reference" / name / f"heldout_n{n}"
+                    if mdir is None:              # M_0 on every GPU group (the editor GPU + one replica per slot)
+                        m0 = self.m0_server()
+                        reps = self.m0_replicas_for(m0)
+                        try:
+                            h = self.heldout_on(reps, hdir, decoding=dec)
+                        finally:
+                            for s in reps:
+                                s.close()
+                    else:
+                        h = self.model_heldout(mdir, f"{rc.run_id}-ref-{name}", hdir, decoding=dec)
+                    out = read_json(bdir / "reference.json", {}) or {}
+                    out.setdefault(name, {})[str(n)] = h
+                    write_json(bdir / "reference.json", out)
+        res = {"m0": (out.get("m0") or {}).get(str(n)), "q0": (out.get("q0") or {}).get(str(n))}
+        res["final"] = res["q0"] if last["gen"] == 0 else (out.get(f"final_g{last['gen']:02d}") or {}).get(str(n))
+        return res
 
     def _evopress(self, prob: QuantProblem, ref: dict, budget: float, bdir: Path):
         """The EvoPress-style search (resumable per generation: baselines/evopress/search.json)."""
@@ -1016,10 +1115,14 @@ class Runner:
                  f"final {f['gate_mean']['final']} (gap closed {f['gap_closed']})")
 
 
-def _mean_acc(h: dict | None):
-    """Mean accuracy over the tasks of a held-out result {task: {accuracy, ...}} (None when there is none)."""
-    vals = [v.get("accuracy") for v in (h or {}).values() if isinstance(v, dict) and v.get("accuracy") is not None]
-    return round(sum(vals) / len(vals), 4) if vals else None
+def _heldout_metrics(h: dict | None, n: int) -> dict:
+    """avg@n / pass@n (mean over the held-out tasks) of a held-out result {task: {accuracy, avg_at_n, pass_at_n}}."""
+    def mean(key):
+        vals = [v.get(key) for v in (h or {}).values() if isinstance(v, dict) and v.get(key) is not None]
+        return round(sum(vals) / len(vals), 4) if vals else None
+    avg = mean("avg_at_n")
+    return {"heldout_n": n, "heldout_avg_at_n": avg if avg is not None else mean("accuracy"),
+            "heldout_pass_at_n": mean("pass_at_n")}
 
 
 def _acc(records: list[dict]):
