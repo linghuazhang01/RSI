@@ -73,8 +73,9 @@ LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval", "
                       "mock_overrides.baselines") + _REMOVED_LOCK_PATHS + tuple(
     f"mock_overrides.{p}" for p in _REMOVED_LOCK_PATHS)
 # execution knobs that change only batching, like --gpus, ignored at this dotted path anywhere in the config (top
-# level, under mock_overrides., under hardware_profiles.<name>.): scoring.concurrency (Paper A, 2026-11-23)
-LOCK_IGNORED_SUFFIXES = ("scoring.concurrency",)
+# level, under mock_overrides., under hardware_profiles.<name>.): scoring.concurrency (Paper A, 2026-11-23),
+# gpu_layout.gate_split (Paper A, 2026-11-24: GPUs per candidate gate)
+LOCK_IGNORED_SUFFIXES = ("scoring.concurrency", "gpu_layout.gate_split")
 HARDWIRED_FLOW = ("candidates are never screened; every candidate gets one gate evaluation during the search, paired "
                   "vs the current model; the passing candidate with the largest paired gain is accepted; no "
                   "api.evaluate, full / rerun stage, gate submissions after the search, noise band or KL score term")

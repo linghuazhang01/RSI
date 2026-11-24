@@ -1,0 +1,19 @@
+# Paper A experiment config (2026-11-24): math · 8 GPUs · 4 x 1 candidates per generation (4 proposals per round) ·
+# up to 30 tool rounds · threshold 0 · no significance test. Overrides only: merged after base.yaml +
+# domains/math.yaml + the hardware profile (--hw) and before any --set. Hardware is NOT set here (B300 / H20).
+#   ./launch.sh --hw b300 --paper A --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_r30_4x1.yaml --tag r30_4x1
+# GPUs: GPU 0 = editor (4 sessions at once; sleeps while the candidates are gated and lends its GPU) -> 8 candidate
+#   slots. Each of the 4 candidates' gates (500 x 4) runs on 2 GPUs (gpu_layout.gate_split: ceil(8 / 4)), the items
+#   split over the two replicas, so the gate phase takes about as long as with 8 x 1 at half the gate samples.
+#   The incumbent's screen (500 x 4) and the held-out test still use every free GPU.
+search:
+  threads: 4                      # 4 independent sessions per generation ...
+  steps: 1                        # ... of one candidate each
+  max_candidates: 4
+editor:
+  tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
+  turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
+  max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)
+gate:
+  min_delta: 0.0                  # accept the candidate with the largest strictly positive paired gate gain
+  require_significant: false      # no 95% CI requirement

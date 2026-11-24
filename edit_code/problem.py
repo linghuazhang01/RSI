@@ -98,6 +98,9 @@ class QuantProblem:
         self._inflight: dict = {}                  # (hash, stage) -> threading.Event
         self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
         self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
+        # (2026-11-24) candidates gated at the same time (run.Runner.run_search sets it to the threads of a step);
+        # None = one slot per candidate gate. See gate_slots().
+        self.gate_parallel: int | None = None
         self.prep_gpus = list(prep_gpus) if prep_gpus else None   # generation-0 prep on these GPUs (one worker each)
         from rsicore.draws import is_eval_set
         # an eval-set train role (simple_<d>_pool is one): the editor may see every item, so feedback examples
@@ -150,6 +153,14 @@ class QuantProblem:
             self._pool.put(j)
         with self._lock:
             self._removed.add(i)
+
+    def gate_slots(self) -> int:
+        """Slots ONE candidate gate may use (2026-11-24, gpu_layout.gate_split, default on): ceil(n_slots /
+        gate_parallel), e.g. 8 slots and 4 proposals per step -> 2 GPUs per candidate (1 x 8 -> 8, 8 x 1 -> 1 as
+        before). The gate items are split over the replicas (score_split; same decoding and seed per item)."""
+        if not self.gate_parallel or not (self.cfg.get("gpu_layout") or {}).get("gate_split", True):
+            return 1
+        return max(1, math.ceil(self.n_slots / max(1, int(self.gate_parallel))))
 
     def _dec_key(self, stage: str) -> str | None:
         """The stage's decoding as a canonical string (None = tasks.yaml decoding), stored in evaluation records."""
@@ -600,16 +611,18 @@ class QuantProblem:
             self._pool.put(slot)
 
     @contextmanager
-    def serve_all(self, art: dict, name: str):
+    def serve_all(self, art: dict, name: str, most: int | None = None, keep: bool = False):
         """Serve one config on EVERY free slot of the pool at once (2026-11-22, like Paper B's parent screen over all
-        main replicas): blocks for the first slot, then takes every other slot that is free right now, so it never
-        waits on a running evaluation. Real mode: the checkpoint is written once (the incumbent's exported model when
-        it is there, else a finished export registered in self.exported, e.g. Q_0's baseline/q0/model, else a shared
-        copy under out_dir/ckpt/shared/, removed afterwards) and every slot serves it; the servers start together.
+        main replicas): blocks for the first slot, then takes every other slot that is free right now (at most
+        `most` slots in all; None = no limit), so it never waits on a running evaluation. Real mode: the checkpoint
+        is written once (the incumbent's exported model when it is there, else a finished export registered in
+        self.exported, e.g. Q_0's baseline/q0/model, else a shared copy under out_dir/ckpt/shared/, removed
+        afterwards; keep=True, a candidate's gate (2026-11-24): its usual checkpoint out_dir/ckpt/slot<k>/<hash> on
+        the first slot, kept for adopt_checkpoint) and every slot serves it; the servers start together.
         Yields the list of servers."""
         from rsicore.servers import VLLMServer, start_all
         slots = [self._pool.get()]
-        while True:
+        while most is None or len(slots) < most:
             try:
                 slots.append(self._pool.get_nowait())
             except queue.Empty:
@@ -628,7 +641,9 @@ class QuantProblem:
                 ex = self.exported.get(art["config_hash"])
                 if ckpt is None and ex and (Path(ex) / "fake_quant.json").exists():   # e.g. Q_0's exported model
                     ckpt = Path(ex)
-                if ckpt is None:
+                if ckpt is None and keep:
+                    ckpt = self.materialize(art, slot=slots[0])
+                elif ckpt is None:
                     tmp = self.out_dir / "ckpt" / "shared" / art["config_hash"]
                     ckpt = self.materialize(art, dst=tmp, slot=slots[0])
                 srvs = [VLLMServer(ckpt, name, self.slots[s], seed=self.rc.seed, log_dir=logs,
@@ -705,7 +720,17 @@ class QuantProblem:
         # (2026-11-23) so is Q_0's gate (origin "reference", generation 0, nothing else running): it was on ONE GPU
         # (2026-11-23) and so are the classic baselines' gates (run.Runner.run_baselines, after the generations)
         split = not reuse and (origin in ("reference", "baseline") or (origin == "incumbent" and stage != "gate"))
-        with (nullcontext() if reuse else self.serve_all(art, name) if split else self.serve(art, name)) as srv:
+        # (2026-11-24) a candidate's gate on gate_slots() slots: e.g. 8 GPUs, 4 proposals per step -> 2 GPUs each
+        share = self.gate_slots() if (origin == "gate" and not reuse and not split) else 1
+        if reuse:
+            ctx = nullcontext()
+        elif split:
+            ctx = self.serve_all(art, name)
+        elif share > 1:
+            ctx = self.serve_all(art, name, most=share, keep=True)
+        else:
+            ctx = self.serve(art, name)
+        with ctx as srv:
             srvs = srv if isinstance(srv, list) else [srv]
             srv = srvs[0]
             for ds in dsets:

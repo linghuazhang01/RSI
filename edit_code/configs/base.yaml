@@ -257,6 +257,10 @@ gpu_layout:
                                       # every GPU group, items / tasks split over the replicas
   parallel_heldout: true              # held-out evaluation of an exported model on every free GPU group (tasks split)
   prep_all_gpus: true                 # generation-0 calibration / profile table / cache / hessian table on every GPU
+  gate_split: true                    # (2026-11-24) a candidate's gate on ceil(slots / proposals per step) slots, the
+                                      # items split over them (same decoding and seed per item): 8 GPUs and 4
+                                      # proposals (search.threads 4) -> 2 GPUs per candidate; 8 x 1 -> 1 as before;
+                                      # batching only (not part of the run lock)
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
 # cards; the b300 profile plans them at 220 GB (2026-11-21). rsicore.config merges the profile over base/domain

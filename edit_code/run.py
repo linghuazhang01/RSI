@@ -539,6 +539,8 @@ class Runner:
         fns = self.search_fns(prob, gdir, ed, archive=archive)
         phases = EditorPhases(ed, prob, self.gpu_editor, self.editor_sleep, log=self.log)
         ss = search_settings(self.cfg["search"])
+        # (2026-11-24) candidates gated at once = proposals per step; each gate gets ceil(slots / that) GPUs
+        prob.gate_parallel = max(1, min(int(ss["threads"]), int(ss["max_candidates"] or ss["threads"])))
         return S.inner_search(self.rc, gen, threads=ss["threads"], steps=ss["steps"],
                               max_candidates=ss["max_candidates"], out_dir=gdir, parallel=max(2, prob.n_slots),
                               phases=phases, **fns)
