@@ -544,42 +544,73 @@ class Run:
         draws.ensure_gate(self.rc)
         if self.rc.mock and not (read_json(self.registry, {}) or {}).get(self.served(0)):
             self.set_quality(self.served(0), float(self.mcfg.get("base_quality", 0.6)))
+        # (2026-11-24) reuse.baseline_from: M_0's gate / held-out scores of an earlier run (same model, seed, domain,
+        # decoding and items; checked, else the run stops) instead of sampling M_0 again (rsicore.reuse)
+        from rsicore import reuse as RU
+        pending = not self.st.done("baseline/gate") or (self.cfg.get("heldout", {}).get("enabled", True)
+                                                        and not self.st.done("baseline/heldout"))
+        src = RU.baseline_from(self.rc, self.cfg) if pending else None   # a finished generation 0 never reads it
+        if src is not None:                   # every pending step checked before anything is copied
+            from rsicore.heldout import heldout_domains as _hd
+            RU.preflight(self.rc, self.cfg, src,
+                         gate_ids=None if self.st.done("baseline/gate") else self.gate_level(),
+                         heldout_domains=_hd(self.cfg, self.rc.domain)
+                         if self.cfg.get("heldout", {}).get("enabled", True)
+                         and not self.st.done("baseline/heldout") else None)
         key = "baseline/gate"
         if not self.st.done(key):
-            self.servers.get("main", self.model_path(0), self.served(0))
-            tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
-            eps = [s.endpoint for s in self.servers.replicas("main") + tmp]
-            from rsicore.evaluate import score_split
             gate = self.gate_level()
-            res = {}
-            for ds, ids in gate.items():
+            tmp = []
+            if src is not None:
+                raw = RU.gate_records(self.rc, self.cfg, src, gate, lambda ds: bdir / "gate" / ds)
+                RU.record_code(self.rc.run_dir, src, mock=self.rc.mock)   # the source fingerprint (chained reuse)
+                print(f"[lora_code] baseline: M_0 gate records reused from {src}", flush=True)
+            else:
+                self.servers.get("main", self.model_path(0), self.served(0))
+                tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
+                eps = [s.endpoint for s in self.servers.replicas("main") + tmp]
+                from rsicore.evaluate import score_split
                 # gate score: the gate decoding (greedy unless decoding.gate is set), like every candidate's gate
-                er = score_split(eps, self.served(0), ds, pool="pool", ids=ids, out_dir=bdir / "gate" / ds,
-                                 mock=self.rc.mock, decoding=self.decodings()["gate"])
-                recs = [{"id": x.get("id"), "score": x.get("score")} for x in er.records]
+                raw = {ds: score_split(eps, self.served(0), ds, pool="pool", ids=ids, out_dir=bdir / "gate" / ds,
+                                       mock=self.rc.mock, decoding=self.decodings()["gate"]).records
+                       for ds, ids in gate.items()}
+            res = {}
+            for ds in gate:
+                recs = [{"id": x.get("id"), "score": x.get("score")} for x in raw[ds]]
                 sc = [x["score"] for x in recs if x["score"] is not None]
                 m = mean_or_none(sc)
                 se = (sum((x - m) ** 2 for x in sc) / max(len(sc) - 1, 1) / max(len(sc), 1)) ** 0.5 if sc else None
                 # M_0's gate score and its standard error (reported; there is no noise band, 2026-11-23)
                 res[ds] = {"score": m, "n": len(recs), "n_scored": len(sc), "se": se, "records": recs}
             write_json(bdir / "gate_scores.json", res)
+            if src is None:
+                RU.record_code(self.rc.run_dir, mock=self.rc.mock)   # grading code of these scores
             for s in tmp:
                 s.stop()
-            self.st.mark(key, {ds: {"score": v["score"]} for ds, v in res.items()})
+            info = {ds: {"score": v["score"]} for ds, v in res.items()}
+            if src is not None:
+                info["reused_from"] = str(src)
+            self.st.mark(key, info)
         if self.cfg.get("heldout", {}).get("enabled", True) and not self.st.done("baseline/heldout"):
             from rsicore.heldout import heldout_domains, run_heldout
-            self.servers.get("main", self.model_path(0), self.served(0))
-            tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
-            try:
-                h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(0), bdir / "heldout",
-                                domains=heldout_domains(self.cfg, self.rc.domain), mock=self.rc.mock,
-                                limit=self.cfg.get("heldout", {}).get("limit"),
-                                decoding=self.cfg.get("heldout", {}).get("decoding"))
-            finally:
-                for s in tmp:
-                    s.stop()
+            if src is not None:
+                h = RU.heldout(self.rc, self.cfg, src, heldout_domains(self.cfg, self.rc.domain), bdir / "heldout")
+                RU.note_heldout_code(self.rc.run_dir, src, mock=self.rc.mock)   # gate may have been scored here
+                print(f"[lora_code] baseline: M_0 held-out reused from {src}", flush=True)
+            else:
+                self.servers.get("main", self.model_path(0), self.served(0))
+                tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
+                try:
+                    h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(0),
+                                    bdir / "heldout", domains=heldout_domains(self.cfg, self.rc.domain),
+                                    mock=self.rc.mock, limit=self.cfg.get("heldout", {}).get("limit"),
+                                    decoding=self.cfg.get("heldout", {}).get("decoding"))
+                finally:
+                    for s in tmp:
+                        s.stop()
+                RU.note_heldout_code(self.rc.run_dir, mock=self.rc.mock)   # other code than the gate -> null
             write_json(bdir / "heldout.json", h)
-            self.st.mark("baseline/heldout", {"tasks": len(h)})
+            self.st.mark("baseline/heldout", dict({"tasks": len(h)}, **({"reused_from": str(src)} if src else {})))
 
     # ================================================================== one generation
     def generation(self, g: int):

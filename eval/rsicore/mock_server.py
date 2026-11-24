@@ -307,6 +307,10 @@ def make_handler(mock: Mock):
                 with mock.lock:
                     mock.loras.pop(name)
                 return self._send(200, f"Success: LoRA adapter '{name}' removed successfully.")
+            if p == "/tokenize":            # vLLM's /tokenize (the KL gate's prompt length): the mock tokenizer
+                text = req.get("prompt") or ""
+                n = len(re.findall(r"\w+|[^\w\s]", text) or [text or " "])
+                return self._send(200, {"count": n, "max_model_len": 131072, "tokens": list(range(n))})
             if p not in ("/v1/chat/completions", "/v1/completions"):
                 return self._err(404, "not found", "NotFoundError")
             model = req.get("model")

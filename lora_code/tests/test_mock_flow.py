@@ -1090,3 +1090,95 @@ def test_context_budget_line():
     assert "You are session 3 of 8 in this generation" in msg and "search_history and the archive below" in msg
     r2 = ContextRenderer(task_text="T", diag_text="D", sessions=4)
     assert "You are session 4 of 4" in r2([], 3) and "search_history" not in r2([], 3)
+
+
+def test_mock_reuse_baseline_from(tmp_path):
+    """reuse.baseline_from (2026-11-24): a second run takes M_0's generation-0 gate and held-out scores from an
+    earlier run with the same model / seed / domain / decoding / items instead of sampling M_0 again (state
+    reused_from, identical files, generation 0's parent gate then adopted from those records); a mismatch (another
+    held-out limit) stops the run with the differences."""
+    py = REPO / "eval" / ".venv" / "bin" / "python"
+    py = str(py) if py.exists() else sys.executable
+    base = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
+            "--runs-dir", str(tmp_path), "--set", "method.mode=scratch", "--set", "merge.mode=adapter"]
+    r = subprocess.run(base + ["--run-id", "B_src"], capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    r = subprocess.run(base + ["--run-id", "B_dst", "--set", f"reuse.baseline_from={tmp_path / 'B_src' / 'baseline'}"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))   # its baseline/ folder
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
+    src, dst = tmp_path / "B_src", tmp_path / "B_dst"
+    assert "baseline: M_0 gate records reused from" in r.stdout and "baseline: M_0 held-out reused from" in r.stdout
+    st = json.loads((dst / "state.json").read_text())
+    assert st["baseline/gate"]["reused_from"] == str(src) and st["baseline/heldout"]["reused_from"] == str(src)
+    for f in ("gate_scores.json", "heldout.json"):
+        assert json.loads((dst / "baseline" / f).read_text()) == json.loads((src / "baseline" / f).read_text()), f
+    assert (dst / "baseline" / "gate" / "simple_math_eval" / "simple_math_eval.jsonl").read_text() == \
+        (src / "baseline" / "gate" / "simple_math_eval" / "simple_math_eval.jsonl").read_text()
+    assert not list((dst / "baseline" / "gate" / "simple_math_eval").glob("_part*"))   # nothing sampled here
+    _check_parent_gate_reuse(dst, 1, on_m0=True)
+    # a mismatch is refused, not silently re-sampled (mock_overrides pin heldout.limit, so: another gate n / seed)
+    r = subprocess.run(base + ["--run-id", "B_bad", "--set", "reuse.baseline_from=B_src", "--set", "decoding.gate.n=2"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "cannot reuse M_0's gate scores" in r.stdout + r.stderr, r.stdout[-2000:]
+    assert "gate decoding" in r.stdout + r.stderr
+    r = subprocess.run(base + ["--run-id", "B_bad1", "--seed", "7", "--set", "reuse.baseline_from=B_src"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "seed: 42 there, 7 here" in r.stdout + r.stderr, r.stdout[-2000:]
+    r = subprocess.run(base + ["--run-id", "B_bad2", "--set", "reuse.baseline_from=B_nowhere"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "is not a run directory" in r.stdout + r.stderr
+    # a field left unset here is compared too (top_k null here, 20 there)
+    r = subprocess.run(base + ["--run-id", "B_bad3", "--set", "reuse.baseline_from=B_src", "--set", "decoding.gate.top_k=null"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    out = r.stdout + r.stderr
+    assert r.returncode != 0 and "cannot reuse M_0's gate scores" in out and "decoding.gate:" in out, out[-2000:]
+    assert "'top_k': 20" in out.split(" there, ")[0], out[-2000:]
+    # another held-out decoding (n 2 here, 4 there): refused
+    r = subprocess.run(base + ["--run-id", "B_bad4", "--set", "reuse.baseline_from=B_src", "--set", "heldout.decoding.n=2"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "cannot reuse M_0's held-out scores" in r.stdout + r.stderr, r.stdout[-2000:]
+    assert not (tmp_path / "B_bad4" / "baseline" / "gate_scores.json").exists()   # checked before anything is copied
+    # data rebuilt since the source scored M_0 (stored processed_sha256 differs): refused
+    import shutil
+    stale = tmp_path / "B_stale"
+    shutil.copytree(src, stale)
+    sp = stale / "baseline" / "gate" / "simple_math_eval" / "summary.json"
+    sj = json.loads(sp.read_text())
+    sj["simple_math_eval"]["data_provenance"]["processed_sha256"] = "0" * 64
+    sp.write_text(json.dumps(sj))
+    r = subprocess.run(base + ["--run-id", "B_bad5", "--set", "reuse.baseline_from=B_stale"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "data rebuilt since" in r.stdout + r.stderr, r.stdout[-2000:] + r.stderr[-2000:]
+    # a source without the grading-code fingerprint (scored before 2026-11-24) needs reuse.trust_unrecorded_code
+    old = tmp_path / "B_old"
+    shutil.copytree(src, old)
+    (old / "baseline" / "eval_code.json").unlink()
+    r = subprocess.run(base + ["--run-id", "B_bad6", "--set", "reuse.baseline_from=B_old"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "reuse.trust_unrecorded_code=true" in r.stdout + r.stderr, r.stdout[-2000:]
+    r = subprocess.run(base + ["--run-id", "B_trust", "--set", "reuse.baseline_from=B_old",
+                               "--set", "reuse.trust_unrecorded_code=true"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    assert json.loads((tmp_path / "B_trust" / "baseline" / "eval_code.json").read_text())["sha256"] is None
+    r = subprocess.run(base + ["--run-id", "B_bad7", "--set", "reuse.baseline_from=B_trust"],   # the flag is inherited
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "reuse.trust_unrecorded_code=true" in r.stdout + r.stderr, r.stdout[-2000:]
+    # gate items never graded there (pending, e.g. code without Docker): refused
+    pend = tmp_path / "B_pending"
+    shutil.copytree(src, pend)
+    sp = pend / "baseline" / "gate" / "simple_math_eval" / "summary.json"
+    sj = json.loads(sp.read_text())
+    sj["simple_math_eval"]["n_pending"] = 5
+    sp.write_text(json.dumps(sj))
+    r = subprocess.run(base + ["--run-id", "B_bad8", "--set", "reuse.baseline_from=B_pending"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode != 0 and "never graded there" in r.stdout + r.stderr, r.stdout[-2000:]
+    # a run that reused can itself be a source (its summary and fingerprint travel with the records)
+    r = subprocess.run(base + ["--run-id", "B_chain2", "--set", "reuse.baseline_from=B_dst"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    # a finished generation 0 never reads the source again: resuming with a source that no longer exists works
+    r = subprocess.run(base + ["--run-id", "B_dst", "--set", "reuse.baseline_from=B_nowhere"],
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]

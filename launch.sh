@@ -5,7 +5,8 @@
 # Usage:
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20|h20_80]
 #               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42]
-#               [--config FILE] [--set KEY=VALUE ...] [--tag NAME] [--dry-run] [--mock] [--skip-checks]
+#               [--config FILE] [--set KEY=VALUE ...] [--tag NAME] [--baseline-from DIR] [--dry-run] [--mock]
+#               [--skip-checks]
 #
 #   --paper     A, B or both (default both)
 #   --domains   all = math,code,knowledge,instruction_following,tool_calling (default all); one run per paper and domain
@@ -38,6 +39,10 @@
 #   --config FILE  experiment config (2026-11-21; repeatable): YAML overrides merged after the hardware profile and
 #               before --set. Hardware stays on --hw, so one file runs on B300 and H20.
 #               Example: plan/configs/run/B_math_r30_nosig.yaml
+#   --baseline-from DIR  generation 0 reads M_0's gate / held-out scores (and Paper A's KL gate reference) from an
+#               earlier run instead of scoring M_0 again: a run directory, its baseline/ folder, or a run id in
+#               experiment_records/ (= --set reuse.baseline_from=DIR; checked, a mismatch stops the run). Runs made
+#               before 2026-11-24 also need --set reuse.trust_unrecorded_code=true
 #   --tag NAME  append _NAME to every run id (letters, digits, - and _), e.g. --tag nosig ->
 #               B_math_s42_single_simple_nosig: a separate run (own locked config) next to the untagged one,
 #               for runs that change --set values of an existing run id.
@@ -83,6 +88,7 @@ while [ $# -gt 0 ]; do
     --hw) need "$@"; HW="$2"; shift ;;
     --set) need "$@"; SETS+=(--set "$2"); shift ;;
     --tag) need "$@"; TAG="$2"; shift ;;
+    --baseline-from) need "$@"; SETS+=(--set "reuse.baseline_from=$2"); shift ;;
     --config) need "$@"; [ -f "$2" ] || { echo "ERROR: --config $2: file not found" >&2; exit 2; }
               CONFIGS+=(--config "$2"); shift ;;
     --model) need "$@"; MODEL="$2"; shift ;;

@@ -73,6 +73,23 @@ gate:                                 # L2: beat the incumbent on the fixed gate
                                       # paired gate gain)
   require_significant: true           # some dataset 95% CI lower bound > 0, none with upper bound < 0
   allow_unscored: false               # true lets a gate with no scored items pass (code w/o Docker)
+  # (2026-11-24) metric: accuracy = the candidate answers the gate items (500 x decoding.gate n samples), paired per
+  # item with the incumbent; kl = nothing is sampled: the candidate reads fixed reference traces (M_0's own answers to
+  # held-back gate items, written once in generation 0: baseline/kl_gate) and the gate is the per-trace token
+  # KL(M_0 || candidate) on the answer positions (top-k, rsicore.kl), paired per trace (gain = KL reduction;
+  # min_delta / require_significant apply to it). The held-out report stays accuracy.
+  metric: accuracy
+  kl:
+    traces: 256                       # gate items with one reference trace each (evenly spaced over the gate set)
+    max_tokens: 8192                  # max answer tokens of a trace (M_0's sampling)
+    top_k: 20                         # logprobs per position (<= the servers' --max-logprobs 20)
+    temperature: 0.6                  # M_0's sampling of the traces (thinking mode, the run's seed)
+    top_p: 0.95
+    sample_top_k: 20
+    max_num_batched_tokens: null      # vLLM --max-num-batched-tokens of every server while the KL gate is on: prompt
+                                      # logprobs are computed for each prefill token of a chunk outside vLLM's memory
+                                      # profile. null = 1024 with hardware h20_80 (0.92 utilization leaves ~6 GB),
+                                      # vLLM's default otherwise. Batching only: not locked
 
 feedback:                             # evaluations are compared with the INCUMBENT on the same items (2026-11-20;
                                       # M_0 is not scored on the items)
@@ -214,6 +231,16 @@ heldout:                              # held-out report = simple_<domain>_test (
     thinking: true
     max_tokens: 16384
   enabled: true                       # false: no held-out report (M_0, Q_0, new incumbents)
+
+reuse:                                # (2026-11-24) generation 0 without sampling M_0 again (rsicore.reuse)
+  baseline_from: null                 # run id in the same runs dir (or a path) of an earlier run with the same model,
+                                      # seed, domain, gate decoding / items and held-out decoding / limit: M_0's gate
+                                      # and held-out scores are copied from it (Paper A or B layout); a mismatch stops
+                                      # the run with the differences. Q_0, calibration texts and the layer cache are
+                                      # still built here. Not locked (it changes no number). null = score M_0 here
+  trust_unrecorded_code: false       # a source scored before 2026-11-24 has no baseline/eval_code.json (the
+                                      # grading-code fingerprint checked on reuse) and is refused; true accepts it when eval/ has
+                                      # not changed since it scored M_0
 
 baselines:                            # (2026-11-23) classic baselines, run ONCE after the generations and scored like
                                       # the method: same budget, gate set (paired with Q_0's records) and held-out set

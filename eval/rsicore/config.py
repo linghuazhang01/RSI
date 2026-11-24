@@ -69,17 +69,21 @@ LOCK_REFUSED_KNOBS = ("search.screen_candidates", "search.gate_every_candidate",
                       "baseline.noise_temperature", "baseline.noise_fixed")
 _REMOVED_LOCK_PATHS = tuple(REMOVED_KNOBS) + REMOVED_BLOCKS
 # baselines (Paper A, 2026-11-23): the classic baselines are report-only (run once after the generations)
+# reuse (2026-11-24): reuse.baseline_from copies M_0's generation-0 scores from a matching earlier run (checked by
+# rsicore.reuse); it changes no number, so a run may be started or resumed with or without it
 LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval", "baselines",
-                      "mock_overrides.baselines") + _REMOVED_LOCK_PATHS + tuple(
+                      "mock_overrides.baselines", "reuse", "mock_overrides.reuse") + _REMOVED_LOCK_PATHS + tuple(
     f"mock_overrides.{p}" for p in _REMOVED_LOCK_PATHS)
 # execution knobs that change only batching, like --gpus, ignored at this dotted path anywhere in the config (top
 # level, under mock_overrides., under hardware_profiles.<name>.): scoring.concurrency (Paper A, 2026-11-23),
 # gpu_layout.gate_split (Paper A, 2026-11-24: GPUs per candidate gate)
-LOCK_IGNORED_SUFFIXES = ("scoring.concurrency", "gpu_layout.gate_split")
+LOCK_IGNORED_SUFFIXES = ("scoring.concurrency", "gpu_layout.gate_split", "gate.kl.max_num_batched_tokens")
 HARDWIRED_FLOW = ("candidates are never screened; every candidate gets one gate evaluation during the search, paired "
                   "vs the current model; the passing candidate with the largest paired gain is accepted; no "
                   "api.evaluate, full / rerun stage, gate submissions after the search, noise band or KL score term")
-LOCK_DEFAULTS = {"simple.screen_n": 500}
+# Paper A KL gate (2026-11-24): runs locked before these keys existed used the accuracy gate
+LOCK_DEFAULTS = {"simple.screen_n": 500, "gate.metric": "accuracy", "gate.kl.traces": 256, "gate.kl.max_tokens": 8192,
+                 "gate.kl.top_k": 20, "gate.kl.temperature": 0.6, "gate.kl.top_p": 0.95, "gate.kl.sample_top_k": 20}
 # --set / --config values of the removed selectors that are accepted as no-ops (the one remaining flow)
 LEGACY_SELECTORS = {"objective": "simple", "scope": "single"}
 

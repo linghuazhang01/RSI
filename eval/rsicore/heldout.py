@@ -75,6 +75,25 @@ def _same_decoding(prev_dec: dict | None, key: dict | None) -> bool:
     return all(prev_dec.get(k) == v for k, v in key.items())
 
 
+def stored_heldout(src: Path, decoding: dict | None, domains, limit) -> dict | None:
+    """The held-out result already stored in `src` (a run_heldout out_dir: summary.json per task) when EVERY task of
+    `domains` is there, complete (no pending items, its jsonl present), with the same decoding (n included) and limit
+    as asked; else None (2026-11-24: reuse instead of sampling the same model again).
+    -> {task: {accuracy, avg_at_n, pass_at_n, ...}} like run_heldout."""
+    src = Path(src)
+    sp = src / "summary.json"
+    summ = json.loads(sp.read_text()) if sp.exists() else {}
+    out = {}
+    for task, _pool in heldout_tasks(domains):
+        prev = summ.get(task)
+        if not isinstance(prev, dict) or prev.get("limit") != limit or prev.get("n_pending") \
+                or not _same_decoding(prev.get("decoding"), decoding_args(decoding, task)["key"]) \
+                or not (src / f"{task}.jsonl").exists():
+            return None
+        out[task] = {k: prev[k] for k in _KEYS if k in prev}
+    return out or None
+
+
 def run_heldout(endpoint, served_name, out_dir: Path, *, domains, lora=None, mock=False, limit=None,
                 decoding: dict | None = None, concurrency: int | None = None) -> dict:
     """endpoint: one URL, or a list of URLs of replicas of the same model (2026-11-20). domains: heldout_domains(cfg).

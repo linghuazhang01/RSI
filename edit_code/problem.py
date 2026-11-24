@@ -115,6 +115,10 @@ class QuantProblem:
         # same decoding.
         from rsicore.config import stage_decoding
         self.decoding = {st: stage_decoding(cfg, st, getattr(rc, "seed", None)) for st in ("screen", "full", "gate")}
+        # (2026-11-24) gate.metric kl: a candidate's gate = per-trace top-k token KL(M_0 || candidate) on the
+        # reference traces of generation 0 (run_dir/baseline/kl_gate), score = -KL; no answers are sampled
+        self.kl_gate = (cfg.get("gate") or {}).get("metric", "accuracy") == "kl"
+        self._kl_items: list | None = None
         self._evals = {}
         for r in read_jsonl(self.out_dir / "evals.jsonl"):
             if r.get("decoding") == self._dec_key(r["stage"]):
@@ -735,7 +739,9 @@ class QuantProblem:
             srv = srvs[0]
             for ds in dsets:
                 ids = self._ids(ds, stage)
-                if reuse:
+                if stage == "gate" and self.kl_gate:
+                    res = SimpleNamespace(records=self._kl_gate_records([s.endpoint for s in srvs], name, ds, edir))
+                elif reuse:
                     edir.mkdir(parents=True, exist_ok=True)
                     (edir / f"{ds}.jsonl").write_text("".join(__import__("json").dumps(r, ensure_ascii=False) + "\n"
                                                               for r in reuse[ds]))
@@ -748,8 +754,9 @@ class QuantProblem:
                                 decoding=dec, concurrency=scoring_concurrency(self.cfg))
                 acc, per, pending = _mean_per_id(res.records)
                 dom = DATASET_DOMAIN.get(ds, ds)
-                p = {"dataset": ds, "score": None if acc is None else round(acc, 4), "n": len(per), "pending": pending}
-                if acc is not None and per:
+                nd = 6 if (stage == "gate" and self.kl_gate) else 4      # KL scores are small numbers
+                p = {"dataset": ds, "score": None if acc is None else round(acc, nd), "n": len(per), "pending": pending}
+                if acc is not None and per and nd == 4:      # (a binomial CI: accuracy only, not the KL gate)
                     se = math.sqrt(max(acc * (1 - acc), 1e-9) / len(per))
                     p["ci"] = [round(max(0.0, acc - 1.96 * se), 4), round(min(1.0, acc + 1.96 * se), 4)]
                 if stage == "gate":
@@ -809,6 +816,31 @@ class QuantProblem:
             self._evals[key] = rec
             append_jsonl(self.out_dir / "evals.jsonl", rec)
         return dict(rec, feedback=dict(fb))
+
+    def kl_items(self) -> list[dict]:
+        """The KL gate's reference traces [{ds, id, text}] (run_dir/baseline/kl_gate/traces.json, generation 0)."""
+        if self._kl_items is None:
+            tr = read_json(self.rc.run_dir / "baseline" / "kl_gate" / "traces.json", None)
+            if not tr:
+                raise RuntimeError("gate.metric kl: no reference traces (baseline/kl_gate/traces.json); generation 0 "
+                                   "writes them")
+            self._kl_items = list(tr["items"])
+        return self._kl_items
+
+    def _kl_gate_records(self, endpoints: list, served: str, ds: str, edir: Path) -> list[dict]:
+        """One KL gate evaluation on dataset ds: per trace {id, score = -KL, kl, n_positions} (jsonl in edir)."""
+        from rsicore.kl import token_kl
+        items = [it for it in self.kl_items() if it["ds"] == ds]
+        r = token_kl(self.rc.run_dir / "baseline" / "kl_gate" / "ref.jsonl", endpoints, served,
+                     [it["text"] for it in items], top_k=int(self.cfg["gate"]["kl"]["top_k"]))
+        recs = [{"id": it["id"], "score": -round(k, 6), "kl": round(k, 6), "n_positions": n}
+                for it, k, n in zip(items, r["per_text"], r["n_positions"])]
+        edir.mkdir(parents=True, exist_ok=True)
+        (edir / f"{ds}.jsonl").write_text("".join(__import__("json").dumps(x) + "\n" for x in recs))
+        write_json(edir / "summary.json", {ds: {"metric": "kl", "mean_kl": round(r["mean"], 6),
+                                                "token_mean_kl": round(r["token_mean"], 6), "n_texts": r["n_texts"],
+                                                "n_tokens": r["n_tokens"], "top_k": r["top_k"]}})
+        return recs
 
     def _gate_decision(self, art: dict, probes: dict) -> tuple[bool, str]:
         """Fixed-size gate: fits the budget AND beats the incumbent on the gate set (paired per item):
@@ -944,7 +976,7 @@ class QuantProblem:
         gains = [p["vs_incumbent"] for p in probes if p.get("vs_incumbent") is not None]
         cis = {p["dataset"]: p.get("delta_ci") for p in probes if p.get("delta_ci") is not None}
         broken, fixed = [], []
-        for p in probes:
+        for p in ([] if self.kl_gate else probes):      # KL gate: no right / wrong items
             inc = ((self.incumbent or {}).get("gate") or {}).get(p["dataset"]) or {}
             if not inc.get("records") or not p.get("records") or not Path(p["records"]).exists() \
                     or not Path(inc["records"]).exists():
@@ -955,13 +987,17 @@ class QuantProblem:
             broken += [i for i in ids if b[i] > 0.5 >= a[i]]
             fixed += [i for i in ids if a[i] > 0.5 >= b[i]]
         rd = lambda v, k=5: None if v is None else round(v, k)  # noqa: E731
-        return {"passed": bool(gi.get("passed")), "reason": gi.get("reason"),
-                "accuracy": rd(sum(accs) / len(accs), 4) if accs else None,
-                "reference_accuracy": rd(sum(refs) / len(refs), 4) if refs else None,
+        out = {"passed": bool(gi.get("passed")), "reason": gi.get("reason"),
+                "accuracy": rd(sum(accs) / len(accs), 6 if self.kl_gate else 4) if accs else None,
+                "reference_accuracy": rd(sum(refs) / len(refs), 6 if self.kl_gate else 4) if refs else None,
                 "gain": rd(sum(gains) / len(gains)) if gains else None,
                 "ci": (next(iter(cis.values())) if len(cis) == 1 else cis) or None,
                 "broken": len(broken), "fixed": len(fixed), "broken_ids": broken[:50], "fixed_ids": fixed[:50],
                 "bytes_gib": art.get("bytes_gib")}
+        if self.kl_gate:                  # score = -KL: report the KL itself (gain = KL reduction)
+            out.update(metric="kl", kl=None if out["accuracy"] is None else rd(-out["accuracy"], 6),
+                       reference_kl=None if out["reference_accuracy"] is None else rd(-out["reference_accuracy"], 6))
+        return out
 
 
 # ---------------------------------------------------------------------------------- data helpers
@@ -978,26 +1014,39 @@ def kl_texts_for(rc, gen: int, datasets_all: list[str], cfg: dict) -> list[tuple
 
 
 def add_self_generated(texts: list[tuple[str, str]], endpoint, served_name: str, cfg: dict,
-                       cache: Path) -> list[tuple[str, str]]:
+                       cache: Path, *, sampling: dict | None = None, max_tokens: int | None = None,
+                       batch: int | None = None) -> list[tuple[str, str]]:
     """prompt + response: append the reference model's own greedy response to each KL / calibration prompt
     (2504.04823: reasoning-style calibration text), so the calibration statistics and the profile table's KL also
     cover the answer tokens. endpoint: a URL or a list of URLs (replicas: the batches are spread over them, 2026-11-20), or a
     callable returning one (called only when some response is not cached yet, so a resume needs no server).
     Requests go in batches of kl.self_generated_batch prompts. Cached as jsonl
     {sha, response, finish_reason}; <|im_end|> is appended only to responses that finished (not cut by
-    kl.self_generated_max_tokens)."""
+    kl.self_generated_max_tokens). sampling (2026-11-24, the KL gate's reference traces): {temperature, top_p, top_k,
+    seed} instead of greedy; max_tokens / batch override the kl block's."""
     import hashlib
     import json
     import urllib.request
     kc = cfg["kl"]
-    have = {r["sha"]: r for r in read_jsonl(cache)}
+    have = {}
+    if Path(cache).exists():                  # tolerant of a torn last line (crash mid-write): that prompt is redone
+        for line in Path(cache).read_text().splitlines():
+            try:
+                r = json.loads(line) if line.strip() else None
+            except json.JSONDecodeError:
+                r = None
+            if r and r.get("sha"):
+                have[r["sha"]] = r
+        if Path(cache).stat().st_size and not Path(cache).read_bytes().endswith(b"\n"):
+            with open(cache, "a") as f:
+                f.write("\n")
     shas = [hashlib.sha256(t.encode()).hexdigest() for _, t in texts]
     todo = [(sha, t) for sha, (_, t) in zip(shas, texts) if sha not in have]
     todo = list(dict(todo).items())                        # one request per distinct prompt
     if todo:
         eps = endpoint() if callable(endpoint) else endpoint
         urls = [e.rstrip("/") + "/completions" for e in (eps if isinstance(eps, (list, tuple)) else [eps])]
-        bs = max(1, int(kc.get("self_generated_batch", 64)))
+        bs = max(1, int(batch or kc.get("self_generated_batch", 64)))
         chunks = [todo[b:b + bs] for b in range(0, len(todo), bs)]
         lock = threading.Lock()
 
@@ -1008,7 +1057,10 @@ def add_self_generated(texts: list[tuple[str, str]], endpoint, served_name: str,
                         return
                     chunk = chunks.pop(0)
                 body = {"model": served_name, "prompt": [t for _, t in chunk], "temperature": 0.0,
-                        "max_tokens": int(kc.get("self_generated_max_tokens", 2048))}
+                        "max_tokens": int(max_tokens or kc.get("self_generated_max_tokens", 2048))}
+                for k_, v_ in (sampling or {}).items():   # sampled reference traces (seeded) instead of greedy
+                    if v_ is not None:
+                        body[k_] = v_
                 req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=7200) as r:
                     resp = json.loads(r.read())

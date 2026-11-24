@@ -272,6 +272,92 @@ class TestMockFlow(unittest.TestCase):
         self.assertIn("unknown", r.stdout + r.stderr)
         self.assertNotIn("[gen 1]", r.stdout)            # refused at startup, before any work
 
+    def test_kl_gate(self):
+        """gate.metric kl (2026-11-24): generation 0 writes M_0's reference traces on held-back gate items and caches
+        its top-k logprobs; M_0 is not sampled on the gate (its KL is 0); Q_0 and every candidate are gated by the
+        per-trace token KL to M_0 (score = -KL, gain = KL reduction, paired per trace); the held-out stays accuracy.
+        A second run reuses the reference (and the held-out) from the first run's baseline/ folder."""
+        base = ["--domain", "math", "--gens", "1", "--set", "gate.metric=kl", "--set", "gate.kl.traces=12",
+                "--set", "heldout.limit=2", "--set", "simple.screen_n=20"]
+        r, _ = run(base + ["--run-id", "A_mock_kl"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        rd = self.runs / "A_mock_kl"
+        kd = rd / "baseline" / "kl_gate"
+        items = json.loads((kd / "traces.json").read_text())["items"]
+        self.assertEqual(len(items), 12)
+        self.assertTrue(all(it["text"].startswith(it["prompt"]) and it["ds"] == "simple_math_eval" for it in items))
+        ref = jl(kd / "ref.jsonl")
+        self.assertEqual(len(ref), 12)
+        self.assertTrue(all(x["n_prompt"] > 0 and len(x["pos"]) > x["n_prompt"] for x in ref))
+        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()), {"simple_math_eval": 0.0})
+        self.assertFalse(list((rd / "baseline").glob("gate/*.jsonl")))       # M_0 not sampled on the gate
+        q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
+        self.assertLess(q0["gate_scores"]["simple_math_eval"], 0)            # score = -KL(M_0 || Q_0)
+        self.assertEqual(len(jl(Path(q0["gate"]["simple_math_eval"]["records"]))), 12)   # one record per trace
+        subs = json.loads((rd / "gen_01" / "gate.json").read_text())["submissions"]
+        evald = [x for x in subs if x["info"].get("metric") == "kl"]
+        self.assertTrue(evald, subs)
+        for x in evald:
+            i = x["info"]
+            self.assertGreaterEqual(i["kl"], 0)
+            self.assertAlmostEqual(i["gain"], i["reference_kl"] - i["kl"], places=4)   # gain = KL reduction
+        from rsicore.chat_tools import _gate_outcomes          # the editor's search_history rows: KL, not accuracy
+        rows = [r for r in _gate_outcomes(rd / "gen_01").values() if r.get("metric") == "kl"]
+        self.assertTrue(rows and all("kl" in r and "accuracy" not in r and "broken" not in r for r in rows), rows)
+        thread = (rd / "gen_01" / "editor" / "thread_0.jsonl").read_text()
+        self.assertIn("KL divergence KL(original || quantized)", thread)    # the editor is told how it is gated
+        self.assertIsNotNone(json.loads((rd / "baseline" / "heldout.json").read_text()))   # held-out: accuracy
+        # the reference traces, their logprobs and the held-out are reused from the first run's baseline/ folder
+        r, _ = run(base + ["--run-id", "A_mock_kl_reuse", "--set", f"reuse.baseline_from={rd / 'baseline'}"],
+                   self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertIn("KL gate reference traces reused from", r.stdout)
+        self.assertIn("M_0 held-out reused from", r.stdout)
+        d2 = self.runs / "A_mock_kl_reuse" / "baseline" / "kl_gate"
+        self.assertEqual((d2 / "ref.jsonl").read_text(), (kd / "ref.jsonl").read_text())
+        q0b = json.loads((self.runs / "A_mock_kl_reuse" / "baseline" / "incumbent.json").read_text())
+        self.assertEqual(q0b["gate_scores"], q0["gate_scores"])              # the same reference: the same Q_0 KL
+        # other gate.kl settings: refused, nothing copied
+        r, _ = run(base + ["--run-id", "A_mock_kl_bad", "--set", "gate.kl.top_k=10",
+                           "--set", "reuse.baseline_from=A_mock_kl"], self.runs)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot reuse M_0's KL gate reference", r.stdout + r.stderr)
+
+    def test_reuse_baseline_from(self):
+        """reuse.baseline_from (2026-11-24): M_0's generation-0 gate and held-out scores copied from an earlier run
+        with the same model / seed / domain / decoding / items (state reused_from, identical files, no M_0 gate
+        scoring parts here); Q_0 is still built and gated here; a mismatch stops the run with the differences."""
+        base = ["--domain", "math", "--gens", "1", "--set", "heldout.limit=2", "--set", "simple.screen_n=20"]
+        r, _ = run(base + ["--run-id", "A_mock_reuse_src"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        r, _ = run(base + ["--run-id", "A_mock_reuse_dst", "--set", "reuse.baseline_from=A_mock_reuse_src"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        src, dst = self.runs / "A_mock_reuse_src", self.runs / "A_mock_reuse_dst"
+        self.assertIn("M_0 gate scores reused from", r.stdout)
+        self.assertIn("M_0 held-out reused from", r.stdout)
+        st = json.loads((dst / "state.json").read_text())
+        self.assertEqual(st["baseline/gate"]["reused_from"], str(src.resolve()))
+        self.assertEqual(st["baseline/heldout"]["reused_from"], str(src.resolve()))
+        for f in ("gate.json", "heldout.json"):
+            self.assertEqual(json.loads((dst / "baseline" / f).read_text()),
+                             json.loads((src / "baseline" / f).read_text()), f)
+        self.assertEqual((dst / "baseline" / "gate" / "simple_math_eval.jsonl").read_text(),
+                         (src / "baseline" / "gate" / "simple_math_eval.jsonl").read_text())
+        self.assertFalse(list((dst / "baseline" / "gate").glob("_part*")))      # M_0 not sampled on the gate here
+        self.assertTrue((dst / "baseline" / "incumbent.json").exists())         # Q_0 still built and gated here
+        r, _ = run(base + ["--run-id", "A_mock_reuse_bad", "--seed", "7",
+                           "--set", "reuse.baseline_from=A_mock_reuse_src"], self.runs)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("seed: 42 there, 7 here", r.stdout + r.stderr)
+        # a run that reused can itself be a source: Paper A's layout keeps the run_eval summary entry and fingerprint
+        r, _ = run(base + ["--run-id", "A_mock_reuse_chain", "--set", "reuse.baseline_from=A_mock_reuse_dst"],
+                   self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertIn("simple_math_eval", json.loads((dst / "baseline" / "gate" / "summary.json").read_text()))
+        # a finished generation 0 never reads the source again: resuming with a missing source works
+        r, _ = run(base + ["--run-id", "A_mock_reuse_dst", "--set", "reuse.baseline_from=A_mock_nowhere"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+
     def test_four_gpus_all_used(self):
         """4 GPUs (2026-11-20): M_0's generation-0 gate scoring split over 4 replicas, the held-out task split over
         the GPU groups, the editor's GPU lent as a 4th candidate slot while it sleeps."""
@@ -537,7 +623,7 @@ class TestEditorConfig(unittest.TestCase):
                                             "quantizers": ["rtn", "gptq", "awq"]})
         base = P.SYSTEM_PROMPT.format(tools="DOC", bits=prob.space["bits"], group_sizes=prob.space["group_sizes"],
                                       quantizers=prob.space["quantizers"], timeout_s=1800,
-                                      screen="the items", gate="the items",
+                                      screen="the items", gate_desc=P.GATE_DESC_ACC.format(gate="the items"),
                                       acceptance=P.acceptance_text({"gate": {"min_delta": 0.005}}))
         cfg = {"gate": {"min_delta": 0.005}}
         self.assertEqual(P.system_prompt(prob, "DOC", dict(cfg, editor={"tool_rounds": 0})), base)

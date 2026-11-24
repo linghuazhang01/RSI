@@ -232,6 +232,15 @@ heldout:                    # simple_<domain>_test (500 items never screened or 
     seed: null
     n_by_task: null
 
+reuse:                      # (2026-11-24) generation 0 without sampling M_0 again (rsicore.reuse)
+  baseline_from: null       # run id in the same runs dir (or a path) of an earlier run with the same model, seed,
+                            # domain, gate decoding / items and held-out decoding / limit: M_0's gate and held-out
+                            # scores are copied from it (Paper A or B layout); a mismatch stops the run with the
+                            # differences. Not locked (it changes no number). null = score M_0 here
+  trust_unrecorded_code: false  # a source scored before 2026-11-24 has no baseline/eval_code.json (the
+                            # grading-code fingerprint checked on reuse) and is refused; true accepts it when eval/ has
+                            # not changed since it scored M_0
+
 merge:
   gpu: true                 # accumulate W + dW on gpu1 (else CPU)
   # (2026-11-22, method.mode scratch) How an accepted LoRA becomes the next model. Code defaults, no live keys here

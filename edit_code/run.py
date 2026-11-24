@@ -60,8 +60,8 @@ from rsicore.state import RunState  # noqa: E402
 from edit_code import mock as M  # noqa: E402
 from edit_code import baselines as BL  # noqa: E402
 from edit_code.common import (candidate_args, candidate_groups, deep_merge, error_line, gpu_layout,  # noqa: E402
-                              program_note, read_json, read_jsonl, scoring_concurrency, search_settings, tail,
-                              write_json)
+                              load_processed, program_note, read_json, read_jsonl, record_text, scoring_concurrency,
+                              search_settings, tail, with_kl_chunk_cap, write_json)
 from edit_code.problem import QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
 from edit_code.prompts import archive_row, archive_text, history_row, make_render_context, system_prompt  # noqa: E402
 from edit_code.quant import schema, sizes  # noqa: E402
@@ -81,7 +81,7 @@ def server_args(cfg: dict, args_key: str) -> list[str]:
     if args_key == "candidate_args":
         return candidate_args(cfg)
     args = list((cfg.get("vllm") or {}).get(args_key) or [])
-    return apply_context_tokens(args, cfg) if args_key == "editor_args" else args
+    return with_kl_chunk_cap(cfg, apply_context_tokens(args, cfg) if args_key == "editor_args" else args)
 
 
 _DEFAULT = object()
@@ -197,7 +197,7 @@ def effective_config(rc, args) -> dict:
 # gate statistics kept per candidate in gen_XX/gate.json (gate per candidate, 2026-11-21; the same keys as
 # rsicore.chat_tools.GATE_STATS, so search_history rows show them)
 GATE_INFO = ("reason", "accuracy", "reference_accuracy", "gain", "ci", "broken", "fixed", "broken_ids", "fixed_ids",
-             "bytes_gib")
+             "bytes_gib", "metric", "kl", "reference_kl")
 
 
 def gate_outcomes(d: Path) -> dict:
@@ -242,6 +242,10 @@ def gate_candidate(prob, art: dict, cid: str, log: GateLog) -> dict:
         g = {"passed": False, "reason": "identical to the incumbent (no change): paired gain +0.0000, not evaluated",
              "accuracy": s, "reference_accuracy": s, "gain": 0.0, "ci": None, "broken": 0, "fixed": 0,
              "broken_ids": [], "fixed_ids": [], "bytes_gib": art["bytes_gib"]}
+        if getattr(prob, "kl_gate", False):    # KL gate: score = -KL, no right / wrong items
+            g = {"passed": False, "reason": "identical to the incumbent (no change): KL reduction +0, not evaluated",
+                 "metric": "kl", "kl": None if s is None else -s, "reference_kl": None if s is None else -s,
+                 "gain": 0.0, "ci": None, "bytes_gib": art["bytes_gib"]}
         log.add(cid, False, g)
         return g
     r = prob.evaluate(art, "gate", cid, origin="gate")
@@ -406,6 +410,30 @@ class Runner:
             for s in extra:                  # the candidate GPUs are needed for candidates next
                 s.close()
 
+    def kl_gate_reference(self, m0: LazyServer, reps: list, kdir: Path) -> int:
+        """gate.metric kl (2026-11-24): M_0 answers gate.kl.traces gate items (evenly spaced, thinking-mode sampling
+        with the run's seed, up to gate.kl.max_tokens answer tokens; cached in kdir/answers.jsonl) and its top-k
+        prompt logprobs on these traces are cached (kdir/ref.jsonl). kdir/traces.json = [{ds, id, prompt, text}]."""
+        from rsicore.kl import reference_logprobs
+        kc = (self.cfg.get("gate") or {}).get("kl") or {}
+        items = []
+        for ds in self.gate_datasets:
+            ids = sorted(D.gate_ids(self.rc, ds))
+            n = min(int(kc.get("traces", 256)), len(ids))
+            pick = [ids[int(i * len(ids) / n)] for i in range(n)] if n else []
+            recs = load_processed(ds, pick)
+            items += [{"ds": ds, "id": i, "prompt": record_text(recs[i], max_chars=10 ** 9)} for i in pick if i in recs]
+        eps = [s.endpoint for s in start_lazy(reps)]
+        texts = add_self_generated([(it["ds"], it["prompt"]) for it in items], eps, m0.name, self.cfg,
+                                   kdir / "answers.jsonl", max_tokens=int(kc.get("max_tokens", 8192)),
+                                   sampling={"temperature": kc.get("temperature"), "top_p": kc.get("top_p"),
+                                             "top_k": kc.get("sample_top_k"), "seed": self.rc.seed})
+        for it, (_d, t) in zip(items, texts):
+            it["text"] = t
+        write_json(kdir / "traces.json", {"items": items, "kl": kc, "seed": self.rc.seed})
+        reference_logprobs(eps, m0.name, items, kdir / "ref.jsonl", top_k=int(kc.get("top_k", 20)))
+        return len(items)
+
     def data_for(self, gen: int) -> dict:
         return {ds: {"screen": D.ids(self.rc, gen, ds, "screen"), "signal": D.ids(self.rc, gen, ds, "signal")}
                 for ds in self.datasets}
@@ -556,11 +584,38 @@ class Runner:
                 D.draw_gen(rc, 0)
         if rc.mock:
             M.save_state(bdir / "mock_model.json", self.source_state())
+        # (2026-11-24) reuse.baseline_from: M_0's gate / held-out scores of an earlier run (same model, seed, domain,
+        # decoding and items; checked, else the run stops) instead of sampling M_0 again (rsicore.reuse)
+        from rsicore import reuse as RU
+        kl_gate = (cfg.get("gate") or {}).get("metric", "accuracy") == "kl"
+        pending = not st.done("baseline/gate") or (self.heldout_enabled and not st.done("baseline/heldout")) \
+            or (kl_gate and not st.done("baseline/kl_gate"))
+        src = RU.baseline_from(rc, cfg) if pending else None     # a finished generation 0 never reads the source
+        if src is not None:                   # every pending step checked before anything is copied
+            RU.preflight(rc, cfg, src,
+                         gate_ids=None if (st.done("baseline/gate") or kl_gate)
+                         else {ds: D.gate_ids(rc, ds) for ds in self.gate_datasets},
+                         heldout_domains=heldout_domains(cfg, rc.domain)
+                         if self.heldout_enabled and not st.done("baseline/heldout") else None,
+                         kl_ref=kl_gate and not st.done("baseline/kl_gate"))
         m0 = self.m0_server()
         reps = self.m0_replicas_for(m0)          # M_0 on every GPU: nothing else runs in generation 0 yet
         try:
             with st.step("baseline/gate") as todo:
-                if todo:
+                if todo and kl_gate:              # KL gate: M_0's own KL is 0 by definition, nothing is sampled
+                    res = {ds: 0.0 for ds in self.gate_datasets}
+                    write_json(bdir / "gate.json", res)
+                    RU.record_code(rc.run_dir, mock=rc.mock)   # the code of this run's generation-0 scores
+                    st.mark("baseline/gate", {"metric": "kl", "scores": res})
+                elif todo and src is not None:
+                    recs = RU.gate_records(rc, cfg, src, {ds: D.gate_ids(rc, ds) for ds in self.gate_datasets},
+                                           lambda ds: bdir / "gate")
+                    res = {ds: _acc(r) for ds, r in recs.items()}
+                    write_json(bdir / "gate.json", res)
+                    RU.record_code(rc.run_dir, src, mock=rc.mock)   # the source fingerprint (chained reuse)
+                    st.mark("baseline/gate", {"reused_from": str(src)})
+                    self.log(f"[baseline] M_0 gate scores reused from {src}", res)
+                elif todo:
                     eps = [s.endpoint for s in start_lazy(reps)]
                     res = {}
                     dec = C.stage_decoding(cfg, "gate", rc.seed)   # the candidates' gate decoding (2026-11-21)
@@ -570,11 +625,29 @@ class Runner:
                                         concurrency=scoring_concurrency(cfg))
                         res[ds] = _acc(r.records)
                     write_json(bdir / "gate.json", res)
+                    RU.record_code(rc.run_dir, mock=rc.mock)   # grading code of these scores
                     self.log("[baseline] M_0 gate scores", res)
             with st.step("baseline/heldout") as todo:
-                if todo and self.heldout_enabled:   # heldout.enabled false: no held-out report
+                if todo and self.heldout_enabled and src is not None:
+                    h = RU.heldout(rc, cfg, src, heldout_domains(cfg, rc.domain), bdir / "heldout")
+                    write_json(bdir / "heldout.json", h)
+                    RU.note_heldout_code(rc.run_dir, src, mock=rc.mock)   # gate scored here, held-out from src
+                    st.mark("baseline/heldout", {"reused_from": str(src)})
+                    self.log(f"[baseline] M_0 held-out reused from {src}")
+                elif todo and self.heldout_enabled:   # heldout.enabled false: no held-out report
                     h = self.heldout_on(reps, bdir / "heldout")
                     write_json(bdir / "heldout.json", h)
+                    RU.note_heldout_code(rc.run_dir, mock=rc.mock)   # other code than the gate -> null
+            with st.step("baseline/kl_gate") as todo:   # the KL gate's reference traces + M_0's logprobs on them
+                if todo and kl_gate and src is not None:
+                    RU.kl_gate(rc, cfg, src, bdir / "kl_gate")
+                    RU.note_heldout_code(rc.run_dir, src, mock=rc.mock)   # other code than this run's -> null
+                    st.mark("baseline/kl_gate", {"reused_from": str(src)})
+                    self.log(f"[baseline] KL gate reference traces reused from {src}")
+                elif todo and kl_gate:
+                    n = self.kl_gate_reference(m0, reps, bdir / "kl_gate")
+                    RU.note_heldout_code(rc.run_dir, mock=rc.mock)   # code changed since the fingerprint -> null
+                    self.log(f"[baseline] KL gate: {n} reference traces written by M_0, its logprobs cached")
             # kl_texts creates its own candidate replicas; release the baseline replicas first.
             for replica in reps[1:]:
                 replica.close()
@@ -1139,20 +1212,9 @@ def _heldout_metrics(h: dict | None, n: int) -> dict:
 
 
 def _reuse_heldout(src: Path, decoding: dict | None, domains, limit) -> dict | None:
-    """The held-out result stored in `src` (a run_heldout out_dir: summary.json per task) when EVERY held-out task
-    of `domains` is there, complete, with the same decoding (n included) and limit as asked; else None.
-    -> {task: {accuracy, avg_at_n, pass_at_n, ...}} like run_heldout."""
-    from rsicore.heldout import _KEYS, _same_decoding, decoding_args, heldout_tasks
-    summ = read_json(Path(src) / "summary.json", None) or {}
-    out = {}
-    for task, _pool in heldout_tasks(domains):
-        prev = summ.get(task)
-        if not isinstance(prev, dict) or prev.get("limit") != limit or prev.get("n_pending") \
-                or not _same_decoding(prev.get("decoding"), decoding_args(decoding, task)["key"]) \
-                or not (Path(src) / f"{task}.jsonl").exists():
-            return None
-        out[task] = {k: prev[k] for k in _KEYS if k in prev}
-    return out or None
+    """rsicore.heldout.stored_heldout (the held-out result stored in `src` when it matches; else None)."""
+    from rsicore.heldout import stored_heldout
+    return stored_heldout(src, decoding, domains, limit)
 
 
 def _acc(records: list[dict]):

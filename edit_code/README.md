@@ -37,6 +37,8 @@
 | 验收集 / 测试集 | `simple_<领域>_eval` / `simple_<领域>_test` | 各 500 道 |
 | 每个任务的最大生成长度（打分解码没写 `max_tokens` 时） | `max_tokens.<任务>`（覆盖 `eval/configs/tasks.yaml`） | dapo_math 4096、taco_verified 4096、ifeval_train 2048、sealtool_train 1024、triviaqa_train 1024 |
 | 留出评测的解码参数 | `heldout.decoding` | thinking 采样 0.6 / 0.95 / top_k 20，16384 token，n 8，种子 = `--seed` |
+| 验收证据：准确率或 KL | `gate.metric`（`accuracy` / `kl`）和 `gate.kl.*` | 默认 `accuracy`：候选在验收集上作答（500 × 4 个样本），和 incumbent 逐题配对。`kl`：不采样。第 0 代 M_0 给 `gate.kl.traces`（默认 256）道验收题各写一条参考答案（thinking 采样，种子 = `--seed`，最长 `gate.kl.max_tokens` 8192 token），并缓存它在这些轨迹上的 top-`gate.kl.top_k`（20）logprob（`baseline/kl_gate/`）；之后 Q_0 和每个候选只读这些轨迹（teacher forcing），验收分数 = 逐条轨迹在答案部分的 token 级 KL(M_0 ‖ 候选) 取负（`rsicore/kl.py`，top-k 近似），和 incumbent 逐条配对，增益 = KL 降低量，`gate.min_delta` / `require_significant` 照常作用。M_0 的验收分数记为 0（不再采样）；留出评测仍是准确率。改动者的提示词按所选指标说明验收方式。`reuse.baseline_from` 也能复用参考轨迹（`gate.kl` 设置相同才行）。进运行锁 |
+| 复用之前运行的第 0 代 M_0 分数 | `reuse.baseline_from` | 空 = 本次自己评。写一个之前运行的 run id（同一 runs 目录）或路径：M_0 在验收集和测试集上的分数直接从那次运行拷过来，不再采样。要求模型路径、种子、领域、验收解码和题目、留出解码和 limit 都一致（按存下的打分记录核对），数据文件哈希、评分包版本和评分代码指纹（`baseline/eval_code.json`）也要一致，不一致就报出差异并停止，不会悄悄重评。Paper A / B 的目录都能读（但两篇默认的留出 n 不同：A 是 8，B 是 4，所以默认配置下跨论文复用会因留出解码不同而被拒绝；所有待复用的步骤都在拷贝之前先检查，不会复用一半才停）。验收题里有没评完的（例如代码题在没有 Docker 的机器上跑）也会被拒绝。2026-11-24 之前跑的运行没有评分代码指纹，会被拒绝；确认 eval/ 之后没改过的话加 `reuse.trust_unrecorded_code=true`。Q_0、校准文本和 layer cache 仍在本次运行里做。不进运行锁 |
 | 校准文本 / 诊断表 / 留出评测 | `calibration.max_texts`、`diagnostics.profile_contexts`、`heldout.limit` | |
 
 噪声带（`noise:` 块、`baseline/noise.json`）2026-11-23 起删除：验收用逐题配对的 CI。

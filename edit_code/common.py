@@ -221,6 +221,18 @@ def role_gpus(rc, cfg: dict, role: str) -> list[int]:
     return gpu_layout(rc, cfg)[0][role]
 
 
+def with_kl_chunk_cap(cfg: dict, args: list[str]) -> list[str]:
+    """(2026-11-24) gate.metric kl: --max-num-batched-tokens gate.kl.max_num_batched_tokens (null = 1024 on hardware
+    h20_80) appended to a server's vLLM args unless they set it; prompt logprobs over long reference traces use memory
+    outside vLLM's profile, proportional to the prefill chunk."""
+    g = cfg.get("gate") or {}
+    if g.get("metric", "accuracy") != "kl" or "--max-num-batched-tokens" in args:
+        return list(args)
+    n = (g.get("kl") or {}).get("max_num_batched_tokens")
+    n = n if n is not None else (1024 if cfg.get("hardware") == "h20_80" else None)
+    return list(args) + (["--max-num-batched-tokens", str(int(n))] if n is not None else [])
+
+
 def candidate_args(cfg: dict) -> list[str]:
     """vLLM args of a candidate server (and of M_0's replicas / exported models on candidate GPUs):
     vllm.candidate_args, with --max-model-len = vllm.candidate_max_model_len when that is set (2026-11-21, base.yaml:
@@ -228,7 +240,7 @@ def candidate_args(cfg: dict) -> list[str]:
     from rsicore.servers import set_max_model_len
     v = cfg.get("vllm") or {}
     n = v.get("candidate_max_model_len")
-    return set_max_model_len(list(v.get("candidate_args") or []), None if n is None else int(n))
+    return with_kl_chunk_cap(cfg, set_max_model_len(list(v.get("candidate_args") or []), None if n is None else int(n)))
 
 
 def scoring_concurrency(cfg: dict) -> int | None:

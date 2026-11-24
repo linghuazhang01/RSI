@@ -43,7 +43,7 @@ Config schema (JSON object):
 - The packed size (codes + fp16 scales + zero points + unquantized parts) must be <= the budget; check with api.bytes(config).
 - profile_table() gives, per group key and bit width, the whole-model KL increase when only that group is RTN-quantized (forward pass on the original model, 64 texts). hessian_table() gives, per group, quantizer (rtn / gptq / awq) and bit width, the Hessian-weighted output error of that group alone (every calibration token, no forward pass): lower noise, local. Sensitivities are roughly additive at >= 3.5 average bits and underestimate damage at 2-3 bits; only a real evaluation measures the real thing.
 - Analysis (free): group_error(config) shows where a config's quantization error concentrates.
-- The incumbent answered this round's screen items ({screen}, held-back TRAINING items; thinking mode): a summary is in your context and api.screen_results / api.screen_output give every item with its prompt, gold answer, extracted answers and the full outputs incl. the thinking, so you can see what the incumbent gets wrong, gets right only sometimes, or truncates. Your returned config is NOT scored on these items: it gets ONE evaluation on the fixed gate set ({gate}), paired per item with the incumbent; its gate result (accuracy, paired gain, CI, passed or not and why, ids of broken / fixed gate items, never their content) is shown to later sessions and rounds. There is no api.evaluate.
+- The incumbent answered this round's screen items ({screen}, held-back TRAINING items; thinking mode): a summary is in your context and api.screen_results / api.screen_output give every item with its prompt, gold answer, extracted answers and the full outputs incl. the thinking, so you can see what the incumbent gets wrong, gets right only sometimes, or truncates. Your returned config is NOT scored on these items: {gate_desc} There is no api.evaluate.
 - {acceptance}
 - In your program `api` exists only as the argument of main(api) (it is not a global there): pass it to helper functions explicitly, e.g. def pick(api, budget): ...
 - Time: your program is killed after {timeout_s} s of wall clock, every tool call included (group_error / hessian_table on settings that are not cached yet quantize on the GPU and take real time). A killed program is a lost candidate.
@@ -84,11 +84,34 @@ def _tool_rounds(cfg: dict) -> tuple[int, bool, bool, int]:
             int(s.get("max_tool_calls") or 0))
 
 
+GATE_DESC_ACC = ("it gets ONE evaluation on the fixed gate set ({gate}), paired per item with the incumbent; its gate "
+                 "result (accuracy, paired gain, CI, passed or not and why, ids of broken / fixed gate items, never their "
+                 "content) is shown to later sessions and rounds.")
+GATE_DESC_KL = ("it gets ONE gate evaluation that samples nothing: the model it quantizes reads {gate} (fixed answers "
+                "written once by the original BF16 model to held-back gate items, never shown to you) and the gate "
+                "measures the token-level KL divergence KL(original || quantized) on every position (top-{k} "
+                "approximation), averaged per trace; lower is closer to the original. Paired per trace with the "
+                "incumbent; gain = the incumbent's KL minus yours (positive = closer to the original). Its gate result "
+                "(KL, the incumbent's KL, gain, CI, passed or not and why) is shown to later sessions and rounds.")
+
+
+def is_kl_gate(cfg: dict) -> bool:
+    return ((cfg or {}).get("gate") or {}).get("metric", "accuracy") == "kl"
+
+
 def acceptance_text(cfg: dict) -> str:
     """The acceptance rule as configured (2026-11-21; gate.min_delta / require_significant), not a fixed text: every
     candidate is gated; the largest passing gain is accepted."""
     g = cfg.get("gate") or {}
     md = float(g.get("min_delta", 0.0))
+    if is_kl_gate(cfg):                  # (2026-11-24) gain = KL reduction vs the incumbent
+        rule = (f"mean KL reduction >= {md:g}" if md > 0 else "a positive mean KL reduction")
+        rule += (", a statistically significant reduction" if g.get("require_significant", True)
+                 else "; there is no significance test")
+        return ("Acceptance (end of the round): a config passes its gate evaluation when size <= budget and its KL to "
+                f"the original model is lower than the incumbent's on the fixed reference traces (paired per trace: "
+                f"{rule}); among the passing configs of the round the one with the LARGEST KL reduction becomes the new "
+                "incumbent. None passes: the incumbent stays.")
     rule = (f"mean gain >= {md:g} ({md * 100:g} accuracy points)" if md > 0
             else "a positive mean gain")       # (2026-11-21) threshold 0: any strictly positive gain
     rule += (", a statistically significant gain and no significant loss on any domain"
@@ -110,7 +133,20 @@ def _sizes(problem) -> dict:
         out["gate_n"] = sum(len(problem._ids(ds, "gate")) for ds in problem.gate_datasets)
     except Exception:  # noqa: BLE001 - informative only
         out["gate_n"] = None
+    if getattr(problem, "kl_gate", False):     # KL gate: the reference traces, one each, nothing sampled
+        try:
+            out["gate_n"], out["gate_k"] = len(problem.kl_items()), 1
+        except Exception:  # noqa: BLE001 - informative only (traces not written yet)
+            out["gate_k"] = 1
     return out
+
+
+def _gate_desc(cfg: dict, sz: dict) -> str:
+    if is_kl_gate(cfg):
+        n = sz.get("gate_n")
+        return GATE_DESC_KL.format(gate=(f"{n} reference traces" if n else "the reference traces"),
+                                   k=int(((cfg.get("gate") or {}).get("kl") or {}).get("top_k", 20)))
+    return GATE_DESC_ACC.format(gate=_items(sz["gate_n"], sz["gate_k"]))
 
 
 def _items(n, k) -> str:
@@ -129,7 +165,7 @@ def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False) -> s
     sz = _sizes(problem)
     text = SYSTEM_PROMPT.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
                                 quantizers=sp["quantizers"], timeout_s=int((cfg.get("sandbox") or {}).get("timeout_s", 1800)),
-                                screen=_items(sz["screen_n"], sz["screen_k"]), gate=_items(sz["gate_n"], sz["gate_k"]),
+                                screen=_items(sz["screen_n"], sz["screen_k"]), gate_desc=_gate_desc(cfg, sz),
                                 acceptance=acceptance_text(cfg))
     rounds, gpu_tools, persistent, calls = _tool_rounds(cfg)
     if rounds > 0:                           # tool_rounds 0: the single-call prompt
@@ -233,15 +269,19 @@ def gate_cell(g: dict | None) -> str:
     ci = g.get("ci")
     ci = f" [{ci[0]:+.4f}, {ci[1]:+.4f}]" if isinstance(ci, list) and len(ci) == 2 and None not in ci else ""
     gain = "-" if g.get("gain") is None else f"{g['gain']:+.4f}"
-    out = f"{'PASSED' if g.get('passed') else 'failed'} gain {gain}{ci}, broken {g.get('broken')} / fixed {g.get('fixed')}"
+    if g.get("metric") == "kl":           # KL gate: gain = KL reduction, no broken / fixed items
+        out = f"{'PASSED' if g.get('passed') else 'failed'} KL reduction {gain}{ci}"
+    else:
+        out = f"{'PASSED' if g.get('passed') else 'failed'} gain {gain}{ci}, broken {g.get('broken')} / fixed {g.get('fixed')}"
     if not g.get("passed") and g.get("reason"):
         out += f" ({str(g['reason']).split(' (')[0][:80]})"
     return out
 
 
-def gate_table(history) -> str:
-    """Candidate table: size and the gate result."""
-    head = "| cid | thread | step | GiB | avg bits | gate accuracy | gain vs incumbent [95% CI] / broken / fixed |"
+def gate_table(history, kl: bool = False) -> str:
+    """Candidate table: size and the gate result (kl: the KL gate's KL and KL reduction)."""
+    head = ("| cid | thread | step | GiB | avg bits | gate KL to original | KL reduction vs incumbent [95% CI] |" if kl
+            else "| cid | thread | step | GiB | avg bits | gate accuracy | gain vs incumbent [95% CI] / broken / fixed |")
     lines = [head, "|" + "---|" * (head.count("|") - 1)]
     for c in history:
         fb = _feedback(c) or {}
@@ -249,7 +289,8 @@ def gate_table(history) -> str:
         g = fb.get("gate") if isinstance(fb.get("gate"), dict) else None
         cell = "error: " + c.error.splitlines()[0][:80] if c.error else gate_cell(g)
         lines.append(f"| {c.cid} | {c.thread} | {c.step} | {_fmt(art.get('bytes_gib'))} | "
-                     f"{_fmt(art.get('linear_avg_bits'), 2)} | {_fmt((g or {}).get('accuracy'), 4)} | {cell} |")
+                     f"{_fmt(art.get('linear_avg_bits'), 2)} | "
+                     f"{_fmt((g or {}).get('kl' if kl else 'accuracy'), 6 if kl else 4)} | {cell} |")
     return "\n".join(lines)
 
 
@@ -286,6 +327,8 @@ def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict |
                 summary_cache["s"] = {"n_items": 0, "error": str(e)[:200]}
         return summary_cache["s"]
 
+    kl = bool(getattr(problem, "kl_gate", False))
+
     def render(history, thread: int) -> str:
         step = sum(1 for c in history if c.thread == thread)
         budget = (f"Budget (fixed for every round): {problem.budget_gib:.3f} GiB packed. "
@@ -306,9 +349,12 @@ def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict |
                                                  "lm_head_tied": info["lm_head_tied"]}))
             inc = problem.incumbent
             if inc:
+                gs = inc.get("gate_scores") or {}
+                what = ("its gate KL to the original model (per dataset, mean over the traces): "
+                        + json.dumps({d: (None if v is None else round(-v, 6)) for d, v in gs.items()})
+                        if kl else "its gate accuracy: " + json.dumps(gs))
                 parts.append(f"Incumbent to beat (accepted in round {inc.get('gen')}, {inc.get('bytes_gib')} GiB, "
-                             f"linear avg bits {inc.get('linear_avg_bits')}); its gate accuracy: "
-                             + json.dumps(inc.get("gate_scores")) + "; config (compressed form): "
+                             f"linear avg bits {inc.get('linear_avg_bits')}); {what}; config (compressed form): "
                              + json.dumps(inc.get("config"))[:3000])
             parts.append("Profile summary (KL increase if only that group is RTN-quantized):\n"
                          + json.dumps(summarize_profile(problem.tables["profile"], top=8))[:4000])
@@ -319,10 +365,15 @@ def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict |
                 parts.append(archive)
         parts.append(screen_summary_text(screen_summary()))
         if history:
-            parts.append("Candidates of this round so far, with their gate results (gain = paired accuracy gain over the "
-                         "incumbent on the gate set; broken / fixed = gate items the incumbent got right and the "
-                         "candidate wrong / the reverse; read_record(cid, 'feedback') has the ids):\n"
-                         + gate_table(history))
+            if kl:
+                parts.append("Candidates of this round so far, with their gate results (KL = mean token KL from the "
+                             "original model on the reference traces, lower is better; KL reduction = the incumbent's KL "
+                             "minus the candidate's, paired per trace):\n" + gate_table(history, kl=True))
+            else:
+                parts.append("Candidates of this round so far, with their gate results (gain = paired accuracy gain over "
+                             "the incumbent on the gate set; broken / fixed = gate items the incumbent got right and the "
+                             "candidate wrong / the reverse; read_record(cid, 'feedback') has the ids):\n"
+                             + gate_table(history))
             ok = [c for c in history if c.score is not None]
             if ok:
                 best = max(ok, key=lambda c: c.score)
@@ -352,8 +403,8 @@ def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict |
 
 ARCHIVE_HEAD = ("Archive of earlier rounds: EVERY candidate tried, one row each, failures included (2026-11-22, as in "
                 "Paper B). config = the config in one line (default setting; overrides grouped by setting: module kind, "
-                "layers L, count x), GiB / avg_bits = its size, gate = its gate result (gain = paired gain in gate accuracy "
-                "vs that round's incumbent, ci = its 95% interval, reason when it failed), error = why it was not built, "
+                "layers L, count x), GiB / avg_bits = its size, gate = its gate result (gain = paired gain in gate "
+                "accuracy, or the KL reduction under the KL gate, vs that round's incumbent, ci = its 95% interval, reason when it failed), error = why it was not built, "
                 "note = its own account of what it tried and why.")
 ARCHIVE_READ = ("Full program or feedback (with the full config) of any candidate above: read_record(cid, 'program' | "
                 "'feedback'); search_history lists them with more statistics. Do not repeat what failed: try something "

@@ -105,6 +105,8 @@ SEARCH_HISTORY_DOC = (
     "Scores are relative to the reference model of their own generation: compare within a generation. "
     "gate = the candidate's gate result (passed, reason and, when the gate scored it, statistics such as the paired "
     "gain, its CI, accuracy and the counts / ids of items broken or fixed; never item content). "
+    "Under a KL gate (metric 'kl'): kl / reference_kl = mean token KL to the original model (lower is closer), "
+    "gain = the KL reduction vs that round's incumbent. "
     "read_record(cid, part) then shows any listed candidate's full program or full feedback.")
 
 FORCED_MARK = "[No more function calls"     # start of the editor's forced-final notice (see editor.py)
@@ -175,7 +177,10 @@ class SearchHistory:
 
 # gate statistics copied from a gate.json submission's info into search_history rows (2026-11-21, gate per candidate:
 # statistics only, never item content; absent keys are skipped, so older gate.json files give passed / reason only)
-GATE_STATS = ("gain", "ci", "accuracy", "reference_accuracy", "broken", "fixed", "broken_ids", "fixed_ids")
+GATE_STATS = ("gain", "ci", "accuracy", "reference_accuracy", "broken", "fixed", "broken_ids", "fixed_ids",
+              "metric", "kl", "reference_kl")
+# Paper A's KL gate (2026-11-24): accuracy fields hold -KL there and broken / fixed do not exist, so they are left out
+_KL_HIDDEN = ("accuracy", "reference_accuracy", "broken", "fixed", "broken_ids", "fixed_ids")
 
 
 def _gate_outcomes(d: Path, cids=None) -> dict:
@@ -191,6 +196,8 @@ def _gate_outcomes(d: Path, cids=None) -> dict:
             why = "; ".join(map(str, why))
         row = {"passed": bool(sub.get("passed")), **({"reason": cut(str(why), 200)} if why else {})}
         for k in GATE_STATS:
+            if info.get("metric") == "kl" and k in _KL_HIDDEN:
+                continue
             if info.get(k) is not None:
                 v = info[k]
                 row[k] = v[:20] if isinstance(v, list) and k.endswith("_ids") else v
