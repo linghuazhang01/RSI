@@ -1,0 +1,36 @@
+# Paper B experiment config (2026-11-24): math · 8 GPUs (H20 110 GB or B300) · 4 x 1 candidates per generation ·
+# self-written LoRAs kept as an adapter (merge.mode adapter: M_g = M_0 + C_g, never merged) · up to 30 tool rounds ·
+# threshold 0 · no significance test · no non-LLM control. Overrides only (merged after base.yaml + domains/math.yaml
+# + the hardware profile from --hw, before any --set).
+#   ./launch.sh --hw h20 --paper B --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/B_math_r30_4x1_adapter.yaml --tag r30_4x1_adapter
+# GPUs (gpu_layout.main_replicas): main = GPUs 0-6 (7 vLLM replicas of M_0, every adapter loaded on all of them;
+#   editor session k on replica k mod 7, so sessions 0-3 each have a replica of their own) | train = GPU 7 (HF model:
+#   SVD / acts / train_loss with the hf backend / diagnostics; the 4 sessions' GPU tool calls queue there).
+# Each generation: the current model (M_0 + C_g) answers the 500 screen items (n 4, split over the 7 replicas); 4
+#   sessions write one LoRA each; each candidate is served as C_g (+) its LoRA (rank-concatenated, SVD-truncated to
+#   merge.adapter_rank_budget) and gated at the same time (500 x 4, split over the 7 replicas); the largest strictly
+#   positive paired gain is accepted and becomes C_{g+1}; then the test set.
+# Memory (H20 planned at 110 GB): adapter mode serves with --max-lora-rank 256 (padded(max(256, rank_cap 64))) and vLLM
+#   reserves max_loras x rank-256 LoRA buffers on every replica [estimate ~3.2 GB per slot from ~0.8 GB per rank-64
+#   slot]. max_loras 6 (C_g + 4 candidates + 1 spare; the evaluator keeps at most max_loras - 2 = 4 candidate adapters
+#   loaded) leaves ~30 GB KV per replica instead of ~25 GB with 8 slots. Check the vLLM startup log ("# GPU blocks" /
+#   KV cache size) in the smoke run.
+method:
+  mode: scratch                   # build LoRAs from zero (no training)
+merge:
+  mode: adapter                   # an accepted LoRA joins the cumulative adapter C_g on M_0 (no merge, no restart)
+search:
+  threads: 4                      # 4 independent sessions per generation ...
+  steps: 1                        # ... of one candidate each
+  max_candidates: 4
+server:
+  max_loras: 6
+editor:
+  tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
+  turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
+  max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)
+gate:
+  min_gain: 0.0                   # accept the candidate with the largest strictly positive paired gate gain
+  require_significant: false      # no 95% CI requirement
+nonllm:
+  enabled: false                  # no random-construction control branch
