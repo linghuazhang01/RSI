@@ -208,7 +208,8 @@ heldout:                              # held-out report = simple_<domain>_test (
     top_p: 0.95
     top_k: 20
     seed: null                        # null = the run's --seed (one experiment seed for everything)
-    n: 4                              # samples per item (accuracy = avg@n)
+    n: 8                              # samples per item (accuracy = avg@n). 8 = baselines.heldout_n (2026-11-24), so
+                                      # the end-of-run comparison rows (M_0, Q_0, final incumbent) reuse these runs
     n_by_task: null                   # {task: n} overrides n per task
     thinking: true
     max_tokens: 16384
@@ -222,8 +223,10 @@ baselines:                            # (2026-11-23) classic baselines, run ONCE
                                       # always reported); all five: about 5 gate + held-out runs and the search
   keep_models: true                   # keep each baseline's fake-quant checkpoint (baselines/<method>/model, ~54 GB)
   heldout_n: 8                        # held-out samples per item for the baselines AND their comparison rows (M_0, Q_0,
-                                      # the final incumbent, re-evaluated with this n): avg@8 and pass@8. null = the
-                                      # heldout.decoding n. Another value on a resume adds a new held-out run
+                                      # the final incumbent): avg@8 and pass@8. null = the heldout.decoding n. The
+                                      # comparison rows reuse the generations' held-out runs when heldout.decoding has
+                                      # this n (2026-11-24); another n samples them again. Another value on a resume
+                                      # adds a new held-out run
   evopress:                           # EvoPress-style search (KL to M_0 on the calibration contexts, one HF model per GPU)
     generations: 40
     offspring: 16                     # children per generation, scored on a quarter of the contexts

@@ -74,8 +74,10 @@ def test_simple_profile_resolution(tmp_path):
     assert stage_decoding(cfg, "full", 42) == dict(THINK, n=4, seed=42)                      # full = screen
     assert stage_decoding(cfg, "gate", 42) == dict(THINK, n=4, seed=42)
     hd = cfg["heldout"]["decoding"]
+    # held-out n 8 (2026-11-24) = baselines.heldout_n, so the end-of-run comparison rows reuse the generations' runs
     assert {k: hd[k] for k in ("temperature", "top_p", "top_k", "thinking", "max_tokens", "n", "seed")} == \
-        dict(THINK, n=4, seed=42)
+        dict(THINK, n=8, seed=42)
+    assert cfg["baselines"]["heldout_n"] == hd["n"]
     assert not hd.get("n_by_task") and cfg["heldout"]["enabled"] is True
     assert "data_roles" not in cfg and cfg["editor"]["tool_rounds"] == 20
     assert _mml(server_args(cfg, "candidate_args")) == 32768

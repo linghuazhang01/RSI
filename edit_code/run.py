@@ -781,11 +781,22 @@ class Runner:
         if last["gen"] > 0:
             todo.append((f"final_g{last['gen']:02d}", Path(last["model_dir"])))
         dec = self.baseline_heldout_decoding(n)
+        # (2026-11-24) the generations already scored these three models on the held-out set (baseline/heldout,
+        # baseline/q0/heldout, gen_XX/heldout): reuse that run when it has the same decoding (n included) and limit
+        # instead of sampling the same model again
+        earlier = {"m0": self.run_dir / "baseline" / "heldout", "q0": self.run_dir / "baseline" / "q0" / "heldout"}
+        if last["gen"] > 0:
+            earlier[f"final_g{last['gen']:02d}"] = self.run_dir / f"gen_{last['gen']:02d}" / "heldout"
         for name, mdir in todo:
             with self.st.step(f"baselines/ref_{name}/heldout_n{n}") as go:
                 if go:
                     hdir = bdir / "reference" / name / f"heldout_n{n}"
-                    if mdir is None:              # M_0 on every GPU group (the editor GPU + one replica per slot)
+                    h = _reuse_heldout(earlier[name], dec, heldout_domains(self.cfg, rc.domain),
+                                       self.cfg["heldout"].get("limit"))
+                    if h is not None:
+                        self.log(f"[baselines] {name}: held-out n {n} reused from "
+                                 f"{earlier[name].relative_to(self.run_dir)}")
+                    elif mdir is None:            # M_0 on every GPU group (the editor GPU + one replica per slot)
                         m0 = self.m0_server()
                         reps = self.m0_replicas_for(m0)
                         try:
@@ -1125,6 +1136,23 @@ def _heldout_metrics(h: dict | None, n: int) -> dict:
     avg = mean("avg_at_n")
     return {"heldout_n": n, "heldout_avg_at_n": avg if avg is not None else mean("accuracy"),
             "heldout_pass_at_n": mean("pass_at_n")}
+
+
+def _reuse_heldout(src: Path, decoding: dict | None, domains, limit) -> dict | None:
+    """The held-out result stored in `src` (a run_heldout out_dir: summary.json per task) when EVERY held-out task
+    of `domains` is there, complete, with the same decoding (n included) and limit as asked; else None.
+    -> {task: {accuracy, avg_at_n, pass_at_n, ...}} like run_heldout."""
+    from rsicore.heldout import _KEYS, _same_decoding, decoding_args, heldout_tasks
+    summ = read_json(Path(src) / "summary.json", None) or {}
+    out = {}
+    for task, _pool in heldout_tasks(domains):
+        prev = summ.get(task)
+        if not isinstance(prev, dict) or prev.get("limit") != limit or prev.get("n_pending") \
+                or not _same_decoding(prev.get("decoding"), decoding_args(decoding, task)["key"]) \
+                or not (Path(src) / f"{task}.jsonl").exists():
+            return None
+        out[task] = {k: prev[k] for k in _KEYS if k in prev}
+    return out or None
 
 
 def _acc(records: list[dict]):

@@ -13,14 +13,14 @@
 只有一种流程（原来的 `objective: simple` + `scope: single`；`objective`、`scope`、`data_roles`、`eval_target`、E_t、`--domain all` 等都已删除）。配置直接写在 `configs/base.yaml` 顶层。`--set objective=simple` / `--set scope=single` 仍然接受，但不起作用；运行名默认仍是 `A_<领域>_s<种子>_single_simple`。之前的 `*_single_simple` 运行用同一条命令可以续跑：锁定比较时会忽略已删除的键（`rsicore.config.lock_view`）。
 
 - **数据**：用 `simple_data/<领域>/`（`data/scripts/make_simple_data.py`，从去污染、去重后的训练集池子里抽）。训练角色 = `simple_<领域>_pool`，即整个干净池子减去验收题和测试题。**每代重新抽** `simple.screen_n`（默认 500）道当快速筛（只给 incumbent 答，候选不跑）。抽题种子只含 `--seed`、领域和轮次（`rsicore.draws`），所以 Paper A 第 g 代和 Paper B 第 g-1 代抽到同一批题。校准文本 = 池子里另外 400 道（kl 角色，只用第 0 代那批）加上 M_0 的回答。各代的快速筛可以重叠，题号写在 `draws/gen_XX/ids/`。验收 = `simple_<领域>_eval` 的 500 道（照常的配对验收，与 incumbent 比）；**留出评测 = `simple_<领域>_test` 的另外 500 道**（`rsicore.heldout.heldout_domains`）。
-- **打分解码**：快速筛、验收、留出评测全部用 Qwen3 thinking 采样（temperature 0.6 / top_p 0.95 / top_k 20，max_tokens 16384，种子 = 运行的 `--seed`）。三者都是 n 4，每题分数 = 4 次的平均（avg@4）。incumbent、Q_0、M_0 的验收基线和所有候选用完全相同的解码和种子。候选服务的 `--max-model-len` 提到 32768（`vllm.candidate_max_model_len`），保证 prompt + 16384 放得下。
+- **打分解码**：快速筛、验收、留出评测全部用 Qwen3 thinking 采样（temperature 0.6 / top_p 0.95 / top_k 20，max_tokens 16384，种子 = 运行的 `--seed`）。快速筛和验收是 n 4（每题分数 = 4 次的平均，avg@4），留出评测是 n 8（avg@8，和 baselines.heldout_n 相同，所以跑完后 M_0 / Q_0 / 最终 incumbent 的对比行直接复用各代已有的留出结果，不再重新采样）。incumbent、Q_0、M_0 的验收基线和所有候选用完全相同的解码和种子。候选服务的 `--max-model-len` 提到 32768（`vllm.candidate_max_model_len`），保证 prompt + 16384 放得下。
 - **每代流程（2026-11-21；2026-11-23 起写死在代码里，没有开关）**：
   - 每代先让**最新模型（incumbent）**回答本代的快速筛题一次（n 4，所有线程 / 步共用）。**候选从不跑快速筛**。
   - 改造者在每步上下文里看到 incumbent 快速筛的摘要：avg@4、每题答对次数分布、截断率、几道失败题的题目 / 标准答案 / 抽取答案。程序和 run_python 里还有只读工具查看全部数据：`api.screen_results(ids, filter='all'|'wrong'|'unstable'|'right', limit, offset, gen)` 和 `api.screen_output(id, sample, offset, gen)`（整段输出，含 thinking，分页）。
   - **没有 `api.evaluate`**，也没有评测预算和 `compare`（候选没有快速筛记录可比）。
   - 每个候选建好后做**一次验收评测**（500 题 × 4 次，和 incumbent 的验收记录逐题配对、同一种子）。超出预算的配置不评测，直接拒绝。
   - 结果按候选写进 `gen_XX/gate.json`（submissions 列表，每个候选一条：准确率、配对增益、CI、是否通过 / 原因、broken / fixed 个数和题号，不含题目内容）。后面的步和后面的代都能看到这些结果：候选表、自己的反馈、`search_history`、`read_record`、存档。存档里还有往期 incumbent 的快速筛摘要，`screen_results(gen=k)` 可读往期数据。
-  - 一代结束时，在通过验收规则（尺寸、`gate.min_delta`、`require_significant` 时的 CI）的候选里接受**增益最大**的那个（平分时 cid 靠前者）；都不通过就保持。然后新 incumbent 跑测试集（500 × 4，唯一无偏的数字）。
+  - 一代结束时，在通过验收规则（尺寸、`gate.min_delta`、`require_significant` 时的 CI）的候选里接受**增益最大**的那个（平分时 cid 靠前者）；都不通过就保持。然后新 incumbent 跑测试集（500 × 8，唯一无偏的数字）。
   - 代价：每代 线程 × 步 × 500 × 4 个 thinking 采样花在验收集上。
   - **已删除（2026-11-23）**：`search.screen_candidates / gate_every_candidate / charge_screens / program_evaluate_calls / program_evaluate_total / max_evaluate / top_full / rerun_seeds / kl_weight`、`gate.max_submissions`、`kl.eval_texts`、`kl.top_k`、`tools.compare`、整个 `noise:` 块，以及它们背后的代码（候选快速筛、`api.evaluate` 和评测预算、`compare`、完整评测重排、搜索后按排名交验收、噪声带、每个候选的 KL 和 M_0 的参考 logprob）。`--set` / `--config` 给这些键会报错；给的正好是写死的值（如 `search.screen_candidates=false`、`noise.temperature=0`）时当作空操作。锁定比较忽略这些键，所以之前的 `*_single_simple` 运行用同一条命令续跑；锁里用过别的值（如 `screen_candidates: true`、`kl_weight > 0`、`noise.temperature > 0`）的运行不能续跑。
 - **搜索**：8 个线程 × 1 步（`search.threads` / `search.steps` 都可配置，提示词用配置的数字）。1 步时提示"你是本轮 N 个会话中的第 k 个、彼此独立"，并让它用 `search_history` / 存档避开往期思路；多步时保留"改进本线程最好的配置"。
@@ -36,14 +36,14 @@
 | 校准文本数（第 0 代） | （`rsicore.draws.KL_N`，固定） | 400 |
 | 验收集 / 测试集 | `simple_<领域>_eval` / `simple_<领域>_test` | 各 500 道 |
 | 每个任务的最大生成长度（打分解码没写 `max_tokens` 时） | `max_tokens.<任务>`（覆盖 `eval/configs/tasks.yaml`） | dapo_math 4096、taco_verified 4096、ifeval_train 2048、sealtool_train 1024、triviaqa_train 1024 |
-| 留出评测的解码参数 | `heldout.decoding` | thinking 采样 0.6 / 0.95 / top_k 20，16384 token，n 4，种子 = `--seed` |
+| 留出评测的解码参数 | `heldout.decoding` | thinking 采样 0.6 / 0.95 / top_k 20，16384 token，n 8，种子 = `--seed` |
 | 校准文本 / 诊断表 / 留出评测 | `calibration.max_texts`、`diagnostics.profile_contexts`、`heldout.limit` | |
 
 噪声带（`noise:` 块、`baseline/noise.json`）2026-11-23 起删除：验收用逐题配对的 CI。
 
 ## 经典基线（2026-11-23）
 
-`baselines.methods` 里的方法在所有代跑完之后**各跑一次**，评法和本方法完全一样：同一个体积上限；在同一个验收集上评测（500 × 4，同样的解码和种子，和 Q_0 存下的逐题记录配对，分到所有卡上）；在测试集上做留出评测，每题 `baselines.heldout_n` 个样本（默认 8），报告 **avg@8 和 pass@8**。对照行 M_0、Q_0（= 统一 GPTQ）和最终 incumbent 也用同样的 n 重新做一次留出评测（`baselines/reference.json`），所以表里每一行可以直接比。结果在 `run_dir/baselines/<方法>.json`、`baselines/summary.json` 和 `summary.json` 的 `final.baselines`（每行：验收均分、相对 Q_0 的增益和 CI、gap closed、`heldout_avg_at_n`、`heldout_pass_at_n`、大小）。本方法那一行的验收均分是挑选候选时的那次评测，偏高，比较时看留出。
+`baselines.methods` 里的方法在所有代跑完之后**各跑一次**，评法和本方法完全一样：同一个体积上限；在同一个验收集上评测（500 × 4，同样的解码和种子，和 Q_0 存下的逐题记录配对，分到所有卡上）；在测试集上做留出评测，每题 `baselines.heldout_n` 个样本（默认 8），报告 **avg@8 和 pass@8**。对照行 M_0、Q_0（= 统一 GPTQ）和最终 incumbent 也用同样的 n 报告留出结果（`baselines/reference.json`）：`heldout.decoding` 的 n 和它相同时（默认都是 8）直接复用各代已经跑过的留出结果，不再重新采样；n 不同才重新评测。所以表里每一行可以直接比。结果在 `run_dir/baselines/<方法>.json`、`baselines/summary.json` 和 `summary.json` 的 `final.baselines`（每行：验收均分、相对 Q_0 的增益和 CI、gap closed、`heldout_avg_at_n`、`heldout_pass_at_n`、大小）。本方法那一行的验收均分是挑选候选时的那次评测，偏高，比较时看留出。
 
 | 方法 | 做法 |
 |---|---|

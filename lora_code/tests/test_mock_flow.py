@@ -49,6 +49,34 @@ def _ws(tmp_path, budget=None, mode="scratch", raw=None):
     return ws
 
 
+def _check_parent_gate_reuse(run: Path, gens: int, on_m0: bool) -> None:
+    """(2026-11-24) the current model's gate records come from an earlier scoring of the same model when there is
+    one: generation 0 = the baseline's M_0 gate; after a kept generation = the previous parent's records; after an
+    accepted one = the accepted candidate's records when M_{g+1} is served exactly as gated (mode=edit, merge.mode
+    adapter); a merged model is scored again."""
+    for g in range(gens):
+        gd = run / f"gen_{g:02d}"
+        gat = [p for p in (gd / "evals" / "__parent__").iterdir() if p.name.startswith("gate")]
+        assert len(gat) == 1, gat
+        pg = json.loads((gat[0] / "simple_math_eval.json").read_text())
+        assert json.loads((gd / "parent_gate.json").read_text())["simple_math_eval"] == pg["score"]
+        assert (gat[0] / "simple_math_eval_raw" / "simple_math_eval.jsonl").exists() or pg.get("adopted_from") is None
+        src = pg.get("adopted_from")
+        if g == 0:
+            assert src and "baseline/gate/simple_math_eval" in src, src
+            continue
+        acc = json.loads((run / f"gen_{g - 1:02d}" / "accepted.json").read_text())
+        if acc["source"] == "keep" or not acc.get("name"):
+            assert src and f"gen_{g - 1:02d}/evals/__parent__/" in src, (g, src)
+        elif on_m0:
+            assert src and f"gen_{g - 1:02d}/evals/{acc['name']}/" in src, (g, src)
+            prev = json.loads((run / f"gen_{g - 1:02d}" / "evals" / acc["name"] / gat[0].name
+                               / "simple_math_eval.json").read_text())
+            assert prev["score"] == pg["score"] and prev["records"] == pg["records"]
+        else:
+            assert src is None, (g, src)                      # a merged model is new weights: scored again
+
+
 def test_mode_tool_surface(tmp_path):
     from lora_code.mock import MockStore, m_sgd
     from lora_code.prompts import system_prompt
@@ -355,6 +383,7 @@ def test_mock_edit_chain_trains_once(tmp_path):
             assert model["lora"] == s["accepted"]["name"]                           # replaced by the accepted one
         prev = model["lora"]
     assert len({json.loads((run / f"gen_{g:02d}" / "model.json").read_text())["path"] for g in range(3)}) == 1
+    _check_parent_gate_reuse(run, 3, on_m0=True)
 
 
 def test_mock_scratch_adapter(tmp_path):
@@ -398,6 +427,7 @@ def test_mock_scratch_adapter(tmp_path):
         prev = model["lora"]
     assert accepted >= 1, "no generation accepted a candidate; the adapter path was not exercised"
     assert len({json.loads((run / f"gen_{g:02d}" / "model.json").read_text())["path"] for g in range(3)}) == 1
+    _check_parent_gate_reuse(run, 3, on_m0=True)
 
 
 def test_mock_simple_flow(tmp_path):
@@ -433,6 +463,8 @@ def test_mock_simple_flow(tmp_path):
     assert len(scr) == 1 and len(gat) == 1 and "screen" not in par and "gate" not in par, par
     pg = json.loads((gd / "evals" / "__parent__" / gat[0] / "simple_math_eval.json").read_text())
     assert pg["decoding"]["n"] == 4 and pg["decoding"]["thinking"] and all(x["ns"] == 4 for x in pg["records"])
+    _check_parent_gate_reuse(run, 1, on_m0=False)                   # gen 0: M_0's baseline gate, not sampled again
+    assert "gen 0: current model's gate records reused from baseline/gate" in r.stdout
     ps = json.loads((gd / "evals" / "__parent__" / scr[0] / "simple_math_pool.json").read_text())
     assert ps["decoding"]["n"] == 4 and ps["n"] == 20
     assert len(list((gd / "evals" / "__parent__" / scr[0] / "simple_math_pool_raw").glob("_part*"))) == 3

@@ -734,7 +734,7 @@ class Run:
                 ranked = rank_fn(load_candidates(rc, g).values())
             ev, ws = ctx_objects()
             learned = (st.get("learned") or {}).get("scores", {})
-            ref = self.gate_reference(gd, ev)
+            ref = self.gate_reference(gd, ev, g)
             fallback = "keep" if edit_later else self.gate_fallback
             # every candidate was gate-evaluated during the search (the only flow): the largest passing paired gain
             acc = self.accept_best_gate(gd, ranked)
@@ -1045,7 +1045,7 @@ class Run:
         # evaluation (decoding.gate) paired vs the current model, whose gate records are computed once per generation
         # (gate_reference); the result is recorded in gen_XX/gate.json at once, so later steps / generations see it.
         # It is inner_search's screen_fn: score = the paired gain.
-        gref = self.gate_reference(gd, ev)
+        gref = self.gate_reference(gd, ev, g)
         learned = (self.st.get("learned") or {}).get("scores", {})
 
         def screen(art, cid):
@@ -1187,15 +1187,40 @@ class Run:
         return by[best["cid"]] if best else None
 
     # ------------------------------------------------------------------ gate
-    def gate_reference(self, gd, ev) -> dict:
+    def gate_reference(self, gd, ev, g: int) -> dict:
         """Reference of the gate: always the current model (2026-11-23; mode=edit after generation 0: M_0 + the
         current LoRA): {"kind": "parent", "scores": {dataset: gate score}}. The parent's gate scores are computed once
-        per generation."""
+        per generation, or (2026-11-24) taken from an earlier scoring of the same model (parent_gate_source), so the
+        gate set is not sampled again for a model that was already scored on it."""
         pg = read_json(gd / "parent_gate.json")
         if pg is None:
+            src = self.parent_gate_source(g)
+            if src is not None and ev.adopt_parent("gate", src[1], layout=src[0]):
+                print(f"[lora_code] gen {g}: current model's gate records reused from "
+                      f"{src[1].relative_to(self.rc.run_dir)}", flush=True)
             pg = {ds: r["score"] for ds, r in ev.run(None, "gate").items()}
             write_json(gd / "parent_gate.json", pg)
         return {"kind": "parent", "scores": pg}
+
+    def parent_gate_source(self, g: int) -> tuple[str, Path] | None:
+        """(layout, dir) of an earlier gate scoring of M_g, the same model on the same gate items with the same
+        decoding (2026-11-24), for Evaluator.adopt_parent; None = score it:
+        - g = 0: M_g = M_0, scored by the baseline (baseline/gate);
+        - generation g-1 kept its model (no LoRA accepted): M_g = M_{g-1}, its parent's records;
+        - generation g-1 accepted a LoRA and M_g is served exactly as the gate scored it: mode=edit (M_0 + the
+          accepted LoRA) and merge.mode adapter (C_g (+) delta, rebuilt by the same composition): that candidate's
+          records. A merged model (merge.mode merge, weights mode) is new weights files whose numerics differ from
+          the adapter the gate scored, so it is scored again."""
+        if g == 0:
+            return "baseline", self.rc.run_dir / "baseline" / "gate"
+        prev = read_json(self.gdir(g - 1) / "accepted.json")
+        if not prev:
+            return None
+        if prev.get("source") == "keep" or not prev.get("name"):
+            return "cache", self.gdir(g - 1) / "evals" / "__parent__"
+        if self.on_m0:
+            return "cache", self.gdir(g - 1) / "evals" / str(prev["name"])
+        return None
 
     def gate_check(self, ev, ws, lo, ref, learned) -> tuple[bool, dict]:
         """ref = gate_reference(...): paired per item on the gate set vs the current model (2026-11-20, like Paper A):

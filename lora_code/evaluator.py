@@ -325,6 +325,53 @@ class Evaluator:
             res[ds] = got
         return res
 
+    def adopt_parent(self, level: str, src: Path, *, layout: str = "cache") -> bool:
+        """Seed the current model's `level` results from an earlier scoring of the SAME model (2026-11-24), so the
+        parent is not sampled again: layout "cache" = another Evaluator's evals/<key> dir (a previous generation's
+        __parent__ or the accepted candidate's), "baseline" = Runner.baseline's gate dir (<src>/<ds>/<ds>.jsonl, M_0
+        with the gate decoding). Taken only when every dataset of `level` is there with exactly this level's items
+        (and, for "cache", the same decoding, which the level directory's tag also encodes); otherwise nothing is
+        written and run() scores the parent as before. -> True when the cache now holds every dataset."""
+        import shutil
+        key, src, dec = "__parent__", Path(src), self.level_decoding(level)
+        plan = []
+        for ds, ids in sorted(self.ids.get(level, {}).items()):
+            lv = self._cache_level(level, ds, ids)
+            dst = self.out_dir / "evals" / key / lv
+            if read_json(dst / f"{ds}.json") is not None:
+                continue
+            if layout == "cache":
+                got = read_json(src / lv / f"{ds}.json")
+                raw = src / lv / f"{ds}_raw"
+                if got is None or got.get("decoding") != (dict(dec) if dec is not None else None):
+                    return False
+            else:
+                raw = src / ds / f"{ds}.jsonl"
+                if not raw.exists():
+                    return False
+                recs = [_compact(json.loads(x)) for x in raw.read_text().splitlines() if x.strip()]
+                summ = read_json(src / ds / "summary.json") or {}
+                scored = [r["score"] for r in recs if r["score"] is not None]
+                m, ci = mean_ci(scored, seed=self.rc.seed)
+                got = {"score": m, "ci": ci, "n": len(recs), "n_scored": len(scored), "records": recs,
+                       "status": summ.get("status") if isinstance(summ, dict) else None}
+                if dec is not None:
+                    got["decoding"] = dict(dec)
+            if sorted(str(r.get("id")) for r in got.get("records") or []) != sorted(str(i) for i in ids):
+                return False
+            plan.append((ds, lv, dst, got, raw))
+        for ds, lv, dst, got, raw in plan:
+            with self._key_lock(key, lv):
+                if read_json(dst / f"{ds}.json") is not None:
+                    continue
+                if raw.is_dir():
+                    shutil.copytree(raw, dst / f"{ds}_raw", dirs_exist_ok=True)
+                elif raw.exists():
+                    (dst / f"{ds}_raw").mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(raw, dst / f"{ds}_raw" / f"{ds}.jsonl")
+                write_json(dst / f"{ds}.json", dict(got, adopted_from=str(raw)))
+        return self.cached(None, level) is not None
+
     # ------------------------------------------------------------------ comparisons
     def _paired(self, cand: list[dict], ref: list[dict]) -> dict:
         """delta = candidate − reference, paired by item id (rsicore.paired_delta(a=ref, b=cand))."""

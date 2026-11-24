@@ -214,6 +214,15 @@ class TestMockFlow(unittest.TestCase):
         r, _ = run(on, self.runs)                       # the lock ignores the baselines block
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         self.assertEqual((rd / "gen_01" / "accepted.json").read_text(), acc0)
+        # (2026-11-24) heldout.decoding n = baselines.heldout_n = 8: M_0, Q_0 and the final incumbent reuse the
+        # generations' held-out runs instead of sampling the same models again
+        last = json.loads((rd / "gen_01" / "incumbent.json").read_text())
+        for name in ("m0", "q0") + ((f"final_g{last['gen']:02d}",) if last["gen"] > 0 else ()):
+            self.assertIn(f"[baselines] {name}: held-out n 8 reused from", r.stdout, name)
+            self.assertFalse((rd / "baselines" / "reference" / name).exists(), name)
+        reused = json.loads((rd / "baselines" / "reference.json").read_text())
+        self.assertEqual(reused["m0"]["8"], json.loads((rd / "baseline" / "heldout.json").read_text()))
+        self.assertEqual(reused["q0"]["8"], json.loads((rd / "baseline" / "q0" / "heldout.json").read_text()))
         summ = json.loads((rd / "baselines" / "summary.json").read_text())
         refrows = {"uniform_gptq (Q_0)", "M_0 (BF16)"}
         self.assertEqual(set(summ) - {k for k in summ if k.startswith("method (final incumbent")}, set(methods) | refrows)
