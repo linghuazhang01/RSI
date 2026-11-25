@@ -5,7 +5,7 @@
 Covers: RunState resume, ToolAPI budgets (fixed, measured cost_fn, dedupe), sandbox (tool round trip, timeout kill, budget exceeded,
 error propagation, environment isolation, file/subprocess/network denial), Editor with mock_policy
 (transcript + replay), inner_search with toy functions (resume, out_dir), the per-generation draws
-of simple_<d>_pool in a temp run dir, evaluate.score / paired_delta / run_heldout (simple_<d>_test) and the mock
+of simple_<d>_pool in a temp run dir, evaluate.score / paired_delta and the mock
 server's prompt_logprobs (Paper B's train_loss) against the mock server, per-domain mock quality (target up, other
 domain down), sampled mock answers depending on the seed, gate helpers, and the end-to-end toy paper (twice: the
 second run must skip everything).
@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "eval"))
 
-from rsicore import config, draws, editor, evaluate, gate, heldout, records, sandbox, search, servers, state  # noqa: E402
+from rsicore import config, draws, editor, evaluate, gate, records, sandbox, search, servers, state  # noqa: E402
 
 TMP = Path(tempfile.mkdtemp(prefix="rsicore_test_"))
 RESULTS = []
@@ -299,19 +299,9 @@ def test_evaluate_mock():
             plp[name] = r["choices"][0]["prompt_logprobs"]
         check(plp["base"][0] is None and len(plp["base"]) > 3 and all(isinstance(x, dict) and x for x in plp["base"][1:])
               and plp["base"] != plp["weak"], "mock prompt_logprobs")
-        dom = heldout.heldout_domains(rc.paper_cfg, rc.domain)
-        check(dom == "eval:simple_math_test", dom)
-        h = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout", domains=dom, mock=True, limit=5)
-        check(set(h) == {"simple_math_test"} and h["simple_math_test"]["n"] == 5, f"heldout {h}")
-        t0 = time.time()
-        heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout", domains=dom, mock=True, limit=5)
-        check(time.time() - t0 < 2, "heldout rerun not skipped")
-        hc = heldout.run_heldout(srv.endpoint, "base", rc.run_dir / "heldout_code", domains="eval:simple_code_test",
-                                 mock=True, limit=3)
-        check(hc["simple_code_test"]["n_pending"] == 3, f"code pending {hc}")
     check(gate.relative_pass(0.8, 1.0, 0.8) and not gate.relative_pass(0.79, 1.0, 0.8), "relative_pass")
     return (f"simple_math_pool screen acc base={a.accuracy:.3f} weak={b.accuracy:.3f} delta={d['delta']:.3f} "
-            f"ci=[{d['ci'][0]:.3f},{d['ci'][1]:.3f}]; heldout acc={ {k: v['accuracy'] for k, v in h.items()} }")
+            f"ci=[{d['ci'][0]:.3f},{d['ci'][1]:.3f}]")
 
 
 def test_toolapi_cost_fn_dedupe():

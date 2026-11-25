@@ -1,5 +1,2 @@
-# Paper A, one domain: screen / calibration texts from simple_code_pool, gate simple_code_eval, held-out simple_code_test
-# (rsicore.draws, rsicore.heldout).
+# Paper A, one domain: the KL set (kl_eval.n items) and the calibration texts from simple_code_pool (rsicore.draws).
 domain: code
-# TACO-verified is graded in the Docker sandbox; without Docker its items stay pending and the gate
-# has no scored items (set gate.allow_unscored only for dry runs).

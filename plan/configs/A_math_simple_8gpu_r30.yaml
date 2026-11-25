@@ -1,3 +1,4 @@
+# STALE: this snapshot predates 2026-11-25 (no loop.start, gate.metric / gate.kl, scoring, reuse); edit_code/configs/base.yaml is authoritative.
 # Paper A · math · 8 GPUs (B300) · 8 threads x 1 step · up to 30 tool rounds per candidate · simple flow v2
 # self-quantization: the frozen M_0 writes quantization configs (fixed W4-size budget); the incumbent is the latest model.
 # Generated (2026-11-21) from the merged config: edit_code/configs/base.yaml + domains/math.yaml + hardware b300 +

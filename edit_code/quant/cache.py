@@ -1,6 +1,6 @@
-"""Per-generation layer quantization cache.
+"""Run-level layer quantization cache, built once from M_0 (run_dir/prep/cache).
 
-Every (module, quantizer, bits, group size) is quantized at most once per source model (M_t) and
+Every (module, quantizer, bits, group size) of the original model M_0 is quantized at most once and
 stored on disk as packed integer codes + fp16 scales + packed zero points (+ AWQ channel scales):
     <root>/<module tensor name>/<quantizer>_b<bits>_g<gs>.safetensors
 A candidate config is then assembled by dequantizing cached entries (seconds per layer), instead of
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from . import quantizers as Q
 from .hessian import hessian_path, load_hessian
@@ -97,7 +97,7 @@ class QuantCache:
     def _load(self, path: Path) -> Q.QResult:
         with safe_open(str(path), framework="pt") as f:
             meta = f.metadata()
-        d = load_file(str(path))
+            d = {k: f.get_tensor(k) for k in f.keys()}
         bits, gs = int(meta["bits"]), int(meta["group_size"])
         o, i, zo, zg = d["shape"].tolist()
         return Q.QResult(codes=Q.unpack(d["codes"], bits, o * i).reshape(o, i), scale=d["scale"],

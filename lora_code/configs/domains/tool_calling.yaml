@@ -1,2 +1,2 @@
-# Domain tool_calling: train pool simple_tool_calling_pool (from Seal-Tools train), gate simple_tool_calling_eval,
-# held-out simple_tool_calling_test. Override here only what differs from base.yaml.
+# Domain tool_calling: train pool simple_tool_calling_pool (from Seal-Tools train); the fixed
+# 500-item training set is drawn from it. Override here only what differs from base.yaml.

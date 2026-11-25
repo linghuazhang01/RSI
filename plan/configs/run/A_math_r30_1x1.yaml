@@ -1,0 +1,18 @@
+# Paper A experiment config (KL only, 2026-11-25): math · 8 GPUs · 1 x 1 candidate per generation, many generations ·
+# up to 30 tool rounds · patience 10. Overrides only: merged after base.yaml + domains/math.yaml + the hardware profile
+# (--hw) and before any --set. Hardware is NOT set here (B300 / H20).
+#   ./launch.sh --hw h20 --paper A --domains math --gens 20 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_r30_1x1.yaml --tag r30_1x1
+# GPUs: GPU 0 = editor (one session; sleeps while the candidate is evaluated and lends its GPU) -> 8 candidate slots.
+#   The single candidate's KL evaluation (256 traces) is split over all 8 slots (gpu_layout.gate_split). While the
+#   editor writes, GPUs 1-7 wait.
+# Each accepted candidate (KL below the incumbent's) is the incumbent the next proposal starts from.
+search:
+  threads: 1                      # one session per generation ...
+  steps: 1                        # ... of one candidate
+  max_candidates: 1
+loop:
+  patience: 10                    # one candidate per generation is rejected more often: stop after 10 in a row
+editor:
+  tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
+  turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
+  max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)

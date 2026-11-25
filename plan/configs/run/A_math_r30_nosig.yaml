@@ -1,6 +1,7 @@
-# Paper A experiment config (2026-11-21): math · 8 x 1 candidates per generation · up to 30 tool rounds · threshold 0 ·
-# no significance test. Overrides only: merged after base.yaml + domains/math.yaml + the hardware profile (--hw) and
-# before any --set. Hardware is NOT set here, so the same file runs on B300 / H20.
+# Paper A experiment config (KL only, 2026-11-25): math · 8 x 1 candidates per generation · up to 30 tool rounds ·
+# the lowest KL to M_0 on the 256 fixed reference traces wins when it is below the incumbent's. Overrides only: merged
+# after base.yaml + domains/math.yaml + the hardware profile (--hw) and before any --set. Hardware is NOT set here, so
+# the same file runs on B300 / H20.
 #   ./launch.sh --hw b300 --paper A --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_r30_nosig.yaml --tag r30_nosig
 search:
   threads: 8                      # 8 independent sessions per generation ...
@@ -9,6 +10,3 @@ editor:
   tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
   turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
   max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)
-gate:
-  min_delta: 0.0                  # accept the candidate with the largest strictly positive paired gate gain
-  require_significant: false      # no 95% CI requirement

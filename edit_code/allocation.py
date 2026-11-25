@@ -4,8 +4,8 @@ of each group's (bytes, damage) options; Lagrangian-greedy, optimal up to one it
 damage(key, bits, gs) = profile dkl_mean(key, bits)  [RTN, profile group size]
                         x gs_factor[gs] / gs_factor[profile gs]       (heuristic, configs/base.yaml)
                         x weight(key)                                  (editor-chosen multipliers)
-bits 16 (keep BF16) has damage 0. Used by the editor tool `solve_allocation`, the KL-greedy baseline
-and the mock editor.
+bits 16 (keep BF16) has damage 0. Used by the editor tool `solve_allocation`, the KL-greedy baseline,
+the HAWQ baseline (Hessian rows) and the mock editor.
 """
 from __future__ import annotations
 
@@ -105,13 +105,13 @@ def solve_allocation(spec: ModelSpec, profile_rows: list[dict], budget_gib: floa
     used = base
     for key in groups:
         if key in fixed:
-            used += sizes.group_bytes(spec, key, fixed[key])
+            used += sizes.modules_bytes(groups[key], fixed[key], spec.weight_dtype_bytes)
             continue
         pts = []
         for (b, g, q) in options:
-            s = {"bits": b, "group_size": g or 128, "quantizer": q if b < 16 else "rtn"}
-            pts.append((sizes.group_bytes(spec, key, s), w[key] * _damage(dl, key, b, g or 128, prof_gs, gsf),
-                        {"bits": b, "group_size": g, "quantizer": q}))
+            opt = {"bits": b, "group_size": g, "quantizer": q}
+            pts.append((sizes.modules_bytes(groups[key], opt, spec.weight_dtype_bytes),
+                        w[key] * _damage(dl, key, b, g, prof_gs, gsf), opt))
         pts.sort(key=lambda p: (p[0], p[1]))
         hull = []   # lower convex hull, decreasing damage with increasing bytes
         for p in pts:
@@ -157,12 +157,12 @@ def solve_allocation(spec: ModelSpec, profile_rows: list[dict], budget_gib: floa
             s["bits"] = 16
     from collections import Counter
     common = Counter(tuple(sorted(s.items())) for s in groups_cfg.values() if s.get("bits", 16) < 16)
-    default = dict(common.most_common(1)[0][0]) if common else {"bits": 16}
-    if default.get("bits") == 16:
-        default = {"bits": 16, "group_size": group_sizes[0], "quantizer": quantizer}
+    default = dict(common.most_common(1)[0][0]) if common else \
+        {"bits": 16, "group_size": group_sizes[0], "quantizer": quantizer}
     cfg = {"default": default, "groups": {k: s for k, s in groups_cfg.items() if s != default},
            "embed": embed, "lm_head": lm_head}
     norm = schema.normalize(cfg, spec, action_space)
+    # common.AUTO_NOTE parses this text (program_note strips it): keep the two in step
     cfg["note"] = (f"solve_allocation: {sizes.config_bytes(norm, spec)['gib']:.3f} GiB of {budget_gib:.3f}; "
                    f"predicted weighted damage {sum(hulls[k][i][1] for k, i in choice.items()):.5f}"
                    + ("" if feasible else " (INFEASIBLE: cheapest options exceed the budget)"))

@@ -5,7 +5,7 @@
 # Usage:
 #   ./launch.sh [--paper A|B|both] [--domains all|math,code,...] [--gens 5] [--hw b300|h20|h20_80]
 #               [--gpus 0,1,2,...] [--per-run N] [--model qwen3.8-27b] [--seed 42]
-#               [--config FILE] [--set KEY=VALUE ...] [--tag NAME] [--baseline-from DIR] [--dry-run] [--mock]
+#               [--config FILE] [--set KEY=VALUE ...] [--tag NAME] [--dry-run] [--mock]
 #               [--skip-checks]
 #
 #   --paper     A, B or both (default both)
@@ -22,16 +22,19 @@
 #   --set       passed to every run.py (repeatable), e.g. --set search.threads=4, --set method.mode=weights
 #               (Paper B: scratch | weights | edit), --set merge.mode=adapter (Paper B: merge | adapter), or a manual
 #               GPU split --set 'gpu_roles.train=[2,3]' (indices into the run's GPUs; overrides the automatic one)
-#   What every run does (the only flow; 2026-11-22): each run uses ONLY its own domain's simple_data/<domain>/.
-#               Every generation screens a fresh 500 items drawn from the domain's clean pool minus its eval and test
-#               items (same items for Papers A and B; the rest of the pool is the train data), accepts on the 500 eval
-#               items simple_<domain>_eval (the usual paired gate) and reports held-out on the 500 test items
-#               simple_<domain>_test. Hard-wired, no knobs: candidates are never screened; each candidate gets ONE gate
-#               evaluation during the search (paired vs the current model); the passing candidate with the largest
-#               paired gain is accepted. There is no api.evaluate / evaluate budget, no top_full re-scoring, no noise
-#               band and no KL term; --set / --config of those removed keys (search.screen_candidates, max_evaluate,
-#               top_full, kl_weight, noise.*, ...) is refused unless it gives the hard-wired value.
-#               Decoding per the paper config's decoding / heldout.decoding blocks.
+#   What every run does (the only flow; 2026-11-25): each run uses ONLY its own domain's simple_data/<domain>/.
+#               Generation 0 draws items from the domain's clean pool minus its eval and test items (the eval / test
+#               items are only excluded; there is no held-out test and no reuse of earlier runs).
+#               Paper A: kl_eval.n (256) of those items, one thinking-mode trace of M_0 each (top-20 logprobs cached);
+#               every candidate gets ONE KL(M_0 || candidate) on those fixed traces; the in-budget candidate with the
+#               lowest KL is accepted if it beats the incumbent's KL (no accuracy gate).
+#               Paper B: one fixed set of simple.screen_n (500) items, the same every generation: training items, the
+#               current model's answers the editor reads, and each candidate's ONE paired evaluation vs the current
+#               model; the largest paired gain > 0 is accepted.
+#               Hard-wired, no knobs: no candidate screens, no api.evaluate / evaluate budget, no top_full re-scoring,
+#               no noise band, no KL score term; --set / --config of those removed keys (search.screen_candidates,
+#               max_evaluate, top_full, kl_weight, noise.*, ...) is refused unless it gives the hard-wired value.
+#               Decoding per the paper config's decoding block.
 #               simple_data/ (pool_ids.json, eval.jsonl, test.jsonl) comes from data/scripts/make_simple_data.py.
 #               Merged configs: plan/configs/{A,B}_<domain>_simple.yaml. A changed config cannot resume an older
 #               run (locked config): use --tag / --run-id.
@@ -39,10 +42,6 @@
 #   --config FILE  experiment config (2026-11-21; repeatable): YAML overrides merged after the hardware profile and
 #               before --set. Hardware stays on --hw, so one file runs on B300 and H20.
 #               Example: plan/configs/run/B_math_r30_nosig.yaml
-#   --baseline-from DIR  generation 0 reads M_0's gate / held-out scores (and Paper A's KL gate reference) from an
-#               earlier run instead of scoring M_0 again: a run directory, its baseline/ folder, or a run id in
-#               experiment_records/ (= --set reuse.baseline_from=DIR; checked, a mismatch stops the run). Runs made
-#               before 2026-11-24 also need --set reuse.trust_unrecorded_code=true
 #   --tag NAME  append _NAME to every run id (letters, digits, - and _), e.g. --tag nosig ->
 #               B_math_s42_single_simple_nosig: a separate run (own locked config) next to the untagged one,
 #               for runs that change --set values of an existing run id.
@@ -52,8 +51,8 @@
 #
 # Run ids: <A|B>_<domain>_s<seed>_single_simple[_<tag>], in experiment_records/ (the suffix is kept from the time
 # other objectives existed, so older runs resume with the same command).
-# --seed is the one experiment seed: per-generation screen draws, vLLM servers, editor sampling, training answers,
-# held-out sampling and bootstrap CIs all use it (the simple_data split keeps its fixed seed 20261118).
+# --seed is the one experiment seed: the generation-0 item draw, vLLM servers, editor sampling, training answers,
+# scoring samples and bootstrap CIs all use it (the simple_data split keeps its fixed seed 20261118).
 # Logs and pids: experiment_records/_launch/<timestamp>/. Rerunning the same command resumes every run
 # (finished steps are skipped); a run whose process is still alive is not started twice.
 #
@@ -88,7 +87,6 @@ while [ $# -gt 0 ]; do
     --hw) need "$@"; HW="$2"; shift ;;
     --set) need "$@"; SETS+=(--set "$2"); shift ;;
     --tag) need "$@"; TAG="$2"; shift ;;
-    --baseline-from) need "$@"; SETS+=(--set "reuse.baseline_from=$2"); shift ;;
     --config) need "$@"; [ -f "$2" ] || { echo "ERROR: --config $2: file not found" >&2; exit 2; }
               CONFIGS+=(--config "$2"); shift ;;
     --model) need "$@"; MODEL="$2"; shift ;;
@@ -176,7 +174,7 @@ if [ "$SKIP" -eq 0 ]; then
   fi
   for d in $DOMS; do
     if [ -s "simple_data/$d/pool_ids.json" ] && [ -s "simple_data/$d/eval.jsonl" ] && [ -s "simple_data/$d/test.jsonl" ]; then
-      ok "simple_data/$d (pool ids / 500 gate / 500 test)"
+      ok "simple_data/$d (pool ids / 500 eval / 500 test, excluded from the pool)"
     else bad "simple_data/$d incomplete: needs pool_ids.json, eval.jsonl, test.jsonl ($PY -I data/scripts/make_simple_data.py --only $d)"; fi
     ds="$(ds_of "$d")"   # simple_<d>_pool is built from the training set's processed records
     if [ -s "data/processed/$ds.jsonl" ]; then ok "data $ds (source of simple_${d}_pool)"

@@ -6,7 +6,6 @@ is not importable (e.g. eval/.venv has torch only).
 """
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 import unittest

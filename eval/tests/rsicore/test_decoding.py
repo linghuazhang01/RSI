@@ -1,5 +1,5 @@
 """Decoding plumbing (2026-11-21): rsicore.evaluate.score / score_split `decoding=`, config.stage_decoding /
-check_decoding, heldout.decoding_args; n > 1 per-record means against the mock server; thinking truncation.
+check_decoding; n > 1 per-record means against the mock server; thinking truncation.
 
   python -I -m pytest -q eval/tests/rsicore/test_decoding.py
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT), str(ROOT / "eval")]
 
-from rsicore import config, draws, evaluate, heldout, records, servers  # noqa: E402
+from rsicore import config, draws, evaluate, records, servers  # noqa: E402
 
 SAMPLED = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "thinking": True, "max_tokens": 16384, "n": 4}
 
@@ -57,30 +57,15 @@ class DecodingUnitTest(unittest.TestCase):
                 argv += ["--set", x]
             return config.load_run_config("B", config.build_arg_parser("B").parse_args(argv))
 
-        rc = load("decoding.gate={temperature: 0.6, n: 4, thinking: true, max_tokens: 16384}",
-                  "heldout.decoding.thinking=true", "heldout.decoding.max_tokens=16384")
+        rc = load("decoding.gate={temperature: 0.6, n: 4, thinking: true, max_tokens: 16384}")
         self.assertEqual(rc.paper_cfg["decoding"]["gate"]["seed"], 9)
         self.assertEqual(config.stage_decoding(rc.paper_cfg, "gate", rc.seed)["n"], 4)
         # (2026-11-22) the simple decoding is base.yaml's own now: screen keeps it, its null seed becomes --seed
         self.assertEqual(config.stage_decoding(rc.paper_cfg, "screen", rc.seed)["seed"], 9)
         self.assertIsNone(config.stage_decoding(load("decoding.screen=null").paper_cfg, "screen", 9))
-        self.assertEqual(rc.paper_cfg["heldout"]["decoding"]["seed"], 9)
-        for bad in ("decoding.final={n: 2}", "decoding.gate={min_p: 0.1}", "heldout.decoding.foo=1"):
+        for bad in ("decoding.final={n: 2}", "decoding.gate={min_p: 0.1}"):
             with self.assertRaises(SystemExit, msg=bad):
                 load(bad)
-
-    def test_heldout_decoding_args(self):
-        old = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "seed": 42, "n": 1, "n_by_task": {"aime24": 8}}
-        a = heldout.decoding_args(old, "aime24")                               # unchanged for older blocks
-        self.assertEqual(a["key"], {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "seed": 42, "n": 8})
-        self.assertEqual((a["kw"], a["extra"]), ({"temperature": 0.7, "top_p": 0.8, "top_k": 20, "seed": 42},
-                                                 ["--n", "8"]))
-        b = heldout.decoding_args(dict(SAMPLED, seed=42), "simple_math_test")
-        self.assertEqual(b["key"], dict(SAMPLED, seed=42))                     # thinking / max_tokens in the resume key
-        self.assertEqual(b["decoding"], dict(SAMPLED, seed=42))
-        self.assertEqual(b["extra"], ["--n", "4", "--thinking", "on", "--max-tokens", "16384"])
-        self.assertFalse(heldout._same_decoding(dict(old, thinking=False, max_tokens=16384), b["key"]))
-        self.assertEqual(heldout.decoding_args(None, "x"), {"kw": {}, "extra": [], "key": None})
 
     def test_thinking_truncation(self):
         """thinking on: a sample cut at max_tokens while still thinking (no reasoning, no </think>) scores 0."""
@@ -121,16 +106,6 @@ class DecodingMockTest(unittest.TestCase):
                                mock=True)
             s2 = evaluate.score(srv.endpoint, "base", "simple_math_test", pool="pool", ids=ids, out_dir=tmp / "s2",
                                 mock=True, decoding=dict(dec, seed=43))
-            hd = dict(SAMPLED, seed=42, n_by_task={"aime24": 8})               # held-out = the test set, avg@4
-            h1 = heldout.run_heldout(srv.endpoint, "base", tmp / "h", domains="eval:simple_math_test", mock=True,
-                                     limit=12, decoding=hd)
-            mtime = (tmp / "h" / "simple_math_test.jsonl").stat().st_mtime_ns
-            h2 = heldout.run_heldout(srv.endpoint, "base", tmp / "h", domains="eval:simple_math_test", mock=True,
-                                     limit=12, decoding=hd)
-            self.assertEqual((tmp / "h" / "simple_math_test.jsonl").stat().st_mtime_ns, mtime)   # resumed
-            heldout.run_heldout(srv.endpoint, "base", tmp / "h", domains="eval:simple_math_test", mock=True,
-                                limit=12, decoding=dict(hd, max_tokens=8192))                  # new key: rescored
-            hs = json.loads((tmp / "h" / "summary.json").read_text())["simple_math_test"]
         d = a.summary["decoding"]
         self.assertEqual((d["temperature"], d["top_p"], d["top_k"], d["n"], d["thinking"], d["seed"]),
                          (0.6, 0.95, 20, 4, True, 42))
@@ -150,10 +125,6 @@ class DecodingMockTest(unittest.TestCase):
         self.assertEqual(g.summary["decoding"]["temperature"], 0.0)            # None = tasks.yaml (greedy, n 1)
         self.assertTrue(all("scores" not in r for r in g.records))
         self.assertNotEqual([r["scores"] for r in s2.records], [r["scores"] for r in a.records])
-        self.assertEqual(h1, h2)
-        self.assertEqual((h1["simple_math_test"]["n"], h1["simple_math_test"]["avg_at_n"]),
-                         (12, h1["simple_math_test"]["accuracy"]))
-        self.assertEqual((hs["decoding"]["n"], hs["decoding"]["thinking"], hs["decoding"]["max_tokens"]), (4, True, 8192))
 
 
 if __name__ == "__main__":

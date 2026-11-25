@@ -1,3 +1,4 @@
+# STALE: predates 2026-11-25 (fixed 500-item training set); lora_code/configs/base.yaml is authoritative.
 # Paper B · math · 8 GPUs (B300) · 8 threads x 1 step · up to 30 tool rounds per candidate · simple flow v2
 # self-written LoRA (scratch, nothing trained): the current model M_g writes LoRAs; the accepted one is merged and M_{g+1} is the next editor.
 # Generated (2026-11-21; regenerated 2026-11-22 after the simple flow was folded into base.yaml) from the merged config: lora_code/configs/base.yaml + domains/math.yaml + hardware b300 +

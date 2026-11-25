@@ -1,5 +1,5 @@
 """The simple flow (2026-11-21; the only flow since 2026-11-22): per-generation screen / train / kl draws of
-simple_<d>_pool (rsicore.draws), the gate and held-out test sets, the data / registration they rest on, the default
+simple_<d>_pool (rsicore.draws), the eval / test sets excluded from it, the data / registration they rest on, the default
 run id, the removed selectors and the run lock across the removals. Config level only (no servers).
 
   python -I -m pytest -q eval/tests/rsicore/test_simple_draws.py
@@ -16,7 +16,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "eval")]
 
 import yaml  # noqa: E402
 
-from rsicore import config, draws, evalsets, heldout  # noqa: E402
+from rsicore import config, draws, evalsets  # noqa: E402
 from rsicore.config import build_arg_parser, load_run_config  # noqa: E402
 
 DOMAINS = ("math", "code", "knowledge", "instruction_following", "tool_calling")
@@ -28,7 +28,7 @@ class SimpleDrawsTest(unittest.TestCase):
         pdir = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: shutil.rmtree(pdir, ignore_errors=True))
         (pdir / "configs" / "domains").mkdir(parents=True)
-        (pdir / "configs" / "base.yaml").write_text(yaml.safe_dump(base or {"heldout": {"domains": "run"}}))
+        (pdir / "configs" / "base.yaml").write_text(yaml.safe_dump(base or {"simple": {"screen_n": 500}}))
         return str(pdir)
 
     def load(self, paper, domain, *sets, run_id=None, pdir=None, runs=None):
@@ -138,20 +138,17 @@ class SimpleDrawsTest(unittest.TestCase):
         with self.assertRaises(ValueError):                                     # only the train role is drawn
             draws.ids(rc, 0, "simple_code_eval", "screen")
 
-    def test_heldout_builds_test_set(self):
-        """heldout_domains gives eval:simple_<d>_test; run_heldout's ensure_built builds it before it is read."""
-        self.assertEqual(heldout.heldout_domains({}, "code"), "eval:simple_code_test")
-        self.assertEqual(heldout.heldout_domains({"domain": "math"}), "eval:simple_math_test")          # Paper A
-        self.assertEqual(self.load("B", "knowledge").paper_cfg["heldout"]["domains"], "knowledge")      # run -> domain
-        self.assertEqual(heldout.heldout_domains(self.load("B", "knowledge").paper_cfg), "eval:simple_knowledge_test")
-        with self.assertRaises(ValueError):
-            heldout.heldout_domains({"heldout": {"domains": "all"}})
-        with self.assertRaises(ValueError):
-            heldout.heldout_tasks("math")                                       # public benchmarks: removed
-        heldout.ensure_built("eval:simple_tool_calling_test")
-        self.assertEqual(heldout.heldout_tasks("eval:simple_tool_calling_test"), [("simple_tool_calling_test", "pool")])
-        self.assertEqual(len(heldout._task_ids("simple_tool_calling_test", "pool")), 500)
+    def test_eval_and_test_sets_excluded(self):
+        """ensure_gate builds simple_<d>_eval and simple_<d>_test (500 each); generation 0's screen (both papers'
+        fixed item set since 2026-11-25) holds none of their ids."""
+        rc = self.load("B", "tool_calling")
+        draws.ensure_gate(rc)
+        test = draws.build_eval_set("simple_tool_calling_test")
+        self.assertEqual(len(test), 500)
         self.assertTrue((ROOT / "data" / "processed" / "simple_tool_calling_test.jsonl").exists())
+        screen = set(draws.ids(rc, 0, "simple_tool_calling_pool", "screen"))
+        self.assertEqual(len(screen), 500)
+        self.assertFalse(screen & (set(test) | set(draws.build_eval_set("simple_tool_calling_eval"))))
 
     def test_run_id_and_removed_selectors(self):
         """Default run id keeps the _single_simple suffix; objective=simple / scope=single are accepted no-ops (--set
@@ -183,7 +180,7 @@ class SimpleDrawsTest(unittest.TestCase):
         draw_config keys, mock_objective_overrides, max_tokens.math_eval, theta0 hardware keys) resumes with the same
         command once base.yaml holds the folded values; a real difference is still refused; a run of a removed
         objective cannot be resumed."""
-        new = {"search": {"threads": 8, "steps": 1}, "heldout": {"domains": "run", "enabled": True},
+        new = {"search": {"threads": 8, "steps": 1},
                "max_tokens": {"dapo_math": 4096}, "simple": {"screen_n": 500},
                "mock_overrides": {"search": {"threads": 3, "steps": 1}, "gate": {"min_delta": 0.0}},
                "hardware": "h20", "hardware_profiles": {"h20": {"gpu_layout": {"m0_replicas": True}}},

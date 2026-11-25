@@ -1,10 +1,11 @@
 """Evaluation of LoRA candidates on the served model M_t (vLLM multi-LoRA, hot-loaded adapters).
 
-Levels: `screen` (this generation's screen draw of the target domain), `full` (the signal draw; = screen in the
-simple flow), `gate` (the fixed gate set of the target domain). Every result is cached on disk per (name, level), so
-a resumed run never re-evaluates. Feedback follows RSI_LOOP_DESIGN §3.4 (target domain only).
-datasets (2026-11-21): the screen / full levels hold the train dataset (`target_dataset`, simple_<d>_pool), the gate
-level the gate dataset (`gate_dataset`, simple_<d>_eval; default the same); a level's target is the one it holds.
+Levels: `screen`, `full` and `gate` all hold the run's ONE fixed training set (2026-11-25: simple.screen_n items of
+generation 0's draw of simple_<d>_pool, the same items every generation); with equal decodings they share one
+scoring directory (_cache_level). Every result is cached on disk per (name, level), so a resumed run never
+re-evaluates. Feedback follows RSI_LOOP_DESIGN §3.4 (target domain only).
+datasets: every level holds the train dataset (`target_dataset`, simple_<d>_pool); `gate_dataset` defaults to it
+(Paper B passes the same dataset); a level's target is the one it holds.
 decoding (2026-11-21): `decoding` = {level: rsicore decoding dict | None} (rsicore.config.stage_decoding; None =
 tasks.yaml greedy). The parent (the current model) and every candidate of a level are scored with the same dict,
 seed included; a level's cache directory carries a tag of its decoding (evals/<name>/<level>@<tag>/, plain <level>/
@@ -99,7 +100,7 @@ class Evaluator:
         self._kinds: dict[str, str] = {}
         self.ids = ids                      # level -> {dataset: [ids]}
         self.target = target_dataset        # screen / full target (the train dataset)
-        self.gate_target = gate_dataset or target_dataset   # gate target (the gate dataset)
+        self.gate_target = gate_dataset or target_dataset   # gate target (Paper B: the training dataset)
         self.store = store
         self.mock = mock
         self.registry = registry
@@ -295,8 +296,8 @@ class Evaluator:
 
     def _cache_level(self, level: str, ds: str, ids) -> str:
         """Cache directory level of (level, ds): a level with the same dataset, the same items AND the same decoding
-        as the screen level (full = screen in the simple flow) shares the screen result instead of scoring them again; a
-        different dataset (the gate set) never does. A sampled decoding adds its tag (<level>@<hash>, 2026-11-21)."""
+        as the screen level (full and gate = screen in Paper B) shares the screen result instead of scoring them
+        again; a different dataset or item set never does. A sampled decoding adds its tag (<level>@<hash>, 2026-11-21)."""
         scr = self.ids.get("screen") or {}
         if (level != "screen" and ds in scr and sorted(ids) == sorted(scr[ds])
                 and self.level_decoding(level) == self.level_decoding("screen")):

@@ -1,3 +1,2 @@
-# Paper A, one domain: screen / calibration texts from simple_knowledge_pool, gate simple_knowledge_eval, held-out simple_knowledge_test
-# (rsicore.draws, rsicore.heldout).
+# Paper A, one domain: the KL set (kl_eval.n items) and the calibration texts from simple_knowledge_pool (rsicore.draws).
 domain: knowledge

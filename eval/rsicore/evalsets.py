@@ -4,7 +4,8 @@ Each entry is {task, file, dataset} (the items of a jsonl file, simple_data/<d>/
 {task, ids_file, dataset} (the task dataset's records listed in ids_file; simple_<d>_pool = the whole clean pool).
 data/scripts/build_eval_target.py builds them into data/processed/<dataset>.jsonl (pool `pool`); the run_eval task of
 the same name is derived by evallib.tasks.eval_target_tasks. A run of domain d uses simple_<d>_pool (train role,
-per-generation draws, rsicore.draws), simple_<d>_eval (gate) and simple_<d>_test (held-out report).
+generation 0's draw, rsicore.draws); simple_<d>_eval and simple_<d>_test are built only so their items are excluded
+from simple_<d>_pool, never scored (2026-11-25).
 """
 from functools import lru_cache
 

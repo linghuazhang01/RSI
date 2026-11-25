@@ -40,12 +40,24 @@ def precision_bytes(t: dict | None, prec) -> float:
     return weight_bytes(out_f, in_f, int(prec), EMBED_GROUP, "rtn")
 
 
-def group_bytes(spec: ModelSpec, key: str, setting: dict) -> float:
+def special_precisions(spec: ModelSpec, embed, lm_head) -> dict[str, int]:
+    """{tensor name: bits} of the embedding / LM head when not "bf16" (RTN at EMBED_GROUP in the export and the
+    EvoPress worker)."""
+    return {t["name"]: int(prec) for t, prec in ((spec.embed, embed), (spec.lm_head, lm_head))
+            if t and prec != "bf16"}
+
+
+def modules_bytes(mods, setting: dict, dtype_bytes: int = 2) -> float:
+    """Packed bytes of these modules under one setting."""
     total = 0.0
-    for m in spec.groups()[key]:
+    for m in mods:
         total += weight_bytes(m.shape[0], m.shape[1], setting["bits"], setting.get("group_size") or 128,
-                              setting.get("quantizer", "rtn"), spec.weight_dtype_bytes)
+                              setting.get("quantizer", "rtn"), dtype_bytes)
     return total
+
+
+def group_bytes(spec: ModelSpec, key: str, setting: dict) -> float:
+    return modules_bytes(spec.groups()[key], setting, spec.weight_dtype_bytes)
 
 
 def config_bytes(norm: dict, spec: ModelSpec) -> dict:
@@ -55,8 +67,7 @@ def config_bytes(norm: dict, spec: ModelSpec) -> dict:
     by_group: dict[str, float] = {}
     for key, ms in groups.items():
         s = norm["groups"][key]
-        b = sum(weight_bytes(m.shape[0], m.shape[1], s["bits"], s.get("group_size") or 128,
-                             s.get("quantizer", "rtn"), spec.weight_dtype_bytes) for m in ms)
+        b = modules_bytes(ms, s, spec.weight_dtype_bytes)
         lin += b
         g = key.split(".", 1)[1]
         by_group[g] = by_group.get(g, 0.0) + b

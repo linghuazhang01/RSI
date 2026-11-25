@@ -10,15 +10,15 @@ hessian_table     one row per (group key, quantizer, bits): Hessian-weighted out
 activation_table  one row per linear module: input RMS / max-over-median / outlier fraction / red flag
                   (from the calibration pass, quant/hessian.py).
 bytes_table       one row per group key: params and packed MiB for each (bits, group size).
-All three are cached per generation in <gen>/diagnostics/*.json. In mock mode they are synthetic
-with the same schema (edit_code/mock.py). behavior_sensitivity (METHOD_DESIGN §2.2) is future work.
+All four are computed once from M_0 and cached in prep/diagnostics/*.json (hessian_table after the
+layer cache). In mock mode they are synthetic with the same schema (edit_code/mock.py). behavior_sensitivity (METHOD_DESIGN §2.2) is future work.
 """
 from __future__ import annotations
 
 import time
 from pathlib import Path
 
-from .common import read_json, write_json
+from .common import exit_with_parent, read_json, write_json
 from .quant import sizes
 from .quant.spec import ModelSpec
 
@@ -43,9 +43,9 @@ def profile_table_real(model, spec: ModelSpec, batches, refs, *, bits_list=(2, 3
     done = 0
     for gi, (key, mods) in enumerate(groups.items()):
         if rows_dir is not None:
-            prev = read_json(Path(rows_dir) / f"{key}.json")
-            if prev and prev.get("meta") == meta:
-                rows += prev["rows"]
+            prev = saved_profile_rows(rows_dir, key, meta)
+            if prev is not None:
+                rows += prev
                 continue
         params = {m.name: model.get_parameter(m.name) for m in mods}
         orig = {n: p.data.clone() for n, p in params.items()}
@@ -83,6 +83,12 @@ def profile_meta(texts: list[str], dcfg: dict) -> dict:
             "group_size": int(dcfg["profile_group_size"])}
 
 
+def saved_profile_rows(rows_dir: Path, key: str, meta: dict) -> list | None:
+    """The rows saved in rows_dir/<key>.json when they were computed with `meta` (profile_meta), else None."""
+    rec = read_json(Path(rows_dir) / f"{key}.json")
+    return rec["rows"] if rec and rec.get("meta") == meta else None
+
+
 def warn_slow_kernels(log=print) -> None:
     """Without flash-linear-attention (and causal-conv1d) transformers runs the Gated-DeltaNet layers of Qwen3.5 /
     Qwen3.8 with a pure-torch fallback, several times slower."""
@@ -117,25 +123,15 @@ def profile_worker(model_dir: str, device: str, spec_path: str, texts: list[str]
                    groups: list[str], tag: str = "") -> None:  # pragma: no cover - GPU path (own process)
     """One prep worker of the profile table (2026-11-21): a separate PROCESS per GPU (the earlier threads shared one
     GIL), loads its own HF model and writes rows_dir/<key>.json for each of its groups."""
-    import os
-    import threading
     import torch
     from .quant.hessian import load_hf_model
 
     def log(msg):
         print(f"[prep:{tag}:{device}] {msg}", flush=True)
 
-    parent = os.getppid()
-
-    def watchdog():                    # the run was killed (kill <pid>): do not keep holding the GPU
-        while True:
-            time.sleep(5)
-            if os.getppid() != parent:
-                print(f"[prep:{tag}:{device}] parent process gone, exiting", flush=True)
-                os._exit(1)
-    threading.Thread(target=watchdog, daemon=True).start()
+    exit_with_parent(f"[prep:{tag}:{device}] parent process gone, exiting")   # the run was killed (kill <pid>)
     meta = profile_meta(texts, dcfg)
-    todo = [k for k in groups if (read_json(Path(rows_dir) / f"{k}.json") or {}).get("meta") != meta]
+    todo = [k for k in groups if saved_profile_rows(rows_dir, k, meta) is None]
     if not todo:
         log(f"[profile] all {len(groups)} groups already done")
         return
@@ -179,7 +175,7 @@ def bytes_table(spec: ModelSpec, bits_list=(2, 3, 4, 8), group_sizes=(32, 64, 12
 
 
 def summarize_profile(rows: list[dict], top: int = 12) -> dict:
-    """Compact view for the prompt: most / least sensitive groups at 3 and 2 bits."""
+    """Compact view for the prompt: most / least sensitive groups per profiled bit width."""
     out = {}
     for b in sorted({r["bits"] for r in rows}):
         rs = sorted((r for r in rows if r["bits"] == b), key=lambda r: -r["dkl_mean"])

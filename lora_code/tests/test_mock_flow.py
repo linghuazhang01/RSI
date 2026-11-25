@@ -6,10 +6,10 @@
   run through rsicore.sandbox.run_program, checks).
 - test_mode_tool_surface / test_raw_recipe: method.mode (scratch default / weights / edit) tool sets, the raw LoRA handle,
   no training / gradient tool in any mode (2026-11-20), and the raw recipe (size) resolution.
-- test_mock_run_end_to_end: lora_code/run.py --mock (mode=edit) for 1 generation in a temp runs dir (only the
-  run's domain: simple_math_pool / simple_math_eval / simple_math_test; screen size, raw size; no noise band),
-  then a second invocation of the same run-id must skip everything.
-- test_mock_simple_flow: the default (simple) flow on 4 GPUs, scratch; weights / edit chain / merge.mode adapter runs.
+- test_mock_run_end_to_end: lora_code/run.py --mock (mode=edit) for 1 generation in a temp runs dir (2026-11-25: one
+  fixed training set from generation 0's draw of simple_math_pool, no eval / test set, no held-out, no non-LLM branch;
+  raw size), then a second invocation of the same run-id must skip everything.
+- test_mock_simple_flow: the default flow on 4 GPUs, scratch; weights / edit chain / merge.mode adapter runs.
 - editor tool loop (2026-11-21): test_explore_api_surface_and_budgets (Workspace.explore_api: no raw_lora /
   GPU tools, no generation budget spent, handles freed, gpu_tools budget), test_editor_context_tokens_sets_main_max_model_len
   (editor.context_tokens -> main servers' --max-model-len), test_mock_tool_loop_scratch (one run_python round per
@@ -50,28 +50,27 @@ def _ws(tmp_path, budget=None, mode="scratch", raw=None):
 
 
 def _check_parent_gate_reuse(run: Path, gens: int, on_m0: bool) -> None:
-    """(2026-11-24) the current model's gate records come from an earlier scoring of the same model when there is
-    one: generation 0 = the baseline's M_0 gate; after a kept generation = the previous parent's records; after an
-    accepted one = the accepted candidate's records when M_{g+1} is served exactly as gated (mode=edit, merge.mode
-    adapter); a merged model is scored again."""
+    """The current model's records on the fixed training set (one cache dir shared by the screen / gate levels) come
+    from an earlier scoring of the same model when there is one: generation 0 = the baseline's M_0 records; after a
+    kept generation = the previous parent's records; after an accepted one = the accepted candidate's records when
+    M_{g+1} is served exactly as evaluated (mode=edit, merge.mode adapter); a merged model is scored again."""
     for g in range(gens):
         gd = run / f"gen_{g:02d}"
-        gat = [p for p in (gd / "evals" / "__parent__").iterdir() if p.name.startswith("gate")]
-        assert len(gat) == 1, gat
-        pg = json.loads((gat[0] / "simple_math_eval.json").read_text())
-        assert json.loads((gd / "parent_gate.json").read_text())["simple_math_eval"] == pg["score"]
-        assert (gat[0] / "simple_math_eval_raw" / "simple_math_eval.jsonl").exists() or pg.get("adopted_from") is None
+        lv = sorted((gd / "evals" / "__parent__").iterdir())
+        assert len(lv) == 1 and lv[0].name.startswith("screen@"), lv           # screen = gate: one scoring
+        pg = json.loads((lv[0] / "simple_math_pool.json").read_text())
+        assert json.loads((gd / "parent_gate.json").read_text())["simple_math_pool"] == pg["score"]
         src = pg.get("adopted_from")
         if g == 0:
-            assert src and "baseline/gate/simple_math_eval" in src, src
+            assert src and "baseline/gate/simple_math_pool" in src, src
             continue
         acc = json.loads((run / f"gen_{g - 1:02d}" / "accepted.json").read_text())
         if acc["source"] == "keep" or not acc.get("name"):
             assert src and f"gen_{g - 1:02d}/evals/__parent__/" in src, (g, src)
         elif on_m0:
             assert src and f"gen_{g - 1:02d}/evals/{acc['name']}/" in src, (g, src)
-            prev = json.loads((run / f"gen_{g - 1:02d}" / "evals" / acc["name"] / gat[0].name
-                               / "simple_math_eval.json").read_text())
+            prev = json.loads((run / f"gen_{g - 1:02d}" / "evals" / acc["name"] / lv[0].name
+                               / "simple_math_pool.json").read_text())
             assert prev["score"] == pg["score"] and prev["records"] == pg["records"]
         else:
             assert src is None, (g, src)                      # a merged model is new weights: scored again
@@ -241,59 +240,55 @@ def test_mock_program_through_sandbox(tmp_path):
 
 
 def test_mock_run_end_to_end(tmp_path):
-    """mode=edit, 1 generation, the one (simple) flow: the raw LoRA is trained in generation 0 (raw.n_train), every
-    candidate is gated during the search (reference = the current model, so the summary says 'parent'), only the
-    run's domain is drawn / scored (simple.screen_n screen items, the simple_math_eval gate, the simple_math_test
-    held-out), M_0's gate score without a noise band; no E_t / theta0 / retention anywhere; the generation-0 prompt
-    describes the real gate (per candidate vs the current model, RAW as the fallback); a rerun skips everything."""
+    """mode=edit, 1 generation: the raw LoRA is trained in generation 0 (raw.n_train of the fixed set), every candidate
+    is evaluated during the search on the same fixed training set (reference = the current model, 'parent'); only
+    generation 0's draw of the run's pool is used (no eval / test set, no held-out, no non-LLM branch); the prompt
+    describes the real rule (per candidate vs the current model on the training items, RAW as the fallback); a rerun
+    skips everything."""
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
            "--runs-dir", str(tmp_path), "--run-id", "B_test_mock", "--set", "method.mode=edit",
-           "--set", "simple.screen_n=30", "--set", "raw.n_train=40", "--set", "heldout.limit=4"]
+           "--set", "simple.screen_n=40", "--set", "raw.n_train=20"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     assert "roles {'main': [0], 'train': [1]}" in r.stdout and "theta0" not in r.stdout
     run = tmp_path / "B_test_mock"
     state = json.loads((run / "state.json").read_text())
-    for k in ("baseline/gate", "baseline/heldout", "gen00/raw", "gen00/search", "gen00/gate",
-              "gen00/merge", "gen00/nonllm", "gen00/heldout", "gen00/summary"):
+    for k in ("baseline/gate", "gen00/raw", "gen00/search", "gen00/gate", "gen00/merge", "gen00/summary"):
         assert k in state, k
-    assert not any(k == "e_ref" or "/e_t/" in k or k.endswith("/sft") for k in state)
-    assert not (run / "e_ref").exists() and not (run / "gen_00" / "e_t").exists()
-    assert state["gen00/raw"]["n_train"] == 40
-    assert len(json.loads((run / "draws" / "gen_00" / "ids" / "simple_math_pool.screen.json").read_text())) == 30
+    for gone in ("baseline/heldout", "gen00/nonllm", "gen00/heldout", "learned"):
+        assert gone not in state, gone
+    assert not (run / "baseline" / "heldout.json").exists() and not (run / "gen_00" / "heldout.json").exists()
+    assert not (run / "gen_00" / "baselines" / "nonllm.json").exists()
+    assert state["gen00/raw"]["n_train"] == 20
+    screen = json.loads((run / "draws" / "gen_00" / "ids" / "simple_math_pool.screen.json").read_text())
+    assert len(screen) == 40 and sorted((run / "draws").iterdir())[0].name == "gen_00"
+    fixed = sorted(screen)[:30]                                                     # eval.limit 30 (mock)
     gate = json.loads((run / "baseline" / "gate_scores.json").read_text())
-    assert list(gate) == ["simple_math_eval"] and gate["simple_math_eval"]["n"] == 30          # gate_limit 30 (mock)
-    assert set(gate["simple_math_eval"]) == {"score", "n", "n_scored", "se", "records"}           # no noise band
-    assert not (run / "baseline" / "noise").exists() and set(state["baseline/gate"]["simple_math_eval"]) == {"score"}
+    assert list(gate) == ["simple_math_pool"] and gate["simple_math_pool"]["n"] == 30
+    assert sorted(x["id"] for x in gate["simple_math_pool"]["records"]) == fixed
+    assert sorted(json.loads((run / "gen_00" / "train_data.json").read_text())) == fixed   # train ids = the same set
     summ = json.loads((run / "summary.json").read_text())["gens"]["0"]
     assert summ["search"]["candidates"] >= 1 and summ["accepted"]["source"] in ("llm", "raw_fallback", "keep")
     assert summ["method"] == "edit" and summ["gate_reference"] == "parent" and summ["raw"]["source"] == "trained"
-    assert summ["data_roles"] == {"train": "simple_math_pool", "gate": "simple_math_eval"}
-    for gone in ("E", "E_ref", "dE_write", "dE_nonLLM", "dE_reference_branch", "scope", "retention_domains", "sft"):
+    assert summ["data"] == {"dataset": "simple_math_pool", "items": 30}
+    for gone in ("heldout", "nonllm", "data_roles", "E", "sft"):
         assert gone not in summ, gone
-    assert set(summ["heldout"]) == {"simple_math_test"}
-    assert set(summ["accepted"].get("gate_scores") or {"simple_math_eval": 0}) == {"simple_math_eval"}
+    assert set(summ["accepted"].get("gate_scores") or {"simple_math_pool": 0}) == {"simple_math_pool"}
     evals = {p.name for p in (run / "gen_00" / "evals").glob("*/*/*.json")}
-    assert evals <= {"simple_math_pool.json", "simple_math_eval.json"}, evals
-    raw = json.loads((run / "gen_00" / "baselines" / "raw.json").read_text())
-    assert not {"worst_retention_delta", "kl"} & set(raw["points"]["screen"])
-    non = json.loads((run / "gen_00" / "baselines" / "nonllm.json").read_text())
-    for p in (non.get("random_search") or {}).get("points") or []:
-        assert "regmean" not in p and "worst_retention_delta" not in p
-    assert not (run / "gen_00" / "baselines" / "sft.json").exists()
+    assert evals <= {"simple_math_pool.json"}, evals
     assert (run / "gen_00" / "model.json").exists() and (run / "gen_00" / "diagnostics.json").exists()
     reg = json.loads((run / "mock_registry.json").read_text())
     model = json.loads((run / "gen_00" / "model.json").read_text())   # mode=edit: M_1 = M_0 + a LoRA, no merge
-    assert "m0" in reg and "theta0" not in reg and (model["lora"] is None or model["lora"] in reg) and "m1" not in reg
+    assert "m0" in reg and (model["lora"] is None or model["lora"] in reg) and "m1" not in reg
     tr = [json.loads(x) for x in (run / "gen_00" / "editor" / "thread_0.jsonl").read_text().splitlines() if x.strip()]
     prompt = "\n".join(str(x.get("content")) for x in tr if x.get("role") in ("system", "user"))   # what it reads
-    assert "Single-domain run" in prompt and "regmean_preserve" not in prompt and "retention" not in prompt
-    assert "The gate accepts a candidate on simple_math_eval" in prompt
-    assert "evaluated ONCE on a fixed hidden set of 30 items" in prompt and "raw LoRA's by more than" not in prompt
-    assert "RAW itself is accepted if it passes the same gate" in prompt and "token-KL" not in prompt
-    assert "act ratio" not in prompt and "after the search, not visible" not in prompt
+    assert "Single-domain run" in prompt and "the same items in every generation" in prompt
+    assert "simple_math_eval" not in prompt and "held-out" not in prompt and "hidden set" not in prompt
+    assert "evaluated ONCE on the 30 training items" in prompt and "there is no significance test" in prompt
+    assert "RAW itself is accepted if it passes the same gate" in prompt
+    _check_parent_gate_reuse(run, 1, on_m0=True)
     n_cand = len((run / "gen_00" / "candidates.jsonl").read_text().splitlines())
     t0 = time.time()
     r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -318,7 +313,7 @@ def _run_b(tmp_path, *sets):
 def test_mock_weights_mode(tmp_path):
     """method.mode weights (2026-11-21): the editor edits the weights directly (no training); 4 GPUs = editor [0],
     candidate slots [1], [2] (+ the editor's GPU while it sleeps), train [3]; an accepted edit is written into the
-    weights; the non-LLM branch makes random weight edits; the default mode is scratch."""
+    weights; the default mode is scratch."""
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "2", "--mock",
@@ -331,11 +326,7 @@ def test_mock_weights_mode(tmp_path):
     summ = json.loads((run / "summary.json").read_text())["gens"]
     for g in ("0", "1"):
         s = summ[g]
-        assert s["method"] == "weights" and s["accepted"]["source"] in ("llm", "keep")
-        if s["accepted"]["source"] == "keep":                           # 2026-11-21: nothing accepted -> skipped
-            assert s["nonllm"]["kind"] is None and "skip_if_rejected" in s["nonllm"]["skipped"]
-        else:
-            assert s["nonllm"]["kind"] == "random_weight_search"
+        assert s["method"] == "weights" and s["accepted"]["source"] in ("llm", "keep") and "nonllm" not in s
         assert all(k.startswith("weights") or k in ("keep", "error", "none") for k in s["search"]["strategies"]), \
             s["search"]["strategies"]
     msgs = [json.loads(x) for x in (run / "gen_00" / "editor" / "thread_0.jsonl").read_text().splitlines() if x.strip()]
@@ -354,13 +345,13 @@ def test_mock_edit_chain_trains_once(tmp_path):
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
     cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "3", "--mock",
-           "--runs-dir", str(tmp_path), "--run-id", "B_chain", "--set", "raw.n_train=64", "--set", "method.mode=edit"]
+           "--runs-dir", str(tmp_path), "--run-id", "B_chain", "--set", "raw.n_train=20", "--set", "method.mode=edit"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     run = tmp_path / "B_chain"
     state = json.loads((run / "state.json").read_text())
     summ = json.loads((run / "summary.json").read_text())["gens"]
-    assert state["gen00/raw"]["n_train"] == 64 and not any(k.endswith("/sft") for k in state)
+    assert state["gen00/raw"]["n_train"] == 20 and not any(k.endswith("/sft") for k in state)
     prev = None
     for g in range(3):
         gd = run / f"gen_{g:02d}"
@@ -431,71 +422,61 @@ def test_mock_scratch_adapter(tmp_path):
 
 
 def test_mock_simple_flow(tmp_path):
-    """The simple flow v2 (2026-11-21; the only flow since 2026-11-22), 4 GPUs (3 main replicas): a fresh 500-item screen of the clean
-    pool per generation (draws/gen_XX), train = the rest of the pool, gate = simple_math_eval, held-out =
-    simple_math_test (avg@4). The CURRENT model answers the screen once (n 4, thinking text kept: reference_screen.json,
-    api.screen_results); candidates are NOT screened; each of the k x 1 candidates gets ONE gate evaluation paired vs
-    the parent's gate records (scored once), recorded in gate.json; the largest passing gain is accepted; no
-    api.evaluate. Thread 1 runs the paper-style recipe (screen tools, acts on own outputs, direction / unit,
-    tensor_compute(vectors), project_out, save_edit / load_edit)."""
+    """The default flow (2026-11-25), 4 GPUs (3 main replicas): ONE fixed training set (generation 0's draw of the clean
+    pool, eval / test items excluded) for every generation; the CURRENT model answers it once (n 4, thinking text
+    kept: reference_screen.json, api.screen_results), the screen and gate levels share that one scoring; each of the
+    k x 1 candidates gets ONE evaluation on the same items paired vs those records, recorded in gate.json; the largest
+    gain > 0 is accepted; no api.evaluate. Thread 1 runs the paper-style recipe (screen tools, acts on own outputs,
+    direction / unit, tensor_compute(vectors), project_out, save_edit / load_edit)."""
     py = REPO / "eval" / ".venv" / "bin" / "python"
     py = str(py) if py.exists() else sys.executable
-    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-           "--gpus", "0,1,2,3", "--runs-dir", str(tmp_path), "--set", "hardware=h20",
-           "--set", "simple.screen_n=20", "--set", "heldout.limit=4"]
+    cmd = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "2", "--mock",
+           "--gpus", "0,1,2,3", "--runs-dir", str(tmp_path), "--set", "hardware=h20", "--set", "simple.screen_n=20"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=dict(os.environ))
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
     assert "roles {'main': [0, 1, 2], 'train': [3]}" in r.stdout
     run = tmp_path / "B_math_s42_single_simple_mock"                             # the default run id
     # every scoring job is split over the 3 replicas
-    assert len(list((run / "baseline" / "gate" / "simple_math_eval").glob("_part*"))) == 3
-    ids = run / "draws" / "gen_00" / "ids"
-    screen = json.loads((ids / "simple_math_pool.screen.json").read_text())
+    assert len(list((run / "baseline" / "gate" / "simple_math_pool").glob("_part*"))) == 3
+    assert [p.name for p in (run / "draws").iterdir()] == ["gen_00"]              # one draw for the whole run
+    screen = json.loads((run / "draws" / "gen_00" / "ids" / "simple_math_pool.screen.json").read_text())
     gate = json.loads((REPO / "data" / "splits" / "simple_math_eval" / "pool.json").read_text())
     test = json.loads((REPO / "data" / "splits" / "simple_math_test" / "pool.json").read_text())
     assert len(screen) == 20 and not set(screen) & (set(gate) | set(test))
-    held = json.loads((run / "baseline" / "heldout.json").read_text())
-    assert set(held) == {"simple_math_test"} and held["simple_math_test"].get("avg_at_n") is not None   # avg@4
-    gd = run / "gen_00"
-    par = sorted(p.name for p in (gd / "evals" / "__parent__").iterdir())
-    scr = [p for p in par if p.startswith("screen@")]
-    gat = [p for p in par if p.startswith("gate@")]
-    assert len(scr) == 1 and len(gat) == 1 and "screen" not in par and "gate" not in par, par
-    pg = json.loads((gd / "evals" / "__parent__" / gat[0] / "simple_math_eval.json").read_text())
-    assert pg["decoding"]["n"] == 4 and pg["decoding"]["thinking"] and all(x["ns"] == 4 for x in pg["records"])
-    _check_parent_gate_reuse(run, 1, on_m0=False)                   # gen 0: M_0's baseline gate, not sampled again
+    assert not (run / "baseline" / "heldout.json").exists()
+    _check_parent_gate_reuse(run, 2, on_m0=False)                   # gen 0: M_0's baseline records, not sampled again
     assert "gen 0: current model's gate records reused from baseline/gate" in r.stdout
-    ps = json.loads((gd / "evals" / "__parent__" / scr[0] / "simple_math_pool.json").read_text())
-    assert ps["decoding"]["n"] == 4 and ps["n"] == 20
-    assert len(list((gd / "evals" / "__parent__" / scr[0] / "simple_math_pool_raw").glob("_part*"))) == 3
-    rs = json.loads((gd / "reference_screen.json").read_text())["summary"]
-    assert rs["n_items"] == 20 and rs["samples_per_item"] == 4 and sum(rs["correct_counts"].values()) == 20
-    # candidates: k x 1, never screened (only gate@ caches), one gate result each, recorded in gate.json
-    non = json.loads((gd / "baselines" / "nonllm.json").read_text())
-    nonllm = {p.get("name") for p in (non.get("random_search") or {}).get("points") or []}
+    for g in (0, 1):
+        gd = run / f"gen_{g:02d}"
+        lv = next((gd / "evals" / "__parent__").iterdir())
+        ps = json.loads((lv / "simple_math_pool.json").read_text())
+        assert ps["decoding"]["n"] == 4 and ps["decoding"]["thinking"] and ps["n"] == 20
+        assert sorted(x["id"] for x in ps["records"]) == sorted(screen)
+        rs = json.loads((gd / "reference_screen.json").read_text())["summary"]
+        assert rs["n_items"] == 20 and rs["samples_per_item"] == 4 and sum(rs["correct_counts"].values()) == 20
+        assert sorted(json.loads((gd / "train_data.json").read_text())) == sorted(screen)
+        cands = [json.loads(x) for x in (gd / "candidates.jsonl").read_text().splitlines() if x.strip()]
+        assert sorted(c["cid"] for c in cands) == [f"g{g:02d}_t{t}_s00" for t in range(3)]
+        for c in cands:
+            if not c["artifact"]:
+                continue
+            fb = c["screen"]["feedback"]
+            assert "target" not in fb and fb["gate"]["n"] == 20 and c["screen"]["score"] == fb["gate"]["gain"]
+            assert {"passed", "accuracy", "reference_accuracy", "gain", "ci", "broken", "fixed"} <= set(fb["gate"])
+        for d in (gd / "evals").iterdir():                          # one level dir per model: the shared one
+            assert [x.name for x in d.iterdir()] == [lv.name], (d, list(d.iterdir()))
+        glog = json.loads((gd / "gate.json").read_text())
+        assert sorted(x["cid"] for x in glog["submissions"]) == sorted(c["cid"] for c in cands if c["artifact"])
+        acc = json.loads((gd / "accepted.json").read_text())
+        passed = [x for x in glog["submissions"] if x["passed"]]
+        assert all(x["info"]["gain"] > 0 for x in passed)
+        if passed:
+            best = max(passed, key=lambda x: x["info"]["gain"])
+            assert acc["source"] == "llm" and acc["cid"] == glog["accepted"] == best["cid"]
+        else:
+            assert acc["source"] == "keep" and glog["accepted"] is None
+    gd = run / "gen_00"
     cands = [json.loads(x) for x in (gd / "candidates.jsonl").read_text().splitlines() if x.strip()]
-    assert sorted(c["cid"] for c in cands) == [f"g00_t{t}_s00" for t in range(3)]
-    for c in cands:
-        if not c["artifact"]:
-            continue
-        fb = c["screen"]["feedback"]
-        assert "target" not in fb and fb["gate"]["n"] == 30 and c["screen"]["score"] == fb["gate"]["gain"]
-        assert {"passed", "accuracy", "reference_accuracy", "gain", "ci", "broken", "fixed"} <= set(fb["gate"])
-    for d in (gd / "evals").iterdir():
-        if d.name != "__parent__" and d.name not in nonllm:            # the non-LLM branch screens its own points
-            assert all(x.name.startswith("gate@") for x in d.iterdir()), list(d.iterdir())
-    glog = json.loads((gd / "gate.json").read_text())
-    assert glog["rule"].startswith("gate_every_candidate")
-    assert sorted(x["cid"] for x in glog["submissions"]) == sorted(c["cid"] for c in cands if c["artifact"])
-    acc = json.loads((gd / "accepted.json").read_text())
-    passed = [x for x in glog["submissions"] if x["passed"]]
-    if passed:
-        best = max(passed, key=lambda x: x["info"]["gain"])
-        assert acc["source"] == "llm" and acc["cid"] == glog["accepted"] == best["cid"]
-    else:
-        assert acc["source"] == "keep" and glog["accepted"] is None
-    st = json.loads((run / "state.json").read_text())["gen00/search"]
-    assert "evaluate_budget" not in st and "evaluate_spent" not in st
     t1 = next(c for c in cands if c["cid"] == "g00_t1_s00")
     tools = t1["artifact"]["tools_used"]
     assert "evaluate" not in tools and t1["artifact"]["strategy"] == "pure_construct", t1
@@ -505,12 +486,11 @@ def test_mock_simple_flow(tmp_path):
     assert (gd / "saved" / "g00_t1_s00" / "best.json").exists()
     tr = [json.loads(x) for x in (gd / "editor" / "thread_0.jsonl").read_text().splitlines() if x.strip()]
     sysmsg, user = tr[0]["content"], next(x for x in tr if x.get("role") == "user")["content"]
-    assert "there is no api.evaluate" in sysmsg and "evaluated ONCE on a fixed hidden set of 30 items" in sysmsg
+    assert "there is no api.evaluate" in sysmsg and "evaluated ONCE on the 20 training items" in sysmsg
     assert "- evaluate(" not in sysmsg and "- screen_results(" in sysmsg and "api.project_out" in sysmsg
     assert "share ONE Python session" in sysmsg and "up to 20 rounds" in sysmsg
-    assert "You are session 1 of 3 in this generation" in user and "Your own answers on this generation's 20" in user
+    assert "You are session 1 of 3 in this generation" in user and "Your own answers on the 20 training items" in user
     assert "No api.evaluate this generation" in user
-    assert "worst_retention_delta" not in user and "full_score" not in user and "act ratio" not in user
 
 
 # ============================================================================ editor tool loop (2026-11-21)
@@ -976,7 +956,7 @@ def test_prompt_gate_text_and_rules():
     base = {"gate": {"min_gain": 0.01, "require_significant": True}}
     sig = gate_text(base, gate_n=500)
     assert "statistically significant" in sig and "about 5 more correct items out of 500" in sig
-    assert "evaluated ONCE on a fixed hidden set of 500 items" in sig and "none passes: the model stays as it is" in sig
+    assert "evaluated ONCE on the 500 training items" in sig and "none passes: the model stays as it is" in sig
     nosig = gate_text({"gate": {"min_gain": 0.01, "require_significant": False}}, gate_n=500)
     assert "no significance test" in nosig and "95% CI" not in nosig and "Retention" not in nosig
     rawfb = gate_text({"gate": {"min_gain": 0.0}}, gate_n=30, raw_fallback=True)
@@ -995,7 +975,7 @@ def test_prompt_gate_text_and_rules():
     assert "api.tensors()" not in sp and "T5.name" not in sp and "tensor_compute" not in sp   # tool switched off
     noscr = system_prompt(dict(cfg, tools={"tensor_compute": False, "screen_results": False}),
                           budget={"gpu_seconds": 7200}, mode="scratch")
-    assert "you only see each\n  candidate's gate statistics" in noscr and "- screen_results(" not in noscr
+    assert "evaluated on exactly these items" in noscr.replace("\n  ", " ") and "- screen_results(" not in noscr
     on = dict(cfg, tools={})                                     # absent keys: on
     fp = system_prompt(on, budget={"gpu_seconds": 7200}, mode="scratch", gate_n=500)
     assert "api.tensors()" in fp and "T5.name" in fp and "lora = {module: (A [r, in], B [out, r])}" in fp
@@ -1029,8 +1009,8 @@ class _CountingEv:
 
 
 def test_no_evaluate_tool_and_budget(tmp_path):
-    """2026-11-23: there is no evaluate tool or evaluate budget; Workspace.evaluate_lora (the raw LoRA's / non-LLM
-    branch's points) scores once per (LoRA, level), never charged; api.budget() shows the program's time left and the
+    """2026-11-23: there is no evaluate tool or evaluate budget; Workspace.evaluate_lora (the raw LoRA's
+    points) scores once per (LoRA, level), never charged; api.budget() shows the program's time left and the
     note that every returned candidate gets one gate evaluation."""
     from lora_code.mock import MockStore, m_sgd
     from lora_code.primitives.train import TrainData
@@ -1079,7 +1059,7 @@ def test_context_budget_line():
     assert ("No api.evaluate this generation: every returned candidate gets one gate evaluation automatically, 50 of "
             "7200 GPU-seconds.") in msg
     assert "600 s (median)" in msg and "1 program(s) were killed" in msg and "about 90 s" in msg
-    assert "score = the paired gain in gate accuracy vs the current model" in msg
+    assert "score = the paired accuracy gain on the training items vs the current model" in msg
     for gone in ("evaluate calls", "Few evaluations", "vs_raw", "worst_retention_delta", "\"kl\"", "full_score"):
         assert gone not in msg, gone
     assert "No api.evaluate" not in ContextRenderer(task_text="T", diag_text="D")([], 0)
@@ -1090,95 +1070,3 @@ def test_context_budget_line():
     assert "You are session 3 of 8 in this generation" in msg and "search_history and the archive below" in msg
     r2 = ContextRenderer(task_text="T", diag_text="D", sessions=4)
     assert "You are session 4 of 4" in r2([], 3) and "search_history" not in r2([], 3)
-
-
-def test_mock_reuse_baseline_from(tmp_path):
-    """reuse.baseline_from (2026-11-24): a second run takes M_0's generation-0 gate and held-out scores from an
-    earlier run with the same model / seed / domain / decoding / items instead of sampling M_0 again (state
-    reused_from, identical files, generation 0's parent gate then adopted from those records); a mismatch (another
-    held-out limit) stops the run with the differences."""
-    py = REPO / "eval" / ".venv" / "bin" / "python"
-    py = str(py) if py.exists() else sys.executable
-    base = [py, "-I", str(REPO / "lora_code" / "run.py"), "--domain", "math", "--gens", "1", "--mock",
-            "--runs-dir", str(tmp_path), "--set", "method.mode=scratch", "--set", "merge.mode=adapter"]
-    r = subprocess.run(base + ["--run-id", "B_src"], capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
-    r = subprocess.run(base + ["--run-id", "B_dst", "--set", f"reuse.baseline_from={tmp_path / 'B_src' / 'baseline'}"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))   # its baseline/ folder
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-5000:]
-    src, dst = tmp_path / "B_src", tmp_path / "B_dst"
-    assert "baseline: M_0 gate records reused from" in r.stdout and "baseline: M_0 held-out reused from" in r.stdout
-    st = json.loads((dst / "state.json").read_text())
-    assert st["baseline/gate"]["reused_from"] == str(src) and st["baseline/heldout"]["reused_from"] == str(src)
-    for f in ("gate_scores.json", "heldout.json"):
-        assert json.loads((dst / "baseline" / f).read_text()) == json.loads((src / "baseline" / f).read_text()), f
-    assert (dst / "baseline" / "gate" / "simple_math_eval" / "simple_math_eval.jsonl").read_text() == \
-        (src / "baseline" / "gate" / "simple_math_eval" / "simple_math_eval.jsonl").read_text()
-    assert not list((dst / "baseline" / "gate" / "simple_math_eval").glob("_part*"))   # nothing sampled here
-    _check_parent_gate_reuse(dst, 1, on_m0=True)
-    # a mismatch is refused, not silently re-sampled (mock_overrides pin heldout.limit, so: another gate n / seed)
-    r = subprocess.run(base + ["--run-id", "B_bad", "--set", "reuse.baseline_from=B_src", "--set", "decoding.gate.n=2"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "cannot reuse M_0's gate scores" in r.stdout + r.stderr, r.stdout[-2000:]
-    assert "gate decoding" in r.stdout + r.stderr
-    r = subprocess.run(base + ["--run-id", "B_bad1", "--seed", "7", "--set", "reuse.baseline_from=B_src"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "seed: 42 there, 7 here" in r.stdout + r.stderr, r.stdout[-2000:]
-    r = subprocess.run(base + ["--run-id", "B_bad2", "--set", "reuse.baseline_from=B_nowhere"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "is not a run directory" in r.stdout + r.stderr
-    # a field left unset here is compared too (top_k null here, 20 there)
-    r = subprocess.run(base + ["--run-id", "B_bad3", "--set", "reuse.baseline_from=B_src", "--set", "decoding.gate.top_k=null"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    out = r.stdout + r.stderr
-    assert r.returncode != 0 and "cannot reuse M_0's gate scores" in out and "decoding.gate:" in out, out[-2000:]
-    assert "'top_k': 20" in out.split(" there, ")[0], out[-2000:]
-    # another held-out decoding (n 2 here, 4 there): refused
-    r = subprocess.run(base + ["--run-id", "B_bad4", "--set", "reuse.baseline_from=B_src", "--set", "heldout.decoding.n=2"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "cannot reuse M_0's held-out scores" in r.stdout + r.stderr, r.stdout[-2000:]
-    assert not (tmp_path / "B_bad4" / "baseline" / "gate_scores.json").exists()   # checked before anything is copied
-    # data rebuilt since the source scored M_0 (stored processed_sha256 differs): refused
-    import shutil
-    stale = tmp_path / "B_stale"
-    shutil.copytree(src, stale)
-    sp = stale / "baseline" / "gate" / "simple_math_eval" / "summary.json"
-    sj = json.loads(sp.read_text())
-    sj["simple_math_eval"]["data_provenance"]["processed_sha256"] = "0" * 64
-    sp.write_text(json.dumps(sj))
-    r = subprocess.run(base + ["--run-id", "B_bad5", "--set", "reuse.baseline_from=B_stale"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "data rebuilt since" in r.stdout + r.stderr, r.stdout[-2000:] + r.stderr[-2000:]
-    # a source without the grading-code fingerprint (scored before 2026-11-24) needs reuse.trust_unrecorded_code
-    old = tmp_path / "B_old"
-    shutil.copytree(src, old)
-    (old / "baseline" / "eval_code.json").unlink()
-    r = subprocess.run(base + ["--run-id", "B_bad6", "--set", "reuse.baseline_from=B_old"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "reuse.trust_unrecorded_code=true" in r.stdout + r.stderr, r.stdout[-2000:]
-    r = subprocess.run(base + ["--run-id", "B_trust", "--set", "reuse.baseline_from=B_old",
-                               "--set", "reuse.trust_unrecorded_code=true"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
-    assert json.loads((tmp_path / "B_trust" / "baseline" / "eval_code.json").read_text())["sha256"] is None
-    r = subprocess.run(base + ["--run-id", "B_bad7", "--set", "reuse.baseline_from=B_trust"],   # the flag is inherited
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "reuse.trust_unrecorded_code=true" in r.stdout + r.stderr, r.stdout[-2000:]
-    # gate items never graded there (pending, e.g. code without Docker): refused
-    pend = tmp_path / "B_pending"
-    shutil.copytree(src, pend)
-    sp = pend / "baseline" / "gate" / "simple_math_eval" / "summary.json"
-    sj = json.loads(sp.read_text())
-    sj["simple_math_eval"]["n_pending"] = 5
-    sp.write_text(json.dumps(sj))
-    r = subprocess.run(base + ["--run-id", "B_bad8", "--set", "reuse.baseline_from=B_pending"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode != 0 and "never graded there" in r.stdout + r.stderr, r.stdout[-2000:]
-    # a run that reused can itself be a source (its summary and fingerprint travel with the records)
-    r = subprocess.run(base + ["--run-id", "B_chain2", "--set", "reuse.baseline_from=B_dst"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
-    # a finished generation 0 never reads the source again: resuming with a source that no longer exists works
-    r = subprocess.run(base + ["--run-id", "B_dst", "--set", "reuse.baseline_from=B_nowhere"],
-                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
-    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]

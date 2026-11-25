@@ -6,7 +6,7 @@ All quantizers are asymmetric min-max per group along the input dimension (GPTQ/
     code  = clamp(round(w / scale) + zero, 0, 2^b - 1)
     w'    = (code - zero) * scale
 GPTQ (Frantar et al. 2023) uses the Hessian H = sum_x x x^T of the module's input activations
-(collected from the CURRENT model on calibration texts, see quant/hessian.py); groups' scales are
+(collected from the original model M_0 on calibration texts, see quant/hessian.py); groups' scales are
 computed on the error-compensated weights when the group is reached ("static groups" off).
 AWQ-lite: per-input-channel scaling s = rms(x)^alpha (normalised), alpha chosen on a grid to
 minimise the H-weighted output error tr((W - W') H (W - W')^T); the dequantized weight is

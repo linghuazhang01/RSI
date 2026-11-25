@@ -1,4 +1,4 @@
-# Domain code: train pool simple_code_pool (from TACO-verified), gate simple_code_eval, held-out simple_code_test.
+# Domain code: train pool simple_code_pool (from TACO-verified) (the fixed 500-item training set is drawn from it).
 # Code scores need the Docker sandbox. Override here only what differs from base.yaml.
 train_data:
   mode: gold                # sampled solutions cannot be verified without Docker; use TACO reference solutions

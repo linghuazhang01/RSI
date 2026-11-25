@@ -293,7 +293,7 @@ def test_program_build_weights(tmp_path):
 
 
 def test_evaluate_lora_with_edits(tmp_path):
-    """Workspace.evaluate_lora (the non-LLM branch's points) on weight edits: identical edits are scored once, a LoRA
+    """Workspace.evaluate_lora on weight edits: identical edits are scored once, a LoRA
     is scored as the edit that adds it, a capped edit fails the checks; there is no evaluate tool (2026-11-23)."""
     from lora_code.mock import m_construct
     ev = _Ev()
@@ -345,19 +345,3 @@ def test_summarize_candidate_edit():
     assert s["strategy"] == "weights_only" and s["kind"] == "weights" and s["modules"] == 3
     c.artifact = {"strategy": "pure_construct"}
     assert "kind" not in summarize_candidate(c)
-
-
-def test_random_weight_search(tmp_path):
-    from lora_code import baselines as BL
-    from lora_code.mock import MockWeightEdit
-    ev = _Ev()
-    ws = _ws(tmp_path, evaluator=ev)
-    best, log = BL.random_weight_search(ws, evals=6, seed=42, top_full=2)
-    assert len(log["points"]) == 6 and isinstance(best, MockWeightEdit) and best.modules()
-    scored = [p for p in log["points"] if p.get("score") is not None]
-    assert scored and log["best"]["score"] == max(p["score"] for p in scored)
-    assert all(p["kind"] in ("rows", "cols", "scale") for p in log["points"])
-    assert any(lvl == "full" for _, lvl in ev.calls)
-    assert ws.check(best)[0] and ws.spent.get("evaluate", 0) == 0     # not charged to the editor budget
-    best2, log2 = BL.random_weight_search(_ws(tmp_path / "b", evaluator=_Ev()), evals=6, seed=42, top_full=2)
-    assert best2.digest() == best.digest()                             # deterministic

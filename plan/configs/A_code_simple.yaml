@@ -1,3 +1,4 @@
+# STALE: this snapshot predates 2026-11-25 (no loop.start, gate.metric / gate.kl, scoring, reuse); edit_code/configs/base.yaml is authoritative.
 # Paper A · self-quantization (fixed W4-size budget; the editor is the frozen M_0, the incumbent is the latest model) · code only · simple flow (v2, 2026-11-21) · B300 planned at 220 GB per card
 # Generated snapshot of the MERGED config (edit_code/configs/base.yaml + domains/code.yaml + hardware b300).
 # Not read by the code (source of truth: base.yaml + --set); a run locks its own copy in

@@ -14,8 +14,8 @@ no evaluate tool (2026-11-23): every returned candidate gets one gate evaluation
 All accounting is done by the workspace's rsicore.sandbox.ToolAPI (`ws.api`, created with the workspace):
 GPU tools = cost {"gpu_seconds": 0} (refused once exhausted) + cost_fn (measured seconds, capped at what
 was left before the call so a successful call keeps its result; the uncapped total is ws.gpu_measured).
-Workspace.evaluate_lora scores a LoRA directly (the raw LoRA's and the non-LLM branch's points; never charged).
-Data access: acts / train_example only accept this generation's `train` ids (TrainData).
+Workspace.evaluate_lora scores a LoRA directly (the raw LoRA's points; never charged).
+Data access: acts / train_example only accept the fixed training set's `train` ids (TrainData).
 The editor never trains and never computes gradients (2026-11-20: no sgd / grad / from_grad tools in any
 mode). Tool set by method.mode (tools_for_mode): edit = every LoRA tool plus raw_lora (the raw LoRA under handle
 "RAW"); scratch = every LoRA tool without raw_lora; weights = every LoRA tool without raw_lora plus the weight-edit
@@ -32,7 +32,7 @@ It runs WITHOUT the workspace lock (only resolving inputs / registering outputs 
 semaphore (max_concurrent), with timeout min(timeout_s, the calling program's / exploration call's time left).
 The simple flow (2026-11-21; the only flow, 2026-11-23; paper_tools_enabled / screen_tools_enabled): no evaluate
 tool; screen_results / screen_output read the current model's own answers on the
-generation's screen items (ws.screen, set by run.py); paper tools save_edit / load_edit / list_edits / drop_edit
+fixed training set (ws.screen, set by run.py); paper tools save_edit / load_edit / list_edits / drop_edit
 (out_dir/saved/<root cid>/), output_matrices, unit, direction, project_out, acts(source='own'),
 tensor_compute(vectors=...).
 Exploration (2026-11-21): ws.explore_api(tag) is the `api` of the editor's run_python chat tool (rsicore.chat_tools)
@@ -54,7 +54,7 @@ from .common import stable_hash, write_json
 TOOL_DOCS = {
     "modules": "modules(layer=None, leaf=None, group=None) -> list of {module, layer, layer_type, leaf, group, out, in} (the only valid module names)",
     "diagnostics": "diagnostics(module=None, layer=None, top=20, sort='w_norm') -> rows of the fixed diagnostics table (a list; can be EMPTY for a module or layer without a row: check before indexing)",
-    "train_ids": "train_ids(n=None) -> ids of this generation's train items (the only items activation tools accept)",
+    "train_ids": "train_ids(n=None) -> ids of the fixed training set (the same items every generation; the only items activation tools accept)",
     "train_example": "train_example(id) -> {prompt, target} of one train item (truncated)",
     "svd": "svd(module, k=8) -> {handle, S, shape}: top-k singular triplets of the CURRENT weight W",
     "acts": "acts(module, ids=None, k=4) -> {handle, in_norm, out_norm, pc_var}: activation stats on train items",
@@ -156,11 +156,26 @@ ACTS_OWN_DOC = ("acts(module, ids=None, k=4, source='prompt', sample=0) -> {hand
                 "(api.screen_results); contrast groups, e.g. right vs wrong items (costs gpu_seconds)")
 TC_VECTORS_DOC = (" vectors=[refs] passes vector refs ('S3.u0', 'A2.out_mean', 'T5.dir', ...) to the code as "
                   "V = {ref: 1-D tensor}.")
-# The current model's own answers on this generation's screen items (2026-11-21, screen_tools_enabled; free)
+# (2026-11-25) loras=: the exact factors of LoRA handles as code inputs (every mode, whenever tensor_compute is on)
+TC_LORAS_DOC = (" loras=[handles] (or {{handle: [modules]}}) passes LoRA factors to the code as LORA = {{handle: {{module: "
+                "(A [r, in], B [out, r])}}}} (fp32, dW = B @ A, the scaling folded into B): any LoRA handle: {which}; at "
+                "most 8 handles, their size counts toward the input limit (pick modules for a large LoRA); tensors= may "
+                "then be empty.")
+_TC_OWN = "your own 'L<n>' or an earlier candidate's LoRA (api.candidate(cid))"
+TC_LORAS_WHICH = {   # which handles stand for earlier changes, per mode / merge.mode (T = what tensor_compute reads)
+    "merge": "the adapters accepted in earlier generations, already merged into the weights T reads (api.stack(): "
+             "'H0', ...), " + _TC_OWN,
+    "adapter": "the adapters accepted in earlier generations (api.stack(): 'H0', ...) and, once one was accepted, 'CUR', "
+               "the cumulative adapter C exactly as served (T reads W_0 + B_C A_C; C can be an SVD-truncated "
+               "recompression of the H sum), " + _TC_OWN,
+    "edit": "'RAW', the LoRA you edit (not in T: T reads the original weights), " + _TC_OWN,
+    "weights": "your own 'L<n>' (LoRAs built with the LoRA tools; weight edits are not LoRAs)",
+}
+# The current model's own answers on the fixed training set (2026-11-21, screen_tools_enabled; free)
 SCREEN_DOCS = {
     "screen_results": "screen_results(ids=None, filter='all', limit=50, offset=0) -> list of {id, prompt, gold, scores, "
                       "answers, finish, lengths, truncated_thinking}: YOUR OWN (the current model's) sampled answers "
-                      "on this generation's screen items (training-pool items; prompt / gold may be read), one row "
+                      "on the fixed training items (the set your candidates are evaluated on; prompt / gold may be read), one row "
                       "per item with one score / extracted answer per sample; filter all | wrong (no sample right) | "
                       "unstable (some right) | right (all right); free",
     "screen_output": "screen_output(id, sample=0, offset=0) -> {text, total_chars, next_offset, score, answer, finish, "
@@ -203,12 +218,27 @@ def tools_for_mode(mode: str, cfg: dict | None = None) -> dict:
         if "tensor_compute" in out:
             out["tensor_compute"] = out["tensor_compute"].replace("tensor_compute(code, tensors", "tensor_compute(code, "
                                                                   "tensors, vectors=None", 1) + TC_VECTORS_DOC
+    if "tensor_compute" in out:                # (2026-11-25) the factors of LoRA handles as inputs
+        doc = out["tensor_compute"].replace(") -> {", ", loras=None) -> {", 1).rstrip()
+        out["tensor_compute"] = (doc + ("" if doc.endswith(".") else ".")
+                                 + TC_LORAS_DOC.format(which=TC_LORAS_WHICH[lora_kind(mode, cfg)]))
+        if "stack" in out and mode == "scratch":   # stack() is empty in edit / weights mode (run.Run.stack)
+            out["stack"] += "; read their factors with tensor_compute(code, loras=[handle])" + (
+                ", the served cumulative adapter as 'CUR'" if lora_kind(mode, cfg) == "adapter" else "")
     if screen_tools_enabled(cfg):
         out.update(SCREEN_DOCS)
     for name, on in ((cfg or {}).get("tools") or {}).items():   # the switches also remove the tools added here
         if on is False:
             out.pop(name, None)
     return out
+
+
+def lora_kind(mode: str, cfg: dict | None) -> str:
+    """How earlier changes are part of the current model (2026-11-25, for the loras= docs): scratch -> merge.mode
+    (merge | adapter), edit -> 'edit', weights -> 'weights'."""
+    if mode != "scratch":
+        return mode
+    return "adapter" if str(((cfg or {}).get("merge") or {}).get("mode") or "merge") == "adapter" else "merge"
 
 
 def tensor_compute_enabled(cfg: dict | None) -> bool:
@@ -263,7 +293,7 @@ def paper_tools_enabled(cfg: dict | None) -> bool:
 
 def screen_tools_enabled(cfg: dict | None) -> bool:
     """tools.screen_results (2026-11-21): api.screen_results / api.screen_output over the current model's own answers
-    on this generation's screen items. Absent key: on (candidates are never screened, 2026-11-23)."""
+    on the fixed training set. Absent key: on (candidates are never screened, 2026-11-23)."""
     on = ((cfg or {}).get("tools") or {}).get("screen_results")
     return bool(on) if on is not None else True
 
@@ -317,7 +347,7 @@ class Workspace:
         self._n = 0
         self._lock = threading.RLock()
         self._evaluated: dict[str, tuple] = {}
-        # (2026-11-21) the current model's own answers on this generation's screen items (dict or a
+        # (2026-11-21) the current model's own answers on the fixed training set (dict or a
         # loader; Workspace.screen_data) for screen_results / screen_output / acts(source='own'); None = not available
         self.screen = None
         self.program_timeout_s = int((cfg.get("sandbox", {}) or {}).get("timeout_s", 1800))
@@ -339,6 +369,8 @@ class Workspace:
             self._h[f"H{g}"] = lo
         if raw is not None:
             self._h["RAW"] = raw
+        if self.base_lora is not None:          # (2026-11-25) merge.mode adapter: C_g exactly as served (it can be an
+            self._h["CUR"] = self.base_lora     # SVD-truncated recompression of the H<g> sum; tensor_compute(loras=)
 
     # ------------------------------------------------------------------ bookkeeping
     @property
@@ -1148,9 +1180,11 @@ class Workspace:
             return M.synth_tensor(self.store.synth_spec(name))
         return self.store.tensor(name, device="cpu")
 
-    def t_tensor_compute(self, code, tensors=None, edit=None, vectors=None):
+    def t_tensor_compute(self, code, tensors=None, edit=None, vectors=None, loras=None):
         """Run `code` on fp32 copies of current tensors in a fresh sandbox; register its outputs (see TOOL_DOCS).
-        vectors (2026-11-21, paper tools): vector refs passed to the code as V = {ref: 1-D fp32 tensor}."""
+        vectors (2026-11-21, paper tools): vector refs passed to the code as V = {ref: 1-D fp32 tensor}.
+        loras (2026-11-25): LoRA handles whose factors are passed to the code as LORA = {handle: {module: (A, B)}}
+        (_tc_lora_inputs)."""
         import shutil
 
         from rsicore.sandbox import ToolAPI, run_program
@@ -1163,8 +1197,9 @@ class Workspace:
             raise ValueError("vectors= is not available in this run (tools.paper_tools)")
         if len(vrefs) > 16:
             raise ValueError("at most 16 vectors per call")
-        if not names and not vrefs:
-            raise ValueError("tensors: give at least one tensor name (api.tensors())")
+        lreq = self._tc_lora_request(loras)
+        if not names and not vrefs and not lreq:
+            raise ValueError("tensors: give at least one tensor name (api.tensors()), vector ref or LoRA handle")
         if edit is not None and self.mode != "weights":
             raise ValueError("edit= is only available in mode=weights")
         with self._lock:                                   # resolve inputs
@@ -1180,11 +1215,14 @@ class Workspace:
             if len(canon) > int(tc["max_tensors"]):
                 raise ValueError(f"at most {tc['max_tensors']} tensors per call (tensor_compute.max_tensors)")
             shapes = {n: tuple(self.store.tensor_shape(n)) for n in canon}
-            mb = sum(4 * math.prod(s) for s in shapes.values()) / 2 ** 20
+            lsel, lbytes = self._tc_lora_select(lreq)
+            mb = (sum(4 * math.prod(s) for s in shapes.values()) + lbytes) / 2 ** 20
             if mb > float(tc["max_input_mb"]):
-                raise ValueError(f"inputs are {mb:.0f} MB in fp32 > tensor_compute.max_input_mb {tc['max_input_mb']}")
+                raise ValueError(f"inputs are {mb:.0f} MB in fp32 > tensor_compute.max_input_mb {tc['max_input_mb']}"
+                                 + (" (pass fewer LoRA modules: loras={handle: [modules]})" if lbytes else ""))
             base_ed = self._get(edit, "edit") if edit is not None else None
             vin = {f"V|{r}": self._vec_t(r).contiguous() for r in vrefs}
+            lin_spec, lin = self._tc_lora_inputs(lsel)
             self._tc_n += 1
             n_call = self._tc_n
         cur = {}                                           # tensors the given edit changes: T = W after its ops
@@ -1214,12 +1252,13 @@ class Workspace:
         try:
             if timeout < 5:
                 raise _budget_exc()("tensor_compute: not enough time left after waiting for a free slot")
+            t_prep = time.time()
             if wd.exists():
                 shutil.rmtree(wd, ignore_errors=True)
             wd.mkdir(parents=True, exist_ok=True)
             thr = max(1, int(tc["threads"]))
             spec = {"code": code, "threads": thr, "names": canon, "aliases": aliases, "inputs": sorted(cur),
-                    "vin": list(vrefs)}
+                    "vin": list(vrefs), "lin": lin_spec}
             allow = []
             if self.mock:
                 spec["synth_src"] = M.SYNTH_SRC
@@ -1227,10 +1266,13 @@ class Workspace:
             else:
                 spec["sources"] = {n: list(self.store.tensor_source(n)) for n in canon if n not in cur}
                 allow = sorted({p for p, _ in spec["sources"].values()})
-            if cur or vin:
+            if cur or vin or lin:
                 from safetensors.torch import save_file
-                save_file({**cur, **vin}, str(wd / "in.safetensors"))
+                save_file({**cur, **vin, **lin}, str(wd / "in.safetensors"))
             (wd / "tc_spec.json").write_text(json.dumps(spec))
+            timeout -= time.time() - t_prep               # writing large inputs (LoRA factors) takes real time
+            if timeout < 5:
+                raise _budget_exc()("tensor_compute: not enough time left after writing the inputs")
             res = run_program(TC_WRAPPER, ToolAPI({}), timeout_s=max(5, int(timeout)), mem_gb=float(tc["mem_gb"]),
                               workdir=wd, extra_allow_read=allow, cpu_s=int(timeout * thr) + 30,
                               extra_env={"CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": str(thr),
@@ -1248,6 +1290,93 @@ class Workspace:
         finally:
             sem.release()
             shutil.rmtree(wd, ignore_errors=True)
+
+    MAX_TC_LORAS = 8                        # LoRA handles per tensor_compute call
+
+    @staticmethod
+    def _tc_lora_request(loras) -> dict:
+        """loras= of tensor_compute (2026-11-25) normalised to {handle: None (every module) | [modules]}: a handle, a
+        list of handles, or {handle: module | [modules] | None}. A handle may also be a tool result with a "lora" key
+        (api.raw_lora(), api.scale(...), api.tensor_compute(...)) or an api.stack() row ({"handle": ...})."""
+        if loras is None:
+            return {}
+
+        def hname(h):
+            if isinstance(h, dict) and isinstance(h.get("lora"), str):
+                h = h["lora"]
+            elif isinstance(h, dict) and isinstance(h.get("handle"), str):   # an api.stack() row
+                h = h["handle"]
+            elif isinstance(h, dict) and isinstance(h.get("edit"), str):     # a weight edit: _get says so
+                h = h["edit"]
+            if not isinstance(h, str) or not h:
+                raise ValueError(f"loras: {h!r} is not a LoRA handle (e.g. 'H0' from api.stack(), 'RAW', 'L3')")
+            return h
+        result_keys = {"lora", "handle", "edit", "json", "seconds"}   # a tool result, not a {handle: modules} map
+        if isinstance(loras, dict) and not (result_keys & set(loras)):    # a tool result {"lora": h, ...} is one handle (as
+            items = list(loras.items())                         # in _get; no handle is named 'lora')
+        else:
+            items = [(h, None) for h in ([loras] if isinstance(loras, (str, dict)) else list(loras))]
+        out = {}
+        for h, mods in items:
+            h = hname(h)
+            if mods is not None:
+                if not isinstance(mods, (str, list, tuple)):
+                    raise ValueError(f"loras[{h!r}]: give a list of module names (or None for every module)")
+                mods = [mods] if isinstance(mods, str) else list(mods)
+                if not mods or not all(isinstance(m, str) for m in mods):
+                    raise ValueError(f"loras[{h!r}]: give a list of module names (or None for every module)")
+            if h in out and out[h] is not None and mods is not None:
+                mods = list(dict.fromkeys(out[h] + mods))
+            elif h in out:
+                mods = None
+            out[h] = mods
+        if len(out) > Workspace.MAX_TC_LORAS:
+            raise ValueError(f"loras: at most {Workspace.MAX_TC_LORAS} LoRA handles per call")
+        return out
+
+    def _tc_lora_select(self, req: dict) -> tuple[list, int]:
+        """Resolve {handle: modules} (under the workspace lock) to [(handle, LoRA, [modules])] and the fp32 bytes of
+        their factors. Modules of rank 0 are left out; an unknown module is an error."""
+        sel, nbytes = [], 0
+        for h, mods in req.items():
+            lo = self._get(h, "lora")
+            if lo is None:                                      # 'C:<cid>' of a candidate without a saved LoRA
+                raise KeyError(f"loras: {h!r} has no saved LoRA")
+            have = [m for m in lo.modules() if lo.rank(m) > 0]
+            if mods is None:
+                mods = have
+            else:
+                bad = [m for m in mods if m not in set(have)]
+                if bad:
+                    raise KeyError(f"loras[{h!r}]: no module {bad[0]!r} in this LoRA (it has {len(have)} modules, e.g. "
+                                   f"{have[:3]})")
+            for m in mods:
+                out_f, in_f = self.store.shape(m)
+                nbytes += 4 * lo.rank(m) * (int(in_f) + int(out_f))
+            sel.append((h, lo, list(mods)))
+        return sel, nbytes
+
+    def _tc_lora_inputs(self, sel: list) -> tuple[dict, dict]:
+        """(spec {handle: [modules]}, {"L|<handle>|<module>|A" / "|B": fp32 CPU tensor}) for the sandbox: A [r, in],
+        B [out, r], dW = B @ A (the PEFT scaling is folded into B). Mock LoRAs have no factors: seeded synthetic ones
+        with the recorded rank and ||B A||_F = rel * ||W||_F, so code that measures them sees the mock geometry."""
+        import torch
+        spec, tens = {}, {}
+        for h, lo, mods in sel:
+            spec[h] = list(mods)
+            for m in mods:
+                if self.mock:
+                    r, (out_f, in_f) = lo.rank(m), self.store.shape(m)
+                    gen = torch.Generator().manual_seed(int(stable_hash("tc-lora", lo.digest(), m), 16) % (2 ** 31))
+                    A = torch.randn(r, in_f, generator=gen) / math.sqrt(in_f)
+                    B = torch.randn(out_f, r, generator=gen)
+                    nrm = float(((B.T @ B) * (A @ A.T)).sum().clamp_min(0)) ** 0.5    # ||B A||_F, no [out, in]
+                    B *= float(lo.modules_[m].get("rel", 0.0)) * float(self.store.norm(m)) / max(nrm, 1e-12)
+                else:
+                    A, B = lo.factors[m]
+                tens[f"L|{h}|{m}|A"] = A.detach().to("cpu", torch.float32).contiguous()
+                tens[f"L|{h}|{m}|B"] = B.detach().to("cpu", torch.float32).contiguous()
+        return spec, tens
 
     def _tc_register(self, man, outs, canon, shapes, cur, base_ed, res):
         """Validate the job's outputs and register them (vectors -> T handle, lora -> L handle, writes -> W handle);
@@ -1529,7 +1658,7 @@ class Workspace:
         lo.add(module, A, B)
         return {"lora": self._new("L", lo)}
 
-    # ---- the current model's own answers on this generation's screen items (2026-11-21)
+    # ---- the current model's own answers on the fixed training set (2026-11-21)
     def screen_data(self) -> dict:
         """{"records": {dataset: [run_eval records]}, "items": {dataset: {id: {prompt, reference, messages}}}} set by
         run.py (Run.reference_screen) before the search; RuntimeError when this session has none."""
@@ -1549,7 +1678,7 @@ class Workspace:
             for r in d["records"][ds]:
                 if str(r.get("id")) == str(id_):
                     return ds, r, (d.get("items") or {}).get(ds, {}).get(r["id"]) or {}
-        raise PermissionError(f"{id_!r} is not one of this generation's screen ids (api.screen_results)")
+        raise PermissionError(f"{id_!r} is not one of the training items (api.screen_results)")
 
     def t_screen_results(self, ids=None, filter="all", limit=50, offset=0):  # noqa: A002
         from rsicore import screen_view as SV
@@ -1683,8 +1812,8 @@ class Workspace:
         return f"{self.name_prefix}-{lo.digest()}"
 
     def evaluate_lora(self, lo, level: str = "screen") -> tuple[float | None, dict]:
-        """Register + score `lo` (empty LoRA = keep the model unchanged; never charged: the raw LoRA's and the
-        non-LLM branch's points). Identical LoRAs are cached.
+        """Register + score `lo` (empty LoRA = keep the model unchanged; never charged: the raw LoRA's
+        points). Identical LoRAs are cached.
         Several threads may evaluate at once: the lock covers only the cache and the report / check (weight store,
         applying an edit); evaluator.register / feedback run concurrently."""
         with self._lock:
@@ -2027,8 +2156,14 @@ def main(api):
     if spec.get("vin"):
         with safe_open("in.safetensors", "pt") as f:
             V = {r: f.get_tensor("V|" + r).to(torch.float32) for r in spec["vin"]}
-    g = {"__name__": "__tensor_compute__", "T": T, "V": V, "torch": torch, "math": math, "result": None,
-         "vectors": None, "lora": None, "writes": None}
+    LORA = {}
+    if spec.get("lin"):
+        with safe_open("in.safetensors", "pt") as f:
+            for h, mods in spec["lin"].items():
+                LORA[h] = {m: (f.get_tensor("L|%s|%s|A" % (h, m)).to(torch.float32),
+                               f.get_tensor("L|%s|%s|B" % (h, m)).to(torch.float32)) for m in mods}
+    g = {"__name__": "__tensor_compute__", "T": T, "V": V, "LORA": LORA, "torch": torch, "math": math,
+         "result": None, "vectors": None, "lora": None, "writes": None}
     exec(compile(spec["code"], "<tensor_compute>", "exec"), g)
 
     def ten(x, what):

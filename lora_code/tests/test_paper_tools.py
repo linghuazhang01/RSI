@@ -249,10 +249,11 @@ def test_prompts_gate_mode_and_context():
     cfg["decoding"] = {"screen": {"n": 4, "thinking": True}, "gate": {"n": 4, "thinking": True}}
     cfg["gate"] = {"min_gain": 0.01, "require_significant": True}
     sysmsg = system_prompt(cfg, budget={"gpu_seconds": 300}, mode="scratch", gate_n=500)
-    assert "there is no api.evaluate" in sysmsg and "evaluated ONCE on a fixed hidden set of 500 items" in sysmsg
+    assert "there is no api.evaluate" in sysmsg and "evaluated ONCE on the 500 training items" in sysmsg
+    assert "statistically significant" in sysmsg and "hidden set" not in sysmsg and "held-out" not in sysmsg
     assert "LARGEST gain" in sysmsg and "- evaluate(" not in sysmsg and "api.evaluate draws" not in sysmsg
     assert "source='own'" in sysmsg and "api.project_out" in sysmsg and "api.load_edit(name='best')['lora']" in sysmsg
-    assert "answered by YOU (the current model) 4 time(s)" in sysmsg and "this generation's screen ids" in sysmsg
+    assert "answered by YOU (the current model) 4 time(s)" in sysmsg and "api.train_ids(): the fixed training set" in sysmsg
     assert "up to 20 rounds" in sysmsg and "share ONE Python session" in sysmsg
     cfg["editor"]["tool_rounds"] = 7                      # the round count is configurable (prompt follows it)
     assert "up to 7 rounds" in system_prompt(cfg, budget={"gpu_seconds": 300})
@@ -269,7 +270,7 @@ def test_prompts_gate_mode_and_context():
                                                                      "broken_ids": ["g/1"]}}})
     msg = ctx([c], 1)
     assert "session 2 of 8" in msg and "No api.evaluate this generation" in msg and "at most 0" not in msg
-    assert "paired gain in gate accuracy" in msg and '"gate": {"passed": true, "gain": 0.02' in msg
+    assert "paired accuracy gain on the training items" in msg and '"gate": {"passed": true, "gain": 0.02' in msg
     assert "accuracy avg@4 0.375" in msg
 
 
@@ -298,3 +299,14 @@ def test_accept_best_gate(tmp_path):
                                   "reasons": [], "reference_score": 0.58}, "g")
     assert fb["accuracy"] == 0.6 and fb["reference_accuracy"] == 0.58 and fb["fixed_ids"] == ["b", "c"]
     assert time.time() > 0
+
+
+def test_decoding_mismatch_fails_fast():
+    """screen / full / gate hold the same fixed set (2026-11-25): their decodings must resolve to the same dict."""
+    from lora_code.run import decoding_mismatch
+    d = {"temperature": 0.6, "n": 4, "thinking": True, "seed": None}
+    assert decoding_mismatch({"decoding": {"screen": dict(d), "gate": dict(d)}}, 7) is None
+    assert decoding_mismatch({}, 7) is None                                     # no block: greedy everywhere
+    assert "decoding.screen" in decoding_mismatch({"decoding": {"screen": dict(d), "gate": dict(d, n=8)}}, 7)
+    msg = decoding_mismatch({"decoding": {"screen": dict(d), "full": dict(d, seed=1), "gate": dict(d)}}, 7)
+    assert "decoding.full" in msg and "decoding.screen" not in msg

@@ -11,14 +11,9 @@
     bytes_table()         rows {key, layer, group, params, modules, mib: {"b4_g128": ..., "bf16": ...}}
     bytes(config)         packed size of a config {gib, total_bytes, linear_avg_bits, by_group_gib, fits_budget}
     solve_allocation(...) knapsack over the profile table -> config (removable: tools.solve_allocation=false)
-    screen_results(ids, filter, limit, offset)  the incumbent's (latest model's) answers to this round's screen items:
-                          prompt, gold, per-sample scores / extracted answers / finish / lengths (rsicore.screen_view)
-    screen_output(id, sample, offset)            one sample's full output text (thinking + answer) in pages
 Invalid configs raise a tool error whose message lists every problem (schema.ConfigError).
-No tool evaluates a config (2026-11-23, the hard-wired flow): candidates are never screened, every returned config gets
-ONE gate evaluation outside the program (run.gate_candidate); there is no api.evaluate, no evaluate budget and no
-compare (candidates have no screen records; the tools.compare key was removed 2026-11-23, rsicore.config
-PAPER_REMOVED_KNOBS).
+No tool evaluates a config: every returned config gets ONE KL evaluation on the fixed KL set outside the program
+(run.kl_candidate, 2026-11-25).
 
 explore=True (2026-11-21): the API of the editor's run_python chat tool (rsicore.chat_tools), used while it
 writes a candidate: the same tools, except that group_error refuses settings whose Hessian-weighted error is not
@@ -36,14 +31,13 @@ class ToolError(RuntimeError):
     pass
 
 
-def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, explore: bool = False):
-    """The program's API (cid: the candidate id, or the exploration tag). No tool spends a budget. explore (the
+def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, explore: bool = False):
+    """The program's API. No tool spends a budget. cid is ignored (accepted for older callers). explore (the
     editor's run_python): group_error only on cached settings unless editor.explore.gpu_tools."""
     from rsicore.sandbox import ToolAPI
     tcfg = cfg.get("tools", {})
     gpu_tools = bool(((cfg.get("editor") or {}).get("explore") or {}).get("gpu_tools", False))
     api = ToolAPI({})
-    out_chars = int(tcfg.get("screen_output_chars", 4000))
     spec = problem.spec
 
     def model_info():
@@ -60,7 +54,7 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, explore: bool =
                 "allowed_bits": problem.space["bits"], "group_sizes": problem.space["group_sizes"],
                 "quantizers": problem.space["quantizers"], "embed_options": problem.space["embed"],
                 "incumbent_config": (problem.incumbent or {}).get("config"),
-                "incumbent_scores": problem.incumbent_scores, "tools": api.names()}
+                "incumbent_kl": problem.incumbent_kl, "tools": api.names()}
 
     def profile_table():
         """Whole-model DeltaKL when ONLY this module group is RTN-quantized (original model = reference)."""
@@ -109,36 +103,6 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, explore: bool =
                 "by_group_gib": {k: round(v, 4) for k, v in b["by_group_gib"].items()},
                 "budget_gib": problem.budget_gib, "fits_budget": b["gib"] <= problem.budget_gib + 1e-9}
 
-    def screen_results(ids: list = None, filter: str = "all", limit: int = 50, offset: int = 0, gen: int = None):
-        """The incumbent's (latest model's) answers to this round's screen items (held-back TRAINING items, k sampled
-        answers each, thinking mode): [{id, dataset, prompt (cut), gold, scores [k], answers (extracted final
-        answers), finish (stop | length), lengths (chars incl. thinking), truncated_thinking}]. filter: all | wrong
-        (no sample right) | unstable (some right) | right (every sample right); sorted by id; page with limit /
-        offset. gen = an earlier round's screen (default: this round)."""
-        from rsicore import screen_view
-        recs = problem.screen_records(gen)
-        if not recs:
-            raise ToolError("no screen records of the incumbent for this round" if gen is None
-                            else f"no screen records of the incumbent for round {gen}")
-        try:
-            return screen_view.rows(recs, problem.screen_items(recs), ids=ids, filter=str(filter),
-                                    limit=min(int(limit), 200), offset=int(offset))
-        except ValueError as e:
-            raise ToolError(str(e)) from None
-
-    def screen_output(id: str, sample: int = 0, offset: int = 0, gen: int = None):  # noqa: A002 - tool argument name
-        """One sample's full output text (its thinking + the answer) of the incumbent on a screen item, in pages:
-        {id, sample, n_samples, score, answer, finish, has_thinking, offset, total_chars, text, next_offset}."""
-        from rsicore import screen_view
-        for recs in problem.screen_records(gen).values():
-            rec = next((r for r in recs if str(r.get("id")) == str(id)), None)
-            if rec is not None:
-                try:
-                    return screen_view.output(rec, sample=int(sample), offset=int(offset), chars=out_chars)
-                except ValueError as e:
-                    raise ToolError(str(e)) from None
-        raise ToolError(f"{id!r} is not a screen item of this round (see screen_results)")
-
     def solve_allocation(budget_gib: float = None, weights: dict = None, bits: list = None, group_sizes: list = None,
                          quantizer: str = "gptq", fixed_rules: list = None, fixed_groups: dict = None,
                          embed="bf16", lm_head=8):
@@ -175,8 +139,6 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str, explore: bool =
         api.register("hessian_table", hessian_table)
     if tcfg.get("group_error", True):
         api.register("group_error", group_error)
-    api.register("screen_results", screen_results)
-    api.register("screen_output", screen_output)
     api.register("bytes_table", bytes_table)
     api.register("bytes", bytes)
     if tcfg.get("solve_allocation", True):

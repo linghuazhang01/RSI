@@ -1,5 +1,5 @@
-"""Paper B data, GPU layout and config of the one (simple) flow: only the run's domain is drawn, gated and evaluated
-(simple_<d>_pool / simple_<d>_eval / simple_<d>_test), no theta0 role, the folded base.yaml values."""
+"""Paper B data, GPU layout and config of the one (simple) flow: only the run's domain is drawn (simple_<d>_pool;
+one fixed training set, no gate / test set), no theta0 role, the folded base.yaml values."""
 import sys
 import tempfile
 import unittest
@@ -20,23 +20,21 @@ class DatasetsTest(unittest.TestCase):
         self.rc = SimpleNamespace(domain="math", run_dir=Path(self.tmp.name))
 
     def test_only_the_run_domain_is_read(self):
+        """(2026-11-25) one fixed set: every level holds generation 0's screen draw of the run's pool (eval.limit
+        items of it); no eval / test set is read."""
         run = Run(self.rc, {})
-        self.assertEqual((run.tds, run.gds), ("simple_math_pool", "simple_math_eval"))
-        with patch("rsicore.draws.gate_ids", side_effect=lambda rc, ds: ["math-id"]
-                   if ds == "simple_math_eval" else self.fail(f"other data accessed: {ds}")):
-            self.assertEqual(run.gate_level(), {"simple_math_eval": ["math-id"]})
+        self.assertEqual((run.tds, run.gds), ("simple_math_pool", "simple_math_pool"))
         seen = []
 
         def fake_ids(rc, g, ds, role):
-            seen.append((ds, role))
+            seen.append((g, ds, role))
             return ["b", "a", "c"]
         with patch("rsicore.draws.ids", side_effect=fake_ids), \
-                patch("rsicore.draws.gate_ids", return_value=["g2", "g1"]):
-            ids = Run(self.rc, {"eval": {"screen_limit": 2}}).level_ids(0)
-        self.assertEqual(ids, {"screen": {"simple_math_pool": ["a", "b"]},
-                               "full": {"simple_math_pool": ["a", "b", "c"]},
-                               "gate": {"simple_math_eval": ["g1", "g2"]}})
-        self.assertEqual(sorted(seen), [("simple_math_pool", "screen"), ("simple_math_pool", "signal")])
+                patch("rsicore.draws.gate_ids", side_effect=lambda *a: self.fail("the eval set is not read")):
+            ids = Run(self.rc, {"eval": {"limit": 2}}).level_ids(3)
+            self.assertEqual(run.gate_level(), {"simple_math_pool": ["a", "b", "c"]})
+        self.assertEqual(ids, {lv: {"simple_math_pool": ["a", "b"]} for lv in ("screen", "full", "gate")})
+        self.assertEqual(set(seen), {(0, "simple_math_pool", "screen")})          # generation 0's draw, always
         for gone in ("retention_domains", "datasets", "gate_datasets", "kl_texts", "e_ref", "e_branch", "theta0"):
             self.assertFalse(hasattr(run, gone), gone)
 
@@ -124,7 +122,8 @@ class ConfigTest(unittest.TestCase):
         for gone in ("objective", "objective_profiles", "scope", "scope_profiles", "mock_objective_overrides",
                      "data", "data_roles", "draw_config", "retention", "e_t", "eval_target"):
             self.assertNotIn(gone, cfg, gone)
-        self.assertNotIn("domains", cfg["heldout"])
+        for gone in ("heldout", "reuse", "nonllm"):                                  # 2026-11-25
+            self.assertNotIn(gone, cfg, gone)
         self.assertNotIn("math_eval", cfg["max_tokens"])
         self.assertNotIn("theta0_args", cfg["server"])
         self.assertNotIn("theta0_own_gpu", cfg["gpu_layout"])
@@ -136,16 +135,13 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=bad):
                 self.rc(bad)
 
-    def test_heldout_and_gpu_roles(self):
-        from rsicore.heldout import heldout_domains
-
+    def test_gpu_roles(self):
         from lora_code.common import gpu_layout
         cfg = self.rc("hardware=h20", domain="code").paper_cfg
-        self.assertEqual(heldout_domains(cfg, "code"), "eval:simple_code_test")
         roles, unused = gpu_layout(SimpleNamespace(gpus=[3, 5]), cfg)       # h20, 2 GPUs: main | train
         self.assertEqual((roles, unused), ({"main": [3], "train": [5]}, []))
         run = Run(SimpleNamespace(domain="code", run_dir=Path(tempfile.mkdtemp())), cfg)
-        self.assertEqual((run.tds, run.gds), ("simple_code_pool", "simple_code_eval"))
+        self.assertEqual((run.tds, run.gds), ("simple_code_pool", "simple_code_pool"))
         b2 = self.rc("gpu_roles.train=[2,3]").paper_cfg                     # explicit --set still wins
         self.assertEqual(b2["gpu_roles"]["train"], [2, 3])
 
@@ -157,13 +153,13 @@ class ConfigTest(unittest.TestCase):
         m = deep_merge(cfg, cfg["mock_overrides"])
         self.assertEqual(m["search"]["threads"], 3)
         self.assertEqual(search_settings(m), {"threads": 3, "steps": 1, "max_candidates": 3, "parallel_builds": True})
-        self.assertEqual((m["eval"]["gate_limit"], m["nonllm"]["evaluate"]), (30, 2))
+        self.assertEqual(m["eval"], {"limit": 30})
         self.assertNotIn("baseline", m)
 
     def test_simple_flow(self):
-        """The simple flow v2 (2026-11-21, base.yaml since 2026-11-22): thinking-mode sampled reference screen, gate
-        and held-out (avg@4) with the run seed, 8 x 1 search, candidates not screened, one gate evaluation each, no
-        api.evaluate, tensor / paper / screen tools on, persistent run_python, nonllm 8."""
+        """base.yaml (2026-11-25): thinking-mode sampled scoring (avg@4) with the run seed, screen = gate decoding (the
+        current model is sampled once on the fixed set), 8 x 1 search, one evaluation each, no significance test, no
+        api.evaluate, tensor / paper / screen tools on, persistent run_python."""
         from rsicore.config import stage_decoding
 
         from lora_code.run import context_shortfall
@@ -171,21 +167,18 @@ class ConfigTest(unittest.TestCase):
                                      tensor_compute_enabled)
         rc = self.rc(seed=7)
         cfg = rc.paper_cfg
-        self.assertEqual(cfg["heldout"]["decoding"]["seed"], 7)                     # one seed (null -> --seed)
         samp = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "thinking": True, "max_tokens": 16384, "seed": 7}
         self.assertEqual(stage_decoding(cfg, "screen", 7), dict(samp, n=4))
         self.assertEqual(stage_decoding(cfg, "full", 7), dict(samp, n=4))          # full falls back to screen
         self.assertEqual(stage_decoding(cfg, "gate", 7), dict(samp, n=4))
-        hd = cfg["heldout"]["decoding"]
-        self.assertEqual({k: hd[k] for k in samp}, samp)
-        self.assertEqual((hd["n"], hd.get("n_by_task"), cfg["heldout"]["enabled"]), (4, None, True))
         self.assertEqual(search_settings(cfg), {"threads": 8, "steps": 1, "max_candidates": 8, "parallel_builds": True})
         self.assertEqual(search_settings({"search": {"threads": 2, "steps": 3}})["max_candidates"], 6)   # null: t x s
-        self.assertEqual(cfg["gate"]["min_gain"], 0.0)
+        self.assertEqual((cfg["gate"]["min_gain"], cfg["gate"]["require_significant"]), (0.0, False))
+        self.assertEqual(cfg["simple"]["screen_n"], 500)
         self.assertTrue(tensor_compute_enabled(cfg) and paper_tools_enabled(cfg) and screen_tools_enabled(cfg))
         self.assertTrue(tensor_compute_enabled({}) and paper_tools_enabled({}) and screen_tools_enabled({}))   # on
         self.assertTrue(cfg["editor"]["explore"]["persistent"] and cfg["editor"]["explore"]["gpu_tools"])
-        self.assertEqual((cfg["nonllm"]["evaluate"], cfg["editor"]["tool_rounds"]), (8, 20))
+        self.assertEqual(cfg["editor"]["tool_rounds"], 20)
         self.assertEqual(cfg["tools"]["train_loss_backend"], "vllm")
         self.assertEqual(cfg["method"]["mode"], "scratch")
         self.assertIsNone(context_shortfall(cfg))                   # main replicas 131072 >= prompt + 16384
@@ -216,7 +209,7 @@ class RemovedKnobsTest(unittest.TestCase):
             self.assertNotIn(leaf, b.get(top) or {}, k)
             self.assertNotIn(leaf, (b["mock_overrides"].get(top) or {}), k)
         self.assertNotIn("baseline", b)
-        self.assertEqual(b["eval"]["full_limit"], None)                  # still read (raw / non-LLM full level)
+        self.assertEqual(b["eval"], {"limit": None})
         cfg = self.rc().paper_cfg
         self.assertFalse({"max_evaluate", "top_full", "screen_candidates"} & set(cfg["search"]))
 
@@ -247,23 +240,25 @@ class DecodingTest(unittest.TestCase):
     """Decoding helpers."""
 
     def test_tasks_greedy_scoring_sampled(self):
-        """tasks.yaml decoding is greedy; Paper B scores and evaluates the held-out set with the thinking-mode
-        sampling of its config (decoding.*, heldout.decoding)."""
+        """tasks.yaml decoding is greedy; Paper B scores with the thinking-mode sampling of its config (decoding.*)."""
         import yaml
-        from rsicore.heldout import decoding_args
+        from rsicore.config import stage_decoding
+        from rsicore.evaluate import _decoding_flags
         tasks = yaml.safe_load((ROOT / "eval" / "configs" / "tasks.yaml").read_text())
         self.assertEqual(tasks["defaults"]["temperature"], 0.0)
         for name, t in tasks["tasks"].items():
             self.assertEqual(t.get("temperature", 0.0), 0.0, name)
             self.assertEqual(t.get("n", 1), 1, name)
         b = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())
-        dec = dict(b["heldout"]["decoding"], seed=42)                # resolved to the run's --seed at load time
-        self.assertEqual((dec["temperature"], dec["top_p"], dec["top_k"], dec["n"]), (0.6, 0.95, 20, 4))
-        d = decoding_args(dec, "simple_math_test")
-        self.assertEqual(d["extra"][:2], ["--n", "4"])
-        self.assertEqual({k: d["kw"][k] for k in ("temperature", "top_p", "top_k", "seed")},
-                         {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": 42})
-        self.assertEqual(decoding_args(None, "gsm8k"), {"kw": {}, "extra": [], "key": None})
+        self.assertEqual(b["decoding"]["gate"], b["decoding"]["screen"])        # same 500 items, sampled once
+        dec = stage_decoding(b, "gate", run_seed=42)                 # null seed -> the run's --seed
+        self.assertEqual((dec["temperature"], dec["top_p"], dec["top_k"], dec["n"], dec["seed"]),
+                         (0.6, 0.95, 20, 4, 42))
+        flags = _decoding_flags("dapo_math", dec, [])
+        self.assertEqual(flags[flags.index("--n") + 1], "4")
+        self.assertEqual({f: flags[flags.index(f) + 1] for f in ("--temperature", "--top-p", "--top-k", "--seed")},
+                         {"--temperature": "0.6", "--top-p": "0.95", "--top-k": "20", "--seed": "42"})
+        self.assertIsNone(stage_decoding({}, "gate", run_seed=42))       # no block -> tasks.yaml (greedy)
 
     def test_run_eval_sends_top_k_only_when_sampling(self):
         sys.path.insert(0, str(ROOT / "eval"))
@@ -361,10 +356,9 @@ class MaxTokensTest(unittest.TestCase):
     def test_score_passes_the_configured_length(self):
         import yaml
         from rsicore import evaluate as E
-        for paper in ("lora_code", "edit_code"):
-            mt = yaml.safe_load((ROOT / paper / "configs" / "base.yaml").read_text())["max_tokens"]
-            self.assertEqual(mt, {"dapo_math": 4096, "taco_verified": 4096, "ifeval_train": 2048,
-                                  "sealtool_train": 1024, "triviaqa_train": 1024}, paper)   # no math_eval (2026-11-22)
+        mt = yaml.safe_load((ROOT / "lora_code" / "configs" / "base.yaml").read_text())["max_tokens"]
+        self.assertEqual(mt, {"dapo_math": 4096, "taco_verified": 4096, "ifeval_train": 2048,
+                              "sealtool_train": 1024, "triviaqa_train": 1024})   # no math_eval (2026-11-22)
         E.set_max_tokens({"dapo_math": 1234})
         cmds = []
 

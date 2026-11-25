@@ -18,8 +18,9 @@ api.evaluate, no full / rerun stage, no submissions after the search, no noise b
 the removed variants (REMOVED_KNOBS) are refused on --set / --config unless given their hard-wired value (a no-op),
 and a lock that used another value cannot be resumed.
 
-One flow (2026-11-22, formerly `objective: simple` + `scope: single`): train role simple_<d>_pool, gate
-simple_<d>_eval, held-out simple_<d>_test (rsicore.draws / rsicore.heldout). The default run id keeps the old
+One flow (2026-11-22, formerly `objective: simple` + `scope: single`): items come from generation 0's draw of
+simple_<d>_pool (rsicore.draws); simple_<d>_eval / _test are only excluded from that pool. No held-out test and no
+reuse of earlier runs (2026-11-25: rsicore.heldout / rsicore.reuse deleted). The default run id keeps the old
 suffix: <paper>_<domain>_s<seed>_single_simple[_mock].
 """
 import argparse
@@ -68,10 +69,9 @@ LOCK_REFUSED_KNOBS = ("search.screen_candidates", "search.gate_every_candidate",
                       "search.top_full", "search.rerun_seeds", "search.kl_weight", "noise.temperature", "noise.fixed",
                       "baseline.noise_temperature", "baseline.noise_fixed")
 _REMOVED_LOCK_PATHS = tuple(REMOVED_KNOBS) + REMOVED_BLOCKS
-# baselines (Paper A, 2026-11-23): the classic baselines are report-only (run once after the generations)
-# reuse (2026-11-24): reuse.baseline_from copies M_0's generation-0 scores from a matching earlier run (checked by
-# rsicore.reuse); it changes no number, so a run may be started or resumed with or without it
-LOCK_IGNORED_PATHS = ("kl.domains", "heldout.domains", "max_tokens.math_eval", "baselines",
+# blocks of deleted report-only features (2026-11-25), ignored so that older locks still compare: heldout (the
+# held-out test), baselines (Paper A's classic baselines), reuse (reuse.baseline_from); nothing reads them
+LOCK_IGNORED_PATHS = ("kl.domains", "heldout", "mock_overrides.heldout", "max_tokens.math_eval", "baselines",
                       "mock_overrides.baselines", "reuse", "mock_overrides.reuse") + _REMOVED_LOCK_PATHS + tuple(
     f"mock_overrides.{p}" for p in _REMOVED_LOCK_PATHS)
 # execution knobs that change only batching, like --gpus, ignored at this dotted path anywhere in the config (top
@@ -81,9 +81,11 @@ LOCK_IGNORED_SUFFIXES = ("scoring.concurrency", "gpu_layout.gate_split", "gate.k
 HARDWIRED_FLOW = ("candidates are never screened; every candidate gets one gate evaluation during the search, paired "
                   "vs the current model; the passing candidate with the largest paired gain is accepted; no "
                   "api.evaluate, full / rerun stage, gate submissions after the search, noise band or KL score term")
-# Paper A KL gate (2026-11-24): runs locked before these keys existed used the accuracy gate
-LOCK_DEFAULTS = {"simple.screen_n": 500, "gate.metric": "accuracy", "gate.kl.traces": 256, "gate.kl.max_tokens": 8192,
-                 "gate.kl.top_k": 20, "gate.kl.temperature": 0.6, "gate.kl.top_p": 0.95, "gate.kl.sample_top_k": 20}
+# Paper A KL gate (2026-11-24): runs locked before gate.metric existed used the accuracy gate. The gate.kl block is
+# compared only when gate.metric is kl (lock_view drops it under the accuracy gate, where nothing reads it; 2026-11-25:
+# so its defaults, e.g. gate.kl.traces null = the whole gate set, can change without touching accuracy-gate locks)
+# loop.start (Paper A, 2026-11-25): runs locked before it existed started from Q_0
+LOCK_DEFAULTS = {"simple.screen_n": 500, "gate.metric": "accuracy", "loop.start": "q0"}
 # --set / --config values of the removed selectors that are accepted as no-ops (the one remaining flow)
 LEGACY_SELECTORS = {"objective": "simple", "scope": "single"}
 
@@ -223,8 +225,8 @@ def _apply_hardware(cfg: dict, sets) -> dict:
 # eval/configs/tasks.yaml value (greedy, thinking off). max_tokens wins over the run-wide max_tokens table. n > 1:
 # each record's score is the mean over its n samples (avg@n). thinking: chat_template_kwargs enable_thinking; only
 # the final answer is graded. min_p: only 0 / null (run_eval sends none; vLLM's default is 0).
-# Paper config: `decoding: {screen: ..., full: ..., gate: ...}` (null = tasks.yaml; full falls back to screen) and
-# heldout.decoding (also n_by_task). A null seed = the run's --seed.
+# Paper config: `decoding: {screen: ..., full: ..., gate: ...}` (null = tasks.yaml; full falls back to screen).
+# A null seed = the run's --seed.
 DECODING_KEYS = ("temperature", "top_p", "top_k", "min_p", "n", "thinking", "max_tokens", "seed")
 DECODING_STAGES = ("screen", "full", "gate")
 
@@ -282,19 +284,6 @@ def _resolve_decoding(cfg: dict, seed: int) -> dict:
         for st, d in block.items():
             if check_decoding(d, f"decoding.{st}") is not None and d.get("seed") is None:
                 d["seed"] = int(seed)
-    hd = (cfg.get("heldout") or {}).get("decoding")
-    if isinstance(hd, dict):
-        check_decoding(hd, "heldout.decoding", extra_keys=("n_by_task",))
-        if hd.get("seed") is None:                   # one experiment seed (2026-11-20)
-            hd["seed"] = int(seed)
-    return cfg
-
-
-def _resolve_run_domain(cfg: dict, domain: str) -> dict:
-    """heldout.domains: run -> the run's domain."""
-    h = cfg.get("heldout")
-    if isinstance(h, dict) and h.get("domains") == "run":
-        h["domains"] = domain
     return cfg
 
 
@@ -320,8 +309,8 @@ def _check_removed(key: str, where: str) -> None:
     top = str(key).split(".")[0]
     if top in REMOVED_SET_KEYS:
         alt = REMOVED_SET_KEYS[top]
-        raise SystemExit(f"{where}: {top} was removed (2026-11-22; the train / gate / held-out sets are fixed to "
-                         f"simple_<domain>_pool / _eval / _test)" + (f"; use {alt}" if alt else ""))
+        raise SystemExit(f"{where}: {top} was removed (2026-11-22; the item sets are fixed: generation 0's "
+                         f"draw of simple_<domain>_pool)" + (f"; use {alt}" if alt else ""))
 
 
 def _removed_table(paper: str | None) -> dict:
@@ -421,6 +410,12 @@ def lock_view(cfg: dict | None, paper: str | None = None) -> dict:
         else:
             if d.get(leaf) is None:
                 d[leaf] = v
+    gates = [c.get("gate"), (c.get("mock_overrides") or {}).get("gate") if isinstance(c.get("mock_overrides"), dict)
+             else None]
+    if not any(isinstance(g, dict) and g.get("metric") == "kl" for g in gates):   # (mock_overrides may set kl)
+        for g in gates:
+            if isinstance(g, dict):
+                g.pop("kl", None)        # the accuracy gate never reads gate.kl
     return _strip_ignored(c, "", paper)
 
 
@@ -516,8 +511,7 @@ def load_run_config(paper: str, args) -> RunConfig:
     for f in files:                              # then the file's values, over the profile, under --set
         cfg = _deep_merge(cfg, {k: v for k, v in f.items() if k not in PROFILE_KEYS})
     cfg = _apply_set(cfg, sets)
-    cfg = _resolve_run_domain(cfg, args.domain)
-    # one experiment seed (2026-11-20): a null decoding seed (decoding.<stage>, heldout.decoding) = the run's --seed
+    # one experiment seed (2026-11-20): a null decoding seed (decoding.<stage>) = the run's --seed
     cfg = _resolve_decoding(cfg, int(args.seed))
     run_id = args.run_id or f"{paper}_{args.domain}_s{args.seed}{RUN_SUFFIX}" + ("_mock" if args.mock else "")
     run_dir = Path(getattr(args, "runs_dir", None) or ROOT / "experiment_records").resolve() / run_id

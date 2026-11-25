@@ -1,3 +1,4 @@
+# STALE: predates 2026-11-25 (fixed 500-item training set); lora_code/configs/base.yaml is authoritative.
 # Paper B · self-written LoRA (method.mode scratch: nothing is trained; the merged model is the next editor) · math only · simple flow (v2, 2026-11-21) · B300 planned at 220 GB per card
 # Generated snapshot of the MERGED config (lora_code/configs/base.yaml (2026-11-22: the simple flow folded in) + domains/math.yaml + hardware b300).
 # Not read by the code (source of truth: base.yaml + --set); a run locks its own copy in

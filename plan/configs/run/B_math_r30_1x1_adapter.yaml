@@ -1,0 +1,35 @@
+# Paper B experiment config (2026-11-24; comments updated 2026-11-25 for the fixed 500-item training set): math ·
+# 8 GPUs (H20 110 GB or B300) · 1 x 1 candidate per generation, many generations · self-written LoRAs kept as an
+# adapter (merge.mode adapter: M_g = M_0 + C_g, never merged) · up to 30 tool rounds · threshold 0 · patience 10.
+# Overrides only (merged after base.yaml + domains/math.yaml + the hardware profile from --hw, before any --set).
+#   ./launch.sh --hw h20 --paper B --domains math --gens 20 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/B_math_r30_1x1_adapter.yaml --tag r30_1x1_adapter
+# GPUs (gpu_layout.main_replicas): main = GPUs 0-6 (7 vLLM replicas of M_0 + C_g; the one editor session on replica
+#   0) | train = GPU 7 (HF model: SVD / acts / diagnostics).
+# Data: ONE fixed training set = simple.screen_n (500) items of generation 0's draw of simple_math_pool, the same items
+#   every generation for everything (train ids, the current model's answers the editor reads, every evaluation).
+# Each generation: the current model answers the 500 items once (n 4, split over the 7 replicas; adopted from the
+#   previous generation's scoring when the model is unchanged); one session writes one LoRA; it is served as
+#   C_g (+) its LoRA and evaluated once on the same 500 items (n 4, paired per item vs the current model); a strictly
+#   positive paired gain makes it C_{g+1}, the model the next generation's editor runs as.
+# Memory: adapter mode serves with --max-lora-rank 256. max_loras 4 (C_g + the candidate + 2 spare; the evaluator keeps
+#   at most max_loras - 2 = 2 candidate adapters loaded) reserves ~13 GB of LoRA buffers per replica instead of ~19 GB
+#   with 6 [estimate ~3.2 GB per rank-256 slot], so more KV is left.
+method:
+  mode: scratch                   # build LoRAs from zero (no training)
+merge:
+  mode: adapter                   # an accepted LoRA joins the cumulative adapter C_g on M_0 (no merge, no restart)
+search:
+  threads: 1                      # one session per generation ...
+  steps: 1                        # ... of one candidate
+  max_candidates: 1
+loop:
+  patience: 10                    # one candidate per generation is rejected more often: stop after 10 in a row
+server:
+  max_loras: 4
+editor:
+  tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
+  turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
+  max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)
+gate:
+  min_gain: 0.0                   # accept the candidate if its paired gain on the 500 items is strictly positive
+  require_significant: false      # no 95% CI requirement (now the base.yaml default; kept explicit)

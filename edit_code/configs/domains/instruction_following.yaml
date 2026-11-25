@@ -1,3 +1,2 @@
-# Paper A, one domain: screen / calibration texts from simple_instruction_following_pool, gate simple_instruction_following_eval, held-out simple_instruction_following_test
-# (rsicore.draws, rsicore.heldout).
+# Paper A, one domain: the KL set (kl_eval.n items) and the calibration texts from simple_instruction_following_pool (rsicore.draws).
 domain: instruction_following

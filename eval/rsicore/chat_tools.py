@@ -4,14 +4,15 @@
     ed = Editor(endpoint, name, system_prompt=SYS, seed=s, transcript=tr, tools=tools, **editor_kwargs(cfg))
     code = ed.propose(msg, ctx={"cid": cid, "gen_dir": gen_dir, "visible_cids": [...]})
 
-Two functions (OpenAI tool schemas from schemas()):
+Three functions (OpenAI tool schemas from schemas()):
   run_python(code)            runs `code` in rsicore.sandbox.run_program (new process, no network) with the
                               paper's EXPLORE ToolAPI as `api` (no evaluate). Top-level code is fine; set
                               `result = ...` to return a value, or define main(api). Nothing persists between
-                              calls. Workdir gen_dir/explore/<cid>/r{r:02d}_{i}/ (program.py, stdout.txt,
-                              stderr.txt, result.json: the full output, for auditing).
+                              calls, except in the persistent session (below). Workdir
+                              gen_dir/explore/<cid>/r{r:02d}_{i}/ (program.py, stdout.txt, stderr.txt,
+                              result.json: the full output, for auditing).
   read_record(cid, part, offset=0)
-                              the full program ("program": gen_dir/programs/<cid>.py) or L1 feedback
+                              the full program ("program": gen_dir/programs/<cid>.py) or feedback
                               ("feedback": gen_dir/feedback/<cid>.json) of a candidate in ctx["visible_cids"]
                               (the history snapshot the proposal was rendered from), in pages of the result size.
 

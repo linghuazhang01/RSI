@@ -1,7 +1,9 @@
-# Paper B experiment config (2026-11-21): math · 8 x 1 candidates per generation · up to 30 tool rounds · threshold 0 ·
-# no significance test · no non-LLM control. Overrides only: merged after base.yaml + domains/math.yaml + the hardware
-# profile (--hw), and before any --set. Hardware is NOT set here (B300 / H20 alike).
+# Paper B experiment config (2026-11-21; comments updated 2026-11-25 for the fixed 500-item training set): math ·
+# 8 x 1 candidates per generation · up to 30 tool rounds · threshold 0. Overrides only: merged after base.yaml +
+# domains/math.yaml + the hardware profile (--hw), and before any --set. Hardware is NOT set here (B300 / H20 alike).
 #   ./launch.sh --hw b300 --paper B --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/B_math_r30_nosig.yaml --tag r30_nosig
+# Every candidate is evaluated once on the fixed 500-item training set (generation 0's draw of simple_math_pool),
+# paired per item vs the current model; the largest strictly positive paired gain is accepted.
 method:
   mode: scratch                   # build LoRAs from zero (no training); weights = the dense-edit comparison arm
 search:
@@ -12,7 +14,5 @@ editor:
   turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
   max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)
 gate:
-  min_gain: 0.0                   # accept the candidate with the largest strictly positive paired gate gain
-  require_significant: false      # no 95% CI requirement
-nonllm:
-  enabled: false                  # no random-construction control branch
+  min_gain: 0.0                   # accept the candidate with the largest strictly positive paired gain on the 500 items
+  require_significant: false      # no 95% CI requirement (now the base.yaml default; kept explicit)

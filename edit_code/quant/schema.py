@@ -139,16 +139,13 @@ def normalize(config, spec: ModelSpec, action_space: dict | None = None) -> dict
     problems: list[str] = []
     if not isinstance(config, dict):
         raise ConfigError([f"config must be a JSON object (dict), got {type(config).__name__}"])
+    # "calibration", "note" and "name" are accepted and ignored here (a program's note is read by common.program_note)
     unknown = set(config) - {"default", "rules", "groups", "embed", "lm_head", "calibration", "note", "name"}
     if unknown:
         problems.append(f"unknown top-level keys {sorted(unknown)} (allowed: default, rules, groups, embed, lm_head)")
     default = _check_setting(config.get("default"), space, problems, "default", partial=False) \
         if "default" in config else (problems.append("missing 'default' setting") or {})
     keys = spec.group_keys()
-    present = {}
-    for k in keys:
-        layer, g = k.split(".", 1)
-        present.setdefault(g, set()).add(int(layer))
     resolved = {k: dict(default) for k in keys}
     n = spec.num_layers
 

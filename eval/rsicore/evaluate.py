@@ -40,7 +40,6 @@ _MAX_TOKENS: dict[str, int] = {}
 def set_max_tokens(spec: dict | None) -> dict[str, int]:
     """Run-wide max generation length per run_eval task (paper config `max_tokens: {task: tokens}`), overriding
     eval/configs/tasks.yaml for this process; null / {} = keep tasks.yaml. Returns the installed table."""
-    import yaml
     spec = {k: v for k, v in (spec or {}).items() if v is not None}
     from .evalsets import task_names
     known = task_names()                                # tasks.yaml tasks + the eval-set tasks (simple_*)

@@ -6,18 +6,16 @@ Per generation g (Paper-B-like: candidates are LoRA-style JSON artifacts hot-swa
 flow): draw of simple_math_pool -> mock server serving M_g -> M_g on the gate (simple_math_eval) -> inner_search
 with a mock editor whose programs call sandboxed tools -> builders register each candidate's quality in the mock
 registry -> gate per candidate (screen_fn = the paired gate gain over M_g) -> accept the largest positive gain ->
-held-out (simple_math_test, --limit) of M_{g+1} -> summary. The accepted candidate's quality becomes M_{g+1}.
+summary (no held-out test since 2026-11-25). The accepted candidate's quality becomes M_{g+1}.
 A second run with the same arguments must skip every step (prints "ALL STEPS SKIPPED").
 """
-import argparse
-import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "eval"))
 
-from rsicore import config, draws, editor, evaluate, heldout, records, sandbox, search, servers, state  # noqa: E402
+from rsicore import config, draws, editor, evaluate, records, sandbox, search, servers, state  # noqa: E402
 
 SYSTEM = "You write programs `def main(api)` that choose an edit strength in [0, 1]. Reply with one ```python block."
 
@@ -139,21 +137,11 @@ def main():
                                        {"accepted": None, "reason": "no candidate with a positive gate gain"})
             accepted = records.read_json(gd / "accepted.json")
             nxt = accepted.get("artifact") if accepted.get("cid") else None
-            with run(f"gen{g:02d}/heldout") as todo:
-                if todo:
-                    if nxt:
-                        srv.load_lora(nxt["name"], nxt["path"])
-                    h = heldout.run_heldout(srv.endpoint, served, gd / "heldout",
-                                            domains=heldout.heldout_domains(rc.paper_cfg, rc.domain),
-                                            lora=nxt["name"] if nxt else None, mock=True, limit=5)
-                    st.mark(f"gen{g:02d}/heldout", {"acc": {k: v["accuracy"] for k, v in h.items()}})
         next_q = nxt["quality"] if nxt else cur_q
-        info = {"accepted": accepted.get("cid"), "quality": cur_q, "next_quality": next_q,
-                "heldout": st.get(f"gen{g:02d}/heldout")["acc"]}
+        info = {"accepted": accepted.get("cid"), "quality": cur_q, "next_quality": next_q}
         records.update_summary(rc, g, info)
         st.mark(f"gen{g:02d}/done", info)
-        print(f"[toy] gen {g}: accepted={info['accepted']} quality {cur_q} -> {next_q} "
-              f"heldout={info['heldout']}", flush=True)
+        print(f"[toy] gen {g}: accepted={info['accepted']} quality {cur_q} -> {next_q}", flush=True)
         cur_q = next_q
         work += 1
     print("[toy] ALL STEPS SKIPPED" if work == 0 else f"[toy] done ({work} steps) -> {rc.run_dir}", flush=True)

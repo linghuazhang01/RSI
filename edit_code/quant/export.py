@@ -21,20 +21,21 @@ from safetensors.torch import save_file
 from . import quantizers as Q
 from .cache import QuantCache
 from .schema import module_assignment
-from .sizes import EMBED_GROUP, config_bytes
-from .spec import ModelSpec
+from .sizes import EMBED_GROUP, config_bytes, special_precisions
+from .spec import ModelSpec, shard_files
 
 SKIP_COPY_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".tmp")
 
 
-def copy_model_files(src: Path, dst: Path) -> list[str]:
+# safetensors header dtype -> torch dtype, for the weights an export replaces (other dtypes: read the tensor)
+_ST_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
+
+
+def copy_model_files(src: Path, dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
-    copied = []
     for p in Path(src).iterdir():
         if p.is_file() and not p.name.endswith(SKIP_COPY_SUFFIXES) and p.name != "fake_quant.json":
             shutil.copy2(p, dst / p.name)
-            copied.append(p.name)
-    return copied
 
 
 def export_fake_quant(src_dir: Path, out_dir: Path, norm: dict, spec: ModelSpec, cache: QuantCache, *,
@@ -46,28 +47,27 @@ def export_fake_quant(src_dir: Path, out_dir: Path, norm: dict, spec: ModelSpec,
     t0 = time.time()
     copy_model_files(src_dir, tmp_dir)
     assign = module_assignment(norm, spec)
-    special = {}
-    if spec.embed and norm["embed"] != "bf16":
-        special[spec.embed["name"]] = int(norm["embed"])
-    if spec.lm_head and norm["lm_head"] != "bf16":
-        special[spec.lm_head["name"]] = int(norm["lm_head"])
+    special = special_precisions(spec, norm["embed"], norm["lm_head"])
     idx = src_dir / "model.safetensors.index.json"
-    shards = sorted(set(json.load(open(idx))["weight_map"].values())) if idx.exists() else \
-        sorted(p.name for p in src_dir.glob("*.safetensors"))
     n_q = 0
-    for fn in shards:
+    for fn in shard_files(src_dir):
         tensors = {}
         with safe_open(str(src_dir / fn), framework="pt") as f:
             smeta = f.metadata() or {}
             for k in f.keys():
-                t = f.get_tensor(k)
                 if k in assign and assign[k]["bits"] < 16:
-                    t = cache.dequant(k, assign[k], dtype=t.dtype)
+                    # replaced: dtype from the shard header, the stored weight is not read (2026-11-25)
+                    dtype = _ST_DTYPES.get(f.get_slice(k).get_dtype())
+                    if dtype is None:
+                        dtype = f.get_tensor(k).dtype
+                    t = cache.dequant(k, assign[k], dtype=dtype)
                     n_q += 1
-                elif k in special:
-                    q = Q.rtn(t.to(cache.device), special[k], EMBED_GROUP)
-                    t = Q.dequant(q, dtype=t.dtype).cpu()
-                    n_q += 1
+                else:
+                    t = f.get_tensor(k)
+                    if k in special:
+                        q = Q.rtn(t.to(cache.device), special[k], EMBED_GROUP)
+                        t = Q.dequant(q, dtype=t.dtype).cpu()
+                        n_q += 1
                 tensors[k] = t.contiguous()
         save_file(tensors, str(tmp_dir / fn), metadata=dict(smeta, format=smeta.get("format", "pt")))
         del tensors

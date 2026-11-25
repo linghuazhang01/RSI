@@ -91,8 +91,9 @@ eval_targets:
   # + 500 test items sampled from the decontaminated, de-duplicated training pool, graded like the domain's training
   # set. Form {task, file, dataset}: the items of `file` become dataset / task `dataset` (pool `pool`). Form
   # {task, ids_file, dataset}: the task dataset's records whose id is in `ids_file` (simple_<domain>_pool = the whole
-  # clean pool, simple_data/<domain>/pool_ids.json). A run: train role simple_<domain>_pool (per-generation
-  # screen draws, rsicore.draws), gate simple_<domain>_eval, held-out simple_<domain>_test.
+  # clean pool, simple_data/<domain>/pool_ids.json). A run: train role simple_<domain>_pool (generation 0's draw,
+  # rsicore.draws); simple_<domain>_eval / simple_<domain>_test are built only so their items are excluded from
+  # simple_<domain>_pool, never scored (2026-11-25).
   # simple_<domain>_train stays registered for older runs.
   simple_math_train: {task: dapo_math, file: simple_data/math/train.jsonl, dataset: simple_math_train}
   simple_math_eval: {task: dapo_math, file: simple_data/math/eval.jsonl, dataset: simple_math_eval}

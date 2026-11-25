@@ -165,34 +165,6 @@ class TestScoringConcurrency(unittest.TestCase):
         self.assertNotIn("--concurrency", cmds[1])
         self.assertTrue(all(c[c.index("--concurrency") + 1] == "96" for c in cmds[2:]) and len(cmds) == 4)
 
-    def test_config_default_and_lock(self):
-        from rsicore.config import lock_view
-        from edit_code.common import scoring_concurrency
-        import yaml
-        cfg = yaml.safe_load((REPO / "edit_code" / "configs" / "base.yaml").read_text())
-        self.assertEqual(scoring_concurrency(cfg), 96)
-        self.assertIsNone(scoring_concurrency(dict(cfg, scoring={"concurrency": None})))
-        self.assertEqual(lock_view(cfg, "A"), lock_view(dict(cfg, scoring={"concurrency": 32}), "A"))
-        old = {k: v for k, v in cfg.items() if k != "scoring"}           # a lock made before the key existed
-        self.assertEqual(lock_view(old, "A"), lock_view(cfg, "A"))
-
-    def test_old_locks_resume_under_every_profile(self):
-        """A lock written before scoring.concurrency existed (no top-level key, no hardware_profiles.h20_80.scoring)
-        compares equal to today's config under every hardware profile (the stored hardware_profiles block is part of
-        the lock view, so the key is ignored at any depth)."""
-        import copy
-        import yaml
-        from rsicore import config as C
-        new = yaml.safe_load((REPO / "edit_code" / "configs" / "base.yaml").read_text())
-        old = copy.deepcopy(new)
-        old.pop("scoring")
-        old["hardware_profiles"]["h20_80"].pop("scoring")
-        for hw in new["hardware_profiles"]:
-            a = C._apply_hardware(dict(copy.deepcopy(old), hardware=hw), [])
-            b = C._apply_hardware(dict(copy.deepcopy(new), hardware=hw), [])
-            self.assertIn("hardware_profiles", b)                   # the stored block is compared by the lock
-            self.assertEqual(C._diff_paths(C.lock_view(a, "A"), C.lock_view(b, "A")), [], hw)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,10 +1,26 @@
-"""Exact token-level KL(ref || cand) with a local transformers model (used by the profile table and
-the CPU tests; candidate evaluation on the GPU uses vLLM prompt_logprobs via rsicore.evaluate)."""
+"""Exact token-level KL(ref || cand) with a local transformers model.
+
+Packed path (pack / reference_packed / kl_to_reference_packed): the profile table (diagnostics.profile_rows). Unpacked
+path (reference / kl_to_reference): the reference implementation the CPU tests compare against. A candidate's KL
+evaluation is rsicore.kl (vLLM), not this module.
+"""
 from __future__ import annotations
+
+import math
 
 import torch
 
+CHUNK = 512   # log-prob positions per chunk; reference and candidate are chunked alike
 
+
+def _summary(per_tok: list[torch.Tensor], agree: list[torch.Tensor]) -> dict:
+    kl = torch.cat(per_tok) if per_tok else torch.zeros(1)
+    ag = torch.cat(agree) if agree else torch.ones(1)
+    return {"mean": float(kl.mean()), "p99": float(torch.quantile(kl.float().cpu(), 0.99)) if kl.numel() > 1
+            else float(kl.max()), "top1_agree": float(ag.mean()), "tokens": int(kl.numel())}
+
+
+# ----------------------------------------------------------------------------- test oracle (unpacked)
 def _logits(model, ids: torch.Tensor) -> torch.Tensor:
     out = model(input_ids=ids, use_cache=False)
     return out.logits[0, :-1].float()   # predict tokens 1..T-1
@@ -18,7 +34,7 @@ def reference(model, batches: list[torch.Tensor], device=None, store_dtype=torch
 
 @torch.no_grad()
 def kl_to_reference(model, batches: list[torch.Tensor], refs: list[torch.Tensor], device=None,
-                    chunk: int = 512) -> dict:
+                    chunk: int = CHUNK) -> dict:
     device = device or next(model.parameters()).device
     per_tok, agree = [], []
     for b, ref in zip(batches, refs):
@@ -28,10 +44,7 @@ def kl_to_reference(model, batches: list[torch.Tensor], refs: list[torch.Tensor]
             rp, cp = r[s:s + chunk], lp[s:s + chunk]
             per_tok.append((rp.exp() * (rp - cp)).sum(-1).clamp_min(0))
             agree.append((rp.argmax(-1) == cp.argmax(-1)).float())
-    kl = torch.cat(per_tok) if per_tok else torch.zeros(1)
-    ag = torch.cat(agree) if agree else torch.ones(1)
-    return {"mean": float(kl.mean()), "p99": float(torch.quantile(kl.float().cpu(), 0.99)) if kl.numel() > 1
-            else float(kl.max()), "top1_agree": float(ag.mean()), "tokens": int(kl.numel())}
+    return _summary(per_tok, agree)
 
 
 # ----------------------------------------------------------------------------- batched (2026-11-21)
@@ -65,6 +78,11 @@ def pack(batches: list[torch.Tensor], max_tokens: int = 8192, pad_id: int = 0) -
     return out
 
 
+def n_chunks(packed, chunk: int = CHUNK) -> list[int]:
+    """Log-prob chunks of each packed batch, as reference_packed yields them (ceil((n - 1) / chunk) per context)."""
+    return [sum(math.ceil(max(n - 1, 0) / chunk) for n in lens) for _, lens in packed]
+
+
 def _packed_logprobs(model, packed, device, chunk: int):
     for ids, lens in packed:
         logits = model(input_ids=ids.to(device), use_cache=False).logits
@@ -75,13 +93,13 @@ def _packed_logprobs(model, packed, device, chunk: int):
 
 
 @torch.no_grad()
-def reference_packed(model, packed, device=None, store_dtype=torch.bfloat16, chunk: int = 512) -> list[torch.Tensor]:
+def reference_packed(model, packed, device=None, store_dtype=torch.bfloat16, chunk: int = CHUNK) -> list[torch.Tensor]:
     device = device or next(model.parameters()).device
     return [lp.to(store_dtype) for lp in _packed_logprobs(model, packed, device, chunk)]
 
 
 @torch.no_grad()
-def kl_to_reference_packed(model, packed, refs: list[torch.Tensor], device=None, chunk: int = 512) -> dict:
+def kl_to_reference_packed(model, packed, refs: list[torch.Tensor], device=None, chunk: int = CHUNK) -> dict:
     """Same result as kl_to_reference on the unpadded contexts (up to bf16 rounding of batched matmuls)."""
     device = device or next(model.parameters()).device
     per_tok, agree = [], []
@@ -89,7 +107,4 @@ def kl_to_reference_packed(model, packed, refs: list[torch.Tensor], device=None,
         r = ref.to(lp.device).float()
         per_tok.append((r.exp() * (r - lp)).sum(-1).clamp_min(0))
         agree.append((r.argmax(-1) == lp.argmax(-1)).float())
-    kl = torch.cat(per_tok) if per_tok else torch.zeros(1)
-    ag = torch.cat(agree) if agree else torch.ones(1)
-    return {"mean": float(kl.mean()), "p99": float(torch.quantile(kl.float().cpu(), 0.99)) if kl.numel() > 1
-            else float(kl.max()), "top1_agree": float(ag.mean()), "tokens": int(kl.numel())}
+    return _summary(per_tok, agree)

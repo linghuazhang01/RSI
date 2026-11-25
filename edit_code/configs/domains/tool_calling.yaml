@@ -1,3 +1,2 @@
-# Paper A, one domain: screen / calibration texts from simple_tool_calling_pool, gate simple_tool_calling_eval, held-out simple_tool_calling_test
-# (rsicore.draws, rsicore.heldout).
+# Paper A, one domain: the KL set (kl_eval.n items) and the calibration texts from simple_tool_calling_pool (rsicore.draws).
 domain: tool_calling

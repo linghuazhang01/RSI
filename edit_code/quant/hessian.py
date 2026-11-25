@@ -1,4 +1,4 @@
-"""Calibration pass on the CURRENT model (transformers): per-layer input Hessians + activation stats.
+"""Calibration pass on the original model M_0 (transformers): per-layer input Hessians + activation stats.
 
 For each decoder layer and each distinct module input (attn_in, o_in, gdn_in, gdn_out_in, mlp_in,
 down_in; see spec.INPUT_KEY) we accumulate H = sum_t x_t x_t^T (fp32) and per-channel max |x|,
@@ -10,14 +10,13 @@ after the window's last layer.
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
 import torch
 from safetensors.torch import load, save_file
 
-from .spec import ModelSpec
+from .spec import ModelSpec, load_model_config
 
 
 class _StopForward(Exception):
@@ -28,7 +27,7 @@ def load_hf_model(model_dir: Path, device: str = "cpu", dtype=torch.bfloat16):
     """Load the checkpoint with the class named in config.json (Qwen3_5ForConditionalGeneration for
     Qwen3.8-27B). Only local files; no remote code."""
     import transformers
-    cfg = json.load(open(Path(model_dir) / "config.json"))
+    cfg = load_model_config(model_dir)
     arch = (cfg.get("architectures") or ["AutoModelForCausalLM"])[0]
     cls = getattr(transformers, arch, None) or transformers.AutoModelForCausalLM
     model = cls.from_pretrained(str(model_dir), dtype=dtype, device_map=device if device != "cpu" else None,
@@ -62,12 +61,36 @@ def load_hessian(out_dir: Path, layer: int, input_key: str, device="cpu") -> tup
     return d["H"], int(d["n"].item()), d["absmax"]
 
 
+def save_hessian(path: Path, H: torch.Tensor, absmax: torch.Tensor, n: int) -> None:
+    """Write one Hessian file: fp32 `H`, `absmax` and the token count `n` (int64)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_file({"H": H.cpu().contiguous(), "absmax": absmax.cpu().contiguous(),
+               "n": torch.tensor([n], dtype=torch.int64)}, str(path))
+
+
+def read_stats(out_dir: Path, keys, have: dict | None = None) -> dict:
+    """{"L.input_key": activation_summary} for the (layer, input_key) pairs `keys`, in that order; the ones already
+    in `have` are taken from it, the others read from their Hessian files."""
+    have = have or {}
+    out = {}
+    for layer, key in keys:
+        name = f"{layer}.{key}"
+        if name in have:
+            out[name] = have[name]
+        else:
+            H, n, absmax = load_hessian(out_dir, layer, key)
+            out[name] = activation_summary(H, n, absmax)
+    return out
+
+
 @torch.no_grad()
 def collect_stats(model, spec: ModelSpec, batches: list[torch.Tensor], out_dir: Path, *,
                   layers_per_pass: int = 16, device: str | None = None, log=print, return_stats: bool = True) -> dict:
     """Run calibration batches through `model`, write Hessians, return activation statistics
     {"L.input_key": {...}} (return_stats False: {} without reading the written Hessians back; a worker's partial
-    Hessians, 2026-11-23)."""
+    Hessians, 2026-11-23). The stats of the inputs computed here come from the saved tensors; only Hessians already on
+    disk (a resumed pass) are read back (2026-11-25)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = device or str(next(model.parameters()).device)
@@ -117,19 +140,18 @@ def collect_stats(model, spec: ModelSpec, batches: list[torch.Tensor], out_dir: 
             for h in handles:
                 h.remove()
         for (l, k), a in acc.items():
-            save_file({"H": a["H"].cpu().contiguous(), "absmax": a["absmax"].cpu().contiguous(),
-                       "n": torch.tensor([a["n"]], dtype=torch.int64)}, str(hessian_path(out_dir, l, k)))
+            H, absmax = a["H"].cpu(), a["absmax"].cpu()
+            save_hessian(hessian_path(out_dir, l, k), H, absmax, a["n"])
+            if return_stats:
+                stats[f"{l}.{k}"] = activation_summary(H, a["n"], absmax)
+            del H, absmax
         log(f"[hessian] layers {window[0]}-{window[-1]}: {len(acc)} inputs, {time.time() - t0:.1f}s")
         del acc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     if not return_stats:
         return stats
-    for l, ks in reps.items():
-        for k in ks:
-            H, n, absmax = load_hessian(out_dir, l, k)
-            stats[f"{l}.{k}"] = activation_summary(H, n, absmax)
-    return stats
+    return read_stats(out_dir, [(l, k) for l, ks in reps.items() for k in ks], have=stats)
 
 
 def activation_summary(H: torch.Tensor, n: int, absmax: torch.Tensor, outlier_factor: float = 6.0) -> dict:

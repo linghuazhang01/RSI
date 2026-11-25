@@ -5,8 +5,7 @@
 - the Paper A GPU layout (editor 1 GPU, candidate groups);
 - rsicore.search.inner_search(parallel=N) really runs a step's threads at the same time, records them in
   thread order, and parallel=1 keeps the old sequential behaviour;
-- QuantProblem.evaluate is thread-safe: an identical config is evaluated once (the others wait for it), and serve()
-  hands out distinct slots.
+- QuantProblem.serve() hands out distinct slots (evaluate's thread safety: test_kl_flow).
 """
 from __future__ import annotations
 
@@ -96,38 +95,7 @@ def _problem(tmp, n_gpus=4):
     rc = SimpleNamespace(mock=True, run_dir=tmp, run_id="t", seed=42, gpus=list(range(n_gpus)))
     cfg = {"gpu_layout": {"candidate_group_size": 1}, "candidates": {"keep_checkpoints": 1}}
     return QuantProblem(rc, cfg, tag="t", gen=1, out_dir=tmp / "p", prep_dir=tmp / "prep", source_dir=None,
-                        source_state=None, budget_gib=10.0, datasets=["dapo_math"], data={}, kl_texts=[])
-
-
-def test_evaluate_thread_safe(tmp_path, monkeypatch):
-    prob = _problem(tmp_path)
-    assert prob.slots == [[1], [2], [3]]
-    calls, lock = [], threading.Lock()
-
-    def fake(art, stage, cid, key, origin):
-        with lock:
-            calls.append(art["config_hash"])
-        time.sleep(0.2)
-        rec = {"hash": art["config_hash"], "stage": stage, "cid": cid, "score": 0.5, "feedback": {}}
-        with prob._lock:
-            prob._evals[key] = rec
-        return dict(rec)
-    monkeypatch.setattr(prob, "_evaluate", fake)
-    res, errs = [], []
-
-    def go(h):
-        try:
-            res.append(prob.evaluate({"config_hash": h}, "screen", f"c{h}"))
-        except Exception as e:  # noqa: BLE001
-            errs.append(type(e).__name__)
-    ts = [threading.Thread(target=go, args=(h,)) for h in ["a", "a", "a", "b", "c", "d", "e"]]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    assert calls.count("a") == 1                                   # identical config evaluated once
-    assert sorted(set(calls)) == ["a", "b", "c", "d", "e"] and not errs   # no evaluate budget: all evaluated
-    assert sum(1 for r in res if r.get("cached")) == 2             # the two waiting "a" threads
+                        source_state=None, budget_gib=10.0, datasets=["simple_math_pool"], kl_texts=[])
 
 
 def test_serve_pool_distinct_slots(tmp_path, monkeypatch):

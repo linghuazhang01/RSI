@@ -1,29 +1,24 @@
-"""Editor system prompt and per-step context rendering for Paper A.
+"""Editor system prompt and per-step context rendering for Paper A (KL only, 2026-11-25).
 
-The editor (the original model M_0, frozen; or the incumbent with loop.editor=current) must answer with ONE ```python block defining
-`def main(api): ... return config`. render_context(history, thread) shows: the budget and the search shape, a compact
-diagnostics summary and the archive of earlier generations (experience channel; switchable) on the first step, the
-incumbent's (latest model's) answers to this round's screen items, and this round's candidates with their gate
-results.
+The editor (the original model M_0, frozen; or the incumbent with loop.editor=current) must answer with ONE ```python
+block defining `def main(api): ... return config`. render_context(history, thread) shows: the budget and the search
+shape, a compact diagnostics summary, the incumbent (its KL to the original model) and the archive of earlier rounds
+on the first step, and this round's candidates with their KL results.
 
-The flow is hard-wired (2026-11-23; formerly the base.yaml defaults search.screen_candidates false,
-gate_every_candidate true, program_evaluate_calls 0): no api.evaluate anywhere; the editor sees the incumbent's answers
-to this round's screen items (summary in the context, full data through screen_results / screen_output); every
-returned config gets ONE gate evaluation and later steps / rounds see its gate statistics (candidate table, own
-feedback, search_history, archive); the acceptance text names the end-of-round rule (largest passing gain). With
-steps 1 each thread is told that it is session k of N working independently this round and should use
-search_history / the archive to try something different from earlier rounds. Thread / step / tool-round numbers
-always come from the config. editor.explore.persistent: the protocol says that run_python variables persist within a
-proposal.
+There is no screen and no accuracy gate: every returned config gets ONE KL evaluation (per-trace token KL(M_0 ||
+config) on the fixed KL set, M_0's own answers to held-back training items) and later steps / rounds see it
+(candidate table, own feedback, search_history, archive); the lowest KL of the round is accepted when it is below the
+incumbent's. With steps 1 each thread is told that it is session k of N working independently this round and should
+use search_history / the archive to try something different from earlier rounds.
 """
 from __future__ import annotations
 
 import json
 
-from .common import error_line
+from .common import error_line, kl_eval_cfg
 from .diagnostics import summarize_profile
 
-SYSTEM_PROMPT = """You are quantizing a large language model to a fixed memory budget. The model being quantized is a copy of YOURSELF: every config is applied to the original BF16 weights. The budget is the same in every round; each round tries to beat the best quantization accepted so far (the incumbent), which you can see together with the experience of earlier rounds.
+SYSTEM_BODY = """You are quantizing a large language model to a fixed memory budget. The model being quantized is a copy of YOURSELF: every config is applied to the original BF16 weights. The budget is the same in every round; each round tries to beat the lowest-KL quantization accepted so far (the incumbent), which you can see together with the experience of earlier rounds.
 
 Write a Python program `def main(api): ... return config` that returns a quantization config. The program runs in a sandbox (no network, no files outside its working dir); it can only use the tools on `api`, always called with KEYWORD arguments (e.g. `api.bytes(config=cfg)`):
 {tools}
@@ -41,23 +36,24 @@ Config schema (JSON object):
 - Module groups per layer. Full-attention layers: qk (q_proj+k_proj), v, o. Linear-attention (Gated DeltaNet) layers: gdn_qkv (in_proj_qkv), gdn_z (in_proj_z), gdn_ba (in_proj_b+in_proj_a, tiny gates), gdn_out (out_proj). Every layer: gate_up (gate_proj+up_proj), down (down_proj). Group keys look like "17.down".
 - Layer selectors: int (negative = from the end), "a-b", "all", or a list. Group selectors: name, "all" or list. "groups" keys may be "17.down", "down", "56-63.down" or "*.down".
 - The packed size (codes + fp16 scales + zero points + unquantized parts) must be <= the budget; check with api.bytes(config).
-- profile_table() gives, per group key and bit width, the whole-model KL increase when only that group is RTN-quantized (forward pass on the original model, 64 texts). hessian_table() gives, per group, quantizer (rtn / gptq / awq) and bit width, the Hessian-weighted output error of that group alone (every calibration token, no forward pass): lower noise, local. Sensitivities are roughly additive at >= 3.5 average bits and underestimate damage at 2-3 bits; only a real evaluation measures the real thing.
+- profile_table() gives, per group key and bit width, the whole-model KL increase when only that group is RTN-quantized (forward pass on the original model, 64 texts). hessian_table() gives, per group, quantizer (rtn / gptq / awq) and bit width, the Hessian-weighted output error of that group alone (every calibration token, no forward pass): lower noise, local. Sensitivities are roughly additive at >= 3.5 average bits and underestimate damage at 2-3 bits; only the KL evaluation measures the real thing.
 - Analysis (free): group_error(config) shows where a config's quantization error concentrates.
-- The incumbent answered this round's screen items ({screen}, held-back TRAINING items; thinking mode): a summary is in your context and api.screen_results / api.screen_output give every item with its prompt, gold answer, extracted answers and the full outputs incl. the thinking, so you can see what the incumbent gets wrong, gets right only sometimes, or truncates. Your returned config is NOT scored on these items: {gate_desc} There is no api.evaluate.
+- {kl_desc} There is no api.evaluate and no accuracy score: KL to the original model is the only number.
 - {acceptance}
 - In your program `api` exists only as the argument of main(api) (it is not a global there): pass it to helper functions explicitly, e.g. def pick(api, budget): ...
 - Time: your program is killed after {timeout_s} s of wall clock, every tool call included (group_error / hessian_table on settings that are not cached yet quantize on the GPU and take real time). A killed program is a lost candidate.
-- note (optional, at most 600 characters, plain text, the "note" key of the returned config): which groups you changed and WHY those (the evidence that picked them: a profile_table / hessian_table / group_error number, the incumbent's failures), then what you tried and rejected, with the numbers that decided it (e.g. "8 bit for down 0-3 and v 40-47: largest gptq 4-bit herr_rel in hessian_table; paid for with gate_up 20-35 at 3 bit; rejected: awq on gdn_qkv, group_error total +9% vs gptq"). The history already lists the config; the note is for the reasons. Every later session sees it, so a good note keeps them from repeating your failed ideas.
+- note (optional, at most 600 characters, plain text, the "note" key of the returned config): which groups you changed and WHY those (the evidence that picked them: a profile_table / hessian_table / group_error number, the KL of earlier candidates), then what you tried and rejected, with the numbers that decided it (e.g. "8 bit for down 0-3 and v 40-47: largest gptq 4-bit herr_rel in hessian_table; paid for with gate_up 20-35 at 3 bit; rejected: awq on gdn_qkv, group_error total +9% vs gptq"). The history already lists the config; the note is for the reasons. Every later session sees it, so a good note keeps them from repeating your failed ideas.
 
-Answer with a short plan, then exactly one ```python code block containing the full program."""
-
+"""
 
 PERSIST_NONE = "Nothing persists between run_python calls or into your final program: it must be self-contained."
 PERSIST_SESSION = ("Variables, imports and functions persist between your run_python calls while you write this program "
                    "(one session; a timeout or crash restarts it and loses them), but not into your final program: it "
                    "must be self-contained.")
 
+# the body ends the system prompt with FINAL_RULE (tool_rounds 0) or TOOL_PROTOCOL (tool_rounds > 0)
 FINAL_RULE = "Answer with a short plan, then exactly one ```python code block containing the full program."
+SYSTEM_PROMPT = SYSTEM_BODY + FINAL_RULE
 
 # editor.tool_rounds > 0 (2026-11-21): the editor may call chat tools before answering; replaces FINAL_RULE
 TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds (one round = one reply with function calls; at most {calls} calls in all):
@@ -68,115 +64,75 @@ When you are done, reply WITHOUT a function call: a short plan, then exactly one
 
 
 def _tool_rounds(cfg: dict) -> tuple[int, bool, bool, int]:
-    """(editor.tool_rounds, editor.explore.gpu_tools, editor.explore.persistent, editor.max_tool_calls) with the
-    rsicore.editor defaults (the round count is always the configured one, e.g. 20 in the simple profile)."""
-    try:
-        from rsicore.editor import editor_settings
-        s = editor_settings(cfg)
-        ex = s.get("explore") or {}
-    except ImportError:                      # pragma: no cover - rsicore not on sys.path
-        s = cfg.get("editor") or {}
-        s = {"tool_rounds": s.get("tool_rounds", 50), "max_tool_calls": s.get("max_tool_calls", 100)}
-        ex = (cfg.get("editor") or {}).get("explore") or {}
-    if "persistent" not in ex:               # rsicore.editor_settings may not know the key yet
-        ex = dict(ex, persistent=((cfg.get("editor") or {}).get("explore") or {}).get("persistent", False))
+    """(editor.tool_rounds, editor.explore.gpu_tools, editor.explore.persistent, editor.max_tool_calls) as
+    rsicore.editor.editor_settings merges them with its defaults."""
+    from rsicore.editor import editor_settings
+    s = editor_settings(cfg)
+    ex = s["explore"]
     return (int(s["tool_rounds"] or 0), bool(ex.get("gpu_tools")), bool(ex.get("persistent")),
             int(s.get("max_tool_calls") or 0))
 
 
-GATE_DESC_ACC = ("it gets ONE evaluation on the fixed gate set ({gate}), paired per item with the incumbent; its gate "
-                 "result (accuracy, paired gain, CI, passed or not and why, ids of broken / fixed gate items, never their "
-                 "content) is shown to later sessions and rounds.")
-GATE_DESC_KL = ("it gets ONE gate evaluation that samples nothing: the model it quantizes reads {gate} (fixed answers "
-                "written once by the original BF16 model to held-back gate items, never shown to you) and the gate "
-                "measures the token-level KL divergence KL(original || quantized) on every position (top-{k} "
-                "approximation), averaged per trace; lower is closer to the original. Paired per trace with the "
-                "incumbent; gain = the incumbent's KL minus yours (positive = closer to the original). Its gate result "
-                "(KL, the incumbent's KL, gain, CI, passed or not and why) is shown to later sessions and rounds.")
+KL_DESC = ("Every config your program returns gets ONE evaluation that samples nothing: the model it quantizes reads "
+           "{n} fixed reference traces (the original BF16 model's own thinking-mode answers to held-back training "
+           "items, written once before round 1, never shown to you) and the evaluation measures the token-level KL "
+           "divergence KL(original || quantized) on every answer position (top-{k} approximation), averaged per trace "
+           "and then over the traces; lower = closer to the original. Its result (KL, the incumbent's KL, KL reduction "
+           "= the incumbent's KL minus yours, per-trace quantiles) is shown to later sessions and rounds.")
+
+FIRST_ROUND = ("No quantization has been accepted yet (loop.start bf16): the incumbent is the original BF16 model "
+               "itself (KL 0 to itself), which does not fit the budget. ")
 
 
-def is_kl_gate(cfg: dict) -> bool:
-    return ((cfg or {}).get("gate") or {}).get("metric", "accuracy") == "kl"
+def acceptance_text(cfg: dict, first: bool = False) -> str:
+    """The acceptance rule: the lowest KL of the round wins when it is below the incumbent's. first (loop.start bf16,
+    the incumbent is still the BF16 original): the lowest KL among the configs within the budget is accepted."""
+    if first:
+        return (FIRST_ROUND + "Acceptance (end of this round): among the configs that fit the budget, the one with "
+                "the LOWEST KL to the original model becomes the first incumbent, and later rounds must beat it. None "
+                "fits: the incumbent stays the original and the next round uses the same rule.")
+    return ("Acceptance (end of the round): among the configs that fit the budget, the one with the LOWEST KL to the "
+            "original model becomes the new incumbent if its KL is below the incumbent's (no significance test). "
+            "Otherwise the incumbent stays.")
 
 
-def acceptance_text(cfg: dict) -> str:
-    """The acceptance rule as configured (2026-11-21; gate.min_delta / require_significant), not a fixed text: every
-    candidate is gated; the largest passing gain is accepted."""
-    g = cfg.get("gate") or {}
-    md = float(g.get("min_delta", 0.0))
-    if is_kl_gate(cfg):                  # (2026-11-24) gain = KL reduction vs the incumbent
-        rule = (f"mean KL reduction >= {md:g}" if md > 0 else "a positive mean KL reduction")
-        rule += (", a statistically significant reduction" if g.get("require_significant", True)
-                 else "; there is no significance test")
-        return ("Acceptance (end of the round): a config passes its gate evaluation when size <= budget and its KL to "
-                f"the original model is lower than the incumbent's on the fixed reference traces (paired per trace: "
-                f"{rule}); among the passing configs of the round the one with the LARGEST KL reduction becomes the new "
-                "incumbent. None passes: the incumbent stays.")
-    rule = (f"mean gain >= {md:g} ({md * 100:g} accuracy points)" if md > 0
-            else "a positive mean gain")       # (2026-11-21) threshold 0: any strictly positive gain
-    rule += (", a statistically significant gain and no significant loss on any domain"
-             if g.get("require_significant", True) else "; there is no significance test")
-    return ("Acceptance (end of the round): a config passes its gate evaluation when size <= budget and it beats "
-            f"the incumbent on the fixed gate set (paired per item: {rule}); among the passing configs of the "
-            "round the one with the LARGEST gain becomes the new incumbent. None passes: the incumbent stays.")
-
-
-def _sizes(problem) -> dict:
-    """Screen / gate sizes for the prompt texts: items and samples per item (decoding n; 1 = greedy)."""
-    dec = getattr(problem, "decoding", None) or {}
-    out = {"screen_k": int((dec.get("screen") or {}).get("n") or 1), "gate_k": int((dec.get("gate") or {}).get("n") or 1)}
+def _n_traces(problem):
     try:
-        out["screen_n"] = sum(len(problem.data[ds]["screen"]) for ds in problem.datasets)
-    except (AttributeError, KeyError, TypeError):
-        out["screen_n"] = None
-    try:
-        out["gate_n"] = sum(len(problem._ids(ds, "gate")) for ds in problem.gate_datasets)
-    except Exception:  # noqa: BLE001 - informative only
-        out["gate_n"] = None
-    if getattr(problem, "kl_gate", False):     # KL gate: the reference traces, one each, nothing sampled
-        try:
-            out["gate_n"], out["gate_k"] = len(problem.kl_items()), 1
-        except Exception:  # noqa: BLE001 - informative only (traces not written yet)
-            out["gate_k"] = 1
-    return out
+        return len(problem.kl_items())
+    except Exception:  # noqa: BLE001 - informative only (traces not written yet)
+        return None
 
 
-def _gate_desc(cfg: dict, sz: dict) -> str:
-    if is_kl_gate(cfg):
-        n = sz.get("gate_n")
-        return GATE_DESC_KL.format(gate=(f"{n} reference traces" if n else "the reference traces"),
-                                   k=int(((cfg.get("gate") or {}).get("kl") or {}).get("top_k", 20)))
-    return GATE_DESC_ACC.format(gate=_items(sz["gate_n"], sz["gate_k"]))
-
-
-def _items(n, k) -> str:
-    return (f"{n} items" if n else "the items") + (f" x {k} sampled answers" if k > 1 else "")
+def _kl_desc(problem, cfg: dict) -> str:
+    n = _n_traces(problem)
+    return KL_DESC.format(n=n if n else "the", k=int(kl_eval_cfg(cfg)["top_k"]))
 
 
 HISTORY_READ = " or of any earlier candidate that search_history lists"
 HISTORY_LINE = ("\n- search_history(gen, sort, offset) lists every candidate already tried (this generation's and the "
-                "earlier generations') with a one-line description of its config, its size, scores and gate "
-                "outcome; same_as marks a config identical to an earlier one. Check it before you write a program, "
+                "earlier generations') with a one-line description of its config, its size and its KL "
+                "result; same_as marks a config identical to an earlier one. Check it before you write a program, "
                 "so you do not repeat a config that was already tried.")
 
 
 def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False) -> str:
     sp = problem.space
-    sz = _sizes(problem)
-    text = SYSTEM_PROMPT.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
-                                quantizers=sp["quantizers"], timeout_s=int((cfg.get("sandbox") or {}).get("timeout_s", 1800)),
-                                screen=_items(sz["screen_n"], sz["screen_k"]), gate_desc=_gate_desc(cfg, sz),
-                                acceptance=acceptance_text(cfg))
+    first = bool(getattr(problem, "incumbent_is_original", False))
+    text = SYSTEM_BODY.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
+                              quantizers=sp["quantizers"], timeout_s=int((cfg.get("sandbox") or {}).get("timeout_s", 1800)),
+                              kl_desc=_kl_desc(problem, cfg), acceptance=acceptance_text(cfg, first=first))
+    if first:   # loop.start bf16, nothing accepted yet
+        text = text.replace("the lowest-KL quantization accepted so far (the incumbent)",
+                            "the lowest-KL quantization accepted so far (the incumbent; none yet: this round picks the "
+                            "first one)")
     rounds, gpu_tools, persistent, calls = _tool_rounds(cfg)
-    if rounds > 0:                           # tool_rounds 0: the single-call prompt
-        ge = ("" if gpu_tools or not (cfg.get("tools") or {}).get("group_error", True)
-              else "; group_error there only accepts settings already cached (those of hessian_table)")
-        if text.endswith(FINAL_RULE):
-            text = text[:-len(FINAL_RULE)]
-        text += TOOL_PROTOCOL.format(rounds=rounds, calls=calls, group_error=ge, history_read=HISTORY_READ if history else "",
-                                     history=HISTORY_LINE if history else "",
-                                     persist=PERSIST_SESSION if persistent else PERSIST_NONE)
-    return text
+    if rounds <= 0:                          # tool_rounds 0: the single-call prompt
+        return text + FINAL_RULE
+    ge = ("" if gpu_tools or not (cfg.get("tools") or {}).get("group_error", True)
+          else "; group_error there only accepts settings already cached (those of hessian_table)")
+    return text + TOOL_PROTOCOL.format(rounds=rounds, calls=calls, group_error=ge, history_read=HISTORY_READ if history else "",
+                                       history=HISTORY_LINE if history else "",
+                                       persist=PERSIST_SESSION if persistent else PERSIST_NONE)
 
 
 def _fmt(x, nd=3):
@@ -187,12 +143,14 @@ def _fmt(x, nd=3):
     return str(x)
 
 
+def _eval_fb(screen: dict | None) -> dict | None:
+    """The KL feedback (run.kl_feedback) kept in a candidate's screen slot (rsicore.search's name for it)."""
+    return (screen or {}).get("feedback")
+
+
 def _feedback(c) -> dict | None:
-    """A candidate's feedback: its gate feedback (run.gate_feedback), kept in the candidate's screen slot."""
-    fb = (c.screen or {}).get("feedback")
-    if isinstance(fb, dict) and "feedback" in fb and "probes" not in fb:
-        fb = fb["feedback"]
-    return fb
+    """A candidate's feedback: its KL feedback."""
+    return _eval_fb(c.screen)
 
 
 def _setting(x: dict) -> str:
@@ -237,103 +195,57 @@ def config_brief(config: dict | None) -> str | None:
             lay = [x for x in ls if x is not None]
             cells.append(f"{m} " + (f"L{_layer_ranges(lay)} " if lay else "") + f"x{len(ls)}")
         parts.append(f"{st}: " + ", ".join(cells) + (f" (+{len(kinds) - 4} kinds)" if len(kinds) > 4 else ""))
-    for k in ("embed", "lm_head"):
-        v = config.get(k)
-        if isinstance(v, dict) and v:
-            parts.append(f"{k} {_setting(v)}")
     return "; ".join(parts)
 
 
 def history_row(rec: dict) -> dict:
-    """search_history summary of one candidates.jsonl record (2026-11-21): what the config is (config_brief),
-    its size and per-domain gate delta vs that generation's incumbent (* = significant)."""
+    """search_history summary of one candidates.jsonl record: what the config is (config_brief), its size and its KL
+    (the KL reduction vs that generation's incumbent is in the row's gate statistics)."""
     art = rec.get("artifact") or {}
-    fb = (rec.get("screen") or {}).get("feedback") or {}
-    if isinstance(fb, dict) and "feedback" in fb and "probes" not in fb:
-        fb = fb["feedback"]
-    fb = fb if isinstance(fb, dict) else {}
-    deltas = {}
-    for d, p in (fb.get("probes") or {}).items():
-        if isinstance(p, dict) and p.get("vs_incumbent") is not None:
-            deltas[d] = f"{p['vs_incumbent']:+.3f}" + ("*" if p.get("significant") else "")
+    fb = _eval_fb(rec.get("screen"))
+    g = (fb if isinstance(fb, dict) else {}).get("kl_eval") or {}
     return {"config": config_brief(art.get("config")), "GiB": art.get("bytes_gib"),
             "avg_bits": None if art.get("linear_avg_bits") is None else round(float(art["linear_avg_bits"]), 2),
-            "vs_incumbent": deltas or None,
-            "note": art.get("note") or None}
+            "kl": g.get("kl"), "note": art.get("note") or None}
 
 
-def gate_cell(g: dict | None) -> str:
-    """One-line gate result (2026-11-21, gate per candidate): passed / failed, gain [CI], broken / fixed counts."""
+def kl_cell(g: dict | None) -> str:
+    """One-line KL result: KL reduction vs the incumbent (or why it was not evaluated)."""
     if not isinstance(g, dict):
         return "-"
-    ci = g.get("ci")
-    ci = f" [{ci[0]:+.4f}, {ci[1]:+.4f}]" if isinstance(ci, list) and len(ci) == 2 and None not in ci else ""
-    gain = "-" if g.get("gain") is None else f"{g['gain']:+.4f}"
-    if g.get("metric") == "kl":           # KL gate: gain = KL reduction, no broken / fixed items
-        out = f"{'PASSED' if g.get('passed') else 'failed'} KL reduction {gain}{ci}"
-    else:
-        out = f"{'PASSED' if g.get('passed') else 'failed'} gain {gain}{ci}, broken {g.get('broken')} / fixed {g.get('fixed')}"
-    if not g.get("passed") and g.get("reason"):
-        out += f" ({str(g['reason']).split(' (')[0][:80]})"
-    return out
+    if g.get("kl") is None or g.get("gain") is None:
+        return str(g.get("reason") or "-").split(" (")[0][:80]
+    return f"{g['gain']:+.6f}" + ("" if g.get("passed") else f" ({str(g.get('reason') or '')[:60]})")
 
 
-def gate_table(history, kl: bool = False) -> str:
-    """Candidate table: size and the gate result (kl: the KL gate's KL and KL reduction)."""
-    head = ("| cid | thread | step | GiB | avg bits | gate KL to original | KL reduction vs incumbent [95% CI] |" if kl
-            else "| cid | thread | step | GiB | avg bits | gate accuracy | gain vs incumbent [95% CI] / broken / fixed |")
+def kl_table(history) -> str:
+    """Candidate table: size, KL to the original model and the KL reduction vs the incumbent."""
+    head = "| cid | thread | step | GiB | avg bits | KL to original | KL reduction vs incumbent |"
     lines = [head, "|" + "---|" * (head.count("|") - 1)]
     for c in history:
         fb = _feedback(c) or {}
         art = c.artifact or {}
-        g = fb.get("gate") if isinstance(fb.get("gate"), dict) else None
-        cell = "error: " + c.error.splitlines()[0][:80] if c.error else gate_cell(g)
+        g = fb.get("kl_eval") if isinstance(fb.get("kl_eval"), dict) else None
+        cell = "error: " + c.error.splitlines()[0][:80] if c.error else kl_cell(g)
         lines.append(f"| {c.cid} | {c.thread} | {c.step} | {_fmt(art.get('bytes_gib'))} | "
-                     f"{_fmt(art.get('linear_avg_bits'), 2)} | "
-                     f"{_fmt((g or {}).get('kl' if kl else 'accuracy'), 6 if kl else 4)} | {cell} |")
+                     f"{_fmt(art.get('linear_avg_bits'), 2)} | {_fmt((g or {}).get('kl'), 6)} | {cell} |")
     return "\n".join(lines)
 
 
-def screen_summary_text(summary: dict, chars: int = 3500) -> str:
-    """The incumbent's screen run for the context (rsicore.screen_view.summary)."""
-    if not summary or not summary.get("n_items"):
-        return "The incumbent's screen results are not available."
-    k = summary.get("samples_per_item")
-    head = (f"The incumbent on this round's {summary['n_items']} screen items ({k} sampled answers each, thinking): "
-            f"accuracy avg@{k} {summary.get('accuracy')}; items by number of correct samples "
-            f"{json.dumps(summary.get('correct_counts'))}; truncated samples {summary.get('truncation_rate')}"
-            f" (cut while thinking: {summary.get('truncated_thinking')}). Failing examples (all of them: "
-            "api.screen_results(filter='wrong' | 'unstable'); full outputs: api.screen_output(id, sample)):\n")
-    return head + json.dumps(summary.get("failing") or [], ensure_ascii=False)[:chars]
-
-
-def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict | None = None,
-                        history_tool: bool = False):
+def make_render_context(problem, cfg: dict, *, search: dict, archive: str = "", history_tool: bool = False):
     """Returns render_context(history, thread) -> str for rsicore.search.inner_search. search: the search shape
-    {threads, steps} (edit_code.common.search_settings; None = cfg["search"]); history_tool: the editor has the
-    search_history chat tool."""
-    n_examples = cfg["feedback"].get("examples", 2)
-    ss = search if search is not None else (cfg.get("search") or {})
-    threads = int(ss.get("threads", 1))
-    steps = int(ss.get("steps", 1))
+    {threads, steps} (edit_code.common.search_settings); history_tool: the editor has the search_history chat tool."""
+    threads = int(search.get("threads", 1))
+    steps = int(search.get("steps", 1))
     one_step = steps == 1
-    summary_cache = {}
-
-    def screen_summary() -> dict:
-        if "s" not in summary_cache:           # the incumbent's screen run is fixed for the whole search
-            try:
-                summary_cache["s"] = problem.screen_summary(examples=max(3, int(n_examples)))
-            except Exception as e:  # noqa: BLE001 - informative only
-                summary_cache["s"] = {"n_items": 0, "error": str(e)[:200]}
-        return summary_cache["s"]
-
-    kl = bool(getattr(problem, "kl_gate", False))
+    first = bool(getattr(problem, "incumbent_is_original", False))   # loop.start bf16, nothing accepted yet
+    goal = "Find the lowest-KL config within the budget" if first else "Beat the incumbent (lower KL)"
 
     def render(history, thread: int) -> str:
         step = sum(1 for c in history if c.thread == thread)
         budget = (f"Budget (fixed for every round): {problem.budget_gib:.3f} GiB packed. "
-                  "The config your program returns gets one gate evaluation (paired vs the incumbent); "
-                  f"this round: {threads} session(s) x {steps} step(s).")
+                  "The config your program returns gets one KL evaluation (KL to the original model on the fixed "
+                  f"reference traces); this round: {threads} session(s) x {steps} step(s).")
         parts = [f"[thread={thread} step={step} task=main gen={problem.gen}]", budget]   # (marker parsed by mock._MARK)
         if one_step and step == 0 and threads > 1:
             src = "search_history and the archive of earlier rounds" if history_tool else "the archive of earlier rounds"
@@ -348,14 +260,16 @@ def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict |
                                                  "params_by_group": info["params_by_group"],
                                                  "lm_head_tied": info["lm_head_tied"]}))
             inc = problem.incumbent
-            if inc:
-                gs = inc.get("gate_scores") or {}
-                what = ("its gate KL to the original model (per dataset, mean over the traces): "
-                        + json.dumps({d: (None if v is None else round(-v, 6)) for d, v in gs.items()})
-                        if kl else "its gate accuracy: " + json.dumps(gs))
+            if first:
+                parts.append(f"{FIRST_ROUND}Its size: {inc.get('bytes_gib')} GiB (16 bits) vs the budget "
+                             f"{problem.budget_gib:.3f} GiB. Every quantized config has a positive KL. Write the best "
+                             "config you can within the budget: the lowest KL of this round becomes the first "
+                             "incumbent.")
+            elif inc:
                 parts.append(f"Incumbent to beat (accepted in round {inc.get('gen')}, {inc.get('bytes_gib')} GiB, "
-                             f"linear avg bits {inc.get('linear_avg_bits')}); {what}; config (compressed form): "
-                             + json.dumps(inc.get("config"))[:3000])
+                             f"linear avg bits {inc.get('linear_avg_bits')}): KL to the original model "
+                             f"{_fmt(inc.get('kl'), 6)} (per-trace quantiles {json.dumps(inc.get('kl_quantiles'))}); "
+                             "config (compressed form): " + json.dumps(inc.get("config"))[:3000])
             parts.append("Profile summary (KL increase if only that group is RTN-quantized):\n"
                          + json.dumps(summarize_profile(problem.tables["profile"], top=8))[:4000])
             red = [f"{r['layer']}.{r['module']}" for r in problem.tables["activation"] if r.get("red_flag")]
@@ -363,21 +277,14 @@ def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict |
                 parts.append(f"Activation red flags (heavy outliers, {len(red)}): " + ", ".join(red[:30]))
             if archive:                     # archive_text starts with its own header (ARCHIVE_HEAD)
                 parts.append(archive)
-        parts.append(screen_summary_text(screen_summary()))
         if history:
-            if kl:
-                parts.append("Candidates of this round so far, with their gate results (KL = mean token KL from the "
-                             "original model on the reference traces, lower is better; KL reduction = the incumbent's KL "
-                             "minus the candidate's, paired per trace):\n" + gate_table(history, kl=True))
-            else:
-                parts.append("Candidates of this round so far, with their gate results (gain = paired accuracy gain over "
-                             "the incumbent on the gate set; broken / fixed = gate items the incumbent got right and the "
-                             "candidate wrong / the reverse; read_record(cid, 'feedback') has the ids):\n"
-                             + gate_table(history))
+            parts.append("Candidates of this round so far (KL = mean token KL from the original model on the reference "
+                         "traces, lower is better; KL reduction = the incumbent's KL minus the candidate's):\n"
+                         + kl_table(history))
             ok = [c for c in history if c.score is not None]
             if ok:
-                best = max(ok, key=lambda c: c.score)
-                parts.append(f"Largest gate gain so far: {best.cid} ({best.score:+.4f}), config: "
+                best = max(ok, key=lambda c: c.score)       # score = -KL
+                parts.append(f"Lowest KL so far: {best.cid} ({-best.score:.6f}), config: "
                              + json.dumps((best.artifact or {}).get("config"))[:2500])
             mine = [c for c in history if c.thread == thread]
             if mine:
@@ -385,26 +292,26 @@ def make_render_context(problem, cfg: dict, *, archive: str = "", search: dict |
                 if last.error:
                     parts.append(f"Your last program ({last.cid}) failed:\n{last.error[:2500]}")
                 else:
-                    parts.append(f"Gate result of your last candidate {last.cid}:\n" + json.dumps(_feedback(last))[:3500])
+                    parts.append(f"KL result of your last candidate {last.cid}:\n" + json.dumps(_feedback(last))[:3500])
         if history and steps > 1:
-            parts.append("Beat the incumbent: improve this thread's best config using the gate results above, borrow "
+            parts.append(f"{goal}: improve this thread's best config using the KL results above, borrow "
                          "from other threads, or try a different idea. Return one ```python block with def main(api): "
                          "... return config.")
-        elif not history:                   # nothing of this round is visible (2026-11-21)
-            parts.append("Beat the incumbent: try an idea that differs from what earlier rounds tried. "
+        elif not history:                   # nothing of this round is visible
+            parts.append(f"{goal}: try an idea that differs from what earlier rounds tried. "
                          "Return one ```python block with def main(api): ... return config.")
         else:
-            parts.append("Beat the incumbent: improve on the best candidate (yours or another thread's) or try a "
+            parts.append(f"{goal}: improve on the best candidate (yours or another thread's) or try a "
                          "different idea. Return one ```python block with def main(api): ... return config.")
         return "\n\n".join(parts)
 
     return render
 
 
-ARCHIVE_HEAD = ("Archive of earlier rounds: EVERY candidate tried, one row each, failures included (2026-11-22, as in "
-                "Paper B). config = the config in one line (default setting; overrides grouped by setting: module kind, "
-                "layers L, count x), GiB / avg_bits = its size, gate = its gate result (gain = paired gain in gate "
-                "accuracy, or the KL reduction under the KL gate, vs that round's incumbent, ci = its 95% interval, reason when it failed), error = why it was not built, "
+ARCHIVE_HEAD = ("Archive of earlier rounds: EVERY candidate tried, one row each, failures included. config = the config "
+                "in one line (default setting; overrides grouped by setting: module kind, layers L, count x), GiB / "
+                "avg_bits = its size, kl = its KL to the original model on the fixed reference traces (the same traces "
+                "in every round, so KLs are comparable across rounds), error = why it was not built or evaluated, "
                 "note = its own account of what it tried and why.")
 ARCHIVE_READ = ("Full program or feedback (with the full config) of any candidate above: read_record(cid, 'program' | "
                 "'feedback'); search_history lists them with more statistics. Do not repeat what failed: try something "
@@ -419,8 +326,8 @@ def _num(x, nd: int = 4):
 
 
 def archive_row(c, gate: dict | None = None) -> dict:
-    """One archive row of an earlier round's candidate (rsicore.search.Candidate; 2026-11-22): what the config is,
-    its size, its gate result (gate = run.gate_outcomes row) or score, the first line of its error, its note."""
+    """One archive row of an earlier round's candidate (rsicore.search.Candidate): what the config is, its size, its
+    KL (gate = its run.gate_outcomes row), the first line of its error, its note."""
     art = c.artifact or {}
     row = {"cid": c.cid}
     if c.error:
@@ -431,44 +338,31 @@ def archive_row(c, gate: dict | None = None) -> dict:
         if art.get("linear_avg_bits") is not None:
             row["avg_bits"] = round(float(art["linear_avg_bits"]), 2)
     if isinstance(gate, dict):
-        g = {"passed": bool(gate.get("passed"))}
-        if gate.get("gain") is not None:
-            g["gain"] = _num(gate["gain"])
-        ci = gate.get("ci")
-        if isinstance(ci, (list, tuple)):
-            g["ci"] = [_num(x) for x in ci]
-        elif isinstance(ci, dict):           # several gate datasets: {dataset: [lo, hi]}
-            g["ci"] = {ds: [_num(x) for x in v] for ds, v in ci.items() if isinstance(v, (list, tuple))}
-        if not g["passed"] and gate.get("reason") and not c.error:
-            g["reason"] = str(gate["reason"])[:120]
-        row["gate"] = g
-    elif c.score is not None:
-        row["score"] = _num(c.score)
+        if gate.get("kl") is not None:
+            row["kl"] = _num(gate["kl"], 6)
+        elif gate.get("reason") and not c.error:
+            row["error"] = str(gate["reason"])[:120]
     if art.get("note"):
         row["note"] = art["note"]
     return row
 
 
 def archive_text(entries: list[dict], *, read_tools: bool = True, max_chars: int = 30000) -> str:
-    """The experience channel (2026-11-22, structured as Paper B's archive). entries: one per earlier round {gen,
-    accepted, cid, gate_reason, n, best: [(cid, paired gate gain)], reference_screen (flat summary), incumbent_score,
-    rows: [archive_row], configs: [(cid, full config)] (quoted only without read_tools)}. max_chars: the rows of the
-    oldest rounds are dropped first to fit. Gate gains are all on the same fixed gate set."""
+    """The experience channel. entries: one per earlier round {gen, accepted, cid, reason, incumbent_kl, n, best:
+    [(cid, KL)], first_quantization, rows: [archive_row], configs: [(cid, full config)] (quoted only without
+    read_tools)}. max_chars: the rows of the oldest rounds are dropped first to fit."""
     blocks = []
     for e in entries:
         acc = f"new incumbent {e.get('cid')}" if e.get("accepted") else \
-            f"incumbent kept (gate: {str(e.get('gate_reason'))[:300]})"
-        best = ", ".join(f"{cid}={v:+.4f}" for cid, v in (e.get("best") or []) if v is not None)
+            f"incumbent kept ({str(e.get('reason'))[:300]})"
+        best = ", ".join(f"{cid}={v:.6f}" for cid, v in (e.get("best") or []) if v is not None)
+        ik = e.get("incumbent_kl")
         head = [f"- round {e['gen']}: {acc}; {e.get('n', 0)} candidates"
-                + (f"; largest paired gate gains {best}" if best else "")]
-        rs = e.get("reference_screen")
-        if rs and (rs.get("n_items") or rs.get("accuracy") is not None):
-            size = (f" over {rs['n_items']} items x {rs.get('samples_per_item')} samples" if rs.get("n_items") else "")
-            head.append(f"  incumbent on that round's screen items: accuracy {rs.get('accuracy')}{size}, items by correct "
-                        f"samples {json.dumps(rs.get('correct_counts'))}, truncated {rs.get('truncation_rate')} "
-                        f"(screen_results(gen={e['gen']}))")
-        elif e.get("incumbent_score"):
-            head.append(f"  incumbent score on that round's items {e.get('incumbent_score')}")
+                + (f"; incumbent KL {ik:.6f}" if isinstance(ik, (int, float)) else "")
+                + (f"; lowest KLs {best}" if best else "")]
+        if e.get("first_quantization"):      # loop.start bf16: the incumbent was the BF16 original
+            head.append("  first-quantization round: the incumbent was the original BF16 model (KL 0), so the lowest "
+                        "KL within the budget was accepted")
         rows = ["  " + json.dumps(r, ensure_ascii=False, default=str) for r in e.get("rows") or []]
         if not read_tools:
             rows += [f"  full config of {cid}: {json.dumps(cfg)[:2500]}" for cid, cfg in e.get("configs") or []]

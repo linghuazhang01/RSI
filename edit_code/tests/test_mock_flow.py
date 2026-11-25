@@ -1,12 +1,12 @@
 """End-to-end Paper A orchestration in mock mode (no weights, no GPU), against the real rsicore.
-Fixed-size design (2026-11-19): frozen editor (M_0), every candidate quantizes M_0 to one budget,
-a generation is accepted only if it beats the incumbent on the gate. One flow (2026-11-22): train role
-simple_<d>_pool, gate simple_<d>_eval, held-out simple_<d>_test, gate per candidate (hard-wired since 2026-11-23: no
-screened candidates, no api.evaluate, no noise band, no KL term; the mock runs 3 threads x 1 step).
+Fixed-size design: frozen editor (M_0), every candidate quantizes M_0 to one budget. KL only (2026-11-25): generation
+0 writes M_0's reference traces on kl_eval.n items of the training pool (mock: 24); every candidate gets ONE KL
+evaluation on them; the lowest KL of a generation is accepted when it is below the incumbent's. No screen, no
+accuracy gate, no held-out test, no classic baselines (the mock runs 3 threads x 1 step).
 
 Run with the eval interpreter (needs pyyaml; torch / transformers are NOT needed in mock mode):
     eval/.venv/bin/python -I -m pytest edit_code/tests/test_mock_flow.py -q      (or run the file)
-Takes ~3-4 minutes (two mock runs + one resume).
+Takes ~2 minutes.
 """
 from __future__ import annotations
 
@@ -56,114 +56,136 @@ class TestMockFlow(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def test_fixed_budget_loop_and_resume(self):
-        # W3 reference (the default is W4 since 2026-11-20): at W4 the mock damage is too small for the mock
-        # editor's bit exchange to clear the gate, and this test checks the accept / export / resume path
-        r, dt = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_test",
-                     "--set", "budget.reference.default.bits=3", "--set", "simple.screen_n=20"], self.runs)
+    def check_kl_set(self, rd):
+        kd = rd / "baseline" / "kl_gate"
+        tr = json.loads((kd / "traces.json").read_text())
+        items = tr["items"]
+        self.assertEqual(len(items), 24)                                   # mock_overrides.kl_eval.n
+        self.assertEqual({it["ds"] for it in items}, {"simple_math_pool"})
+        screen = set(json.loads((rd / "draws" / "gen_00" / "ids" / "simple_math_pool.screen.json").read_text()))
+        calib = set(json.loads((rd / "draws" / "gen_00" / "ids" / "simple_math_pool.kl.json").read_text()))
+        ids = [it["id"] for it in items]
+        self.assertTrue(set(ids) <= screen and not set(ids) & calib)        # generation 0's draw, not calibration
+        self.assertEqual(ids, sorted(ids))
+        self.assertTrue(all(it["text"].startswith(it["prompt"]) and len(it["text"]) > len(it["prompt"])
+                            for it in items))
+        self.assertEqual(len(jl(kd / "ref.jsonl")), 24)
+        self.assertEqual(len(jl(kd / "answers.jsonl")), 24)
+        return ids
+
+    def test_kl_loop_and_resume(self):
+        args = ["--domain", "math", "--gens", "2", "--run-id", "A_mock_test", "--set", "loop.start=q0",
+                "--set", "budget.reference.default.bits=3"]
+        r, dt = run(args, self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_test"
         st = json.loads((rd / "state.json").read_text())
-        for k in ("baseline/gate", "baseline/heldout", "baseline/prep", "baseline/budget",
-                  "baseline/q0", "baseline/q0_heldout", "gen01/search", "gen01/gate", "gen01/export",
-                  "gen01/heldout", "gen01/done", "gen02/done"):
+        for k in ("baseline/draw", "baseline/kl_gate", "baseline/prep", "baseline/budget", "baseline/q0",
+                  "gen01/search", "gen01/gate", "gen01/done", "gen02/done"):
             self.assertIn(k, st)
-        self.assertFalse([k for k in st if k.endswith("/mark_shown") or k.startswith("e_t/") or k.endswith("/refs")
-                          or k == "baseline/noise"])
-        # one budget for every generation = packed size of the reference config (Q_0)
+        for gone in ("baseline/gate", "baseline/heldout", "baseline/q0_heldout", "gen01/heldout", "gen01/draw"):
+            self.assertNotIn(gone, st)
+        self.assertFalse((rd / "baseline" / "heldout.json").exists() or (rd / "baselines").exists())
+        self.assertFalse((rd / "draws" / "gen_01").exists())                 # only generation 0 draws
+        ids = self.check_kl_set(rd)
         budget = json.loads((rd / "baseline" / "budget.json").read_text())
         self.assertEqual(budget["source"], "budget.reference")
         self.assertAlmostEqual(budget["gib"], budget["reference_gib"], places=3)
-        self.assertLess(budget["fraction_of_bf16"], 0.3)
-        # no noise band (2026-11-23)
-        self.assertFalse((rd / "baseline" / "noise.json").exists() or (rd / "baseline" / "noise").exists())
         q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
-        self.assertEqual(q0["gen"], 0)
-        self.assertTrue((rd / "baseline" / "q0" / "heldout.json").exists())
+        self.assertEqual((q0["gen"], q0["cid"]), (0, "q0"))
+        self.assertGreater(q0["kl"], 0)
+        self.assertEqual(json.loads((rd / "baseline" / "q0" / "record.json").read_text())["kl"], q0["kl"])
+        q0recs = jl(Path(q0["kl_records"]))
+        self.assertEqual([x["id"] for x in q0recs], ids)
+        self.assertAlmostEqual(sum(x["kl"] for x in q0recs) / len(q0recs), q0["kl"], places=5)
         # the layer cache / diagnostics are built once, from M_0
         self.assertTrue((rd / "prep" / "spec.json").exists())
         self.assertFalse((rd / "gen_01" / "prep").exists())
-        diag = rd / "prep" / "diagnostics"
-        prof = json.loads((diag / "profile_table.json").read_text())
-        self.assertEqual({r["bits"] for r in prof}, {2, 3, 4})                       # 8 bit dropped
-        ht = json.loads((diag / "hessian_table.json").read_text())                   # Hessian-weighted error table
-        self.assertEqual({(r["quantizer"], r["bits"]) for r in ht},
-                         {(q, b) for q in ("rtn", "gptq", "awq") for b in (2, 3, 4)})
-        self.assertEqual(len(ht), len({r["key"] for r in prof}) * 9)
-        self.assertTrue(all(r["herr_per_token"] >= 0 for r in ht))
+        prof = json.loads((rd / "prep" / "diagnostics" / "profile_table.json").read_text())
+        self.assertEqual({x["bits"] for x in prof}, {2, 3, 4})
+        prev = q0
         for g in (1, 2):
             gd = rd / f"gen_{g:02d}"
             cands = jl(gd / "candidates.jsonl")
-            self.assertEqual(len(cands), 3)
-            for c in cands:
-                if not c["error"]:
-                    self.assertLessEqual(c["artifact"]["bytes_gib"], budget["gib"] + 1e-9)
-                    self.assertEqual(c["artifact"]["budget_gib"], budget["gib"])
-            inc_scores = json.loads((gd / "incumbent_scores.json").read_text())
-            self.assertIsNotNone(inc_scores["screen"])
-            # M_0 is not scored on the items and computes no KL reference (no KL term)
-            self.assertFalse((gd / "refs").exists())
-            ok = [c for c in cands if not c["error"] and c.get("screen")]
-            self.assertTrue(ok)
-            for c in ok:                                   # unscreened: the screen slot holds the gate feedback
-                fb = c["screen"]["feedback"]
-                self.assertEqual(fb["stage"], "gate")
-                self.assertIn("gain", fb["gate"])
-                self.assertTrue(fb["error_top_groups"])
-            self.assertTrue(any("group_error top" in (c["artifact"] or {}).get("stdout_tail", "") for c in ok),
-                            "the mock editor's analysis tool calls")
-            ie = [e for e in evals_of(gd) if e["origin"] == "incumbent" and e["stage"] == "screen"]
-            self.assertEqual(ie[0]["feedback"]["retention"], 1.0)
-            self.assertNotIn("kl", ie[0]["feedback"])
-            self.assertTrue((gd / "editor" / "thread_0.jsonl").exists())
+            self.assertEqual([(c["thread"], c["step"]) for c in cands], [(0, 0), (1, 0), (2, 0)])
+            subs = json.loads((gd / "gate.json").read_text())["submissions"]
+            self.assertEqual([s_["cid"] for s_ in subs], [c["cid"] for c in cands])
             evals = jl(gd / "evals.jsonl")
-            self.assertFalse([e for e in evals if "charged" in e])           # no evaluate budget
-            self.assertTrue(any(e["origin"] == "incumbent" for e in evals))
-        # generation 1: the mock editor's bit exchange beats the uniform W3 incumbent on the gate
-        acc = json.loads((rd / "gen_01" / "accepted.json").read_text())
-        self.assertTrue(acc["accepted"], acc)
-        self.assertEqual(acc["rule"], "largest passing gate gain of the generation")
-        inc1 = json.loads((rd / "gen_01" / "incumbent.json").read_text())
-        self.assertEqual(inc1["gen"], 1)
-        self.assertGreater(inc1["gate_scores"]["simple_math_eval"], q0["gate_scores"]["simple_math_eval"])
-        self.assertTrue((rd / "gen_01" / "model" / "mock_model.json").exists())
-        # the editor is frozen: always M_0
-        self.assertIn("[gen 2] budget", r.stdout)
+            self.assertTrue(all(e["stage"] == "kl" for e in evals))
+            self.assertFalse([e for e in evals if e["origin"] == "incumbent"])   # the incumbent is never re-scored
+            for c, s_ in zip(cands, subs):
+                if c["error"]:
+                    continue
+                self.assertLessEqual(c["artifact"]["bytes_gib"], budget["gib"] + 1e-9)
+                info = s_["info"]
+                if info.get("kl") is None:
+                    continue
+                self.assertEqual(info["reference_kl"], prev["kl"])
+                self.assertAlmostEqual(info["gain"], prev["kl"] - info["kl"], places=5)
+                self.assertAlmostEqual(c["score"], -info["kl"], places=6)
+                fb = c["screen"]["feedback"]
+                self.assertEqual(fb["kl_eval"]["kl"], info["kl"])
+                self.assertTrue(fb["error_top_groups"])
+            acc = json.loads((gd / "accepted.json").read_text())
+            scored = [s_ for s_ in subs if s_["passed"] and s_["info"].get("kl") is not None]
+            best = min(scored, key=lambda s_: (s_["info"]["kl"], s_["cid"])) if scored else None
+            if best is not None and best["info"]["kl"] < prev["kl"]:
+                self.assertEqual((acc["accepted"], acc["cid"], acc["kl"]), (True, best["cid"], best["info"]["kl"]))
+                self.assertEqual(acc["rule"], "the lowest KL of the round, below the incumbent's")
+                self.assertTrue((gd / "model" / "mock_model.json").exists())
+            else:
+                self.assertFalse(acc["accepted"])
+            self.assertEqual(acc["incumbent_kl"], prev["kl"])
+            prev = json.loads((gd / "incumbent.json").read_text())
         self.assertIn("editor = M_0 (frozen)", r.stdout)
         summ = json.loads((rd / "summary.json").read_text())
         f = summ["final"]
-        self.assertEqual(f["editor"], "frozen")
-        self.assertIn(1, f["accepted_generations"])
-        self.assertGreater(f["gain_vs_q0"], 0)
-        self.assertGreater(f["gap_closed"], 0)
-        for g in ("0", "1", "2"):
-            hb = summ["gens"][g]["heldout_by_domain"]      # the former keys; the test set under eval_target
-            self.assertEqual(list(hb), ["math", "code", "knowledge", "instruction_following", "tool_calling",
-                                        "eval_target"])
-            self.assertIsNotNone(hb["eval_target"])
-            self.assertIn("gate_mean", summ["gens"][g])
-            self.assertNotIn("E", summ["gens"][g])
+        self.assertEqual((f["editor"], f["kl"]["q0"]), ("frozen", q0["kl"]))
+        self.assertEqual(f["kl"]["final"], prev["kl"])
+        self.assertEqual(summ["gens"]["0"]["kl_set"], 24)
+        for g in ("1", "2"):
+            self.assertIn("candidate_kl", summ["gens"][g])
+            self.assertFalse({"heldout", "heldout_by_domain", "gate_scores", "gate_mean"} & set(summ["gens"][g]))
         # resume: everything is skipped
         before = (rd / "state.json").read_text()
-        r2, dt2 = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_test",
-                       "--set", "budget.reference.default.bits=3", "--set", "simple.screen_n=20"], self.runs)
+        r2, dt2 = run(args, self.runs)
         self.assertEqual(r2.returncode, 0, r2.stderr[-3000:])
         self.assertLess(dt2, 30)
         self.assertEqual(json.loads(before).keys(), json.loads((rd / "state.json").read_text()).keys())
-        self.assertNotIn("noise_band", summ["gens"]["0"])
+
+    def test_start_bf16(self):
+        """loop.start bf16 (default): the incumbent of generation 1 is M_0 itself (KL 0, over the budget); the
+        lowest-KL in-budget candidate is accepted whatever its KL; the editor is told so."""
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_bf16"], self.runs)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        rd = self.runs / "A_mock_bf16"
+        inc0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
+        self.assertTrue(inc0["original"] and inc0["kl"] == 0.0 and inc0["config"] is None)
+        self.assertTrue((rd / "baseline" / "q0" / "record.json").exists())          # Q_0 still recorded
+        subs = json.loads((rd / "gen_01" / "gate.json").read_text())["submissions"]
+        scored = [s_ for s_ in subs if s_["info"].get("kl") is not None]
+        self.assertTrue(scored and all(s_["info"]["reference_kl"] == 0.0 for s_ in scored))
+        acc = json.loads((rd / "gen_01" / "accepted.json").read_text())
+        best = min(scored, key=lambda s_: (s_["info"]["kl"], s_["cid"]))
+        self.assertEqual((acc["accepted"], acc["cid"], acc["first_quantization"]), (True, best["cid"], True))
+        self.assertEqual(acc["rule"], "first quantization: the lowest KL among the in-budget candidates")
+        sysmsg = jl(rd / "gen_01" / "editor" / "thread_0.jsonl")[0]["content"]
+        self.assertIn("the incumbent is the original BF16 model", sysmsg)
+        self.assertIn("first incumbent", sysmsg)
+        user = next(x for x in jl(rd / "gen_01" / "editor" / "thread_0.jsonl") if x.get("role") == "user")["content"]
+        self.assertIn("Find the lowest-KL config within the budget", user)
 
     def test_patience_stop_and_unfrozen_editor(self):
         # loop.editor=current (ablation): the incumbent writes; patience 1: the first generation without a
         # new incumbent stops the loop
         r, _ = run(["--domain", "math", "--gens", "4", "--run-id", "A_mock_stop", "--set", "loop.editor=current",
-                    "--set", "loop.patience=1", "--set", "heldout.limit=2", "--set", "simple.screen_n=20"], self.runs)
+                    "--set", "loop.start=q0", "--set", "loop.patience=1"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_stop"
         st = json.loads((rd / "state.json").read_text())
         self.assertIn("stopped", st)
         g = st["stopped"]["gen"]
         self.assertLess(g, 4)
-        self.assertNotIn(f"gen{g + 1:02d}/draw", st)
         acc = json.loads((rd / f"gen_{g:02d}" / "accepted.json").read_text())
         self.assertFalse(acc["accepted"])
         inc = json.loads((rd / f"gen_{g:02d}" / "incumbent.json").read_text())
@@ -171,297 +193,49 @@ class TestMockFlow(unittest.TestCase):
         self.assertEqual(inc["config_hash"], prev["config_hash"])          # the incumbent stays
         self.assertEqual(json.loads((rd / "summary.json").read_text())["final"]["editor"], "current")
 
-    def test_screen_size_calibration_texts_and_removed_knobs(self):
-        # simple.screen_n sets the per-generation screen size; the noise band is gone (2026-11-23): its knobs are
-        # refused unless they give the hard-wired value (a no-op)
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_sizes", "--set", "noise.temperature=0",
-                    "--set", "simple.screen_n=40", "--set", "heldout.limit=2"], self.runs)
+    def test_calibration_texts_and_removed_knobs(self):
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_sizes", "--set", "noise.temperature=0"],
+                   self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_sizes"
         ids = rd / "draws" / "gen_00" / "ids"
-        self.assertEqual(len(json.loads((ids / "simple_math_pool.screen.json").read_text())), 40)
-        self.assertFalse((rd / "baseline" / "noise_detail.json").exists())
-        # every one of the 400 calibration texts is from the run's pool
         self.assertEqual(len(json.loads((ids / "simple_math_pool.kl.json").read_text())), 400)
-        self.assertEqual(sorted(p.name for p in ids.glob("*.kl.json")), ["simple_math_pool.kl.json"])
         # kl.self_generated (default): one cached M_0 response per calibration text, generation 0 only
-        sg = (rd / "kl_selfgen" / "gen_00.jsonl").read_text().splitlines()
-        self.assertEqual(len(sg), 400)
+        self.assertEqual(len((rd / "kl_selfgen" / "gen_00.jsonl").read_text().splitlines()), 400)
         self.assertEqual(sorted(p.name for p in (rd / "kl_selfgen").iterdir()), ["gen_00.jsonl"])
-        for sets in (["noise.temperature=0.6"], ["noise.fixed={simple_math_pool: 0.04}"],
-                     ["search.screen_candidates=true"], ["search.max_evaluate=12"], ["search.kl_weight=0.1"]):
-            r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_removed",
-                        "--set", sets[0]], self.runs)
+        for sets in (["noise.temperature=0.6"], ["search.screen_candidates=true"], ["search.kl_weight=0.1"]):
+            r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_removed", "--set", sets[0]], self.runs)
             self.assertNotEqual(r.returncode, 0, sets)
             self.assertIn("this knob was removed", r.stdout + r.stderr, sets)
             self.assertFalse((self.runs / "A_mock_removed").exists())
 
-    def test_baselines_still_run(self):
-        """Classic baselines (2026-11-23; baselines.methods, mock_overrides keeps them off, so they are switched on
-        there): run once after the generations, each gated on the gate set paired with Q_0's records (over every GPU
-        group) and held-out evaluated; they never touch the search or the acceptance. The block is lock-ignored: a
-        finished run resumes with them switched on, and with the same command again they are not redone."""
-        base = ["--domain", "math", "--gens", "1", "--run-id", "A_mock_baselines", "--set", "heldout.limit=2",
-                "--set", "simple.screen_n=20", "--gpus", "0,1,2,3"]
-        r, _ = run(base, self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        rd = self.runs / "A_mock_baselines"
-        self.assertFalse((rd / "baselines").exists())
-        acc0 = (rd / "gen_01" / "accepted.json").read_text()
-        methods = ["uniform_rtn", "uniform_awq", "hawq", "kl_greedy", "evopress"]
-        on = base + ["--set", "mock_overrides.baselines.methods=[" + ",".join(methods) + "]",
-                     "--set", "mock_overrides.baselines.evopress={generations: 3, offspring: 4}"]
-        r, _ = run(on, self.runs)                       # the lock ignores the baselines block
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        self.assertEqual((rd / "gen_01" / "accepted.json").read_text(), acc0)
-        # (2026-11-24) heldout.decoding n = baselines.heldout_n = 8: M_0, Q_0 and the final incumbent reuse the
-        # generations' held-out runs instead of sampling the same models again
-        last = json.loads((rd / "gen_01" / "incumbent.json").read_text())
-        for name in ("m0", "q0") + ((f"final_g{last['gen']:02d}",) if last["gen"] > 0 else ()):
-            self.assertIn(f"[baselines] {name}: held-out n 8 reused from", r.stdout, name)
-            self.assertFalse((rd / "baselines" / "reference" / name).exists(), name)
-        reused = json.loads((rd / "baselines" / "reference.json").read_text())
-        self.assertEqual(reused["m0"]["8"], json.loads((rd / "baseline" / "heldout.json").read_text()))
-        self.assertEqual(reused["q0"]["8"], json.loads((rd / "baseline" / "q0" / "heldout.json").read_text()))
-        summ = json.loads((rd / "baselines" / "summary.json").read_text())
-        refrows = {"uniform_gptq (Q_0)", "M_0 (BF16)"}
-        self.assertEqual(set(summ) - {k for k in summ if k.startswith("method (final incumbent")}, set(methods) | refrows)
-        self.assertEqual(len(summ), len(methods) + 3)
-        for k, v in summ.items():                       # held-out avg@8 / pass@8 on every row (n 8, 2026-11-23)
-            self.assertEqual(v["heldout_n"], 8, k)
-            self.assertIsNotNone(v["heldout_avg_at_n"], k)
-            self.assertIsNotNone(v["heldout_pass_at_n"], k)
-            self.assertGreaterEqual(v["heldout_pass_at_n"], v["heldout_avg_at_n"], k)
-        q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
-        for m in methods:
-            res = json.loads((rd / "baselines" / f"{m}.json").read_text())
-            self.assertNotIn("error", res, m)
-            self.assertIsNotNone(res["gate_mean"], m)
-            self.assertIsNotNone(res["gain_vs_q0"], m)
-            ho = res["heldout_by_n"]["8"]
-            self.assertTrue(all(t["n"] > 0 for t in ho.values()), m)
-            self.assertTrue((rd / "baselines" / m / "model" / "fake_quant.json").exists(), m)   # kept
-            hs = json.loads((rd / "baselines" / m / "heldout_n8" / "summary.json").read_text())
-            self.assertTrue(all("pass_at_n" in v for v in hs.values()), m)
-            self.assertEqual(res["over_budget_mib"] > 0, m == "uniform_awq", (m, res["over_budget_mib"]))
-            gsum = json.loads((rd / "baselines" / "evals" / f"base_{m}" / "gate" / "summary.json").read_text())
-            self.assertEqual(gsum["simple_math_eval"]["split_over_replicas"], 4, m)   # 3 slots + the editor GPU
-        self.assertEqual(json.loads((rd / "baselines" / "uniform_rtn.json").read_text())["bytes_gib"], q0["bytes_gib"])
-        evo = json.loads((rd / "baselines" / "evopress.json").read_text())["search"]
-        self.assertEqual(evo["trace"][-1]["gen"], 3)
-        self.assertLessEqual(evo["fitness"], evo["trace"][0]["fitness"])
-        for m in methods:
-            self.assertFalse([s_ for g in (1,) for s_ in json.loads((rd / f"gen_0{g}" / "gate.json").read_text())
-                              ["submissions"] if str(s_["cid"]).startswith("base_")], m)
-        final = json.loads((rd / "summary.json").read_text())["final"]
-        self.assertEqual(set(final["baselines"]), set(summ))
-        before = (rd / "baselines" / "summary.json").stat().st_mtime_ns, sorted(
-            p.name for p in (rd / "baselines" / "evals").iterdir())
-        r, _ = run(on, self.runs)                       # resumed again: nothing is redone
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        self.assertEqual(sorted(p.name for p in (rd / "baselines" / "evals").iterdir()), before[1])
-        self.assertNotIn("evopress gen", r.stdout)
-        ref = json.loads((rd / "baselines" / "reference.json").read_text())
-        self.assertIn("8", ref["m0"])
-        self.assertIn("8", ref["q0"])
-        r, _ = run(base + ["--set", "mock_overrides.baselines.methods=[kl_greedy]"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        self.assertEqual(set(json.loads((rd / "baselines" / "summary.json").read_text())), set(summ))   # rows kept
-        r, _ = run(base + ["--set", "mock_overrides.baselines.methods=[evo]"], self.runs)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("unknown", r.stdout + r.stderr)
-        self.assertNotIn("[gen 1]", r.stdout)            # refused at startup, before any work
-
-    def test_kl_gate(self):
-        """gate.metric kl (2026-11-24): generation 0 writes M_0's reference traces on held-back gate items and caches
-        its top-k logprobs; M_0 is not sampled on the gate (its KL is 0); Q_0 and every candidate are gated by the
-        per-trace token KL to M_0 (score = -KL, gain = KL reduction, paired per trace); the held-out stays accuracy.
-        A second run reuses the reference (and the held-out) from the first run's baseline/ folder."""
-        base = ["--domain", "math", "--gens", "1", "--set", "gate.metric=kl", "--set", "gate.kl.traces=12",
-                "--set", "heldout.limit=2", "--set", "simple.screen_n=20"]
-        r, _ = run(base + ["--run-id", "A_mock_kl"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        rd = self.runs / "A_mock_kl"
-        kd = rd / "baseline" / "kl_gate"
-        items = json.loads((kd / "traces.json").read_text())["items"]
-        self.assertEqual(len(items), 12)
-        self.assertTrue(all(it["text"].startswith(it["prompt"]) and it["ds"] == "simple_math_eval" for it in items))
-        ref = jl(kd / "ref.jsonl")
-        self.assertEqual(len(ref), 12)
-        self.assertTrue(all(x["n_prompt"] > 0 and len(x["pos"]) > x["n_prompt"] for x in ref))
-        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()), {"simple_math_eval": 0.0})
-        self.assertFalse(list((rd / "baseline").glob("gate/*.jsonl")))       # M_0 not sampled on the gate
-        q0 = json.loads((rd / "baseline" / "incumbent.json").read_text())
-        self.assertLess(q0["gate_scores"]["simple_math_eval"], 0)            # score = -KL(M_0 || Q_0)
-        self.assertEqual(len(jl(Path(q0["gate"]["simple_math_eval"]["records"]))), 12)   # one record per trace
-        subs = json.loads((rd / "gen_01" / "gate.json").read_text())["submissions"]
-        evald = [x for x in subs if x["info"].get("metric") == "kl"]
-        self.assertTrue(evald, subs)
-        for x in evald:
-            i = x["info"]
-            self.assertGreaterEqual(i["kl"], 0)
-            self.assertAlmostEqual(i["gain"], i["reference_kl"] - i["kl"], places=4)   # gain = KL reduction
-        from rsicore.chat_tools import _gate_outcomes          # the editor's search_history rows: KL, not accuracy
-        rows = [r for r in _gate_outcomes(rd / "gen_01").values() if r.get("metric") == "kl"]
-        self.assertTrue(rows and all("kl" in r and "accuracy" not in r and "broken" not in r for r in rows), rows)
-        thread = (rd / "gen_01" / "editor" / "thread_0.jsonl").read_text()
-        self.assertIn("KL divergence KL(original || quantized)", thread)    # the editor is told how it is gated
-        self.assertIsNotNone(json.loads((rd / "baseline" / "heldout.json").read_text()))   # held-out: accuracy
-        # the reference traces, their logprobs and the held-out are reused from the first run's baseline/ folder
-        r, _ = run(base + ["--run-id", "A_mock_kl_reuse", "--set", f"reuse.baseline_from={rd / 'baseline'}"],
-                   self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        self.assertIn("KL gate reference traces reused from", r.stdout)
-        self.assertIn("M_0 held-out reused from", r.stdout)
-        d2 = self.runs / "A_mock_kl_reuse" / "baseline" / "kl_gate"
-        self.assertEqual((d2 / "ref.jsonl").read_text(), (kd / "ref.jsonl").read_text())
-        q0b = json.loads((self.runs / "A_mock_kl_reuse" / "baseline" / "incumbent.json").read_text())
-        self.assertEqual(q0b["gate_scores"], q0["gate_scores"])              # the same reference: the same Q_0 KL
-        # other gate.kl settings: refused, nothing copied
-        r, _ = run(base + ["--run-id", "A_mock_kl_bad", "--set", "gate.kl.top_k=10",
-                           "--set", "reuse.baseline_from=A_mock_kl"], self.runs)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("cannot reuse M_0's KL gate reference", r.stdout + r.stderr)
-
-    def test_reuse_baseline_from(self):
-        """reuse.baseline_from (2026-11-24): M_0's generation-0 gate and held-out scores copied from an earlier run
-        with the same model / seed / domain / decoding / items (state reused_from, identical files, no M_0 gate
-        scoring parts here); Q_0 is still built and gated here; a mismatch stops the run with the differences."""
-        base = ["--domain", "math", "--gens", "1", "--set", "heldout.limit=2", "--set", "simple.screen_n=20"]
-        r, _ = run(base + ["--run-id", "A_mock_reuse_src"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        r, _ = run(base + ["--run-id", "A_mock_reuse_dst", "--set", "reuse.baseline_from=A_mock_reuse_src"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        src, dst = self.runs / "A_mock_reuse_src", self.runs / "A_mock_reuse_dst"
-        self.assertIn("M_0 gate scores reused from", r.stdout)
-        self.assertIn("M_0 held-out reused from", r.stdout)
-        st = json.loads((dst / "state.json").read_text())
-        self.assertEqual(st["baseline/gate"]["reused_from"], str(src.resolve()))
-        self.assertEqual(st["baseline/heldout"]["reused_from"], str(src.resolve()))
-        for f in ("gate.json", "heldout.json"):
-            self.assertEqual(json.loads((dst / "baseline" / f).read_text()),
-                             json.loads((src / "baseline" / f).read_text()), f)
-        self.assertEqual((dst / "baseline" / "gate" / "simple_math_eval.jsonl").read_text(),
-                         (src / "baseline" / "gate" / "simple_math_eval.jsonl").read_text())
-        self.assertFalse(list((dst / "baseline" / "gate").glob("_part*")))      # M_0 not sampled on the gate here
-        self.assertTrue((dst / "baseline" / "incumbent.json").exists())         # Q_0 still built and gated here
-        r, _ = run(base + ["--run-id", "A_mock_reuse_bad", "--seed", "7",
-                           "--set", "reuse.baseline_from=A_mock_reuse_src"], self.runs)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("seed: 42 there, 7 here", r.stdout + r.stderr)
-        # a run that reused can itself be a source: Paper A's layout keeps the run_eval summary entry and fingerprint
-        r, _ = run(base + ["--run-id", "A_mock_reuse_chain", "--set", "reuse.baseline_from=A_mock_reuse_dst"],
-                   self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        self.assertIn("simple_math_eval", json.loads((dst / "baseline" / "gate" / "summary.json").read_text()))
-        # a finished generation 0 never reads the source again: resuming with a missing source works
-        r, _ = run(base + ["--run-id", "A_mock_reuse_dst", "--set", "reuse.baseline_from=A_mock_nowhere"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-
     def test_four_gpus_all_used(self):
-        """4 GPUs (2026-11-20): M_0's generation-0 gate scoring split over 4 replicas, the held-out task split over
-        the GPU groups, the editor's GPU lent as a 4th candidate slot while it sleeps."""
+        """4 GPUs: M_0's generation-0 jobs on 4 replicas, the editor's GPU lent as a 4th candidate slot while it
+        sleeps."""
         r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_4gpu", "--gpus", "0,1,2,3",
-                    "--set", "hardware=h20", "--set", "heldout.limit=2", "--set", "simple.screen_n=20"], self.runs)
+                    "--set", "hardware=h20"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_4gpu"
-        self.assertEqual(len(list((rd / "baseline" / "gate").glob("_part*"))), 4)
-        self.assertEqual(set(json.loads((rd / "baseline" / "heldout.json").read_text())), {"simple_math_test"})
         self.assertIn("serve as candidate slot 3 (4 slots)", r.stdout)
         self.assertEqual(len(jl(rd / "kl_selfgen" / "gen_00.jsonl")), 400)
-
-    def test_simple_flow(self):
-        """The one flow (FINAL, 2026-11-21; formerly objective simple): train role simple_math_pool with a fresh per-generation screen
-        (simple.screen_n), gate on simple_math_eval (500 items, thinking n 4), held-out = simple_math_test (avg@4).
-        The incumbent answers the screen items once (n 4; shared, shown via the context summary and screen_results /
-        screen_output); candidates are not screened, have no api.evaluate and get ONE gate evaluation each
-        (gen_XX/gate.json, one entry per candidate); the largest passing gain is accepted. The mock runs the layout
-        small (mock_overrides: 3 threads x 1 step). `--set objective=simple` is still accepted (a no-op)."""
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_simple", "--set", "objective=simple",
-                    "--set", "simple.screen_n=20"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        rd = self.runs / "A_mock_simple"
-        self.assertIn("datasets=['simple_math_pool'] gate_datasets=['simple_math_eval'] "
-                      "kl_datasets=['simple_math_pool']", r.stdout)
-        self.assertEqual(json.loads((rd / "baseline" / "gate.json").read_text()).keys(), {"simple_math_eval"})
-        for h in (rd / "baseline" / "heldout.json", rd / "baseline" / "q0" / "heldout.json"):
-            ho = json.loads(h.read_text())
-            self.assertEqual(set(ho), {"simple_math_test"})                          # the test set, avg@4
-            self.assertIn("avg_at_n", ho["simple_math_test"])
-        ids = rd / "draws" / "gen_01" / "ids"                                         # per-generation draw
-        scr_ids = json.loads((ids / "simple_math_pool.screen.json").read_text())
-        self.assertEqual(len(scr_ids), 20)
-        ev = jl(rd / "gen_01" / "evals.jsonl")
-        n = {(e["stage"], v["dataset"]): v.get("n") for e in ev for v in (e["feedback"].get("probes") or {}).values()}
-        self.assertEqual(n.get(("screen", "simple_math_pool")), 20)
-        self.assertEqual(n.get(("gate", "simple_math_eval")), 500)
-        for e in ev:                                  # thinking decoding, n 4 everywhere (screen, full, gate)
-            dec = json.loads(e["decoding"])
-            self.assertEqual((dec["thinking"], dec["temperature"], dec["top_k"], dec["max_tokens"], dec["seed"],
-                              dec["n"]), (True, 0.6, 20, 16384, 42, 4))
-        # the incumbent's screen: sampled once (n 4), the only screen record; candidates are not screened
-        self.assertEqual(sorted(e["stage"] for e in ev if e["origin"] == "incumbent"), ["full", "screen"])
-        self.assertFalse([e for e in ev if e["stage"] in ("screen", "full") and e["origin"] != "incumbent"
-                          and not str(e["origin"]).startswith("baseline")])
-        inc_recs = jl(rd / "gen_01" / "evals" / "incumbent" / "screen" / "simple_math_pool.jsonl")
-        self.assertTrue(len(inc_recs) == 20 and all(len(x["sample_scores"]) == 4 for x in inc_recs))
-        self.assertTrue((rd / "gen_01" / "reference_screen.json").exists())
-        # 3 threads x 1 step, no api.evaluate, ONE gate evaluation per candidate (n 4), recorded in gate.json
-        cands = jl(rd / "gen_01" / "candidates.jsonl")
-        self.assertEqual([(c["thread"], c["step"]) for c in cands], [(0, 0), (1, 0), (2, 0)])
-        self.assertFalse([c for c in cands if c["error"]])
-        self.assertFalse([e for e in ev if str(e["origin"]).startswith("tool:")])
-        gates = [e for e in ev if e["stage"] == "gate"]
-        self.assertEqual(sorted(e["cid"] for e in gates), sorted({c["cid"] for c in cands}))
-        for e in gates:
-            recs = jl(rd / "gen_01" / "evals" / e["cid"] / "gate" / "simple_math_eval.jsonl")
-            self.assertTrue(all(len(x["sample_scores"]) == 4 for x in recs))
-        subs = json.loads((rd / "gen_01" / "gate.json").read_text())["submissions"]
-        self.assertEqual([s["cid"] for s in subs], [c["cid"] for c in cands])
-        for s, c in zip(subs, cands):
-            self.assertTrue({"gain", "ci", "accuracy", "broken", "fixed", "broken_ids"} <= set(s["info"]))
-            self.assertEqual(c["screen"]["feedback"]["gate"]["gain"], s["info"]["gain"])
-            self.assertEqual(c["score"], s["info"]["gain"])
-        acc = json.loads((rd / "gen_01" / "accepted.json").read_text())
-        passing = [s for s in subs if s["passed"]]
-        if passing:
-            best = max(passing, key=lambda s: s["info"]["gain"])
-            self.assertEqual((acc["accepted"], acc["cid"]), (True, best["cid"]))
-        else:
-            self.assertFalse(acc["accepted"])
-        st = json.loads((rd / "state.json").read_text())
-        self.assertNotIn("evaluations", st["gen01/search"])             # no evaluate budget
-        out = cands[2]["artifact"]["stdout_tail"]                   # the greedy mock program reads the screen
-        self.assertIn("screen_results", out)
-        self.assertIn("screen_output", out)
-        # prompts: session k of N, no api.evaluate, the configured tool rounds, the screen summary
-        th1 = jl(rd / "gen_01" / "editor" / "thread_1.jsonl")
-        sys_p = th1[0]["content"]
-        self.assertIn("There is no api.evaluate.", sys_p)
-        self.assertNotIn("api.evaluate(config", sys_p)
-        for stale in ("retention", "KL vs", "its size, KL", "regmean", "evaluate budget"):
-            self.assertNotIn(stale, sys_p)
-        self.assertIn("for up to 20 rounds", sys_p)
-        self.assertIn("persist between your run_python calls", sys_p)
-        user = next(x for x in th1 if x.get("role") == "user")["content"]
-        self.assertIn("You are session 2 of 3 in this round", user)
-        self.assertIn("accuracy avg@4", user)
-        self.assertNotIn("improve on the best candidate", user)
+        self.check_kl_set(rd)
 
     def test_search_history_tool(self):
-        """search_history (2026-11-21): generation 2's editor gets the tool (system prompt) and it lists generation
-        1's candidates with a config description plus generation 2's visible ones; read_record opens generation 1's
-        records; editor.history_tool=false removes it."""
+        """search_history: generation 2's editor gets the tool and it lists generation 1's candidates with a config
+        description and their KL plus generation 2's visible ones; read_record opens generation 1's records;
+        editor.history_tool=false removes it."""
         from types import SimpleNamespace
         from rsicore.chat_tools import ChatTools
         from rsicore.sandbox import ToolAPI
         from edit_code import run as RUN
-        r, _ = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_hist", "--set", "heldout.limit=2",
-                    "--set", "simple.screen_n=20"], self.runs)
+        r, _ = run(["--domain", "math", "--gens", "2", "--run-id", "A_mock_hist"], self.runs)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
         rd = self.runs / "A_mock_hist"
         sysmsg = jl(rd / "gen_02" / "editor" / "thread_0.jsonl")[0]["content"]
         self.assertIn("search_history(gen, sort, offset)", sysmsg)
+        user = next(x for x in jl(rd / "gen_02" / "editor" / "thread_0.jsonl") if x.get("role") == "user")["content"]
+        self.assertIn("Archive of earlier rounds", user)
+        self.assertIn('"kl": ', user)
         h = RUN.Runner.search_history(SimpleNamespace(rc=SimpleNamespace(run_dir=rd)), 2)
         self.assertEqual(sorted(h.past), [1])
         t = ChatTools(lambda tag, ctx: ToolAPI({}), history=h)
@@ -471,34 +245,17 @@ class TestMockFlow(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["total"], len(vis) + len(jl(rd / "gen_01" / "candidates.jsonl")))
         self.assertEqual(out["generations"][0]["gen"], 1)
+        self.assertTrue(out["generations"][0].get("first_quantization"))
         ok = [x for x in out["rows"] if "error" not in x]
         self.assertTrue(ok and all(x["config"].startswith("default ") and x["GiB"] for x in ok), ok[:2])
-        self.assertTrue(any(x["gen"] == 1 for x in out["rows"]) or out.get("next_offset"))
-        submitted = {s_["cid"] for s_ in json.loads((rd / "gen_01" / "gate.json").read_text())["submissions"]}
-        g1 = {x["cid"]: x for x in out["rows"] if x["gen"] == 1}
-        for cid in submitted & set(g1):
-            self.assertIn("gate", g1[cid])
+        g1 = [x for x in out["rows"] if x["gen"] == 1]
+        self.assertTrue(any(x.get("kl") is not None for x in g1), g1[:2])
         c1 = jl(rd / "gen_01" / "candidates.jsonl")[0]["cid"]
         rr = json.loads(t.call("read_record", {"cid": c1, "part": "feedback"}, ctx, 1, 0)["content"])
         self.assertTrue(rr["ok"] and '"config"' in rr["text"])
         cfg = load_cfg(["editor.history_tool=false"], self.runs)
         from rsicore.editor import editor_settings
         self.assertFalse(editor_settings(cfg)["history_tool"])
-
-    def test_acceptance_text_follows_config(self):
-        """System prompt (2026-11-21): the acceptance rule follows gate.min_delta / require_significant; the
-        api-scope rule is stated."""
-        from edit_code.prompts import acceptance_text
-        self.assertIn("statistically significant", acceptance_text({"gate": {"min_delta": 0.005}}))
-        t = acceptance_text({"gate": {"min_delta": 0.005, "require_significant": False}})
-        self.assertIn("no significance test", t)
-        self.assertNotIn("significant gain", t)
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_nosig_prompt", "--set", "heldout.limit=2",
-                    "--set", "gate.require_significant=false", "--set", "simple.screen_n=20"], self.runs)
-        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-        sysmsg = jl(self.runs / "A_mock_nosig_prompt" / "gen_01" / "editor" / "thread_0.jsonl")[0]["content"]
-        self.assertIn("there is no significance test", sysmsg)
-        self.assertIn("it is not a global there", sysmsg)
 
     def test_editor_tool_loop(self):
         """editor tool loop (2026-11-21): by default every proposal makes editor.mock_tool_rounds (1) run_python
@@ -508,8 +265,7 @@ class TestMockFlow(unittest.TestCase):
         runs = {}
         for rid, sets in (("A_mock_tools", []), ("A_mock_notools", ["--set", "editor.tool_rounds=0"]),
                           ("A_mock_cap", ["--set", "editor.tool_rounds=1", "--set", "editor.mock_tool_rounds=3"])):
-            r, _ = run(["--domain", "math", "--gens", "1", "--run-id", rid, "--set", "heldout.limit=2",
-                        "--set", "simple.screen_n=20"] + sets, self.runs)
+            r, _ = run(["--domain", "math", "--gens", "1", "--run-id", rid] + sets, self.runs)
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
             runs[rid] = self.runs / rid / "gen_01"
         gd, g0, gc = runs["A_mock_tools"], runs["A_mock_notools"], runs["A_mock_cap"]
@@ -542,7 +298,7 @@ class TestMockFlow(unittest.TestCase):
         self.assertTrue(progs)
         self.assertEqual(progs, {p.name: p.read_text() for p in (g0 / "programs").glob("*.py")})
         ev, ev0 = jl(gd / "evals.jsonl"), jl(g0 / "evals.jsonl")
-        self.assertEqual(sorted((e["cid"], e["stage"]) for e in ev), sorted((e["cid"], e["stage"]) for e in ev0))
+        self.assertEqual(sorted((e["cid"], e["kl"]) for e in ev), sorted((e["cid"], e["kl"]) for e in ev0))
         self.assertFalse([e for e in ev if "~x" in str(e.get("cid")) or "~x" in str(e.get("origin"))])
         # tool_rounds 0: one call per proposal, no tools, no explore dir
         for c in jl(g0 / "candidates.jsonl"):
@@ -561,8 +317,7 @@ class TestMockFlow(unittest.TestCase):
         self.assertEqual({p.name: p.read_text() for p in (gc / "programs").glob("*.py")}, progs)
 
     def test_budget_below_reference_is_refused(self):
-        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_small", "--budget-gib", "5",
-                    "--set", "heldout.limit=2"], self.runs)
+        r, _ = run(["--domain", "math", "--gens", "1", "--run-id", "A_mock_small", "--budget-gib", "5"], self.runs)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("smaller than budget.reference", r.stdout + r.stderr)
 
@@ -620,47 +375,19 @@ class TestEditorConfig(unittest.TestCase):
         import types
         from edit_code import prompts as P
         prob = types.SimpleNamespace(space={"bits": [2, 3, 4, 8, 16], "group_sizes": [32, 64, 128],
-                                            "quantizers": ["rtn", "gptq", "awq"]})
-        base = P.SYSTEM_PROMPT.format(tools="DOC", bits=prob.space["bits"], group_sizes=prob.space["group_sizes"],
-                                      quantizers=prob.space["quantizers"], timeout_s=1800,
-                                      screen="the items", gate_desc=P.GATE_DESC_ACC.format(gate="the items"),
-                                      acceptance=P.acceptance_text({"gate": {"min_delta": 0.005}}))
-        cfg = {"gate": {"min_delta": 0.005}}
-        self.assertEqual(P.system_prompt(prob, "DOC", dict(cfg, editor={"tool_rounds": 0})), base)
-        t = P.system_prompt(prob, "DOC", dict(cfg, editor={"tool_rounds": 12}))
+                                            "quantizers": ["rtn", "gptq", "awq"]}, kl_items=lambda: [{}] * 256)
+        base = P.system_prompt(prob, "DOC", {"editor": {"tool_rounds": 0}})
+        self.assertTrue(base.endswith(P.FINAL_RULE))
+        t = P.system_prompt(prob, "DOC", {"editor": {"tool_rounds": 12}})
         self.assertIn("for up to 12 rounds", t)
         self.assertIn("at most 100 calls in all", t)                                  # editor.max_tool_calls default
         self.assertIn("killed after 1800 s", base)                                     # sandbox.timeout_s default
-        self.assertNotIn("api.evaluate is NOT available there", t)                   # no api.evaluate anywhere
         self.assertIn("group_error there only accepts settings already cached", t)
         self.assertNotIn(P.FINAL_RULE, t)
         self.assertTrue(t.startswith(base[:-len(P.FINAL_RULE)]))
-        t = P.system_prompt(prob, "DOC", dict(cfg, editor={"explore": {"gpu_tools": True}}))
+        t = P.system_prompt(prob, "DOC", {"editor": {"explore": {"gpu_tools": True}}})
         self.assertIn("for up to 50 rounds", t)                                         # default tool_rounds
         self.assertNotIn("only accepts settings already cached", t)
-
-    def test_explore_api(self):
-        """make_tool_api: no evaluate / compare and no budget anywhere (2026-11-23); explore=True: group_error refuses
-        uncached settings unless editor.explore.gpu_tools."""
-        import types
-        from edit_code.tools import ToolError, make_tool_api
-        prob = types.SimpleNamespace(spec=None, herr_missing=lambda c: ["0.down.down_proj|gptq|8|128"],
-                                     group_error=lambda c, top=10: {"total_per_token": 0.0})
-        full = make_tool_api(prob, {}, cid="c")
-        ex = make_tool_api(prob, {}, cid="c~x01_0", explore=True)
-        for api in (full, ex):
-            self.assertFalse({"evaluate", "compare"} & set(api.names()))
-            self.assertEqual(api.budget, {})
-            self.assertNotIn("evaluate(", api.describe())
-            self.assertTrue({"screen_results", "screen_output"} <= set(api.names()))
-        self.assertEqual(set(full.names()), set(ex.names()))
-        with self.assertRaisesRegex(ToolError, "uncached setting"):
-            ex.call("group_error", {"config": {"default": {"bits": 8}}})
-        self.assertEqual(full.call("group_error", {"config": {"default": {"bits": 8}}}), {"total_per_token": 0.0})
-        gx = make_tool_api(prob, {"editor": {"explore": {"gpu_tools": True}}}, cid="c~x", explore=True)
-        self.assertEqual(gx.call("group_error", {"config": {"default": {"bits": 8}}}), {"total_per_token": 0.0})
-        prob.herr_missing = lambda c: []                                                # cached: allowed
-        self.assertEqual(ex.call("group_error", {"config": {"default": {"bits": 4}}}), {"total_per_token": 0.0})
 
 
 if __name__ == "__main__":

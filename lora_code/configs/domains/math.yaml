@@ -1,2 +1,2 @@
-# Domain math: train pool simple_math_pool (from DAPO-Math-17K), gate simple_math_eval, held-out simple_math_test.
+# Domain math: train pool simple_math_pool (from DAPO-Math-17K) (the fixed 500-item training set is drawn from it).
 # Override here only what differs from base.yaml.

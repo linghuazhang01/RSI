@@ -24,7 +24,7 @@ B = "layers.0.linear_attn.in_proj_b"          # [48, 5120] in the mock geometry
 DT, NORM0, CONV = "layers.0.linear_attn.dt_bias", "layers.0.input_layernorm.weight", "layers.0.linear_attn.conv1d.weight"
 
 
-def _ws(tmp_path, mode="scratch", cfg=None, store=None):
+def _ws(tmp_path, mode="scratch", cfg=None, store=None, **extra):
     from lora_code.mock import MockStore
     from lora_code.primitives.train import TrainData
     from lora_code.tools import Workspace
@@ -34,7 +34,7 @@ def _ws(tmp_path, mode="scratch", cfg=None, store=None):
     for k, v in (cfg or {}).items():
         c[k] = {**c.get(k, {}), **v} if isinstance(v, dict) else v
     ws = Workspace(mock=store is None, store=store or MockStore(), train=train, cfg=c, out_dir=tmp_path,
-                   budget={"gpu_seconds": 500}, mode=mode)
+                   budget={"gpu_seconds": 500}, mode=mode, **extra)
     ws.build_api()
     return ws
 
@@ -119,6 +119,7 @@ def test_vector_handles_in_rank1_and_from_direction(tmp_path):
 def test_vector_handles_real_store(tmp_path):
     """Real path: the child reads the shard files; T-handle vectors build a real LoRA with rank1."""
     import torch
+
     from lora_code.primitives.lora import LoRA
     from lora_code.primitives.weights import WeightStore
     from lora_code.tests.test_wedit import DOWN, _write_ckpt
@@ -216,9 +217,12 @@ def test_weights_writes_real_store(tmp_path):
     """Real path: writes become 'delta' ops of a WeightEdit (T reflects the given edit's ops), checked by
     check_wedit and written by edit_into_model."""
     import torch
-    from lora_code.primitives.weights import WeightStore
+
     from lora_code.primitives.wedit import WeightEdit, edit_into_model
-    from lora_code.tests.test_wedit import DOWN, NORM0 as N0, DT as DT0, P, _read, _write_ckpt
+    from lora_code.primitives.weights import WeightStore
+    from lora_code.tests.test_wedit import DOWN, P, _read, _write_ckpt
+    from lora_code.tests.test_wedit import DT as DT0
+    from lora_code.tests.test_wedit import NORM0 as N0
     ck = _write_ckpt(tmp_path / "m0", sharded=True)
     store = WeightStore(ck)
     ws = _ws(tmp_path / "ws", mode="weights", store=store)
@@ -300,3 +304,173 @@ def test_explore_availability(tmp_path):
     api, cleanup = off.explore_api("g00_t0_s00~x01_0")
     cleanup()
     assert not {"tensors", "tensor_compute"} & set(api.names()) and "tensor_compute" in off.api.names()
+
+
+# ============================================================================ loras=: factors of LoRA handles (2026-11-25)
+A_MOD = "layers.0.linear_attn.in_proj_a"      # [48, 5120] in the mock geometry
+
+
+def test_lora_inputs_surface_and_prompt():
+    from lora_code.prompts import system_prompt
+    from lora_code.tools import tools_for_mode
+    on, adapter = {"tools": {"tensor_compute": True}}, {"tools": {"tensor_compute": True}, "merge": {"mode": "adapter"}}
+    for mode, cfg, names, absent in (("scratch", on, ["'H0'", "already merged"], ["'CUR'", "'RAW'"]),
+                                     ("scratch", adapter, ["'H0'", "'CUR'", "SVD-truncated"], ["'RAW'", "merged into"]),
+                                     ("edit", on, ["'RAW'", "not in T"], ["'H0'", "'CUR'"]),
+                                     ("weights", on, ["weight edits are not LoRAs"], ["'H0'", "'RAW'", "candidate("])):
+        t = tools_for_mode(mode, cfg=cfg)
+        doc = t["tensor_compute"][t["tensor_compute"].find(" loras=["):]
+        assert "loras=None) -> {" in t["tensor_compute"] and "LORA = {handle: {module:" in doc
+        assert ". loras=[handles]" in t["tensor_compute"]
+        assert all(x in doc for x in names) and not any(x in doc for x in absent), (mode, cfg, doc)
+        # stack() is empty in edit / weights mode: only scratch points there for factors
+        assert ("read their factors with tensor_compute" in t["stack"]) == (mode == "scratch")
+        assert ("'CUR'" in t["stack"]) == (cfg is adapter)
+        assert "loras" not in tools_for_mode(mode, cfg={"tools": {"tensor_compute": False}}).get("stack", "")
+        sp = system_prompt(cfg, budget={"gpu_seconds": 7200}, mode=mode)
+        want = {"weights": None, "edit": "With loras=['RAW', ...]"}.get(
+            mode, "With loras=['CUR', 'H0', ...]" if cfg is adapter else "With loras=['H0', ...]")
+        assert (want in sp) if want else "With loras=" not in sp
+        assert "loras=" not in system_prompt({"tools": {"tensor_compute": False}}, budget={"gpu_seconds": 7200},
+                                             mode=mode)
+    paper = tools_for_mode("weights", cfg={"tools": {"tensor_compute": True, "paper_tools": True}})["tensor_compute"]
+    assert paper.startswith("tensor_compute(code, tensors, vectors=None, edit=None, loras=None) -> {")
+
+
+def test_lora_inputs_mock(tmp_path):
+    from lora_code.mock import MockLoRA
+    h0 = MockLoRA()
+    h0.touch([B], 4, 0.02)
+    h0.touch([A_MOD], 8, 0.01)
+    ws = _ws(tmp_path, stack=[(0, h0)])
+    assert ws.api.call("stack", {}) == [{"handle": "H0", "gen": 0, "modules": 2, "max_rank": 8}]
+    code = ("W = {m: T[m] for m in T}\n"
+            "result = {m: [list(A.shape), list(B.shape), float((B @ A).norm())] for m, (A, B) in LORA['H0'].items()}")
+    r = ws.api.call("tensor_compute", {"code": code, "loras": ["H0"]})          # tensors= may be empty
+    assert set(r["json"]) == {B, A_MOD}
+    assert r["json"][B][:2] == [[4, 5120], [48, 4]] and r["json"][A_MOD][:2] == [[8, 5120], [48, 8]]
+    for m, rel in ((B, 0.02), (A_MOD, 0.01)):                                     # ||B A|| = rel * ||W|| (mock)
+        assert r["json"][m][2] == pytest.approx(rel * ws.store.norm(m), rel=1e-3)
+    again = ws.api.call("tensor_compute", {"code": code, "loras": "H0"})
+    assert again["json"] == r["json"]                                             # seeded: the same factors
+    one = ws.api.call("tensor_compute", {"code": "result = sorted(LORA['H0'])", "loras": {"H0": [B]},
+                                         "tensors": [B]})
+    assert one["json"] == [B]
+    # reverse an earlier change: lora = (A, -B) -> a new L handle with the same size
+    rev = ws.api.call("tensor_compute", {"code": "A, Bf = LORA['H0'][%r]\nlora = {%r: (A, -Bf)}" % (B, B),
+                                         "loras": {"H0": B}})
+    assert rev["lora"].startswith("L") and rev["lora_check"]["ok"]
+    assert ws._get(rev["lora"]).modules_[B]["rel"] == pytest.approx(0.02, rel=1e-3)
+    # a handle result ({"lora": ...}) and an own L handle work too
+    lo = ws.api.call("scale", {"lora": "H0", "s": 0.5})
+    both = ws.api.call("tensor_compute", {"code": "result = {h: len(v) for h, v in LORA.items()}",
+                                          "loras": [lo, "H0"]})
+    assert both["json"] == {lo["lora"]: 2, "H0": 2}
+    # whole tool results / stack rows are one handle each (like every other tool's handle arguments)
+    code_n = "result = {h: len(v) for h, v in LORA.items()}"
+    assert ws.api.call("tensor_compute", {"code": code_n, "loras": rev})["json"] == {rev["lora"]: 1}
+    assert ws.api.call("tensor_compute", {"code": code_n, "loras": ws.api.call("stack", {})[0]})["json"] == {"H0": 2}
+    assert ws.api.call("tensor_compute", {"code": code_n, "loras": ws.api.call("stack", {})})["json"] == {"H0": 2}
+    with pytest.raises(KeyError, match="has no saved LoRA"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": "C:nope"})
+    with pytest.raises(ValueError, match="list of module names"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": {"H0": 3}})
+    plain = ws.api.call("tensor_compute", {"code": "result = 1", "tensors": [B]})     # a result without a LoRA
+    with pytest.raises(ValueError, match="not a LoRA handle"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": plain})
+    with pytest.raises(KeyError, match="unknown handle"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": ["H7"]})
+    with pytest.raises(KeyError, match="no module"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": {"H0": ["layers.5.mlp.down_proj"]}})
+    with pytest.raises(ValueError, match="at most 8 LoRA handles"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": {f"L{i}": None for i in range(9)}})
+    with pytest.raises(ValueError, match="not a LoRA handle"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": [3]})
+    with pytest.raises(ValueError, match="at least one tensor name"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": []})
+    small = _ws(tmp_path / "small", stack=[(0, h0)], cfg={"tensor_compute": {"max_input_mb": 0.1}})
+    with pytest.raises(ValueError, match="pass fewer LoRA modules"):
+        small.api.call("tensor_compute", {"code": "result = 1", "loras": ["H0"]})
+    # the exploration api sees the same handles, nothing is charged
+    api, cleanup = ws.explore_api("g00_t0_s00~x01_0")
+    try:
+        x = api.call("tensor_compute", {"code": "result = sorted(LORA['H0'])", "loras": ["H0"]})
+        assert x["json"] == sorted([B, A_MOD])
+    finally:
+        cleanup()
+    assert not list((tmp_path / "work" / "tensor_compute").glob("*"))
+
+
+def test_lora_inputs_weights_mode_refuses_edits(tmp_path):
+    ws = _ws(tmp_path, mode="weights")
+    res = ws.api.call("new_edit", {})
+    for arg in ([res["edit"]], res):                            # the handle, or the whole {"edit": ...} result
+        with pytest.raises(TypeError, match="weight edit"):
+            ws.api.call("tensor_compute", {"code": "result = 1", "loras": arg})
+
+
+def test_lora_inputs_real_store(tmp_path):
+    """Real path: the exact factors (bf16 stored -> fp32 in the code) of a stack adapter, RAW and an own LoRA."""
+    import torch
+
+    from lora_code.primitives.lora import LoRA
+    from lora_code.primitives.weights import WeightStore
+    from lora_code.tests.test_wedit import DOWN, UP, _write_ckpt
+    store = WeightStore(_write_ckpt(tmp_path / "m0", sharded=True))
+    g = torch.Generator().manual_seed(3)
+    A1, B1 = torch.randn(2, 16, generator=g).to(torch.bfloat16), torch.randn(8, 2, generator=g).to(torch.bfloat16)
+    A2, B2 = torch.randn(1, 8, generator=g), torch.randn(16, 1, generator=g)
+    h0 = LoRA({DOWN: (A1 * 0.01, B1 * 0.01)})
+    raw = LoRA({DOWN: (A2[:, :8].repeat(1, 2) * 0.01, B2[:8] * 0.01), UP: (A2 * 0.01, B2 * 0.01)})
+    ws = _ws(tmp_path / "ws", store=store, mode="edit", stack=[(0, h0)], raw=raw)
+    r = ws.api.call("tensor_compute", {"code": "result = {h: {m: [list(a.shape), str(a.dtype), float((b @ a).sum())] "
+                                                "for m, (a, b) in v.items()} for h, v in LORA.items()}",
+                                       "loras": ["H0", "RAW"]})
+    want = float((h0.factors[DOWN][1].float() @ h0.factors[DOWN][0].float()).sum())
+    assert r["json"]["H0"][DOWN][:2] == [[2, 16], "torch.float32"]
+    assert r["json"]["H0"][DOWN][2] == pytest.approx(want, rel=1e-5)
+    assert set(r["json"]["RAW"]) == {DOWN, UP} and r["json"]["RAW"][UP][0] == [1, 8]
+    rev = ws.api.call("tensor_compute", {"code": "a, b = LORA['H0'][%r]\nlora = {%r: (a, -b)}" % (DOWN, DOWN),
+                                         "loras": {"H0": [DOWN]}})
+    L = ws._get(rev["lora"])
+    assert isinstance(L, LoRA) and torch.allclose(L.delta(DOWN), -h0.delta(DOWN).float(), atol=1e-6)
+
+
+def test_lora_inputs_raw_and_cur_handles(tmp_path):
+    """mode=edit: a whole api.raw_lora() result is one handle; merge.mode adapter: 'CUR' = the served C_g."""
+    from lora_code.mock import MockLoRA
+    raw = MockLoRA()
+    raw.touch([B], 4, 0.02)
+    ws = _ws(tmp_path, mode="edit", raw=raw)
+    r = ws.api.call("raw_lora", {})
+    assert set(r) > {"lora"}
+    got = ws.api.call("tensor_compute", {"code": "result = {h: sorted(v) for h, v in LORA.items()}", "loras": r})
+    assert got["json"] == {"RAW": [B]} and "CUR" not in ws._h
+    cum, h0 = MockLoRA(), MockLoRA()
+    cum.touch([B, A_MOD], 6, 0.015)
+    h0.touch([B], 4, 0.02)
+    ad = _ws(tmp_path / "ad", stack=[(0, h0)], base_lora=cum)
+    x = ad.api.call("tensor_compute", {"code": "result = {h: {m: list(a.shape) for m, (a, b) in v.items()} "
+                                               "for h, v in LORA.items()}", "loras": ["CUR", "H0"]})
+    assert x["json"] == {"CUR": {B: [6, 5120], A_MOD: [6, 5120]}, "H0": {B: [4, 5120]}}
+    assert "CUR" not in _ws(tmp_path / "none", base_lora=MockLoRA())._h          # empty C_g: no handle
+
+
+def test_lora_inputs_write_time_counts_toward_the_deadline(tmp_path, monkeypatch):
+    """Writing large inputs (LoRA factors) is charged to the call's time: with the caller's deadline close, a slow
+    write ends the call before the child starts instead of overrunning the deadline."""
+    import safetensors.torch as st
+
+    from lora_code.mock import MockLoRA
+    h0 = MockLoRA()
+    h0.touch([B], 4, 0.02)
+    ws = _ws(tmp_path, stack=[(0, h0)])
+    real = st.save_file
+    monkeypatch.setattr(st, "save_file", lambda *a, **k: (time.sleep(4.0), real(*a, **k))[1])
+    ws._local.deadline = time.time() + 13.0                    # timeout = 13 - 5 = 8 s; after the 4 s write < 5 s
+    t0 = time.time()
+    with pytest.raises(Exception, match="after writing the inputs"):
+        ws.api.call("tensor_compute", {"code": "result = 1", "loras": ["H0"]})
+    assert time.time() - t0 < 8.0
+    ws._local.deadline = None
+    assert ws.api.call("tensor_compute", {"code": "result = 1", "loras": ["H0"]})["json"] == 1

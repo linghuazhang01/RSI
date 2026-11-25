@@ -1,8 +1,8 @@
 """Raw-LoRA training and activation statistics with transformers + peft (gpu1 in the real run, CPU in tests).
 
-TrainData holds the ONLY items training / activation statistics may touch: this generation's `train` role of
-the target domain. Every call that takes ids goes through TrainData.check(), which refuses any other id
-(signal, screen, gate, kl or held-out items) with PermissionError.
+TrainData holds the ONLY items training / activation statistics may touch: the `train` role of the target domain
+(the fixed training set). Every call that takes ids goes through TrainData.check(), which refuses any other id
+with PermissionError.
 
 HFModel lazily loads the current model (BF16, gradient checkpointing) and provides:
   loss(examples, lora)            mean token NLL of the target spans
@@ -32,7 +32,7 @@ class TrainData:
         ids = list(ids)
         bad = [i for i in ids if i not in self.allowed]
         if bad:
-            raise PermissionError(f"{len(bad)} id(s) are not in this generation's train set (e.g. {bad[0]!r}); "
+            raise PermissionError(f"{len(bad)} id(s) are not in the fixed training set (e.g. {bad[0]!r}); "
                                   "only train-role items may be used by gradient / activation tools")
         return ids
 

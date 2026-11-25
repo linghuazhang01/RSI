@@ -3,19 +3,19 @@
 
   python -I lora_code/run.py --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id B_math_s42 [--mock]
 
+Data (2026-11-25: ONE fixed set): the training set = simple.screen_n (500) items of generation 0's draw of the training
+pool simple_<d>_pool (rsicore.draws), the SAME items in every generation and for everything: the editor's train ids
+(train_example / acts / train_loss, the raw LoRA's data), the current model's answers the editor reads
+(screen_results / screen_output) and every candidate's evaluation. There is no separate gate set and no held-out test.
 Generation g (editor M_g -> successor M_{g+1}; the target domain is --domain in every generation):
-  draw (target=domain) -> train data (sampled answers only when the raw LoRA is trained; else gold)
-  -> diagnostics -> [method.mode=edit, generation 0 only] raw LoRA (fixed `raw` recipe, size raw.n_train /
-     steps / rank: the ONLY training of a run; there is no SFT baseline, 2026-11-20)
-  -> inner search (editor = M_g on the main GPU with multi-LoRA; candidates built on the train GPU,
-     hot-loaded for evaluation; no training / gradient tools: edit = edit RAW, scratch = from zero)
-  -> gate (2026-11-23, the only flow: every candidate ONE gate evaluation during the search, paired vs the current
-     model + min_gain; learned targets >= post-learning - delta; sandbox checks)
-  -> accept the passing candidate with the largest paired gain (fallback: edit raw in gen 0 if it passes the same
-     gate, else keep) -> merge into weights (gen_XX/model; edit: the LoRA
-     replaces L_g) -> non-LLM branch (by mode) -> held-out evaluation of M_{g+1} -> summary.
-Data (2026-11-22, the one flow): train pool simple_<d>_pool (a fresh screen draw per generation), gate
-simple_<d>_eval, held-out simple_<d>_test (rsicore.draws). Baseline first: M_0 on the fixed gate and held-out.
+  [method.mode=edit, generation 0 only] raw LoRA (fixed `raw` recipe: the ONLY training of a run)
+  -> the current model answers the 500 items once (decoding.screen = decoding.gate, n 4; the parent of generation 0 is
+     M_0, scored in baseline/gate; a kept or adapter-served model is not scored again)
+  -> inner search (editor = M_g on the main GPU with multi-LoRA; candidates built on the train GPU, hot-loaded for
+     evaluation): every candidate ONE evaluation on the same 500 items, paired per item vs the current model
+  -> accept the candidate with the LARGEST paired gain > 0 (gate.min_gain; gate.require_significant false by default;
+     fallback: edit raw in gen 0 if it passes the same rule, else keep) -> merge into weights (gen_XX/model; edit: the
+     LoRA replaces L_g) -> summary.
 Every step is recorded in state.json (rsicore.state.RunState); rerunning the same run-id resumes.
 """
 from __future__ import annotations
@@ -92,7 +92,7 @@ class Servers:
         return srvs
 
     def extra_main(self, model_path, served: str) -> list:
-        """Temporary servers of model_path on the candidate slots (weights mode; e.g. held-out, generation-0 gate
+        """Temporary servers of model_path on the candidate slots (weights mode; e.g. the generation-0 gate
         scoring on every GPU); the caller stops them. Empty outside weights mode."""
         from rsicore.servers import VLLMServer, start_all
         if not self.slot_groups:
@@ -250,13 +250,12 @@ class Run:
         self.wslots = WeightSlots(self) if method_mode(cfg) == "weights" else None
         self.registry = rc.run_dir / "mock_registry.json"
         self.target = rc.domain
-        # datasets (rsicore.draws, 2026-11-22: fixed): tds = simple_<d>_pool, what the editor works from (train ids /
-        # train_example / acts / train_loss, the raw LoRA's data, the screen / full items); gds = simple_<d>_eval,
-        # what accepts a candidate (baseline gate scores, the paired gate vs the reference). Only the target domain
-        # is evaluated.
+        # dataset (2026-11-25): tds = simple_<d>_pool; the fixed training set (fixed_ids: generation 0's draw) is
+        # everything the run touches: train ids, the current model's answers and every candidate's evaluation. The
+        # "gate" level holds the same dataset and items (gds = tds), so its parent records are the screen records.
         from rsicore import draws as _dr
         self.tds = _dr.train_dataset(rc)
-        self.gds = _dr.gate_dataset(rc)
+        self.gds = self.tds
         self.mcfg = cfg.get("mock", {})
         self.mode = method_mode(cfg)
         self.merge_mode = "adapter" if self.mode == "edit" else merge_mode(cfg)
@@ -395,7 +394,7 @@ class Run:
         return gen_dir(self.rc, g)
 
     def load_lora(self, path: Path):
-        """A saved LoRA, or in weights mode a saved weight edit (accepted / non-LLM candidates)."""
+        """A saved LoRA, or in weights mode a saved weight edit (accepted candidates)."""
         if self.mode == "weights":
             if self.rc.mock:
                 from lora_code.mock import MockWeightEdit
@@ -441,19 +440,20 @@ class Run:
         return out
 
     # ------------------------------------------------------------------ ids / data
-    def level_ids(self, g: int) -> dict:
+    def fixed_ids(self) -> list:
+        """The fixed training set: the screen role of generation 0's draw (simple.screen_n items of the training pool,
+        the eval / test items excluded; rsicore.draws), eval.limit items of it when set (mock / dry runs)."""
         from rsicore import draws
-        ec = self.cfg.get("eval", {})
-        ds = self.tds
-        ids = {"screen": {ds: limit_ids(draws.ids(self.rc, g, ds, "screen"), ec.get("screen_limit"))},
-               "full": {ds: limit_ids(draws.ids(self.rc, g, ds, "signal"), ec.get("full_limit"))}}
-        ids["gate"] = self.gate_level()             # the gate dataset differs from the train one
-        return ids
+        return limit_ids(draws.ids(self.rc, 0, self.tds, "screen"), (self.cfg.get("eval") or {}).get("limit"))
+
+    def level_ids(self, g: int) -> dict:
+        """Every level holds the fixed training set (screen = full = gate: one scoring per model, shared by the
+        levels through Evaluator._cache_level)."""
+        ids = {self.tds: self.fixed_ids()}
+        return {"screen": ids, "full": dict(ids), "gate": dict(ids)}
 
     def gate_level(self) -> dict:
-        from rsicore import draws
-        lim = self.cfg.get("eval", {}).get("gate_limit")
-        return {self.gds: limit_ids(draws.gate_ids(self.rc, self.gds), lim)}
+        return {self.tds: self.fixed_ids()}
 
     def train_data_mode(self, g: int) -> str:
         """Answers are sampled (train_data.mode) only when something is trained: the raw LoRA of mode=edit in
@@ -539,91 +539,47 @@ class Run:
 
     # ================================================================== baseline
     def baseline(self):
+        """M_0 on the fixed training set (decoding.gate, the reference of generation 0's candidates; adopted by the
+        generation-0 evaluator, so M_0 is sampled once)."""
         from rsicore import draws
         bdir = self.rc.run_dir / "baseline"
-        draws.ensure_gate(self.rc)
+        draws.ensure_gate(self.rc)            # the eval / test sets are excluded from the pool draw
+        draws.draw_gen(self.rc, 0, target=self.target)
         if self.rc.mock and not (read_json(self.registry, {}) or {}).get(self.served(0)):
             self.set_quality(self.served(0), float(self.mcfg.get("base_quality", 0.6)))
-        # (2026-11-24) reuse.baseline_from: M_0's gate / held-out scores of an earlier run (same model, seed, domain,
-        # decoding and items; checked, else the run stops) instead of sampling M_0 again (rsicore.reuse)
-        from rsicore import reuse as RU
-        pending = not self.st.done("baseline/gate") or (self.cfg.get("heldout", {}).get("enabled", True)
-                                                        and not self.st.done("baseline/heldout"))
-        src = RU.baseline_from(self.rc, self.cfg) if pending else None   # a finished generation 0 never reads it
-        if src is not None:                   # every pending step checked before anything is copied
-            from rsicore.heldout import heldout_domains as _hd
-            RU.preflight(self.rc, self.cfg, src,
-                         gate_ids=None if self.st.done("baseline/gate") else self.gate_level(),
-                         heldout_domains=_hd(self.cfg, self.rc.domain)
-                         if self.cfg.get("heldout", {}).get("enabled", True)
-                         and not self.st.done("baseline/heldout") else None)
         key = "baseline/gate"
         if not self.st.done(key):
             gate = self.gate_level()
-            tmp = []
-            if src is not None:
-                raw = RU.gate_records(self.rc, self.cfg, src, gate, lambda ds: bdir / "gate" / ds)
-                RU.record_code(self.rc.run_dir, src, mock=self.rc.mock)   # the source fingerprint (chained reuse)
-                print(f"[lora_code] baseline: M_0 gate records reused from {src}", flush=True)
-            else:
-                self.servers.get("main", self.model_path(0), self.served(0))
-                tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
-                eps = [s.endpoint for s in self.servers.replicas("main") + tmp]
-                from rsicore.evaluate import score_split
-                # gate score: the gate decoding (greedy unless decoding.gate is set), like every candidate's gate
-                raw = {ds: score_split(eps, self.served(0), ds, pool="pool", ids=ids, out_dir=bdir / "gate" / ds,
-                                       mock=self.rc.mock, decoding=self.decodings()["gate"]).records
-                       for ds, ids in gate.items()}
+            self.servers.get("main", self.model_path(0), self.served(0))
+            tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
+            eps = [s.endpoint for s in self.servers.replicas("main") + tmp]
+            from rsicore.evaluate import score_split
+            raw = {ds: score_split(eps, self.served(0), ds, pool="pool", ids=ids, out_dir=bdir / "gate" / ds,
+                                   mock=self.rc.mock, decoding=self.decodings()["gate"]).records
+                   for ds, ids in gate.items()}
             res = {}
             for ds in gate:
                 recs = [{"id": x.get("id"), "score": x.get("score")} for x in raw[ds]]
                 sc = [x["score"] for x in recs if x["score"] is not None]
                 m = mean_or_none(sc)
                 se = (sum((x - m) ** 2 for x in sc) / max(len(sc) - 1, 1) / max(len(sc), 1)) ** 0.5 if sc else None
-                # M_0's gate score and its standard error (reported; there is no noise band, 2026-11-23)
                 res[ds] = {"score": m, "n": len(recs), "n_scored": len(sc), "se": se, "records": recs}
             write_json(bdir / "gate_scores.json", res)
-            if src is None:
-                RU.record_code(self.rc.run_dir, mock=self.rc.mock)   # grading code of these scores
             for s in tmp:
                 s.stop()
-            info = {ds: {"score": v["score"]} for ds, v in res.items()}
-            if src is not None:
-                info["reused_from"] = str(src)
-            self.st.mark(key, info)
-        if self.cfg.get("heldout", {}).get("enabled", True) and not self.st.done("baseline/heldout"):
-            from rsicore.heldout import heldout_domains, run_heldout
-            if src is not None:
-                h = RU.heldout(self.rc, self.cfg, src, heldout_domains(self.cfg, self.rc.domain), bdir / "heldout")
-                RU.note_heldout_code(self.rc.run_dir, src, mock=self.rc.mock)   # gate may have been scored here
-                print(f"[lora_code] baseline: M_0 held-out reused from {src}", flush=True)
-            else:
-                self.servers.get("main", self.model_path(0), self.served(0))
-                tmp = self.servers.extra_main(self.model_path(0), self.served(0))   # weights mode: the slots too
-                try:
-                    h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(0),
-                                    bdir / "heldout", domains=heldout_domains(self.cfg, self.rc.domain),
-                                    mock=self.rc.mock, limit=self.cfg.get("heldout", {}).get("limit"),
-                                    decoding=self.cfg.get("heldout", {}).get("decoding"))
-                finally:
-                    for s in tmp:
-                        s.stop()
-                RU.note_heldout_code(self.rc.run_dir, mock=self.rc.mock)   # other code than the gate -> null
-            write_json(bdir / "heldout.json", h)
-            self.st.mark("baseline/heldout", dict({"tasks": len(h)}, **({"reused_from": str(src)} if src else {})))
+            self.st.mark(key, {ds: {"score": v["score"]} for ds, v in res.items()})
 
     # ================================================================== one generation
     def generation(self, g: int):
         from rsicore import draws
 
-        from lora_code.tools import search_settings
         rc, cfg, st = self.rc, self.cfg, self.st
         gd = self.gdir(g)
         P = f"gen{g:02d}"
         parent, served = self.model_path(g), self.served(g)
-        draws.draw_gen(rc, g, target=self.target)
+        draws.draw_gen(rc, 0, target=self.target)        # the one draw (generation 0): the fixed training set
         ids = self.level_ids(g)
-        train_ids = draws.ids(rc, g, self.tds, "train")
+        train_ids = self.fixed_ids()
         st.mark(f"{P}/draw", {"train": len(train_ids)}) if not st.done(f"{P}/draw") else None
         store = self.store(parent)
         stack = self.stack(g)
@@ -684,8 +640,11 @@ class Run:
                 if self.adapter:   # candidates are deltas on M_g: served as C_g (+) delta
                     ev.set_base(base, self.budget_rank)
                 if self.wslots is not None:   # weights mode: the slots export edits of M_g (also on a resume that
-                    self.wslots.set_parent(parent, self.store(parent))   # skips the search, e.g. into nonllm)
+                    self.wslots.set_parent(parent, self.store(parent))   # skips the search)
                 state.update(ev=ev, srv=srv)
+                # the current model's records on the fixed set first (adopted from an earlier scoring of the same
+                # model when there is one): the raw LoRA's points and the search then read them, never re-sample
+                self.gate_reference(gd, ev, g)
             ev = state["ev"]
             info = read_json(gd / "baselines" / "raw.json")
             if not edit_later and info and info.get("name") and ev.raw_name != info["name"]:
@@ -764,7 +723,6 @@ class Run:
             if ranked is None:
                 ranked = rank_fn(load_candidates(rc, g).values())
             ev, ws = ctx_objects()
-            learned = (st.get("learned") or {}).get("scores", {})
             ref = self.gate_reference(gd, ev, g)
             fallback = "keep" if edit_later else self.gate_fallback
             # every candidate was gate-evaluated during the search (the only flow): the largest passing paired gain
@@ -775,7 +733,7 @@ class Run:
                        "gate_reference": ref["kind"]}
             elif fallback == "raw":
                 lo = self.load_lora(self.raw_file(gd, raw))
-                ok, info = (self.gate_check(ev, ws, lo, ref, learned) if raw.get("check_ok")
+                ok, info = (self.gate_check(ev, ws, lo, ref) if raw.get("check_ok")
                             else (False, {"reasons": ["raw LoRA failed checks"]}))
                 if ok:
                     rec = {"source": "raw_fallback", "cid": None, "name": raw["name"], "gate": info,
@@ -791,16 +749,12 @@ class Run:
                 self.save_lora(lo, gd / "accepted_lora")
                 g_res = ev.run(rec["name"], "gate")
                 rec["gate_scores"] = {ds: r["score"] for ds, r in g_res.items()}
-                sc = dict(learned)
-                if rec["gate_scores"].get(self.gds) is not None:
-                    sc[self.gds] = rec["gate_scores"][self.gds]
-                st.mark("learned", {"scores": sc})
             write_json(gd / "accepted.json", rec)
             st.mark(f"{P}/gate", {"source": rec["source"], "cid": rec.get("cid")})
         acc = read_json(gd / "accepted.json")
 
         # (2026-11-22) the search is over: free the HF copies on the main replicas' GPUs (tools_on_replicas) before
-        # the merge and the held-out evaluation restart the replicas with M_{g+1}
+        # the merge
         self.release_hf(devices_only=True)
 
         # ---- merge -> M_{g+1}
@@ -871,83 +825,6 @@ class Run:
                 info = {"merged": True, **stat}
             st.mark(f"{P}/merge", info)
 
-        # ---- non-LLM branch (random-construction control). nonllm.enabled false = never run it;
-        # nonllm.skip_if_rejected (default true, 2026-11-21) = not run in a generation whose gate kept the current
-        # model (accepted.json source 'keep'): there is no accepted LoRA to compare it with. Absent keys = enabled
-        # true / skip_if_rejected true; base.yaml only documents them, so run configs locked earlier still resume.
-        nc = cfg.get("nonllm") or {}
-        skip = ("nonllm.enabled false" if not nc.get("enabled", True) else
-                "no candidate passed the gate (nonllm.skip_if_rejected)"
-                if nc.get("skip_if_rejected", True) and acc.get("source") == "keep" else None)
-        if skip and not st.done(f"{P}/nonllm"):
-            write_json(gd / "baselines" / "nonllm.json", {"kind": None, "name": None, "skipped": skip})
-            st.mark(f"{P}/nonllm", {"name": None, "skipped": skip})
-            print(f"[lora_code] gen {g}: non-LLM branch skipped: {skip}", flush=True)
-        if not st.done(f"{P}/nonllm"):
-            ev, ws = ctx_objects()
-            bws = self.workspace(gd, ev, self.store(parent), self.hf(parent), tdata,
-                                 {"gpu_seconds": budget["gpu_seconds"]},
-                                 f"g{g:02d}", stack=stack, base_lora=base)
-            out = {}
-            n_ev = int(nc.get("evaluate", search_settings(cfg)["max_candidates"]))   # absent: the editor's count
-            if self.mode == "edit":
-                rlo = self.load_lora(self.raw_file(gd, raw))
-                best, log = BL.random_edit_search(bws, rlo, evals=n_ev, seed=rc.seed,
-                                                  scales=nc.get("search_scales", [0.5, 0.75, 1.0, 1.25]))
-            elif self.mode == "weights":
-                best, log = BL.random_weight_search(bws, evals=n_ev, seed=rc.seed)
-            else:
-                best, log = BL.random_construct_search(bws, evals=n_ev, seed=rc.seed)
-            out["kind"] = {"edit": "random_edit_search", "scratch": "random_construct_search",
-                           "weights": "random_weight_search"}[self.mode]
-            out["random_search"] = log
-            name = None
-            if best is not None and best.modules():
-                self.save_lora(best, gd / "baselines" / "nonllm_lora")
-                name = bws.lora_name(best)
-            out["name"] = name
-            write_json(gd / "baselines" / "nonllm.json", out)
-            st.mark(f"{P}/nonllm", {"name": name, "best": (log.get("best") or {}).get("score")})
-
-        # ---- held-out evaluation of M_{g+1}
-        # (2026-11-21) gate kept the current model -> M_{g+1} = M_g, already evaluated (previous generation, or the
-        # baseline for generation 0): reuse that result instead of scoring the same model again.
-        prev_h = (self.gdir(g - 1) / "heldout.json") if g > 0 else (rc.run_dir / "baseline" / "heldout.json")
-        if (cfg.get("heldout", {}).get("enabled", True) and not st.done(f"{P}/heldout")
-                and acc.get("source") == "keep" and prev_h.exists()):
-            write_json(gd / "heldout.json", read_json(prev_h))
-            st.mark(f"{P}/heldout", {"tasks": len(read_json(prev_h) or {}), "reused_from": str(prev_h.relative_to(rc.run_dir))})
-            print(f"[lora_code] gen {g}: gate kept the current model; held-out reused from {prev_h.relative_to(rc.run_dir)}",
-                  flush=True)
-        if cfg.get("heldout", {}).get("enabled", True) and not st.done(f"{P}/heldout"):
-            from rsicore.heldout import heldout_domains, run_heldout
-            if self.on_m0:   # M_{g+1} = M_0 + L_{g+1} / C_{g+1}: the same M_0 server, the adapter as the model
-                ev = get_ev()
-                nxt = self.current_lora(g + 1)
-                if nxt:
-                    if not ev.known(nxt[1]):
-                        ev.register(nxt[0], nxt[1], full=True)
-                    ev.ensure_loaded(nxt[1])
-                h = run_heldout(ev.endpoints, served, gd / "heldout", lora=nxt[1] if nxt else None,
-                                domains=heldout_domains(cfg, rc.domain), mock=rc.mock,
-                                limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
-            else:
-                nxt = self.model_path(g + 1)
-                if self.wslots is not None:          # weights mode: take the editor's group back first
-                    self.wslots.reclaim()
-                self.servers.get("main", nxt, self.served(g + 1))
-                state.clear()
-                tmp = self.servers.extra_main(nxt, self.served(g + 1))   # weights mode: the slots too
-                try:
-                    h = run_heldout([s.endpoint for s in self.servers.replicas("main") + tmp], self.served(g + 1),
-                                    gd / "heldout", domains=heldout_domains(cfg, rc.domain), mock=rc.mock,
-                                    limit=cfg.get("heldout", {}).get("limit"), decoding=cfg.get("heldout", {}).get("decoding"))
-                finally:
-                    for s in tmp:
-                        s.stop()
-            write_json(gd / "heldout.json", h)
-            st.mark(f"{P}/heldout", {"tasks": len(h)})
-
         # ---- shown items, summary
         if not st.done(f"{P}/summary"):
             ev = state.get("ev")
@@ -1013,7 +890,7 @@ class Run:
         if tools_on_replicas(cfg) and not ws.devs:
             # (2026-11-22) only for the search: editor session k runs its tools on replica k mod n's GPU (an HF copy
             # of the current model and a weight store there), in the order of the editor endpoints; the copies load
-            # now, one after another, outside any budget (gate / nonllm / a resumed generation never load them)
+            # now, one after another, outside any budget (the gate / a resumed generation never load them)
             parent = self.model_path(g)
             ws.set_devices([{"server": srv,
                              "hf": None if rc.mock else self.hf(parent, device=f"cuda:{srv.gpu_ids[0]}"),
@@ -1032,8 +909,7 @@ class Run:
             rawinfo = {"n_train": tr.get("n_train"), "rank": tr.get("rank"), "steps": tr.get("steps") or tr.get("steps_done"),
                        "target_gain": rp.get("target_gain"), "source": raw.get("source"), "gen": g}
         ctx = ContextRenderer(task_text=task_text(gen=g, target=self.target, dataset=self.tds,
-                                                  n_train=len(ws.train.ids()), raw_info=rawinfo,
-                                                  gate_dataset=self.gds),
+                                                  n_train=len(ws.train.ids()), raw_info=rawinfo),
                               diag_text=D.render(diag, adapter=self.adapter),
                               archive_text=(self.archive(g, read_tools=bool(hist_tool),
                                                          max_chars=int(sc.get("archive_chars", 30000)))
@@ -1072,23 +948,21 @@ class Run:
             return program_build(ws, program, cid, timeout_s=int(sb.get("timeout_s", 1800)),
                                  mem_gb=int(sb.get("mem_gb", 16)), workdir=gd / "work" / cid)
 
-        # gate per candidate (2026-11-21; the only flow since 2026-11-23): every built candidate gets ONE gate
-        # evaluation (decoding.gate) paired vs the current model, whose gate records are computed once per generation
-        # (gate_reference); the result is recorded in gen_XX/gate.json at once, so later steps / generations see it.
-        # It is inner_search's screen_fn: score = the paired gain.
+        # every built candidate gets ONE evaluation on the fixed training set (decoding.gate) paired vs the current
+        # model, whose records are computed once per generation (gate_reference = its screen records); the result is
+        # recorded in gen_XX/gate.json at once, so later steps / generations see it. score = the paired gain.
         gref = self.gate_reference(gd, ev, g)
-        learned = (self.st.get("learned") or {}).get("scores", {})
 
         def screen(art, cid):
-            ok, info = self.gate_check(ev, ws, ws.load_candidate(art["cid"]), gref, learned)
+            ok, info = self.gate_check(ev, ws, ws.load_candidate(art["cid"]), gref)
             fb = {"gate": self.gate_feedback(ok, info, self.gds)}
             self.record_gate(gd, cid, fb["gate"])
             return fb["gate"].get("gain"), fb
 
         n_rep = len(ev.endpoints)
         if self.mode == "weights":
-            # candidates are scored on the slots while the editor sleeps: the current model's references first (full:
-            # the non-LLM branch's pick)
+            # candidates are scored on the slots while the editor sleeps: the current model's references first (all
+            # levels hold the fixed training set and share one scoring)
             parent = self.model_path(g)
             self.wslots.set_parent(parent, self.store(parent))
             for lv in ("screen", "full", "gate"):
@@ -1155,7 +1029,7 @@ class Run:
 
     # ------------------------------------------------------------------ reference screen (2026-11-21)
     def reference_screen(self, gd, ev) -> dict:
-        """The current model's own answers on this generation's screen items (decoding.screen: thinking, n 4), scored ONCE per generation (the evaluator's parent cache, keyed by the decoding) and shared by
+        """The current model's own answers on the fixed training set (decoding.screen: thinking, n 4), scored ONCE per generation (the evaluator's parent cache, keyed by the decoding) and shared by
         every session: {"records": {ds: [run_eval records with every sample's text and thinking]}, "items": {ds: {id:
         {prompt, reference, messages}}}, "summary": screen_view.summary}. gen_XX/reference_screen.json keeps the
         summary for later generations (search_history, archive)."""
@@ -1201,8 +1075,7 @@ class Run:
             write_json(p, log)
 
     def accept_best_gate(self, gd, cands):
-        """End of a generation: among the candidates whose gate result passed (min_gain, CI with require_significant,
-        learned rule), the largest paired gain wins (ties: the earlier cid); None when none passed. Marks it in
+        """End of a generation: among the candidates whose gate result passed (min_gain, CI with require_significant), the largest paired gain wins (ties: the earlier cid); None when none passed. Marks it in
         gen_XX/gate.json ("accepted")."""
         by = {c.cid: c for c in cands}
         log = read_json(gd / "gate.json") or {"submissions": []}
@@ -1222,7 +1095,7 @@ class Run:
         """Reference of the gate: always the current model (2026-11-23; mode=edit after generation 0: M_0 + the
         current LoRA): {"kind": "parent", "scores": {dataset: gate score}}. The parent's gate scores are computed once
         per generation, or (2026-11-24) taken from an earlier scoring of the same model (parent_gate_source), so the
-        gate set is not sampled again for a model that was already scored on it."""
+        fixed training set is not sampled again for a model that was already scored on it."""
         pg = read_json(gd / "parent_gate.json")
         if pg is None:
             src = self.parent_gate_source(g)
@@ -1253,13 +1126,12 @@ class Run:
             return "cache", self.gdir(g - 1) / "evals" / str(prev["name"])
         return None
 
-    def gate_check(self, ev, ws, lo, ref, learned) -> tuple[bool, dict]:
-        """ref = gate_reference(...): paired per item on the gate set vs the current model (2026-11-20, like Paper A):
-        mean paired gain >= min_gain and, with gate.require_significant, the 95% CI lower bound of the paired gain > 0
-        (bootstrap over items, rsicore.evaluate.paired_delta)."""
+    def gate_check(self, ev, ws, lo, ref) -> tuple[bool, dict]:
+        """ref = gate_reference(...): paired per item on the fixed training set vs the current model: mean paired
+        gain >= gate.min_gain (0 = strictly positive) and, only with gate.require_significant (default false), the 95%
+        CI lower bound of the paired gain > 0 (bootstrap over items, rsicore.evaluate.paired_delta)."""
         gcfg = self.cfg.get("gate", {})
-        delta = float(gcfg.get("delta", 0.02))
-        min_gain = float(gcfg.get("min_gain", 0.01))
+        min_gain = float(gcfg.get("min_gain", 0.0))
         with ws._lock:                               # gate submissions run at once; the checks read the weight store
             ok, rep = ws.check(lo)
         info = {"check_ok": ok, "reasons": []}
@@ -1274,7 +1146,7 @@ class Run:
         info["scores"] = scores
         info["reference"] = ref["kind"]
         info["reference_score"] = (ref.get("scores") or {}).get(self.gds)
-        gds = self.gds                               # the gate dataset (simple_<d>_eval)
+        gds = self.gds                               # the fixed training set's dataset (simple_<d>_pool)
         t, s = scores.get(gds), (ref.get("scores") or {}).get(gds)
         if t is None:
             info["reasons"].append("target gate score unavailable")
@@ -1295,37 +1167,34 @@ class Run:
                         fixed_ids=fixed[:50])
             if s is None or d["delta"] is None:
                 info["reasons"].append("parent target gate score unavailable")
-            elif d["delta"] < min_gain or (min_gain <= 0 and d["delta"] <= 0):   # threshold 0: strictly positive
+            elif d["delta"] < min_gain:
                 info["reasons"].append(f"paired gain {d['delta']:+.4f} vs parent ({s:.4f}) < min_gain {min_gain}")
-            elif bool(gcfg.get("require_significant", True)) and not (d["ci"][0] is not None and d["ci"][0] > 0):
+            elif min_gain <= 0 and d["delta"] <= 0:                              # threshold 0: strictly positive
+                info["reasons"].append(f"paired gain {d['delta']:+.4f} vs parent ({s:.4f}) <= 0 (must be > 0)")
+            elif bool(gcfg.get("require_significant", False)) and not (d["ci"][0] is not None and d["ci"][0] > 0):
                 info["reasons"].append(f"paired gain {d['delta']:+.4f} not significant "
                                        f"(95% CI [{d['ci'][0]:+.4f}, {d['ci'][1]:+.4f}])")
-        for ds, v in (learned or {}).items():
-            c = scores.get(ds)
-            if c is not None and v is not None and c < v - delta:
-                info["reasons"].append(f"learned {ds} {c:.4f} < post-learning {v:.4f} - delta {delta}")
         return not info["reasons"], info
 
     # ------------------------------------------------------------------ summary
     def summarize(self, g: int, gd: Path) -> dict:
         acc = read_json(gd / "accepted.json", {}) or {}
         gate = read_json(gd / "gate.json", {}) or {}
-        non = read_json(gd / "baselines" / "nonllm.json", {}) or {}
         raw = read_json(gd / "baselines" / "raw.json", {}) or {}
         info = {"gen": g, "editor": self.editor_name(g), "successor": (read_json(gd / "model.json") or {}).get("lora")
                 if self.on_m0 else self.served(g + 1), "method": self.mode, "merge_mode": self.merge_mode,
-                "data_roles": {"train": self.tds, "gate": self.gds},
+                "data": {"dataset": self.tds, "items": len(self.fixed_ids())},
                 "gate_reference": acc.get("gate_reference") or "parent",
                 "gate_fallback": "keep" if (self.chain and g > 0) else self.gate_fallback,
                 "accepted": {k: acc.get(k) for k in ("source", "cid", "name", "gate_scores")},
                 "gate_submissions": [{"cid": s["cid"], "passed": s["passed"], "reasons": (s.get("info") or {}).get("reasons")}
                                      for s in gate.get("submissions", [])],
-                "nonllm": {"name": non.get("name"), "kind": non.get("kind"),
-                           "best": (non.get("random_search") or {}).get("best"), "skipped": non.get("skipped")},
                 "raw": ({"name": raw.get("name"), "source": raw.get("source"), "gate": raw.get("gate"),
                          "n_train": (raw.get("train") or {}).get("n_train"),
                          "screen": (raw.get("points") or {}).get("screen")} if raw else None),
-                "model": read_json(gd / "model.json"), "heldout": read_json(gd / "heldout.json")}
+                "model": read_json(gd / "model.json"),
+                "current_model_accuracy": ((read_json(gd / "reference_screen.json", {}) or {}).get("summary")
+                                           or {}).get("accuracy")}
         from rsicore.search import load_candidates
         cands = list(load_candidates(self.rc, g).values())
         strat = {}
@@ -1362,19 +1231,31 @@ class Run:
 
 
 def context_shortfall(cfg: dict, prompt_tokens: int = 4096) -> str | None:
-    """A configured scoring max_tokens (decoding.screen / full / gate, heldout.decoding) + prompt_tokens that does not
+    """A configured scoring max_tokens (decoding.screen / full / gate) + prompt_tokens that does not
     fit the --max-model-len of the servers that score it (2026-11-21): the main replicas / weights slots
     (main_server_args). None when everything fits / nothing is set."""
     from rsicore.config import stage_decoding
     from rsicore.servers import max_model_len
     need = [(lv, (stage_decoding(cfg, lv) or {}).get("max_tokens")) for lv in ("screen", "full", "gate")]
-    hd = (cfg.get("heldout") or {}).get("decoding") or {}
-    need.append(("heldout", hd.get("max_tokens") if isinstance(hd, dict) else None))
     n = max_model_len(main_server_args(cfg))
     for stage, mt in need:
         if mt and n and int(mt) + prompt_tokens > n:
             return (f"{stage} decoding max_tokens {mt} + ~{prompt_tokens} prompt tokens > main --max-model-len "
                     f"{n}: raise it (editor.context_tokens) or lower max_tokens")
+    return None
+
+
+def decoding_mismatch(cfg: dict, seed: int | None = None) -> str | None:
+    """None when decoding.screen, decoding.full (falls back to screen) and decoding.gate resolve to the same dict;
+    else the error. They must stay equal (2026-11-25): screen / full / gate hold the same fixed training set, scored
+    once per model (lora_code.evaluator._cache_level shares screen@<tag>), and the editor reads the current model's
+    answers made with the decoding candidates are judged by."""
+    from rsicore.config import stage_decoding
+    d = {lv: stage_decoding(cfg, lv, seed) for lv in ("screen", "full", "gate")}
+    bad = [lv for lv in ("screen", "full") if d[lv] != d["gate"]]
+    if bad:
+        return (f"decoding.{' / decoding.'.join(bad)} must equal decoding.gate (one fixed set, sampled once per "
+                f"model): {', '.join(f'{lv}={d[lv]}' for lv in bad)} vs gate={d['gate']}")
     return None
 
 
@@ -1397,7 +1278,8 @@ def main(argv=None):
     mode, gfb = method_mode(cfg), gate_fallback(cfg)                            # fail fast: valid method / gate
     mmode = "adapter" if mode == "edit" else merge_mode(cfg)                     # fail fast: valid merge.mode
     lrank = server_lora_rank(cfg)                                                # fail fast: adapter rank <= 512
-    short = context_shortfall(cfg) if not rc.mock else None                     # fail fast: prompt + max_tokens fit?
+    short = (decoding_mismatch(cfg, rc.seed)                                     # fail fast: screen = full = gate
+             or (context_shortfall(cfg) if not rc.mock else None))             # fail fast: prompt + max_tokens fit?
     if short:
         print(f"[lora_code] {short}", flush=True)
         return 1

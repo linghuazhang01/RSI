@@ -2,93 +2,30 @@
 
 计划见 `plan/PLAN.md` §3、`plan/research/RSI_LOOP_DESIGN.md` §2、`plan/research/METHOD_DESIGN.md` §2；共用运行时接口见 `eval/rsicore/INTERFACES.md`（本目录只通过它调用 rsicore）。
 
-**设计（2026-11-19 修订）**：改造者的权重冻结，不断迭代的是被量化的模型。
+**设计（2026-11-25 起：只看 KL）**：改造者的权重冻结，不断迭代的是被量化的模型；**唯一的评价指标是量化模型和原模型 M_0 之间的 KL**。没有快速筛（screen）、没有准确率验收（gate）、没有测试集留出评测、没有经典基线。
 - 改造者：原始 BF16 模型 M_0（`loop.editor: frozen`）；消融 `loop.editor: current` 让当前最好的量化模型来写。
-- 每个候选都从 **M_0 的原始权重**出发量化，所有代用**同一个体积**（默认 = 统一 4 bit GPTQ g128（2026-11-20 起；原为 3 bit）、词嵌入和输出层 8 bit 那份配置的打包大小，它也是起点 Q_0）。
-- 第 g 代的目标是超过当前最好的量化 Q_{g-1}（incumbent）：在固定验收集上逐题配对比较，平均提升 ≥ `gate.min_delta`，至少一个领域显著变好、没有领域显著变差，才换成新的 incumbent；否则保留。连续 `loop.patience` 代没有新的 incumbent 就停。
-- 改造者能看到：incumbent 的配置和它在本代题目上的分数、往代**每个**候选一行（经验通道，2026-11-22 起与 Paper B 一致）、诊断表。
+- 每个候选都从 **M_0 的原始权重**出发量化，所有代用**同一个体积**（默认 = 统一 4 bit GPTQ g128、词嵌入和输出层 8 bit 那份配置 Q_0 的打包大小）。
+- **KL 题集（第 0 代定下，之后不变）**：从训练池 `simple_<领域>_pool` 第 0 代的抽题里（已去掉 eval / test 题和校准文本）按种子再抽 `kl_eval.n` = **256** 道。M_0 对每道题用 thinking 采样写一条回答（temperature 0.6 / top_p 0.95 / top_k 20，最长 `kl_eval.max_tokens` 16384 token，种子 = `--seed`；和 Paper B 的打分采样一致），并缓存它在这 256 条"题目 + 回答"上每个位置的 top-20 logprob（`baseline/kl_gate/{traces.json,answers.jsonl,ref.jsonl}`）。
+- **一个配置的评测** = 量化模型读这 256 条固定文本（teacher forcing，不采样），在回答部分逐 token 算 KL(M_0 ‖ 量化模型)（top-20 近似，`rsicore/kl.py`），先每条取平均，再对 256 条取平均。越低越接近原模型。逐条结果存在 `gen_XX/evals/<cid>/kl.jsonl`。
+- **每代**：8 个独立会话（`search.threads` 8 × `search.steps` 1）各写一个配置 → 每个配置评测一次 KL（写进 `gen_XX/gate.json`，后面的步和代都能看到）→ 预算内 KL **最低**的那个，**只有比 incumbent 的 KL 更低**才成为新 incumbent（不做显著性检验；KL 相等不算改进）；否则 incumbent 不变。连续 `loop.patience`（3）代没有新 incumbent 就停。
+- **起点（`loop.start`，默认 `bf16`）**：第 1 代的 incumbent 是 M_0 本身（KL 0，体积超出上限），这一代直接接受预算内 KL 最低的候选（`first_quantization`）。`loop.start: q0` 是消融：从 Q_0 出发。Q_0 的 KL 在第 0 代总会算一次，作为统一 GPTQ 的对照行（`baseline/q0/record.json`）。
+- 改造者能看到：incumbent 的配置和 KL（含逐条 KL 的分位数）、本代已有候选的 KL 表、往代**每个**候选一行（配置、大小、KL、note）、诊断表。和 incumbent 完全相同的配置不再评测（记为 KL 降低 0）。
+- 已删除（2026-11-25）：`simple`、`decoding`、`max_tokens`、`gate`（含 `gate.metric` / `gate.kl`）、`feedback`、`scoring`、`heldout`、`reuse`、`baselines` 这些配置块，以及快速筛工具 `screen_results` / `screen_output`、`baselines.py` / `evopress.py`。KL 设置都在新的 `kl_eval` 块里。旧运行（准确率验收的）不能用新代码续跑，换新的 `--run-id`。
 
-## 数据与每代流程（唯一流程，2026-11-22）
+## 配置要点
 
-只有一种流程（原来的 `objective: simple` + `scope: single`；`objective`、`scope`、`data_roles`、`eval_target`、E_t、`--domain all` 等都已删除）。配置直接写在 `configs/base.yaml` 顶层。`--set objective=simple` / `--set scope=single` 仍然接受，但不起作用；运行名默认仍是 `A_<领域>_s<种子>_single_simple`。之前的 `*_single_simple` 运行用同一条命令可以续跑：锁定比较时会忽略已删除的键（`rsicore.config.lock_view`）。
-
-- **数据**：用 `simple_data/<领域>/`（`data/scripts/make_simple_data.py`，从去污染、去重后的训练集池子里抽）。训练角色 = `simple_<领域>_pool`，即整个干净池子减去验收题和测试题。**每代重新抽** `simple.screen_n`（默认 500）道当快速筛（只给 incumbent 答，候选不跑）。抽题种子只含 `--seed`、领域和轮次（`rsicore.draws`），所以 Paper A 第 g 代和 Paper B 第 g-1 代抽到同一批题。校准文本 = 池子里另外 400 道（kl 角色，只用第 0 代那批）加上 M_0 的回答。各代的快速筛可以重叠，题号写在 `draws/gen_XX/ids/`。验收 = `simple_<领域>_eval` 的 500 道（照常的配对验收，与 incumbent 比）；**留出评测 = `simple_<领域>_test` 的另外 500 道**（`rsicore.heldout.heldout_domains`）。
-- **打分解码**：快速筛、验收、留出评测全部用 Qwen3 thinking 采样（temperature 0.6 / top_p 0.95 / top_k 20，max_tokens 16384，种子 = 运行的 `--seed`）。快速筛和验收是 n 4（每题分数 = 4 次的平均，avg@4），留出评测是 n 8（avg@8，和 baselines.heldout_n 相同，所以跑完后 M_0 / Q_0 / 最终 incumbent 的对比行直接复用各代已有的留出结果，不再重新采样）。incumbent、Q_0、M_0 的验收基线和所有候选用完全相同的解码和种子。候选服务的 `--max-model-len` 提到 32768（`vllm.candidate_max_model_len`），保证 prompt + 16384 放得下。
-- **每代流程（2026-11-21；2026-11-23 起写死在代码里，没有开关）**：
-  - 每代先让**最新模型（incumbent）**回答本代的快速筛题一次（n 4，所有线程 / 步共用）。**候选从不跑快速筛**。
-  - 改造者在每步上下文里看到 incumbent 快速筛的摘要：avg@4、每题答对次数分布、截断率、几道失败题的题目 / 标准答案 / 抽取答案。程序和 run_python 里还有只读工具查看全部数据：`api.screen_results(ids, filter='all'|'wrong'|'unstable'|'right', limit, offset, gen)` 和 `api.screen_output(id, sample, offset, gen)`（整段输出，含 thinking，分页）。
-  - **没有 `api.evaluate`**，也没有评测预算和 `compare`（候选没有快速筛记录可比）。
-  - 每个候选建好后做**一次验收评测**（500 题 × 4 次，和 incumbent 的验收记录逐题配对、同一种子）。超出预算的配置不评测，直接拒绝。
-  - 结果按候选写进 `gen_XX/gate.json`（submissions 列表，每个候选一条：准确率、配对增益、CI、是否通过 / 原因、broken / fixed 个数和题号，不含题目内容）。后面的步和后面的代都能看到这些结果：候选表、自己的反馈、`search_history`、`read_record`、存档。存档里还有往期 incumbent 的快速筛摘要，`screen_results(gen=k)` 可读往期数据。
-  - 一代结束时，在通过验收规则（尺寸、`gate.min_delta`、`require_significant` 时的 CI）的候选里接受**增益最大**的那个（平分时 cid 靠前者）；都不通过就保持。然后新 incumbent 跑测试集（500 × 8，唯一无偏的数字）。
-  - 代价：每代 线程 × 步 × 500 × 4 个 thinking 采样花在验收集上。
-  - **已删除（2026-11-23）**：`search.screen_candidates / gate_every_candidate / charge_screens / program_evaluate_calls / program_evaluate_total / max_evaluate / top_full / rerun_seeds / kl_weight`、`gate.max_submissions`、`kl.eval_texts`、`kl.top_k`、`tools.compare`、整个 `noise:` 块，以及它们背后的代码（候选快速筛、`api.evaluate` 和评测预算、`compare`、完整评测重排、搜索后按排名交验收、噪声带、每个候选的 KL 和 M_0 的参考 logprob）。`--set` / `--config` 给这些键会报错；给的正好是写死的值（如 `search.screen_candidates=false`、`noise.temperature=0`）时当作空操作。锁定比较忽略这些键，所以之前的 `*_single_simple` 运行用同一条命令续跑；锁里用过别的值（如 `screen_candidates: true`、`kl_weight > 0`、`noise.temperature > 0`）的运行不能续跑。
-- **搜索**：8 个线程 × 1 步（`search.threads` / `search.steps` 都可配置，提示词用配置的数字）。1 步时提示"你是本轮 N 个会话中的第 k 个、彼此独立"，并让它用 `search_history` / 存档避开往期思路；多步时保留"改进本线程最好的配置"。
-- **改造者**：每个候选最多 `editor.tool_rounds` 轮工具调用（20，可配置，提示词里的轮数跟着配置走；上下文 `editor.context_tokens` 131072）。`editor.explore.persistent: true`：run_python 每个提案一个持久会话，变量跨轮保留（超时则重启、变量丢失；最终程序仍须自包含）。
-- 五个领域都可以用。各领域合并后的配置见 `plan/configs/A_<领域>_simple.yaml`（由协调方更新）。服务器上需要先有 `simple_data/<领域>/` 的 `eval.jsonl`、`test.jsonl`、`pool_ids.json`，以及 `data/processed/` 里对应的训练集。
-- **mock**：`mock_overrides`（在 `--set` 之后合并，优先于 `--set`）把布局缩小到 3 线程 × 1 步、3 个候选。验收规则和真实运行一样（`gate.min_delta: 0.0`），不跑 baselines（要跑：`--set 'mock_overrides.baselines.methods=[uniform_rtn,hawq]'`）。快速筛题数用 `--set simple.screen_n=20` 缩小。
-
-## 每一步的数据量（2026-11-20）
-
-| 步骤 | 键 | 默认 |
+| 键 | 默认 | 作用 |
 |---|---|---|
-| 每代快速筛题数（incumbent 答） | `simple.screen_n` | 500 |
-| 校准文本数（第 0 代） | （`rsicore.draws.KL_N`，固定） | 400 |
-| 验收集 / 测试集 | `simple_<领域>_eval` / `simple_<领域>_test` | 各 500 道 |
-| 每个任务的最大生成长度（打分解码没写 `max_tokens` 时） | `max_tokens.<任务>`（覆盖 `eval/configs/tasks.yaml`） | dapo_math 4096、taco_verified 4096、ifeval_train 2048、sealtool_train 1024、triviaqa_train 1024 |
-| 留出评测的解码参数 | `heldout.decoding` | thinking 采样 0.6 / 0.95 / top_k 20，16384 token，n 8，种子 = `--seed` |
-| 验收证据：准确率或 KL | `gate.metric`（`accuracy` / `kl`）和 `gate.kl.*` | 默认 `accuracy`：候选在验收集上作答（500 × 4 个样本），和 incumbent 逐题配对。`kl`：不采样。第 0 代 M_0 给 `gate.kl.traces`（默认 256）道验收题各写一条参考答案（thinking 采样，种子 = `--seed`，最长 `gate.kl.max_tokens` 8192 token），并缓存它在这些轨迹上的 top-`gate.kl.top_k`（20）logprob（`baseline/kl_gate/`）；之后 Q_0 和每个候选只读这些轨迹（teacher forcing），验收分数 = 逐条轨迹在答案部分的 token 级 KL(M_0 ‖ 候选) 取负（`rsicore/kl.py`，top-k 近似），和 incumbent 逐条配对，增益 = KL 降低量，`gate.min_delta` / `require_significant` 照常作用。M_0 的验收分数记为 0（不再采样）；留出评测仍是准确率。改动者的提示词按所选指标说明验收方式。`reuse.baseline_from` 也能复用参考轨迹（`gate.kl` 设置相同才行）。进运行锁 |
-| 复用之前运行的第 0 代 M_0 分数 | `reuse.baseline_from` | 空 = 本次自己评。写一个之前运行的 run id（同一 runs 目录）或路径：M_0 在验收集和测试集上的分数直接从那次运行拷过来，不再采样。要求模型路径、种子、领域、验收解码和题目、留出解码和 limit 都一致（按存下的打分记录核对），数据文件哈希、评分包版本和评分代码指纹（`baseline/eval_code.json`）也要一致，不一致就报出差异并停止，不会悄悄重评。Paper A / B 的目录都能读（但两篇默认的留出 n 不同：A 是 8，B 是 4，所以默认配置下跨论文复用会因留出解码不同而被拒绝；所有待复用的步骤都在拷贝之前先检查，不会复用一半才停）。验收题里有没评完的（例如代码题在没有 Docker 的机器上跑）也会被拒绝。2026-11-24 之前跑的运行没有评分代码指纹，会被拒绝；确认 eval/ 之后没改过的话加 `reuse.trust_unrecorded_code=true`。Q_0、校准文本和 layer cache 仍在本次运行里做。不进运行锁 |
-| 校准文本 / 诊断表 / 留出评测 | `calibration.max_texts`、`diagnostics.profile_contexts`、`heldout.limit` | |
+| `kl_eval.n` | 256（mock 24） | KL 题集大小（第 0 代抽题里取） |
+| `kl_eval.max_tokens` / `temperature` / `top_p` / `sample_top_k` | 16384 / 0.6 / 0.95 / 20（与 Paper B 相同） | M_0 写参考回答的采样 |
+| `kl_eval.top_k` | 20 | 每个位置的 logprob 个数（≤ 服务的 `--max-logprobs 20`） |
+| `kl_eval.max_num_batched_tokens` | null（`h20_80` 档自动 1024） | 每个 vLLM 服务的 `--max-num-batched-tokens`：prompt logprob 的显存在 vLLM 的显存估算之外 |
+| `search.threads` / `steps` / `max_candidates` | 8 / 1 / 8 | 每代候选数 |
+| `loop.start` / `loop.patience` | bf16 / 3 | 起点、停止条件 |
+| `gpu_layout.gate_split` | true | 每代提案少于卡数时，一个候选的 KL 评测分到 ⌈槽位数 / 提案数⌉ 张卡上（8 × 1：每个 1 张） |
+| 校准文本 | `rsicore.draws.KL_N` = 400 | 第 0 代训练池里另外 400 道 + M_0 的回答（GPTQ / AWQ 校准和敏感度表用） |
 
-噪声带（`noise:` 块、`baseline/noise.json`）2026-11-23 起删除：验收用逐题配对的 CI。
-
-## 经典基线（2026-11-23）
-
-`baselines.methods` 里的方法在所有代跑完之后**各跑一次**，评法和本方法完全一样：同一个体积上限；在同一个验收集上评测（500 × 4，同样的解码和种子，和 Q_0 存下的逐题记录配对，分到所有卡上）；在测试集上做留出评测，每题 `baselines.heldout_n` 个样本（默认 8），报告 **avg@8 和 pass@8**。对照行 M_0、Q_0（= 统一 GPTQ）和最终 incumbent 也用同样的 n 报告留出结果（`baselines/reference.json`）：`heldout.decoding` 的 n 和它相同时（默认都是 8）直接复用各代已经跑过的留出结果，不再重新采样；n 不同才重新评测。所以表里每一行可以直接比。结果在 `run_dir/baselines/<方法>.json`、`baselines/summary.json` 和 `summary.json` 的 `final.baselines`（每行：验收均分、相对 Q_0 的增益和 CI、gap closed、`heldout_avg_at_n`、`heldout_pass_at_n`、大小）。本方法那一行的验收均分是挑选候选时的那次评测，偏高，比较时看留出。
-
-| 方法 | 做法 |
-|---|---|
-| 统一 GPTQ | 就是 Q_0，总会列出 |
-| `uniform_rtn` / `uniform_awq` | 参照配置（统一 W4 g128，词嵌入 / 输出层 8 bit）换成 RTN / AWQ。AWQ 的每输入通道缩放让它比上限多几 MiB，照样评测并报告 `over_budget_mib` |
-| `hawq` | HAWQ 式混合精度：敏感度 = Hessian 表（只把这一组用 GPTQ 量化时的 tr(dW H dW^T) / token），多选背包分配比特 |
-| `kl_greedy` | 敏感度 = 敏感度表（只把这一组 RTN 量化时整个模型相对 M_0 的 KL），同样的背包 |
-| `evopress` | EvoPress 式进化搜索：从 Q_0 出发，在上限内做"一组升一档、其他组降档"的变异（GPTQ g128，档位 = 动作空间的 bits），适应度 = 校准上下文上相对 M_0 的 KL（每张卡一个 HF 模型进程，权重和导出的 fake-quant 检查点相同），两阶段选择（先用 1/4 上下文筛，再用全部）。**不用验收集挑选**。`baselines.evopress`：`generations` 40、`offspring` 16、`survivors` 2、`max_mutations` 3 |
-
-背包和搜索类基线的词嵌入 / 输出层和 Q_0 一样用 8 bit。默认 `methods: []`。`baselines` 整块只用于报告，运行锁忽略它：跑完的运行可以加上 `--set 'baselines.methods=[uniform_rtn,uniform_awq,hawq,kl_greedy,evopress]'` 用原命令续跑，只补跑基线；已完成的基线不会重跑，失败的下次续跑时重试。每个基线的 fake-quant 检查点保留在 `baselines/<方法>/model`（约 54 GB 一个，`baselines.keep_models: false` 时留出评测后删除；之后需要时会重新导出）。换一个 `heldout_n` 续跑会补做一次留出评测（步骤 `baselines/<方法>/heldout_n<n>`、`baselines/ref_<名字>/heldout_n<n>`）。以前每代跑一次、只在快速筛题上算保持率的 `uniform` / `evo` 已删除。
-
-## 8 卡提速（2026-11-23，不改变结果）
-
-题目、种子、解码和验收规则都不变，只是 vLLM 的批次组成可能不同（浮点层面）：
-- **Q_0 的验收分到所有卡上**：以前 500 × 4 只在一张卡上跑，现在先导出 Q_0（只导出一次，以前导出两遍），再在每个候选组和空闲的改造者卡上各起一份服务，题目分开跑（`score_split`）。
-- **候选并行导出**、**接受的候选不再重新导出**、**每代删掉 `gen_XX/ckpt`**：见下面"改造者 1 张卡"一节。
-- **打分客户端并发** `scoring.concurrency`（默认 96，`h20_80` 档为 null = run_eval 默认 64）：每个请求带 n = 4 个样本，要等最长的那个样本结束才释放名额，64 个请求在运行中途填不满 `--max-num-seqs 128`。只影响批次，运行锁忽略这个键（像 `--gpus` 一样可以改）。
-- **第 0 代校准少读写**：各 worker 的部分 Hessian 不再读回来算一份随即丢掉的统计；求和按键并行读（每个键内仍按 worker 0..k-1 的顺序相加，结果逐位相同）；激活统计直接用内存里的和，不再把 100 GB 读回来。
-- **冻结的改造者提前启动**：incumbent 在候选卡上答本代 500 题的同时，M_0 在自己的卡上启动（以前要等答题结束才开始冷启动）。
-- **每代提案少于卡数时，一个候选的验收用多张卡**（2026-11-24，`gpu_layout.gate_split`，默认开）：每个候选占 ⌈空闲槽位数 / 每步提案数⌉ 个槽位，导出一次，在这些卡上各起一份服务，500 × 4 题分开跑（`score_split`，每题的解码和种子不变）。8 卡（改造者睡眠后共 8 个槽位）：8 × 1 每个候选 1 张卡（和以前一样），**4 × 1 每个候选 2 张卡**，1 × 8 一个候选用全部 8 张。只影响批次，运行锁忽略这个键。8 卡每代 4 个提案的配置：`plan/configs/run/A_math_r30_4x1.yaml`
-  ```bash
-  ./launch.sh --hw b300 --paper A --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_r30_4x1.yaml --tag r30_4x1
-  ```
-
-## 与 Paper B 的流程对齐（2026-11-22）
-
-每代流程和 Paper B 相同：从训练池抽 500 道 → 当前模型（incumbent）在这 500 道上采样（n 4，thinking）→ 8 个会话共享这批题分析、各写一个配置 → 每个配置在验收集上评测一次（与 incumbent 逐题配对）→ 通过且增益最大的成为新 incumbent，再跑测试集。这次改的是和 B 不一致的细节：
-- **incumbent 的快速筛分到所有空闲的候选 GPU 上**（`QuantProblem.serve_all` + `score_split`；原来只用一张卡），和 B 用所有副本采样一样。检查点只写一次（有导出的 incumbent 模型就直接用）。候选的验收仍是一张卡一个（Q_0 的验收 2026-11-23 起也分到所有卡）。
-- **没有 KL 项**（2026-11-23 起删除 `search.kl_weight`）：验收只看配对增益，每代不再让 M_0 生成回答、不算 M_0 的参考 logprob，也不算任何 KL。第 0 代的校准文本（含 M_0 回答，用于 Hessian 和敏感度表）不变。
-- **候选的 note**：程序在返回的配置里写 `"note"`（最多 600 字：改了哪些组、为什么、试过什么被否了及数字），存进候选记录，`search_history` 和存档里都显示（`{"config": ..., "note": ...}` 也接受；`solve_allocation` 自动写的那段去掉，编辑者在后面追加的保留）。
-- **存档列出往代每个候选**（含失败的），每行：配置一行描述（覆盖按设置分组，带层号范围，如 `8b/g128/gptq: down L0-3 x4`）、GiB、平均位数、验收结果（增益、CI、未通过原因）、报错第一行、note；`archive.max_chars`（默认 30000）超长时先删最老几代的行；有 `search_history` / `read_record` 时不再贴完整配置（`archive.top_candidates` 只在没有这两个工具时用）。
-- **和 incumbent 完全相同的配置不再评测验收**：直接记为增益 0、不通过（B 的空 LoRA 同样处理），省一次 500 × 4 的验收，也不会给后面的会话显示一个噪声造成的"通过"。
-- `loop.patience: 3`（和 B 一样：连续 3 代没有新 incumbent 才停）；系统提示写明程序时限（`sandbox.timeout_s`）和工具调用总数上限（`editor.max_tool_calls`）。
-- 改了影响运行的配置（锁定的配置不同），要换 `--run-id` / `--tag`。
-- 没有照搬的：B 每代重测当前模型的验收（A 的 incumbent 就是那份配置本身，同一种子重测只会复现原记录）；B 的改造者跑在多个副本上（A 的 8 个会话共用编辑 GPU 上的一个 M_0 服务）。
-
-## 打分解码与搜索规模（2026-11-21）
-
-**打分解码 `decoding: {screen, gate}`**（顶层，`full` 可选，空 = 跟 screen）：每个阶段一个 dict（temperature、top_p、top_k、min_p、n、thinking、max_tokens、seed），经 `rsicore.config.stage_decoding(cfg, stage, seed)` 传给每一次 `score` / `score_split`：incumbent 的快速筛 / 完整评测、候选和 Q_0 的验收、M_0 的验收基线（`baseline/gate.json`）、经典基线的验收。base.yaml 里是上面的 thinking 采样；null = `eval/configs/tasks.yaml`（贪心）。种子为空时用运行的 `--seed`。评测记录（`evals.jsonl`）里记下 `decoding`；缓存的评测（同一配置、同一阶段）以及"完整评测 / 验收复用快速筛逐题结果"都要求解码相同（n 4 的验收不会复用 n 1 的快速筛）。incumbent 在本代题上只采样一次（cid `incumbent`）。
-
-**搜索规模**（`edit_code.common.search_settings`，只剩这三个键）：`search.threads`（8）、`search.steps`（1）、`search.max_candidates`（8；null = threads × steps）。每个候选验收一次。
-
-steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、看不到同代其他候选，并让它用 `search_history` / 存档避开往期思路。
+mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道。
 
 ## 分析工具与保存的数据（2026-11-20）
 
@@ -100,15 +37,14 @@ steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、�
 | `hessian_table()` | 同上，但噪声小、覆盖 rtn / gptq / awq | 第 0 代：每组单独量化的 Hessian 加权误差 tr(ΔW H ΔWᵀ)，用缓存里的量化权重和全部校准 token 的 Hessian，不做前向 |
 | `activation_table()` | 哪些层的输入激活离群严重（适合 AWQ / 更高比特） | 校准时顺便统计 |
 | `group_error(config)` | 一个配置的误差集中在哪些组 | 同 `hessian_table` 的算法，逐组查表 / 按需计算（结果缓存在 `prep/diagnostics/herr_cache.json`） |
-| `screen_results(...)` / `screen_output(...)` | incumbent 在本代（或往代 `gen=k`）快速筛题上答得怎样 | incumbent 的快速筛记录：题目、标准答案、每次采样的分数 / 抽取答案 / 结束原因 / 长度，整段输出（含 thinking）分页 |
 
-每次评测保存在 `gen_XX/evals/<cid>/<stage>/`：逐题记录（`<数据集>.jsonl`，含原始输出、解析答案、对错）；快速筛 / 完整评测（incumbent、基线方法）另有每组 Hessian 加权误差（`group_error.json`）。候选只有 `gate/`。incumbent 的 cid 是 `incumbent`。量化后的模型文件不保留（每个约 54 GB；配置已存，可从缓存几秒钟重新拼出）。
+每次评测保存在 `gen_XX/evals/<cid>/kl.jsonl`（逐条轨迹的 KL 和计入的位置数）和 `gen_XX/evals.jsonl`（均值、分位数、误差最集中的组）。量化后的模型文件只保留被接受的（`gen_XX/model`，约 54 GB；其余配置已存，可从缓存几秒钟重新拼出）。
 
 ## 改造者：thinking + 工具轮次（2026-11-21）
 
 改造者写每个候选时开 Qwen3 thinking（`editor.extra_body.chat_template_kwargs.enable_thinking: true`，temperature 0.6 / top_p 0.95 / top_k 20 / min_p 0），并且可以先调用工具再交程序（`rsicore.editor` + `rsicore.chat_tools`）：
 - **一轮** = 模型的一次回复里带了工具调用（并行的几个调用算一轮）。最多 `editor.tool_rounds` 轮（base.yaml 20，代码默认 50），之后再给一次 `tool_choice: "none"` 的最终回复。候选 = 不带工具调用、含一个 ```python 块的那次回复。
-- 工具：`run_python(code)` 在同一个沙箱里跑探索代码，`api` 和最终程序的一样（`make_tool_api(explore=True)`；两边都没有 `api.evaluate`），`group_error` 只能查已缓存的设置（`hessian_table` 那些；`editor.explore.gpu_tools: true` 才允许现算）；`read_record(cid, part)` 看表里某个候选的完整程序 / 反馈；`search_history(gen, sort, offset)`（2026-11-21，默认开，`editor.history_tool=false` 关）列出所有试过的候选（本代可见的 + 往期所有代），每个一行：config 描述（默认设置 + 按设置分组的覆盖及其模块类型）、GiB、平均位数、各 domain 相对 incumbent 的验收差、验收结果，`same_as` = config hash 与更早候选相同；`read_record` 也能打开往期候选。系统提示里的验收规则按 `gate.min_delta` / `gate.require_significant` 生成（2026-11-21，关掉显著性时写明"不做显著性检验"），并写明程序里 `api` 只是 `main(api)` 的参数。探索不占候选槽。每次调用的完整输出在 `gen_XX/explore/<cid>/rNN_i/`。
+- 工具：`run_python(code)` 在同一个沙箱里跑探索代码，`api` 和最终程序的一样（`make_tool_api(explore=True)`；两边都没有 `api.evaluate`），`group_error` 只能查已缓存的设置（`hessian_table` 那些；`editor.explore.gpu_tools: true` 才允许现算）；`read_record(cid, part)` 看表里某个候选的完整程序 / 反馈；`search_history(gen, sort, offset)`（2026-11-21，默认开，`editor.history_tool=false` 关）列出所有试过的候选（本代可见的 + 往期所有代），每个一行：config 描述（默认设置 + 按设置分组的覆盖及其模块类型）、GiB、平均位数、KL、相对 incumbent 的 KL 降低量，`same_as` = config hash 与更早候选相同；`read_record` 也能打开往期候选。系统提示写明 KL 评测方式和接受规则（KL 最低且低于 incumbent），并写明程序里 `api` 只是 `main(api)` 的参数。探索不占候选槽。每次调用的完整输出在 `gen_XX/explore/<cid>/rNN_i/`。
 - 记录：`gen_XX/editor/thread_K.jsonl`（format 2，每轮的推理、工具调用和结果都在）；`candidates.jsonl` 的 cost 里有 `editor_rounds / editor_tool_calls / editor_tool_s / editor_prompt_tokens / editor_completion_tokens / editor_stop`。
 
 | 配置（`editor.*`） | 默认 | 作用 |
@@ -149,25 +85,24 @@ steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、�
 # 等价：python -I edit_code/run.py ...；附加参数 --budget-gib 11.5（固定体积），--set key=value（覆盖 configs，写入锁定的 run_config.yaml）
 ```
 
-同一个 run-id 再运行会跳过已完成的步骤（`state.json` 的键：`baseline/{draw,gate,heldout,prep,budget,q0,q0_heldout}`、`genXX/{draw,search,gate,accepted,export,heldout,done}`、`stopped`、`baselines/<方法>`（以及 `baselines/evopress_search`）；旧运行里的 `baseline/noise`、`genXX/refs` 留着不影响续跑）。
+同一个 run-id 再运行会跳过已完成的步骤（`state.json` 的键：`baseline/{draw,kl_gate,prep,budget,q0,start_bf16}`、`genXX/{search,gate,accepted,export,done}`、`stopped`）。
 
 ## 流程（run.py）
 
-- **第 0 代**（`baseline/`）：切固定验收集 → M_0 在验收集上的分数 → M_0 在测试集 `simple_<领域>_test` 上的留出评测 → 校准文本（题目 + M_0 的回答）→ 对 M_0 做一次校准（Hessian + 激活统计）、诊断表、逐层量化缓存（`prep/`，之后每代复用）→ 定体积（`budget.json`）→ Q_0 = 参照配置，在验收集上打分（第一个 incumbent，`incumbent.json`）并做留出评测。
-- **第 g 代**（`gen_XX/`）：draw → incumbent 在本代快速筛题上打分一次（`incumbent_scores.json`、`reference_screen.json`；改造者看的就是它）→ `rsicore.search.inner_search`（改造者 = M_0；8 线程 × 1 步；每个候选验收一次，写进 `gate.json`；候选服务分在各候选卡上）→ 接受通过验收且增益最大的候选（`Runner.accept_best_gate`）→ 通过：导出新 incumbent（fake-quant 检查点）+ 测试集留出评测；不通过：incumbent 不变 → `summary.json`。
-- **主要指标**（`summary.json` 的 `final`）：验收集平均分 M_0 / Q_0 / 最终 incumbent、相对 Q_0 的提升 `gain_vs_q0`、追回的差距 `gap_closed` =（最终 − Q_0）/（M_0 − Q_0）、哪些代换了 incumbent；每代的留出分数和相对 M_0 的比例（`heldout_by_domain`：五个领域键保留为 null，测试集准确率在 `eval_target`）。
+- **第 0 代**（`baseline/`）：抽题（`draws/gen_00/`）→ KL 题集：M_0 写 256 条参考回答并缓存 logprob（`kl_gate/`）→ 校准文本（题目 + M_0 的回答）→ 对 M_0 做一次校准（Hessian + 激活统计）、诊断表、逐层量化缓存（`prep/`，之后每代复用）→ 定体积（`budget.json`）→ Q_0 = 参照配置，算 KL（`q0/record.json`）→ 第 1 代的 incumbent（`incumbent.json`：M_0 或 Q_0）。
+- **第 g 代**（`gen_XX/`）：`rsicore.search.inner_search`（改造者 = M_0；8 线程 × 1 步；每个候选建好就评测 KL，写进 `gate.json`；候选服务分在各候选卡上）→ `Runner.accept_lowest_kl`：KL 最低且低于 incumbent 的被接受（`accepted.json`）→ 导出新 incumbent（fake-quant 检查点 `model/`）；否则 incumbent 不变 → `summary.json`。
+- **主要指标**（`summary.json` 的 `final`）：Q_0 和最终 incumbent 的 KL、两者之比 `kl_vs_q0`（< 1 = 比统一 GPTQ 更接近 M_0）、哪些代换了 incumbent；每代的 `candidate_kl`（每个候选的 KL）。
 
 ## 文件
 
 | 文件 | 内容 |
 |---|---|
 | `run.py` | 编排（上面的流程）、断点续跑、汇总 |
-| `problem.py` | 一个搜索问题（源模型 + 预算 + 数据 + 参照）：prepare（缓存/诊断）、配置校验与大小、候选构建、fake-quant 落盘、候选服务、评测（候选：gate；incumbent / 基线方法：screen / full）与反馈 |
-| `tools.py` | 程序可调用的工具（注册到 `rsicore.sandbox.ToolAPI`）：`model_info`、`profile_table`、`profile_summary`、`hessian_table`、`activation_table`、`bytes_table`、`bytes(config)`、`group_error(config)`、`screen_results(...)`、`screen_output(...)`、`solve_allocation(...)`（`tools.*` 可关掉做消融；没有 `evaluate` / `compare`；`tools.compare` 键已删除，给 true / false 都当作空操作，旧锁里有它也照常续跑） |
-| `allocation.py` | 多选背包（每组 (字节, 损伤) 下凸包 + 贪心），给 `solve_allocation`、KL 贪心基线和 mock 改造者用 |
-| `prompts.py` | 系统提示（配置 schema、工具、规则）和 `render_context(history, thread)`：incumbent 及其验收分数、incumbent 快速筛摘要、本代候选表（大小、验收结果：增益 [CI]、broken / fixed）、增益最大的配置、本线程上次的验收结果、往代档案 |
+| `problem.py` | 一个搜索问题（源模型 + 预算 + KL 题集 + incumbent）：prepare（缓存/诊断）、配置校验与大小、候选构建、fake-quant 落盘、候选服务、KL 评测（`evaluate` / `kl_stats`） |
+| `tools.py` | 程序可调用的工具（注册到 `rsicore.sandbox.ToolAPI`）：`model_info`、`profile_table`、`profile_summary`、`hessian_table`、`activation_table`、`bytes_table`、`bytes(config)`、`group_error(config)`、`solve_allocation(...)`（`tools.*` 可关掉做消融；没有 `evaluate` / `compare`；`tools.compare` 键已删除，给 true / false 都当作空操作，旧锁里有它也照常续跑） |
+| `allocation.py` | 多选背包（每组 (字节, 损伤) 下凸包 + 贪心），给 `solve_allocation` 和 mock 改造者用 |
+| `prompts.py` | 系统提示（配置 schema、工具、KL 评测和接受规则）和 `render_context(history, thread)`：incumbent 及其 KL、本代候选表（大小、KL、KL 降低量）、KL 最低的配置、本线程上次的 KL 结果、往代档案 |
 | `diagnostics.py` | `profile_table`（只把一个模块组 RTN 到 2/3/4 bit 时整模型 ΔKL，参照 = M_0，前 64 段第 0 代校准文本做前向）、`activation_table`（校准时顺便统计的输入激活）、`bytes_table`、`hessian_table`（每组单独用 rtn/gptq/awq 量化到 2/3/4 bit 的 Hessian 加权误差，来自缓存和校准 Hessian，用到全部校准 token，不做前向）；只算一次，存在 `prep/diagnostics/` |
-| `baselines.py` / `evopress.py` | 经典基线（见"经典基线"一节）；`evopress.py` 是 EvoPress 的 KL 适应度（每张卡一个进程） |
 | `mock.py` | mock 模式：合成"真实损伤"模型、合成诊断表、mock registry 登记候选质量、mock 改造者策略 |
 | `quant/spec.py` | 从 safetensors 头读模块名和形状（不加载张量）；Qwen3.5 dense 的分组 |
 | `quant/schema.py` | 配置 schema、校验（列出所有错误）、解析成逐组设置 |
@@ -177,7 +112,7 @@ steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、�
 | `quant/cache.py` | 逐层量化缓存（打包整数 + fp16 scale + 打包 zero point；缺的条目按需计算并落盘） |
 | `quant/export.py` | fake-quant BF16 检查点导出（结构、配置、tokenizer 文件原样复制，分片布局和张量名不变） |
 | `quant/kl.py` | 本地 transformers 精确 token KL（诊断表和测试用） |
-| `configs/base.yaml`、`configs/domains/*.yaml` | 全部参数（固定体积 `budget`、`loop`（改造者冻结与否、patience）、动作空间、搜索规模、验收门槛、校准文本、校准、缓存、基线、硬件档 `hardware_profiles`、mock 覆盖） |
+| `configs/base.yaml`、`configs/domains/*.yaml` | 全部参数（固定体积 `budget`、`loop`（改造者冻结与否、patience）、动作空间、搜索规模、KL 题集 `kl_eval`、校准文本、校准、缓存、硬件档 `hardware_profiles`、mock 覆盖） |
 
 ## 硬件（`hardware`，27B）
 
@@ -186,17 +121,16 @@ steps = 1 时，提示里写明每个线程是本轮 N 个独立会话之一、�
 **用满所有卡（2026-11-20，`gpu_layout.*`，改造者有自己的卡时才生效）**：
 - `prep_all_gpus`：第 0 代准备分到所有卡上，每张卡一个 HF 模型：Hessian 按文本分给各卡后相加（结果和单卡一样）、敏感度表按组分、缓存预热和 Hessian 误差表按模块分。
   - 敏感度表提速（2026-11-21）：每张卡一个**独立进程**（以前是同一进程里的线程，共用 GIL，GPU 利用率约 10%）；上下文右填充后成批前向（每批 ≤ `diagnostics.profile_batch_tokens` 个 token，默认 8192；各层都是因果的，填充不改变真实 token 的 logits，结果和逐段前向只差 bf16 舍入）；每算完一组写 `prep/profile_rows/<组>.json`，中断后同一条命令续跑只算缺的组；校准 Hessian 都在 `prep/hessians/` 时跳过校准。GPU 环境没有 `flash-linear-attention` / `causal-conv1d` 时，transformers 对线性注意力层用纯 torch 回退实现（慢几倍），日志里会有 WARNING：`pip install flash-linear-attention causal-conv1d`。
-- `m0_replicas`：M_0 的批量任务（第 0 代验收打分、留出评测、校准文本的回答）在所有卡上各起一份 M_0，按题目或任务分开跑（`rsicore.evaluate.score_split`、`run_heldout` 传多个地址）。
-- `editor_sleep`：搜索时改造者写完这一轮的程序就进入 vLLM 睡眠模式（`--enable-sleep-mode`，权重移到 CPU 内存约 52 GB，释放 KV cache），它的卡临时当一个候选槽（4 张卡：同时评测 4 个候选）；下一轮开始前收回并唤醒。搜索结束后改造者关闭，验收和导出用所有槽。
-- `parallel_heldout`：新 incumbent / Q_0 的留出评测在每组空闲卡上各起一份，任务分开跑。
-- 验收：每个候选的验收评测在各候选槽上同时跑（搜索中，每个候选建好就验收）。
+- `m0_replicas`：M_0 的批量任务（第 0 代 KL 参考回答和 logprob、校准文本的回答）在所有卡上各起一份 M_0，按题目分开跑。
+- `editor_sleep`：搜索时改造者写完这一轮的程序就进入 vLLM 睡眠模式（`--enable-sleep-mode`，权重移到 CPU 内存约 52 GB，释放 KV cache），它的卡临时当一个候选槽（4 张卡：同时评测 4 个候选）；下一轮开始前收回并唤醒。搜索结束后改造者关闭，KL 评测和导出用所有槽。
+- KL 评测：每个候选的 KL 评测在各候选槽上同时跑（搜索中，每个候选建好就评测）；Q_0 的 KL 用所有槽。
 
 **改造者 1 张卡，其余卡全部用来同时评测候选**（`common.gpu_layout` / `candidate_groups`，不设 `gpu_roles` 时）：
 - 改造者在候选评测时是空闲的，所以默认只给 1 张卡；
 - 其余卡按 `gpu_layout.candidate_group_size`（默认 1）分组，每组起一个候选 vLLM 服务（组内张量并行）。2 张卡 → 1 个候选服务，4 张 → 3 个，8 张 → 7 个；
-- 搜索的每一步里，各线程的程序同时提出、构建、验收（`rsicore.search.inner_search(parallel=组数)`）。每个线程看到的是上一步结束时的全部候选；结果按线程顺序记录；
+- 搜索的每一步里，各线程的程序同时提出、构建、评测 KL（`rsicore.search.inner_search(parallel=组数)`）。每个线程看到的是上一步结束时的全部候选；结果按线程顺序记录；
 - `QuantProblem.serve` 从服务池里取一个空闲组：在这组的卡上导出该候选的 fake-quant 检查点，再在这组卡上起 vLLM，用完归还。2026-11-23 起各组**同时导出**：每组在自己的卡上开一个逐层缓存（`QuantProblem._slot_cache`），缓存里缺的条目只算一次（`QuantCache` 按文件加锁，其他组等它算完再读），导出的张量和原来一次一个时逐位相同。`evaluate` 线程安全：同一个配置只评一次（其他线程等结果）；
-- 磁盘：每个候选服务各留一个检查点（约 54 GB），8 张卡时约 7 × 54 GB。被接受的候选直接把它验收时的检查点移到 `gen_XX/model`（`QuantProblem.adopt_checkpoint`，不再重新导出一遍）；每代结束删掉 `gen_XX/ckpt`（以前没接受的代会留下）；
+- 磁盘：每个候选服务各留一个检查点（约 54 GB），8 张卡时约 7 × 54 GB。被接受的候选直接把它评测时的检查点移到 `gen_XX/model`（`QuantProblem.adopt_checkpoint`，不再重新导出一遍）；每代结束删掉 `gen_XX/ckpt`（以前没接受的代会留下）；
 - 只有 1 组时（2 张卡）就是原来的逐个评测。手动指定：`--set 'gpu_roles.editor=[0,1]'`（改造者张量并行 2），候选用剩下的卡。
 
 H20 档（按每张卡 110 GB 规划，卡约 140 GB）：至少 2 张（每张卡只放一个 27B，约 52 GB）；vLLM 显存用 `--rsi-gpu-memory-gib 110`（启动时换算成显存比例），`--max-num-seqs 128`，校准每次 16 层 Hessian。80 GB 的卡用 `h20_80`（0.92、32 条序列、校准每次 4 层）。B300 / mock 只给 1 张时两个角色共用。
@@ -217,12 +151,14 @@ H20 档（按每张卡 110 GB 规划，卡约 140 GB）：至少 2 张（每张�
 ## 验证状态（2026-11-19，本机 macOS 无 GPU）
 
 - `edit_code/tests/test_quant.py`：13 个 CPU 测试（transformers 5.9.0 临时环境全部通过）。覆盖：打包往返、RTN/GPTQ/AWQ 误差随比特单调下降、GPTQ/AWQ 的输出误差 ≤ RTN、配置大小公式与单调性、schema 解析与报错、小型 Qwen3.5（含 GDN、视觉塔）的模块发现、Hessian 收集、缓存拼装 = 直接量化、fake-quant 导出后 transformers 重新加载 logits 有限、KL 随比特下降、真实 `profile_table` 路径、`QuantProblem.prepare()` 真实路径（CPU）+ 工具 + 两代递归量化。eval/.venv 里的 transformers 5.23 会把 qwen3_5 强制映射到 Qwen3_5Tokenizer，测试用的词表 tokenizer 不能用，这一项会跳过。
-- `edit_code/tests/test_mock_flow.py`：固定体积循环（2 代：第 1 代 mock 改造者的比特交换超过统一 3 bit 的参照被接受；续跑全部跳过）；`loop.editor=current` + patience 1 时第一次没有新 incumbent 就停；体积小于参照配置时拒绝运行。
+- `edit_code/tests/test_kl_flow.py`：KL 流程的单元测试（配置、工具、KL 评测与缓存、接受规则、提示词）。
+- `edit_code/tests/test_mock_flow.py`：mock 端到端（KL 题集、每代 KL 最低且低于 incumbent 才接受、续跑全部跳过、`loop.start` 两种起点、patience 停止、4 卡、`search_history`、工具轮次）。
 - **只能在 GPU 上跑、本机没有验证**：vLLM 加载 27B fake-quant 检查点、27B 的校准/诊断/缓存耗时与显存（H20 上尤其要实测）、候选服务（`problem.serve` 真实分支）、`kl.self_generated`。
 
 ## 尚未做 / 后续
 
 - 真实打包格式（compressed-tensors）导出和速度测量：llm-compressor 装不进 vLLM 0.24.0 + Transformers 5.9.0，没有依赖它。真实打包时，vLLM 的融合模块（qkv、gate_up、in_proj_qkvz、in_proj_ba）内部要求设置相同，目前 fake-quant 下不受此限制。
-- `behavior_sensitivity` 诊断表（METHOD_DESIGN §2.2）、`profile_in_context` 工具、GAMMA 基线（HAWQ 式基线 2026-11-23 已加，见"经典基线"）。
+- `behavior_sensitivity` 诊断表（METHOD_DESIGN §2.2）、`profile_in_context` 工具。
+- 经典基线和测试集准确率已删除（2026-11-25）；如需报告准确率，要另外评测导出的 `gen_XX/model`。
 - 对照：`archive.enabled=false`（不带经验）、`loop.editor=current`（不冻结改造者）都已支持。
 - solver 里 group size 对损伤的缩放（g64 = 0.8、g32 = 0.65）是启发式，要在 A-P0 中实测。

@@ -58,10 +58,11 @@ def test_refusals(tmp_path):
 
 @pytest.mark.parametrize("paper", ["A", "B"])
 def test_shipped_run_configs_equal_the_set_command(paper):
-    sets = ["--set", "editor.tool_rounds=30", "--set", "gate.require_significant=false",
-            "--set", "editor.turn_max_tokens=16384"]          # 49a5fe4: the run configs cap every round at 16k
-    if paper == "B":
-        sets += ["--set", "nonllm.enabled=false"]
+    sets = ["--set", "search.threads=8", "--set", "search.steps=1", "--set", "editor.tool_rounds=30",
+            "--set", "editor.turn_max_tokens=16384",           # 49a5fe4: the run configs cap every round at 16k
+            "--set", "editor.max_tokens=16384"]
+    if paper == "B":                                            # 2026-11-25: Paper A has no accuracy gate
+        sets += ["--set", "method.mode=scratch", "--set", "gate.min_gain=0.0", "--set", "gate.require_significant=false"]
     for hw in ("b300", "h20"):
         a = _cfg(paper, "--config", f"plan/configs/run/{paper}_math_r30_nosig.yaml", "--set", f"hardware={hw}").paper_cfg
         b = _cfg(paper, *sets, "--set", f"hardware={hw}").paper_cfg

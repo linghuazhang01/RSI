@@ -98,9 +98,7 @@ class ModelSpec:
         return len(self.layer_types)
 
     def to_json(self) -> dict:
-        d = asdict(self)
-        d.pop("_by_name", None)
-        return d
+        return asdict(self)
 
     @classmethod
     def from_json(cls, d: dict) -> "ModelSpec":
@@ -140,12 +138,18 @@ def read_safetensors_header(path: Path) -> dict:
     return hdr
 
 
+def shard_files(model_dir: Path) -> list[str]:
+    """Shard file names of a safetensors checkpoint (the index's weight_map, else every *.safetensors), sorted."""
+    model_dir = Path(model_dir)
+    idx = model_dir / "model.safetensors.index.json"
+    return sorted(set(json.load(open(idx))["weight_map"].values())) if idx.exists() else \
+        sorted(p.name for p in model_dir.glob("*.safetensors"))
+
+
 def checkpoint_tensors(model_dir: Path) -> dict[str, dict]:
     """name -> {"dtype", "shape", "file"} for every tensor of a safetensors checkpoint."""
     model_dir = Path(model_dir)
-    idx = model_dir / "model.safetensors.index.json"
-    files = sorted(set(json.load(open(idx))["weight_map"].values())) if idx.exists() else \
-        sorted(p.name for p in model_dir.glob("*.safetensors"))
+    files = shard_files(model_dir)
     if not files:
         raise FileNotFoundError(f"no safetensors files in {model_dir}")
     out = {}
@@ -156,8 +160,7 @@ def checkpoint_tensors(model_dir: Path) -> dict[str, dict]:
 
 
 def load_model_config(model_dir: Path) -> dict:
-    cfg = json.load(open(Path(model_dir) / "config.json"))
-    return cfg
+    return json.load(open(Path(model_dir) / "config.json"))
 
 
 def _text_config(cfg: dict) -> dict:

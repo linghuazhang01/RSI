@@ -10,7 +10,7 @@ One Editor per thread (its own history). One proposal = one call of propose():
   * tools None or tool_rounds 0: exactly one /chat/completions request (payload without tools / tool_choice),
     the code is the last ```python block of the reply ("" if none) -- the behaviour before 2026-11-21.
   * otherwise the tool loop (2026-11-21): the model may call the chat tools (rsicore.chat_tools: run_python,
-    read_record) for up to tool_rounds turns ("round" = one model turn with tool calls, however many parallel
+    read_record, search_history) for up to tool_rounds turns ("round" = one model turn with tool calls, however many parallel
     calls), then one forced final turn with tool_choice "none" (a notice is appended to the last tool message,
     never a new user message). The proposal ends with a reply WITHOUT tool calls that holds a ```python block.
     Empty / cut-at-length / unparsed "<tool_call>" replies get up to 2 nudges during the tool rounds and one
@@ -66,7 +66,6 @@ import builtins
 import json
 import os
 import re
-import shutil
 import socket
 import time
 import urllib.error

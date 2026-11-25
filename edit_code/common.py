@@ -5,22 +5,29 @@ import hashlib
 import json
 import os
 import re
-import sys
 import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-EDIT = REPO / "edit_code"
 DATA = REPO / "data"
 GIB = 1024 ** 3
 
 
-def ensure_paths() -> None:
-    """`python -I` does not put the script directory on sys.path: add the repo root (for
-    `edit_code.*`) and eval/ (for `rsicore`)."""
-    for p in (str(REPO), str(REPO / "eval")):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+def exit_with_parent(msg: str | None = None) -> None:
+    """Start a daemon thread that ends this (worker) process with os._exit(1) once its parent is gone (the run was
+    killed: do not keep holding the GPU), printing msg first when given. Polls every 5 s."""
+    import threading
+    import time
+    parent = os.getppid()
+
+    def watchdog():
+        while True:
+            time.sleep(5)
+            if os.getppid() != parent:
+                if msg:
+                    print(msg, flush=True)
+                os._exit(1)
+    threading.Thread(target=watchdog, daemon=True).start()
 
 
 def read_json(path: Path, default=None):
@@ -93,6 +100,11 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(l) for l in f if l.strip()]
 
 
+def write_jsonl(path: Path, rows, ensure_ascii: bool = True) -> None:
+    """Write rows as a whole jsonl file (one json.dumps per line; the parent dir must exist)."""
+    Path(path).write_text("".join(json.dumps(r, ensure_ascii=ensure_ascii) + "\n" for r in rows))
+
+
 def _json_default(o):
     if isinstance(o, Path):
         return str(o)
@@ -152,16 +164,14 @@ def chatml(messages: list[dict]) -> str:
     return "\n".join(out)
 
 
-def record_text(rec: dict, response: str | None = None, max_chars: int = 8000) -> str:
-    """Render a processed record as a ChatML text for KL / calibration (prompt only, or prompt +
-    a self-generated response)."""
+def record_text(rec: dict, max_chars: int = 8000) -> str:
+    """Render a processed record as a ChatML text for KL / calibration: prompt only (ChatML, assistant turn
+    opened)."""
     if rec.get("messages"):
         msgs = list(rec["messages"])
     else:
         msgs = [{"role": "user", "content": rec.get("prompt") or ""}]
     text = chatml(msgs) + "\n<|im_start|>assistant\n"
-    if response:
-        text += response + "<|im_end|>"
     return text[:max_chars]
 
 
@@ -221,14 +231,22 @@ def role_gpus(rc, cfg: dict, role: str) -> list[int]:
     return gpu_layout(rc, cfg)[0][role]
 
 
+KL_EVAL_DEFAULTS = {"n": 256, "max_tokens": 16384, "top_k": 20, "temperature": 0.6, "top_p": 0.95, "sample_top_k": 20,
+                    "max_num_batched_tokens": None}
+
+
+def kl_eval_cfg(cfg: dict | None) -> dict:
+    """The kl_eval block (2026-11-25, the only evaluation) with its defaults filled in."""
+    return dict(KL_EVAL_DEFAULTS, **((cfg or {}).get("kl_eval") or {}))
+
+
 def with_kl_chunk_cap(cfg: dict, args: list[str]) -> list[str]:
-    """(2026-11-24) gate.metric kl: --max-num-batched-tokens gate.kl.max_num_batched_tokens (null = 1024 on hardware
-    h20_80) appended to a server's vLLM args unless they set it; prompt logprobs over long reference traces use memory
-    outside vLLM's profile, proportional to the prefill chunk."""
-    g = cfg.get("gate") or {}
-    if g.get("metric", "accuracy") != "kl" or "--max-num-batched-tokens" in args:
+    """--max-num-batched-tokens kl_eval.max_num_batched_tokens (null = 1024 on hardware h20_80) appended to a server's
+    vLLM args unless they set it: prompt logprobs over long reference traces use memory outside vLLM's profile,
+    proportional to the prefill chunk."""
+    if "--max-num-batched-tokens" in args:
         return list(args)
-    n = (g.get("kl") or {}).get("max_num_batched_tokens")
+    n = kl_eval_cfg(cfg).get("max_num_batched_tokens")
     n = n if n is not None else (1024 if cfg.get("hardware") == "h20_80" else None)
     return list(args) + (["--max-num-batched-tokens", str(int(n))] if n is not None else [])
 
@@ -243,21 +261,11 @@ def candidate_args(cfg: dict) -> list[str]:
     return with_kl_chunk_cap(cfg, set_max_model_len(list(v.get("candidate_args") or []), None if n is None else int(n)))
 
 
-def scoring_concurrency(cfg: dict) -> int | None:
-    """run_eval --concurrency of every scoring run (scoring.concurrency, 2026-11-23; null = run_eval's default 64).
-    Requests in flight per server, each of n samples. A request holds its slot until its LAST sample finishes, so
-    with n = 4 and long thinking outputs 64 requests leave a --max-num-seqs 128 server under-filled mid-run. Only
-    batching changes (same requests and seeds), so the run lock ignores it."""
-    v = (cfg.get("scoring") or {}).get("concurrency")
-    return None if v is None else int(v)
-
-
 def search_settings(scfg: dict) -> dict:
     """Shape of one inner search from a `search` block -> {threads, steps, max_candidates} (max_candidates null /
-    absent = threads x steps). The flow itself is hard-wired (2026-11-23): candidates are never screened, every built
-    candidate gets ONE gate evaluation during the search (paired vs the incumbent, gen_XX/gate.json), the passing
-    candidate with the largest paired gain is accepted (run.Runner.accept_best_gate); there is no api.evaluate and no
-    evaluate budget."""
+    absent = threads x steps). The flow itself is hard-wired (2026-11-25): every built candidate gets ONE KL evaluation
+    on the fixed KL set during the search (gen_XX/gate.json), the lowest KL is accepted when it is below the
+    incumbent's (run.Runner.accept_lowest_kl); there is no api.evaluate."""
     threads, steps = int(scfg["threads"]), int(scfg["steps"])
     mc = scfg.get("max_candidates")
     return {"threads": threads, "steps": steps, "max_candidates": int(threads * steps if mc is None else mc)}

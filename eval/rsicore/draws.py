@@ -1,13 +1,17 @@
 """Per-generation draws of the simple flow (2026-11-21; the only flow since 2026-11-22).
 
-Datasets of a run of domain d (rsicore.evalsets.simple_sets): train role simple_<d>_pool (the whole clean pool),
-gate simple_<d>_eval (all 500 items), held-out simple_<d>_test (500). Generation g: candidates = pool ids - gate ids
-- test ids; screen = signal = a sample of simple.screen_n (default 500) candidates with
-random.Random(f"{seed}:simple:{domain}:{r}"), r = search_round(rc, g) (no run id or paper; Paper A's generation g and
-Paper B's g-1 are the same round r, so both papers' k-th search screens the same items); train = the other
+Datasets of a run of domain d (rsicore.evalsets.simple_sets): train role simple_<d>_pool (the whole clean pool);
+simple_<d>_eval (500) and simple_<d>_test (500) are built only so that their items are excluded from the pool (there
+is no held-out report since 2026-11-25). Generation g: candidates = pool ids - eval ids - test ids; screen = signal = a sample of simple.screen_n (default 500) candidates with
+random.Random(f"{seed}:simple:{domain}:{r}"), r = search_round(rc, g) (no run id or paper in the seed; the round
+offset differs by paper, see search_round); train = the other
 candidates; kl = KL_N (400) of train with random.Random(f"{seed}:simple_kl:{domain}:{r}"). Written to
 draws/gen_XX/ids/simple_<d>_pool.<role>.json (+ manifest.json; reused on resume). Screens are drawn independently
 every generation (they may overlap earlier generations' screens / train items); nothing is marked shown.
+Both papers use only generation 0's screen role (2026-11-25): Paper A's fixed KL set (kl_eval.n of it), Paper B's
+fixed training / evaluation set (simple.screen_n items, the same every generation). Generation 0 is round 0 in Paper A
+and round 1 in Paper B, so the two sets are independent draws (different seeds; they may share items by chance, but
+Paper A's KL set is not a subset of Paper B's training set).
 """
 import json
 import random
@@ -29,12 +33,12 @@ def train_dataset(rc) -> str:
 
 
 def gate_dataset(rc) -> str:
-    """The gate: simple_<domain>_eval (every item)."""
+    """simple_<domain>_eval (every item): excluded from the pool draws."""
     return f"simple_{rc.domain}_eval"
 
 
 def test_dataset(rc) -> str:
-    """The held-out test set: simple_<domain>_test (every item; report only)."""
+    """simple_<domain>_test (every item): excluded from the pool draws (no held-out report since 2026-11-25)."""
     return f"simple_{rc.domain}_test"
 
 
@@ -70,9 +74,10 @@ _SIMPLE: dict[tuple, dict] = {}                     # (run dir, gen) -> {role: i
 
 
 def search_round(rc, gen: int) -> int:
-    """The paper-independent index of generation `gen` for the screen seed: Paper A searches in generations 1..N
-    (0 = baseline), Paper B in 0..N-1, so A's g and B's g-1 are the same round (A's g=1 and B's g=0 screen identical
-    items)."""
+    """The round index of generation `gen` for the screen seed: gen in Paper A, gen + 1 in Paper B (kept from the
+    per-generation screens, when A's g and B's g-1 screened the same items). Since 2026-11-25 both papers read only
+    generation 0's draw: Paper A round 0 (its KL set), Paper B round 1 (its fixed training set), two independent
+    draws."""
     return int(gen) if getattr(rc, "paper", "A") == "A" else int(gen) + 1
 
 
@@ -112,7 +117,8 @@ def simple_draw(rc, gen: int) -> dict:
 
 
 def ensure_gate(rc) -> dict:
-    """Build the gate and the held-out test set (once per process). Returns {domain: {gate dataset: [ids]}}."""
+    """Build simple_<d>_eval / _test (their ids are excluded from the pool) and the pool (once per process).
+    Returns {domain: {simple_<d>_eval: [ids]}}."""
     gds = gate_dataset(rc)
     build_eval_set(test_dataset(rc))
     build_eval_set(train_dataset(rc))        # also on a resume that finds the draw files already written
@@ -142,7 +148,8 @@ def ids(rc, gen: int, dataset: str, role: str) -> list[str]:
 
 
 def gate_ids(rc, dataset: str) -> list[str]:
-    """Every item of the eval-set `dataset` (the gate: simple_<domain>_eval)."""
+    """Every item of the eval-set `dataset` (e.g. simple_<domain>_eval, built only so its items are excluded from
+    simple_<domain>_pool; never scored)."""
     if not is_eval_set(dataset):
         raise ValueError(f"draws.gate_ids: {dataset!r} is not an eval set (eval/configs/tasks.yaml eval_targets)")
     return build_eval_set(dataset)

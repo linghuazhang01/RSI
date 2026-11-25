@@ -7,8 +7,8 @@ trained once (generation 0) with the fixed recipe; scratch = build from zero; we
 directly with structured, any-rank operations and return {"edit": <handle>}. The editor never trains and has
 no gradient tools in any mode. The context shows the task, the fixed diagnostics (first step of a thread), every candidate
 so far (all threads), this thread's best program and its latest feedback.
-The one flow (2026-11-23, no knobs): there is no api.evaluate; every returned candidate gets ONE gate evaluation
-(paired vs the current model) and the passing candidate with the largest gain is accepted (gate_text). With one step
+The one flow (2026-11-25): there is no api.evaluate; every returned candidate gets ONE evaluation on the fixed 500-item
+training set (paired vs the current model) and the passing candidate with the largest gain is accepted (gate_text). With one step
 per generation each thread is told it is session k of N working independently (ContextRenderer sessions). The tensor
 tools (api.tensors / api.tensor_compute, when on) are mentioned in the vector-reference, module-name and strategy rules.
 """
@@ -64,12 +64,11 @@ Tools
 {tools}
 """
 
-DATA_ACCESS = """- Data access: activation tools accept ONLY the ids returned by api.train_ids() (the target task's
-  training items of this generation). Signal, gate and held-out items are never readable: you only see each
-  candidate's gate statistics."""
-DATA_ACCESS_SCREEN = """- Data access: activation tools accept the ids returned by api.train_ids() (the target task's
-  training items of this generation) and this generation's screen ids (api.screen_results: training-pool items you
-  answered yourself). Gate and held-out items are never readable: you only see each candidate's gate statistics."""
+DATA_ACCESS = """- Data access: activation tools accept ONLY the ids returned by api.train_ids(): the fixed training set
+  (the same items in every generation). Your candidates are evaluated on exactly these items."""
+DATA_ACCESS_SCREEN = """- Data access: activation tools accept the ids returned by api.train_ids(): the fixed training set (the
+  same items in every generation, also listed by api.screen_results with your own answers). Your candidates are
+  evaluated on exactly these items."""
 
 _LORA_TEXT = dict(
     what="a low-rank weight update dW = B A per linear module",
@@ -140,7 +139,19 @@ TENSOR_STRATEGY = (" api.tensor_compute(code, tensors) runs your own torch code 
                    "current tensors (custom statistics, directions, exact factors; prefer torch.svd_lowrank on large "
                    "matrices;\n  a few threads, at most ~{timeout_s} s and never longer than your program has left): "
                    "return vectors for rank1 /\n  from_direction or exact LoRA factors (lora = {{module: (A [r, in], B "
-                   "[out, r])}}; the rank and norm caps apply as for\n  any LoRA).")
+                   "[out, r])}}; the rank and norm caps apply as for\n  any LoRA).{loras}")
+# (2026-11-25) tensor_compute(loras=...): per mode, which handles hold the earlier changes
+TENSOR_LORAS = {
+    "merge": " With loras=['H0', ...] the code also gets the exact factors of LoRA handles (the adapters\n  accepted "
+             "earlier, api.stack(), already merged into your weights; your own) as LORA = {{handle: {{module: (A, "
+             "B)}}}},\n  dW = B @ A: study, reuse, reverse or avoid earlier changes.",
+    "adapter": " With loras=['CUR', 'H0', ...] the code also gets the exact factors of LoRA handles (CUR = the\n  "
+               "cumulative adapter that is part of your current model, the H handles = the adapters accepted earlier,\n  "
+               "api.stack(); your own) as LORA = {{handle: {{module: (A, B)}}}}, dW = B @ A: study, reuse, reverse or "
+               "avoid\n  earlier changes.",
+    "edit": " With loras=['RAW', ...] the code also gets the exact factors of LoRA handles (RAW = the LoRA\n  you edit, "
+            "not in T; your own) as LORA = {{handle: {{module: (A, B)}}}}, dW = B @ A.",
+}
 
 TENSOR_STRATEGY_W = (" api.tensor_compute(code, tensors, edit=None) runs your own torch code on CPU copies of up to\n  "
                      "{max_tensors} current tensors (custom statistics, directions and writes; prefer "
@@ -153,14 +164,14 @@ TENSOR_STRATEGY_W = (" api.tensor_compute(code, tensors, edit=None) runs your ow
 BUDGET_GATE = """Budgets for this generation: there is no api.evaluate. Every {unit} you return gets ONE gate evaluation
   automatically (see Gate below); nothing else is scored, so judge your constructions with the free tools."""
 
-SCREEN_STRATEGY = (" This generation's screen items were answered by YOU (the current model) {n} time(s) each with\n  "
+SCREEN_STRATEGY = (" The training items were answered by YOU (the current model) {n} time(s) each with\n  "
                    "the scoring decoding (the summary is in every message): api.screen_results(filter='wrong' | "
                    "'unstable' | 'right')\n  lists every item with its prompt, gold answer, your extracted answers "
                    "and scores, and api.screen_output(id, sample)\n  pages one full answer, thinking included (both "
                    "free). Find what you get wrong and why before you edit.")
 
 PAPER_RECIPE = (" A recipe from the model-editing literature: collect activations on your OWN answers for two groups\n  "
-                "of screen items (e.g. a = api.acts(module=m, ids=wrong_ids, source='own'), b = the same on "
+                "of training items (e.g. a = api.acts(module=m, ids=wrong_ids, source='own'), b = the same on "
                 "right_ids),\n  take d = api.direction(a=a['handle'] + '.out_mean', b=b['handle'] + '.out_mean') and "
                 "remove it from a layer's\n  output matrices with api.project_out(target=lora, module=m, "
                 "u=d['vector'], alpha=0.5) "
@@ -177,8 +188,9 @@ def screen_text(summary: dict | None) -> str:
     if not sm.get("n_items"):
         return ""
     n = sm.get("samples_per_item") or 1
-    out = (f"Your own answers on this generation's {sm['n_items']} screen items (training-pool items; you = the current "
-           f"model, {n} sampled answer(s) per item with the scoring decoding): accuracy avg@{n} {sm.get('accuracy')}; "
+    out = (f"Your own answers on the {sm['n_items']} training items (the fixed set every candidate is evaluated on; you "
+           f"= the current model, {n} sampled answer(s) per item with the scoring decoding): accuracy avg@{n} "
+           f"{sm.get('accuracy')}; "
            f"items by number of correct samples {json.dumps(sm.get('correct_counts'))}; truncation rate "
            f"{sm.get('truncation_rate')} (thinking cut at the token limit: {sm.get('truncated_thinking')} samples).")
     if sm.get("failing"):
@@ -194,12 +206,12 @@ def _points(x: float) -> str:
 
 
 def gate_text(cfg: dict, *, gate_n: int | None = None, raw_fallback: bool = False) -> str:
-    """The gate rule as configured (2026-11-21; gate.min_gain / require_significant), not a fixed text: each candidate
-    is gated during the search against the current model and the largest passing gain wins (the only flow,
-    2026-11-23). raw_fallback (method.mode edit, generation 0): when none passes, the raw LoRA is accepted if it passes
-    the same gate."""
+    """The acceptance rule as configured (gate.min_gain / require_significant): each candidate is evaluated during the
+    search on the fixed training set against the current model and the largest passing gain wins (2026-11-25: the
+    same items the editor reads). raw_fallback (method.mode edit, generation 0): when none passes,
+    the raw LoRA is accepted if it passes the same rule."""
     g = cfg.get("gate") or {}
-    mg = float(g.get("min_gain", 0.01))
+    mg = float(g.get("min_gain", 0.0))
     if mg <= 0:                                  # (2026-11-21) threshold 0: any strictly positive gain
         rule = "item by item against the current model, the mean gain in target accuracy must be positive"
     else:
@@ -207,17 +219,17 @@ def gate_text(cfg: dict, *, gate_n: int | None = None, raw_fallback: bool = Fals
         rule = (f"item by item against the current model, the mean gain in target accuracy must be at least {mg:g} "
                 f"({_points(mg)}{items})")
     rule += (" and statistically significant (paired 95% CI lower bound above 0)"
-             if g.get("require_significant", True) else "; there is no significance test")
+             if g.get("require_significant", False) else "; there is no significance test")
     from rsicore.config import stage_decoding
     ns = int((stage_decoding(cfg, "gate") or {}).get("n") or 1)
     smp = f", {ns} sampled answers per item, the current model answered the same items with the same seed" \
         if ns > 1 else ""
     none = ("RAW itself is accepted if it passes the same gate, otherwise the model stays as it is" if raw_fallback
             else "the model stays as it is")
-    return (f"Gate: every candidate you return is evaluated ONCE on a fixed hidden set of {gate_n or 'the gate'} "
-            f"items{smp}; {rule}. At the end of the generation the passing candidate with the LARGEST gain "
-            f"is accepted (none passes: {none}). You see each earlier candidate's gate result "
-            "(accuracy, paired gain, CI, passed, broken / fixed item ids; never the items) in later steps and "
+    return (f"Gate: every candidate you return is evaluated ONCE on the {gate_n or ''} training items (the fixed set "
+            f"of api.train_ids(), the same in every generation){smp}; {rule}. At the end of the generation the "
+            f"passing candidate with the LARGEST gain is accepted (none passes: {none}). You see each earlier "
+            "candidate's result (accuracy, paired gain, CI, passed, broken / fixed item ids) in later steps and "
             "generations (search_history), not your own before you return it.")
 
 
@@ -259,7 +271,7 @@ def system_prompt(cfg: dict, *, budget: dict, mode: str = "scratch", gate_n: int
                                             "tensor, any rank)" if tc_on else "")
     text["budget_text"] = BUDGET_GATE.format(unit=text["unit"])   # no api.evaluate, one gate evaluation each
     text["gate"] = gate_text(cfg, gate_n=gate_n, raw_fallback=raw_fallback)
-    # screen items readable when the screen tools are on (2026-11-21), gate items statistics only
+    # the current model's answers on the fixed training set readable when the screen tools are on (2026-11-21)
     text["data_access"] = DATA_ACCESS_SCREEN if "screen_results" in have else DATA_ACCESS
     from .tools import paper_tools_enabled, screen_tools_enabled
     if screen_tools_enabled(cfg) and "screen_results" in have:
@@ -276,8 +288,10 @@ def system_prompt(cfg: dict, *, budget: dict, mode: str = "scratch", gate_n: int
             tensor_write=" and change it only through its writes (mode weights)" if mode == "weights" else
             " (changes to non-linear tensors need method.mode weights)")
         text["tensor_vectors"] = TENSOR_VECTORS
+        from .tools import lora_kind
         text["strategies"] += (TENSOR_STRATEGY_W if mode == "weights" else TENSOR_STRATEGY).format(
-            max_tensors=int(tcs["max_tensors"]), timeout_s=int(tcs["timeout_s"]))
+            max_tensors=int(tcs["max_tensors"]), timeout_s=int(tcs["timeout_s"]),
+            loras=TENSOR_LORAS.get(lora_kind(mode, cfg), "").format())
     out = SYSTEM_PROMPT.format(who=who, whose=whose, timeout_s=cfg.get("sandbox", {}).get("timeout_s", 1800),
                                gpu_seconds=float(budget.get("gpu_seconds", 7200)), tools=tools, **text)
     return _with_tool_protocol(out, cfg, mode=mode)
@@ -350,7 +364,7 @@ def change_fields(art: dict) -> dict:
 
 ARCHIVE_HEAD = ("Archive of earlier generations: EVERY candidate tried, one row each, failures included. types = the "
                 "module types it changed, modules = one line per type: layers (L), module count (x), LoRA rank, "
-                "rel = ||dW||/||W0|| (and the ops of a weight edit), kept = it returned None (no change), gate = its gate result (gain = paired gain in gate accuracy vs that "
+                "rel = ||dW||/||W0|| (and the ops of a weight edit), kept = it returned None (no change), gate = its gate result (gain = paired accuracy gain on the training items vs that "
                 "generation's current model, ci = its 95% interval), note = its own account of what it tried.")
 ARCHIVE_READ = ("Full program or feedback of any candidate above: read_record(cid, 'program' | 'feedback'); "
                 "search_history lists them with more statistics. Do not repeat what failed: try something different "
@@ -516,7 +530,7 @@ class ContextRenderer:
                 parts.append(self.archive_text)
         if history:
             rows = [summarize_candidate(c) for c in sorted(history, key=lambda c: (c.step, c.thread))]
-            head = ("Candidates so far (all threads; score = the paired gain in gate accuracy vs the current model; "
+            head = ("Candidates so far (all threads; score = the paired accuracy gain on the training items vs the current model; "
                     "gate = its gate result):\n")
             parts.append(head + "\n".join(json.dumps(r) for r in rows))
         if mine:
@@ -538,12 +552,10 @@ class ContextRenderer:
         return "\n\n".join(parts)
 
 
-def task_text(*, gen: int, target: str, dataset: str, n_train: int, raw_info: dict | None = None,
-              gate_dataset: str | None = None) -> str:
+def task_text(*, gen: int, target: str, dataset: str, n_train: int, raw_info: dict | None = None) -> str:
     s = (f"Generation {gen}. Target domain: {target} (training set {dataset}; {n_train} train items via "
-         f"api.train_ids()). Single-domain run: only the target domain is evaluated and gated.")
-    if gate_dataset and gate_dataset != dataset:     # (2026-11-21) the gate set differs from the training set
-        s += f" The gate accepts a candidate on {gate_dataset} (scores only; its items are not readable)."
+         f"api.train_ids(), the same items in every generation). Single-domain run: candidates are evaluated on "
+         "these items only.")
     return s + _raw_line(raw_info)
 
 
