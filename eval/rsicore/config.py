@@ -8,9 +8,10 @@ paper / domain / model / seed / mock / paper_cfg are refused. `gens` and `gpus` 
 (extending a run, moving machines); the stored values are updated. The paper_cfg comparison ignores the keys of
 removed features (LOCK_IGNORED_*, 2026-11-22: objective / scope profiles, data sizes, data roles, retention, E_t,
 eval_target, draw_config; 2026-11-23: the search / gate / noise-band / KL-score knobs of REMOVED_KNOBS, and the
-paper-only PAPER_REMOVED_KNOBS such as Paper A's tools.compare) and execution knobs that only change batching
-(LOCK_IGNORED_SUFFIXES: scoring.concurrency, at any depth), so runs made before their removal resume with the same
-command.
+paper-only PAPER_REMOVED_KNOBS such as Paper A's tools.compare) and execution knobs that only change batching or
+memory (LOCK_IGNORED_SUFFIXES: scoring.concurrency, kl_eval.max_num_batched_tokens, calibration.layers_per_pass ...,
+at any depth; 2026-11-25: the memory flags of the vLLM arg lists, LOCK_IGNORED_VLLM_FLAGS), so runs made before their
+removal resume with the same command, and an OOMed run resumes with a new memory plan.
 
 The search flow is hard-wired (2026-11-23): candidates are never screened, every candidate gets ONE gate evaluation
 during the search (paired vs the current model), the passing candidate with the largest paired gain is accepted; no
@@ -76,8 +77,17 @@ LOCK_IGNORED_PATHS = ("kl.domains", "heldout", "mock_overrides.heldout", "max_to
     f"mock_overrides.{p}" for p in _REMOVED_LOCK_PATHS)
 # execution knobs that change only batching, like --gpus, ignored at this dotted path anywhere in the config (top
 # level, under mock_overrides., under hardware_profiles.<name>.): scoring.concurrency (Paper A, 2026-11-23),
-# gpu_layout.gate_split (Paper A, 2026-11-24: GPUs per candidate gate)
-LOCK_IGNORED_SUFFIXES = ("scoring.concurrency", "gpu_layout.gate_split", "gate.kl.max_num_batched_tokens")
+# gpu_layout.gate_split (Paper A, 2026-11-24: GPUs per candidate gate); 2026-11-25 (the h20 profile re-planned at
+# 100 GiB per card after an OOM): kl_eval.max_num_batched_tokens (vLLM's prefill chunk) and calibration.layers_per_pass
+# (the window of layers per calibration pass; the Hessians are the same sums whatever the window), so an OOMed run
+# resumes with the new memory plan
+LOCK_IGNORED_SUFFIXES = ("scoring.concurrency", "gpu_layout.gate_split", "gate.kl.max_num_batched_tokens",
+                         "kl_eval.max_num_batched_tokens", "calibration.layers_per_pass")
+# vLLM arg lists (2026-11-25), at any depth (vllm.editor_args / candidate_args, Paper B's server.main_args, also under
+# hardware_profiles.<name>. and mock_overrides.): the lock compares them without these memory-only flags and their
+# values ("--flag X" or "--flag=X"); every other flag (--max-model-len, --max-num-seqs, --max-logprobs ...) stays locked
+LOCK_ARG_LIST_KEYS = frozenset({"editor_args", "candidate_args", "main_args"})
+LOCK_IGNORED_VLLM_FLAGS = ("--rsi-gpu-memory-gib", "--gpu-memory-utilization", "--max-num-batched-tokens")
 HARDWIRED_FLOW = ("candidates are never screened; every candidate gets one gate evaluation during the search, paired "
                   "vs the current model; the passing candidate with the largest paired gain is accepted; no "
                   "api.evaluate, full / rerun stage, gate submissions after the search, noise band or KL score term")
@@ -373,13 +383,36 @@ def _lock_ignored(key: str, path: str, paper: str | None = None) -> bool:
                                               and path[len("mock_overrides."):] in extra))
 
 
+def lock_vllm_args(args):
+    """A vLLM arg list as the run lock compares it (2026-11-25): LOCK_IGNORED_VLLM_FLAGS dropped with their values
+    ("--flag X" and "--flag=X"); the rest unchanged and in order. The memory plan (GiB / utilization per card) and the
+    prefill chunk change only where a run fits, not what it computes. A non-list is returned as given."""
+    if not isinstance(args, (list, tuple)):
+        return args
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        s = str(a)
+        if s in LOCK_IGNORED_VLLM_FLAGS:
+            skip = True                              # its value is the next item
+        elif not any(s.startswith(f + "=") for f in LOCK_IGNORED_VLLM_FLAGS):
+            out.append(a)
+    return out
+
+
 def _strip_ignored(x, path: str = "", paper: str | None = None):
+    """x without the lock-ignored keys (_lock_ignored), vLLM arg lists normalized (lock_vllm_args); a mapping that
+    held only ignored keys is dropped, so it compares equal to an absent one."""
     if not isinstance(x, dict):
         return x
     out = {}
     for k, v in x.items():
         p = f"{path}.{k}" if path else str(k)
         if not _lock_ignored(str(k), p, paper):
+            if str(k) in LOCK_ARG_LIST_KEYS:
+                v = lock_vllm_args(v)
             sv = _strip_ignored(v, p, paper)
             if not (isinstance(v, dict) and v and not sv):      # a mapping that held only ignored keys: absent
                 out[k] = sv
@@ -389,8 +422,9 @@ def _strip_ignored(x, path: str = "", paper: str | None = None):
 def lock_view(cfg: dict | None, paper: str | None = None) -> dict:
     """paper_cfg as the run lock compares it (2026-11-22): the former mock_objective_overrides.simple folded into
     mock_overrides (both were applied after --set, in this order), the former data.screen_n read as simple.screen_n,
-    LOCK_DEFAULTS filled in, then every LOCK_IGNORED_* key (and the paper's PAPER_REMOVED_KNOBS) dropped. A run locked before the removals and the same
-    command today give the same view."""
+    LOCK_DEFAULTS filled in, then every LOCK_IGNORED_* key (and the paper's PAPER_REMOVED_KNOBS) dropped and the vLLM
+    arg lists stripped of their memory-only flags (LOCK_IGNORED_VLLM_FLAGS, 2026-11-25). A run locked before the
+    removals and the same command today give the same view."""
     c = copy.deepcopy(cfg or {})
     moo = (c.get("mock_objective_overrides") or {}).get("simple") if isinstance(c.get("mock_objective_overrides"), dict) else None
     if moo:

@@ -140,7 +140,7 @@ def test_serve_pool_distinct_slots(tmp_path, monkeypatch):
 
 
 def test_memory_budget_in_gib(monkeypatch):
-    """h20 plans 110 GB per card: --rsi-gpu-memory-gib 110 becomes --gpu-memory-utilization 110 / total."""
+    """--rsi-gpu-memory-gib X becomes --gpu-memory-utilization X / total (e.g. 110 on a 140.4 GiB card)."""
     import rsicore.servers as S
     args = ["--rsi-gpu-memory-gib", "110", "--gpu-memory-utilization", "0.78", "--max-num-seqs", "128"]
     out, info = S.apply_memory_budget(args, [0], total_gib=140.4)
@@ -168,9 +168,13 @@ def test_h20_profiles(tmp_path):
                                                 "--set", f"hardware={hw}"])
         return load_run_config(paper, a).paper_cfg
     a, b = load("A", "h20"), load("B", "h20")
-    for args in (a["vllm"]["editor_args"], a["vllm"]["candidate_args"], b["server"]["main_args"]):
-        assert args[args.index("--rsi-gpu-memory-gib") + 1] == "110" and "128" in args
-    assert a["calibration"]["layers_per_pass"] == 16 and b["train"]["micro_batch"] == 2 and b["server"]["max_loras"] == 8
+    # Paper A's h20 plan: 100 GiB per card in all (2026-11-25): editor 90, candidates / M_0 replicas 84, prefill
+    # chunk 2048, 12 calibration layers per pass; Paper B's h20 profile is unchanged (110)
+    for args, gib in ((a["vllm"]["editor_args"], "90"), (a["vllm"]["candidate_args"], "84"),
+                      (b["server"]["main_args"], "110")):
+        assert args[args.index("--rsi-gpu-memory-gib") + 1] == gib and "128" in args
+    assert a["kl_eval"]["max_num_batched_tokens"] == 2048
+    assert a["calibration"]["layers_per_pass"] == 12 and b["train"]["micro_batch"] == 2 and b["server"]["max_loras"] == 8
     a80, b80 = load("A", "h20_80"), load("B", "h20_80")
     assert a80["calibration"]["layers_per_pass"] == 4 and b80["train"]["micro_batch"] == 1
     assert "--rsi-gpu-memory-gib" not in a80["vllm"]["editor_args"]

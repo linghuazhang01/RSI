@@ -11,7 +11,7 @@
 #   --paper     A, B or both (default both)
 #   --domains   all = math,code,knowledge,instruction_following,tool_calling (default all); one run per paper and domain
 #   --gens      generations per run (default 5)
-#   --hw        hardware profile (default b300): b300 (B300 planned at 220 GB per card), h20 (H20 planned at 110 GB per card),
+#   --hw        hardware profile (default b300): b300 (B300 planned at 220 GB per card), h20 (H20 ~140 GiB: Paper A planned at 100 GiB per card, Paper B at 110),
 #               h20_80 (80 GB H20). Qwen3.8-27B (one model per card): minimum GPUs per run
 #                 Paper A 2 (editor | candidates); Paper B 2 (main | training)
 #   --gpus      GPU ids to use, any order / gaps (default: every GPU nvidia-smi lists). ALL of them are used:

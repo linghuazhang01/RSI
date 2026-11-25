@@ -51,8 +51,10 @@ kl_eval:                              # (2026-11-25) the ONLY evaluation: KL(M_0
   top_p: 0.95
   sample_top_k: 20
   max_num_batched_tokens: null        # vLLM --max-num-batched-tokens of every server: prompt logprobs are computed for
-                                      # each prefill token of a chunk outside vLLM's memory profile. null = 1024 with
-                                      # hardware h20_80 (0.92 utilization leaves ~6 GB), vLLM's default otherwise
+                                      # each prefill token of a chunk outside vLLM's memory profile (~10 B x chunk x
+                                      # 248320 vocab). null = 1024 with hardware h20_80 (0.92 utilization leaves ~6 GB),
+                                      # 2048 with h20 (set by the profile, 2026-11-25), vLLM's default otherwise.
+                                      # Batching only: not part of the run lock
 
 kl:                                   # calibration texts (generation 0, built once; the block keeps its old name):
                                       # GPTQ / AWQ calibration and profile contexts
@@ -66,7 +68,8 @@ kl:                                   # calibration texts (generation 0, built o
 calibration:                          # Hessians for GPTQ / AWQ (original model, generation-0 kl texts, once)
   max_texts: 256
   max_len: 2560                       # tokens per text (prompt + a response of up to 2048 tokens)
-  layers_per_pass: 16                 # window of layers per calibration pass (fp32 Hessians ~1.6 GB/layer)
+  layers_per_pass: 16                 # window of layers per calibration pass (fp32 Hessians ~1.6 GB/layer; h20: 12);
+                                      # the Hessians are the same sums for any window: not part of the run lock
 
 diagnostics:                          # computed once from M_0 (prep/diagnostics/), see edit_code/diagnostics.py
   profile_bits: [2, 3, 4]             # 2026-11-20: 8 bit dropped (near lossless), more contexts instead
@@ -212,17 +215,38 @@ hardware_profiles:
       candidate_args: [--rsi-gpu-memory-gib, "220", --gpu-memory-utilization, "0.81", --max-model-len, "20480",
                        --max-num-seqs, "128", --max-logprobs, "20"]
     editor: {context_tokens: 131072}
-  h20:                                # H20 cards (~140 GB) PLANNED AT 110 GB each (2026-11-20); Qwen3.8-27B BF16 ~52 GB:
-    gpu_layout: {share_single_gpu: false}   # still one model per card (editor + a candidate = 104 GB, no KV left)
-    vllm:                             # --rsi-gpu-memory-gib 110 -> --gpu-memory-utilization = 110 GB / card total
-      # (rsicore.servers; 0.78 = 110/140 if nvidia-smi is unavailable). 110 - 52 GB weights - ~6 GB runtime
-      # leaves ~50 GB for KV cache + GDN states [estimate: ~64 KB/token on the 16 full-attention layers]
-      editor_args: [--rsi-gpu-memory-gib, "110", --gpu-memory-utilization, "0.78", --max-model-len, "131072",
+  h20:                                # H20 cards (~140.4 GiB visible) PLANNED AT 100 GiB each (2026-11-25; was 110):
+    # every process of ours on a GPU together stays <= 100 GiB ("GiB" = nvidia-smi MiB / 1024). 110 OOMed in the
+    # generation-0 profile table (a profile worker peaked ~86 GiB reserved next to foreign memory on the card).
+    # Qwen3.8-27B BF16: ~52 GiB of vLLM weights, ~54.7 GiB as an HF model. Per GPU (vLLM budget + what sits outside it):
+    #   editor GPU       : editor 90 + prompt logprobs ~4.7 (chunk 2048, below)                         = ~95
+    #   lent editor GPU  : sleeping editor ~1-2 (weights in CPU RAM, KV freed) + a candidate 84 + ~4.7  = ~91
+    #   1st candidate GPU: candidate 84 + ~4.7 + group_error / lazy GPTQ torch work of the run (+3-8)   = ~97
+    #   other candidates : candidate 84 + ~4.7 (also the M_0 replicas of generation 0)                  = ~89
+    #   prep (no vLLM)   : calibration ~78 (54.7 HF model + 12 x 1.57 fp32 Hessians + activations), profile worker
+    #                      ~60 (HF model + reference log-probs / packed-batch logits; ~79 allocated / ~86 reserved
+    #                      before its 2026-11-25 hidden-state change), cache warm-up ~8
+    #   not counted above: the run process's CUDA context on every GPU prep touched (~0.5 each) and vLLM's own
+    #   context / CUDA graphs (~1-1.5); worst case ~99 on the 1st candidate GPU. Lower candidate_args to 82 if the
+    #   first H20 run's logs show less headroom (profile workers log their peak; vLLM logs its KV size)
+    # KV left: editor 90 - 52 weights - ~2 activations = ~36 GiB (~64 KB/token on the 16 full-attention layers + GDN
+    # states [estimate]): 4 threads x 8 GiB at 131072 tokens fit; 8 threads at full context preempt (slower, not an
+    # error). Candidates 84 - 52 - ~2 = ~30 GiB: plenty for 32768-token KL traces.
+    gpu_layout: {share_single_gpu: false}   # still one model per card (editor + a candidate = 104 GiB, no KV left)
+    vllm:                             # --rsi-gpu-memory-gib X -> --gpu-memory-utilization = X GiB / card total
+      # (rsicore.servers; 0.64 = 90/140.4 and 0.60 = 84/140.4 if nvidia-smi is unavailable). candidate_args also
+      # serve the M_0 replicas; the first candidate GPU keeps 6 GiB more room for the run's own torch work.
+      # The memory flags (and --max-num-batched-tokens) are not part of the run lock (rsicore.config, 2026-11-25).
+      editor_args: [--rsi-gpu-memory-gib, "90", --gpu-memory-utilization, "0.64", --max-model-len, "131072",
                     --max-num-seqs, "128", --max-logprobs, "20"]
-      candidate_args: [--rsi-gpu-memory-gib, "110", --gpu-memory-utilization, "0.78", --max-model-len, "20480",
+      candidate_args: [--rsi-gpu-memory-gib, "84", --gpu-memory-utilization, "0.60", --max-model-len, "20480",
                        --max-num-seqs, "128", --max-logprobs, "20"]
-    # calibration: the base 16 layers per pass fits (52 GB HF model + 16 x 1.6 GB fp32 Hessians + activations)
-    editor: {context_tokens: 131072}  # ~50 GB KV >= 4 threads x 8 GiB at 131072 tokens
+    kl_eval:                          # vLLM computes prompt logprobs for every prefill token of a chunk OUTSIDE its
+      max_num_batched_tokens: 2048    # profiled budget: ~10 B x chunk x 248320 vocab -> 8192: ~19 GiB, 2048: ~4.7 GiB
+                                      # (edit_code.common.with_kl_chunk_cap; batching only, not locked)
+    calibration:                      # fp32 Hessians ~1.57 GiB/layer: 12 x 1.57 = ~19 GiB next to the 54.7 GiB HF
+      layers_per_pass: 12             # model -> ~78 GiB peak (16 was ~84); the same Hessian sums, not locked
+    editor: {context_tokens: 131072}  # ~36 GiB KV >= 4 threads x 8 GiB at 131072 tokens
   h20_80:                             # 80 GB H20 (the earlier plan): one model per card, ~15 GB KV
     gpu_layout: {share_single_gpu: false}
     vllm:

@@ -827,6 +827,7 @@ def main(argv=None):
     ap.add_argument("--budget-gib", type=float, default=None,
                     help="fixed packed size in GiB for every generation (default: config budget)")
     args = ap.parse_args(argv)
+    from rsicore.servers import install_exit_handlers; install_exit_handlers()  # kill -> stop vLLM servers (2026-11-25)
     rc = C.load_run_config("A", args)
     cfg = effective_config(rc, args)
     Runner(rc, cfg).run()

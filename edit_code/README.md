@@ -19,7 +19,7 @@
 | `kl_eval.n` | 256（mock 24） | KL 题集大小（第 0 代抽题里取） |
 | `kl_eval.max_tokens` / `temperature` / `top_p` / `sample_top_k` | 16384 / 0.6 / 0.95 / 20（与 Paper B 相同） | M_0 写参考回答的采样 |
 | `kl_eval.top_k` | 20 | 每个位置的 logprob 个数（≤ 服务的 `--max-logprobs 20`） |
-| `kl_eval.max_num_batched_tokens` | null（`h20_80` 档自动 1024） | 每个 vLLM 服务的 `--max-num-batched-tokens`：prompt logprob 的显存在 vLLM 的显存估算之外 |
+| `kl_eval.max_num_batched_tokens` | null（`h20_80` 档自动 1024，`h20` 档 2048） | 每个 vLLM 服务的 `--max-num-batched-tokens`：prompt logprob 的显存在 vLLM 的显存估算之外（约 10 B × chunk × 248320，8192 → ~19 GiB，2048 → ~4.7 GiB）；不进运行锁 |
 | `search.threads` / `steps` / `max_candidates` | 8 / 1 / 8 | 每代候选数 |
 | `loop.start` / `loop.patience` | bf16 / 3 | 起点、停止条件 |
 | `gpu_layout.gate_split` | true | 每代提案少于卡数时，一个候选的 KL 评测分到 ⌈槽位数 / 提案数⌉ 张卡上（8 × 1：每个 1 张） |
@@ -80,7 +80,7 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 
 ```bash
 ./run_rsi.sh --paper A --domain math --gens 5 --model qwen3.8-27b --seed 42 --gpus 0,1 --run-id A_math_s42
-./run_rsi.sh --paper A --domain math --gens 5 --gpus 0,1 --run-id A_math_s42 --set hardware=h20   # H20（按每张卡 110 GB 规划）
+./run_rsi.sh --paper A --domain math --gens 5 --gpus 0,1 --run-id A_math_s42 --set hardware=h20   # H20（按每张卡 100 GiB 规划）
 ./run_rsi.sh --paper A --domain math --gens 2 --mock            # 本机，无 GPU，约 1–2 分钟
 # 等价：python -I edit_code/run.py ...；附加参数 --budget-gib 11.5（固定体积），--set key=value（覆盖 configs，写入锁定的 run_config.yaml）
 ```
@@ -133,7 +133,17 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 - 磁盘：每个候选服务各留一个检查点（约 54 GB），8 张卡时约 7 × 54 GB。被接受的候选直接把它评测时的检查点移到 `gen_XX/model`（`QuantProblem.adopt_checkpoint`，不再重新导出一遍）；每代结束删掉 `gen_XX/ckpt`（以前没接受的代会留下）；
 - 只有 1 组时（2 张卡）就是原来的逐个评测。手动指定：`--set 'gpu_roles.editor=[0,1]'`（改造者张量并行 2），候选用剩下的卡。
 
-H20 档（按每张卡 110 GB 规划，卡约 140 GB）：至少 2 张（每张卡只放一个 27B，约 52 GB）；vLLM 显存用 `--rsi-gpu-memory-gib 110`（启动时换算成显存比例），`--max-num-seqs 128`，校准每次 16 层 Hessian。80 GB 的卡用 `h20_80`（0.92、32 条序列、校准每次 4 层）。B300 / mock 只给 1 张时两个角色共用。
+H20 档（2026-11-25 起按每张卡 **100 GiB** 规划（我们在一张卡上的所有进程加起来），卡约 140.4 GiB；以前 110 GiB 时第 0 代敏感度表 OOM）：至少 2 张（每张卡只放一个 27B，vLLM 权重约 52 GiB，HF 模型约 54.7 GiB）；改造者 `--rsi-gpu-memory-gib 90`（没有 nvidia-smi 时 0.64），候选服务和 M_0 副本 `--rsi-gpu-memory-gib 84`（0.60），`--max-num-seqs 128`，`kl_eval.max_num_batched_tokens 2048`（prompt logprob 在 vLLM 预算外约 4.7 GiB），校准每次 12 层 Hessian。每张卡的估算（GiB）：
+
+| 卡 | 组成 | 合计 |
+|---|---|---|
+| 改造者 | vLLM 90 + prompt logprob ~4.7 | ~95 |
+| 借出的改造者卡 | 睡眠的改造者 ~1–2 + 候选 84 + ~4.7 | ~91 |
+| 第一张候选卡 | 候选 84 + ~4.7 + 本进程的 group_error / 现算 GPTQ 3–8 | ~97 |
+| 其他候选卡 | 候选 84 + ~4.7（第 0 代 M_0 副本相同） | ~89 |
+| 第 0 代准备（无 vLLM） | 校准 ~78（HF 模型 + 12 × 1.57 fp32 Hessian + 激活）、敏感度表进程 ~60、缓存预热 ~8 | ≤ 78 |
+
+改造者 KV 约 36 GiB：4 个线程 × 8 GiB（131072 token）放得下，8 个线程上下文都很长时会被抢占（变慢，不报错）。显存 / 批处理旋钮（vLLM 参数里的 `--rsi-gpu-memory-gib`、`--gpu-memory-utilization`、`--max-num-batched-tokens`，`kl_eval.max_num_batched_tokens`，`calibration.layers_per_pass`）不进运行锁：OOM 或中断的运行用同一条命令按新的显存规划续跑。80 GB 的卡用 `h20_80`（0.92、32 条序列、校准每次 4 层）。B300 / mock 只给 1 张时两个角色共用。
 
 ## 模块组（Qwen3.5 dense，含 GDN）
 

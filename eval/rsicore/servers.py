@@ -26,13 +26,27 @@ qwen3_coder` when the template emits "<function=" (Qwen3.5 / Coder XML tool call
 max_position_embeddings (config.json, or its text_config) when that is smaller, with a warning; YaRN is never
 added. Helpers: max_model_len(args), set_max_model_len(args, n), model_max_positions(path),
 detect_tool_call_parser(path). The mock path ignores all of this (and drops --max-model-len from extra_args).
+
+Stopping and exit cleanup (2026-11-25): a server runs in its own session (start_new_session=True), and the GPU
+memory is held by vLLM's EngineCore / worker CHILDREN, not by the `vllm serve` leader. stop() therefore sends
+SIGTERM to the whole process group and waits until no live process of the group remains (up to STOP_GRACE_S),
+then SIGKILLs the group and waits again (STOP_KILL_WAIT_S); a real server with known gpu_ids then waits (up to
+STOP_GPU_WAIT_S, skipped without nvidia-smi) until nvidia-smi no longer lists the group's pids on its GPUs.
+Every started server is kept in a per-process registry until stopped; an atexit handler stops whatever is
+still live. install_exit_handlers() (called at the start of edit_code / lora_code main()) turns SIGTERM and
+SIGHUP (unless ignored, e.g. under nohup) into SystemExit after stopping the live servers, so `kill <run pid>`
+no longer orphans ~110 GiB vLLM servers that make the next run OOM. Spawned children (multiprocessing spawn,
+sandbox subprocesses) start with an empty registry and default signal handlers; a forked child forgets the
+parent's servers (os.register_at_fork), so no child ever stops its parent's servers.
 """
+import atexit
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -187,6 +201,262 @@ def apply_memory_budget(args: list[str], gpu_ids, total_gib: float | None = None
                                                            "utilization": util}
 
 
+# ---------------------------------------------------------------------------- stopping a process group
+# (2026-11-25) Bounds of VLLMServer.stop(): SIGTERM grace for the whole group, the wait after SIGKILL, and the
+# wait for nvidia-smi to drop the group's pids. Module constants so a test or a caller can change them.
+STOP_GRACE_S = 60.0
+STOP_KILL_WAIT_S = 30.0
+STOP_GPU_WAIT_S = 30.0
+_POLL_S = 0.2
+
+
+def _group_members(pgid: int) -> dict[int, str] | None:
+    """{pid: state} of the processes in process group pgid ("Z" = zombie), None when it cannot be listed.
+    Linux: /proc/<pid>/stat; elsewhere `ps -A -o pid=,pgid=,stat=`."""
+    out: dict[int, str] = {}
+    if os.path.isdir("/proc/self"):
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return None
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as f:
+                    stat = f.read().decode("utf-8", "replace")
+            except OSError:
+                continue                                 # exited meanwhile
+            fields = stat[stat.rfind(")") + 2:].split()  # comm may contain spaces / parentheses
+            if len(fields) >= 3 and fields[2] == str(pgid):
+                out[int(name)] = fields[0]
+        return out
+    try:
+        res = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001
+        return None
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == str(pgid) and parts[0].isdigit():
+            out[int(parts[0])] = parts[2]
+    return out
+
+
+def _group_alive(pgid: int, proc=None) -> bool:
+    """True while some non-zombie process of group pgid exists. Reaps our own leader first (proc.poll()), so a
+    leader zombie does not count; zombies of other members (e.g. orphans of an init that does not reap) do not
+    count either."""
+    if proc is not None:
+        proc.poll()
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:   # macOS: EPERM while the group still holds a zombie; ask the process table
+        pass
+    members = _group_members(pgid)
+    if members is None:
+        return True
+    return any(not st.startswith("Z") for st in members.values())
+
+
+def _signal_group(pgid: int, sig, proc=None) -> None:
+    """killpg(pgid, sig); when that fails with EPERM (macOS, zombie leader) signal each live member instead."""
+    if proc is not None:
+        proc.poll()
+    try:
+        os.killpg(pgid, sig)
+        return
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        pass
+    for pid, st in (_group_members(pgid) or {}).items():
+        if not st.startswith("Z"):
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def _pid_exists(pid: int) -> bool:
+    """A process (any state, zombies included) with this pid exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_group(pgid: int, proc, timeout_s: float) -> bool:
+    """Poll until group pgid has no live process (True) or timeout_s passed (False)."""
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        if not _group_alive(pgid, proc):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_POLL_S)
+
+
+def _gpu_compute_pids(gpu_ids) -> set[int] | None:
+    """Pids nvidia-smi lists as compute apps on the physical GPUs gpu_ids; None without nvidia-smi."""
+    try:
+        idx = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=30)
+        apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
+                              capture_output=True, text=True, timeout=30)
+    except Exception:  # noqa: BLE001 - no nvidia-smi, driver hang, ...
+        return None
+    if idx.returncode != 0 or apps.returncode != 0:
+        return None
+    want = {int(g) for g in gpu_ids}
+    uuids = set()
+    for line in idx.stdout.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in want:
+            uuids.add(parts[1])
+    pids = set()
+    for line in apps.stdout.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] in uuids:
+            pids.add(int(parts[0]))
+    return pids
+
+
+# ---------------------------------------------------------------------------- live servers of this process
+# (2026-11-25) Strong references on purpose: a server nobody stopped must still be stopped at exit (a weak
+# reference would lose it and orphan its processes). stop() removes it again.
+_LIVE: dict[int, "VLLMServer"] = {}
+_LIVE_LOCK = threading.RLock()     # re-entrant: the SIGTERM handler may run while the main thread holds it
+
+
+def _say(msg: str) -> None:
+    """One line to stderr; never raises (after a terminal hang-up stderr is a dead tty and print() raises EIO,
+    which must not stop the cleanup that follows)."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _register(srv) -> None:
+    with _LIVE_LOCK:
+        _LIVE[id(srv)] = srv
+
+
+def _unregister(srv) -> None:
+    with _LIVE_LOCK:
+        _LIVE.pop(id(srv), None)
+
+
+def live_servers() -> list:
+    """The servers this process started and has not stopped yet."""
+    with _LIVE_LOCK:
+        return list(_LIVE.values())
+
+
+def _forget_after_fork() -> None:
+    """In a forked child: the parent's servers are not ours to stop."""
+    global _LIVE_LOCK
+    _LIVE_LOCK = threading.RLock()
+    _LIVE.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_after_fork)
+
+
+def stop_servers(servers) -> None:
+    """Stop several servers together: SIGTERM to every group first, then each stop() waits, so the grace
+    periods overlap (no threads: this also runs from atexit). Errors are printed, not raised."""
+    servers = list(servers)
+    sent = set()
+    for s in servers:
+        p = getattr(s, "proc", None)
+        if isinstance(p, subprocess.Popen) and hasattr(s, "_wait_gpu_release") and p.poll() is None:
+            # a real VLLMServer (not a fake) whose leader still runs; a reaped leader is left to stop(), which
+            # checks for pid reuse before signalling the group
+            _signal_group(p.pid, signal.SIGTERM, p)
+            sent.add(id(s))
+    for s in servers:
+        try:
+            if id(s) in sent:
+                s.stop(term_sent=True)          # one SIGTERM only (a second one makes uvicorn force-exit)
+            else:
+                s.stop()
+        except Exception as e:  # noqa: BLE001
+            _say(f"[servers] stop {getattr(s, 'served_name', s)} failed: {e!r}")
+
+
+def stop_all_servers() -> None:
+    """Stop every server this process started and has not stopped (atexit; the SIGTERM / SIGHUP handler)."""
+    stop_servers(live_servers())
+
+
+atexit.register(stop_all_servers)
+
+_EXIT_HANDLERS: dict = {}      # pid that installed the handlers -> signals converted
+_EXITING = {"busy": False}
+
+
+def _exit_on_signal(signum, frame):  # noqa: ARG001
+    """SIGTERM / SIGHUP -> stop this process's servers and multiprocessing children, then SystemExit(128+signum)
+    so try/finally blocks and atexit run. The servers are stopped HERE, before unwinding, because unwinding can
+    block on work that talks to them (a ThreadPoolExecutor's shutdown waits for its queued requests)."""
+    if os.getpid() not in _EXIT_HANDLERS:     # inherited by a forked child: behave as the default action
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+        return
+    if _EXITING["busy"]:                      # a repeated signal must not interrupt the cleanup below
+        return
+    _EXITING["busy"] = True
+    try:
+        name = signal.Signals(signum).name
+        live = live_servers()           # includes a server whose stop() is still waiting (escalated below)
+        _say(f"[servers] {name}: stopping {len(live)} server(s) and exiting")
+        stop_servers(live)
+        try:
+            import multiprocessing as mp
+            kids = mp.active_children()
+            for k in kids:                       # e.g. spawn profile workers holding an HF model on a GPU
+                k.terminate()
+            for k in kids:
+                k.join(10)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        _EXITING["busy"] = False
+    raise SystemExit(128 + signum)
+
+
+def install_exit_handlers() -> list[str]:
+    """Convert SIGTERM and SIGHUP into SystemExit (after stopping the live servers) so `kill <pid>` cleans up.
+    Only from the main thread (else a no-op), idempotent; a signal that is ignored (SIGHUP under nohup) or
+    already has another Python handler is left alone. Returns the names of the converted signals."""
+    if threading.current_thread() is not threading.main_thread():
+        return []
+    pid = os.getpid()
+    if pid in _EXIT_HANDLERS:
+        return list(_EXIT_HANDLERS[pid])
+    done = []
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        cur = signal.getsignal(sig)
+        if cur is _exit_on_signal or cur in (signal.SIG_DFL, None):
+            signal.signal(sig, _exit_on_signal)
+            done.append(name)
+    _EXIT_HANDLERS.clear()                    # a forked child that calls this again owns only its own pid
+    _EXIT_HANDLERS[pid] = done
+    return list(done)
+
+
 class VLLMServer:
     def __init__(self, model_path, served_name: str, gpu_ids: list[int], *, port: int | None = None,
                  enable_lora: bool = False, max_loras: int = 8, max_lora_rank: int = 64,
@@ -297,7 +567,12 @@ class VLLMServer:
         self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
                                      start_new_session=True)
         log.close()
-        self._wait_ready()
+        _register(self)                 # (2026-11-25) stopped at exit / on SIGTERM if nobody stops it
+        try:
+            self._wait_ready()
+        except BaseException:           # not ready, died, Ctrl-C: leave no EngineCore child behind
+            self.stop()
+            raise
         return self
 
     def _wait_ready(self):
@@ -322,20 +597,92 @@ class VLLMServer:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def stop(self, grace_s: float = 60):
-        if self.proc is None:
+    def stop(self, grace_s: float | None = None, *, term_sent: bool = False):
+        """Stop the server's WHOLE process group (2026-11-25): the GPU memory belongs to vLLM's EngineCore /
+        worker children, which outlive the `vllm serve` leader that proc.wait() used to wait for. SIGTERM the
+        group (also when the leader has already exited), wait until no live member remains (grace_s, default
+        STOP_GRACE_S), else SIGKILL and wait STOP_KILL_WAIT_S; then, for a real server, wait up to
+        STOP_GPU_WAIT_S until nvidia-smi no longer lists the group's pids on gpu_ids. Idempotent; never raises
+        for a process that is already gone; prints one line when it had to escalate. term_sent: the caller
+        (stop_servers) already sent the SIGTERM.
+        The server stays registered (live_servers) until its group is gone, so a SIGTERM / Ctrl-C that arrives
+        during the wait still finds it: the handler's re-entrant stop() SIGKILLs the group at once, and any
+        exception raised into the wait (SystemExit, KeyboardInterrupt) SIGKILLs it before propagating."""
+        proc, self.proc = self.proc, None
+        self.sleeping = False           # a restarted server is awake and has no adapters loaded
+        self.loras = {}
+        if proc is None:
+            busy = getattr(self, "_stopping", None)
+            if busy is not None:        # re-entrant (signal handler during our own wait): escalate now
+                _signal_group(busy.pid, signal.SIGKILL, busy)
+                _wait_group(busy.pid, busy, STOP_KILL_WAIT_S)
+            else:
+                _unregister(self)
             return
-        if self.proc.poll() is None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
-                self.proc.wait(timeout=grace_s)
-            except (subprocess.TimeoutExpired, ProcessLookupError, PermissionError):
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.proc.wait(timeout=30)
-        self.proc = None
+        self._stopping = proc
+        try:
+            self._stop_group(proc, grace_s, term_sent)
+        except BaseException:           # interrupted mid-wait: never leave the EngineCore behind
+            _signal_group(proc.pid, signal.SIGKILL, proc)
+            _wait_group(proc.pid, proc, STOP_KILL_WAIT_S)
+            raise
+        finally:
+            self._stopping = None
+            _unregister(self)
+
+    def _stop_group(self, proc, grace_s, term_sent: bool) -> None:
+        grace = STOP_GRACE_S if grace_s is None else float(grace_s)
+        pgid = proc.pid                 # start_new_session=True: the leader's pid is the group id
+        if proc.returncode is not None and _pid_exists(pgid):
+            # the leader was reaped BEFORE this stop (e.g. alive() saw it crash); a live process with that pid
+            # is pid reuse, so the group id may now belong to someone else: do not signal it
+            self._note(f"stop: leader {pgid} had already exited and its pid is in use again; not signalling "
+                       f"process group {pgid}")
+            return
+        watch_gpu = (not self.mock) and bool(self.gpu_ids)
+        pids = set()
+        if watch_gpu:                   # before the signal: the members vanish from the table afterwards
+            pids = set(_group_members(pgid) or {}) | {proc.pid}
+        if not term_sent:
+            _signal_group(pgid, signal.SIGTERM, proc)
+        if not _wait_group(pgid, proc, grace):
+            left = sorted(p for p, st in (_group_members(pgid) or {}).items() if not st.startswith("Z"))
+            self._note(f"stop: process group {pgid} still has {left or 'live members'} {grace:.0f}s after "
+                       f"SIGTERM; sending SIGKILL")
+            _signal_group(pgid, signal.SIGKILL, proc)
+            if not _wait_group(pgid, proc, STOP_KILL_WAIT_S):
+                self._note(f"stop: process group {pgid} survived SIGKILL for {STOP_KILL_WAIT_S:.0f}s "
+                           f"(uninterruptible?); its GPU memory may still be held")
+        try:
+            proc.wait(timeout=5)        # reap the leader (normally done by the polls above)
+        except subprocess.TimeoutExpired:
+            pass
+        if watch_gpu:
+            self._wait_gpu_release(pids)
+
+    def _wait_gpu_release(self, pids: set[int]) -> None:
+        """Poll nvidia-smi (bounded by STOP_GPU_WAIT_S) until none of pids is a compute app on gpu_ids. Silent
+        without nvidia-smi, and when the pids are not visible (another pid namespace) it returns at once."""
+        deadline = time.monotonic() + STOP_GPU_WAIT_S
+        while True:
+            on_gpu = _gpu_compute_pids(self.gpu_ids)
+            if on_gpu is None or not (on_gpu & pids):
+                return
+            if time.monotonic() >= deadline:
+                self._note(f"stop: nvidia-smi still lists pids {sorted(on_gpu & pids)} on GPUs {self.gpu_ids} "
+                           f"{STOP_GPU_WAIT_S:.0f}s after the process group exited")
+                return
+            time.sleep(1.0)
+
+    def _note(self, msg: str) -> None:
+        """One line to stderr and to the server log."""
+        line = f"[servers] {self.served_name}: {msg}"
+        _say(line)
+        try:
+            with open(self.log_path, "ab") as f:
+                f.write(f"==== {time.strftime('%F %T')} {line}\n".encode())
+        except OSError:
+            pass
 
     def __enter__(self):
         return self.start()
@@ -407,7 +754,6 @@ def start_all(servers: list) -> list:
             except Exception as e:  # noqa: BLE001
                 errs.append(e)
     if errs:
-        for s in servers:
-            s.stop()
+        stop_servers(servers)          # (2026-11-25) grace periods overlap
         raise errs[0]
     return servers

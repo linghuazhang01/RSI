@@ -5,6 +5,9 @@
 #   ./launch.sh --hw h20 --paper A --domains math --gens 10 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_kl_4x1_g10.yaml --tag kl_4x1_g10
 # GPUs (8): GPU 0 = editor (4 sessions at once; sleeps while the candidates are evaluated and lends its GPU) -> 8
 #   candidate slots; each of the 4 candidates' KL evaluations runs on 2 GPUs (gpu_layout.gate_split: ceil(8 / 4)).
+# Memory (--hw h20, 2026-11-25): planned at 100 GiB per card (editor 90, candidates / M_0 replicas 84, prefill chunk
+#   2048, 12 calibration layers per pass; edit_code/configs/base.yaml hardware_profiles.h20). These memory knobs
+#   are not part of the run lock: a run that OOMed under the old 110 GiB plan resumes with the same command.
 search:
   threads: 4                      # 4 independent sessions per generation ...
   steps: 1                        # ... of one candidate each

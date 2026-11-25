@@ -139,13 +139,18 @@ def collect_stats(model, spec: ModelSpec, batches: list[torch.Tensor], out_dir: 
         finally:
             for h in handles:
                 h.remove()
-        for (l, k), a in acc.items():
+        n_inputs = len(acc)
+        # (2026-11-25) pop each GPU accumulator as it is saved and drop the last reference: the former
+        # `for (l, k), a in acc.items()` left `a` holding the window's last accumulator (often down_in, 17408^2 fp32
+        # = 1.2 GB on Qwen3.8-27B) alive after `del acc`, into the next window's forward
+        for l, k in list(acc):
+            a = acc.pop((l, k))
             H, absmax = a["H"].cpu(), a["absmax"].cpu()
             save_hessian(hessian_path(out_dir, l, k), H, absmax, a["n"])
             if return_stats:
                 stats[f"{l}.{k}"] = activation_summary(H, a["n"], absmax)
-            del H, absmax
-        log(f"[hessian] layers {window[0]}-{window[-1]}: {len(acc)} inputs, {time.time() - t0:.1f}s")
+            del H, absmax, a
+        log(f"[hessian] layers {window[0]}-{window[-1]}: {n_inputs} inputs, {time.time() - t0:.1f}s")
         del acc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

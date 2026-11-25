@@ -40,6 +40,10 @@ def profile_table_real(model, spec: ModelSpec, batches, refs, *, bits_list=(2, 3
     t0 = time.time()
     keep = set(groups) if groups is not None else None
     groups = {k: v for k, v in spec.groups().items() if keep is None or k in keep}
+    # (2026-11-25) kl_to_reference_packed recomputes the reference log-probs from stored final hidden states with the
+    # current LM head, so no profiled group may touch the head / embedding (spec.groups() are decoder linears only)
+    head = {t["name"] for t in (spec.lm_head, spec.embed) if t}
+    assert not any(m.name in head for ms in groups.values() for m in ms), "a profile group contains the LM head"
     done = 0
     for gi, (key, mods) in enumerate(groups.items()):
         if rows_dir is not None:
@@ -75,12 +79,19 @@ def profile_table_real(model, spec: ModelSpec, batches, refs, *, bits_list=(2, 3
     return rows
 
 
+# (2026-11-25) quant/kl.py KL_PATH; a literal here so profile_meta stays importable without torch (mock mode)
+PROFILE_KL_PATH = "hidden_chunks_v2"
+
+
 def profile_meta(texts: list[str], dcfg: dict) -> dict:
-    """What a saved profile row depends on (contexts, their length cap, bits, group size)."""
+    """What a saved profile row depends on (contexts, their length cap, bits, group size; since 2026-11-25 also the
+    KL computation, kl_path = quant/kl.py KL_PATH, and the packed batch size, which changes the bf16 rounding of the
+    batched matmuls), so rows saved by an older computation are recomputed on resume instead of being mixed in."""
     import hashlib
     return {"texts_sha1": hashlib.sha1("\x00".join(texts).encode()).hexdigest(), "n_texts": len(texts),
             "max_len": int(dcfg["profile_max_len"]), "bits": list(dcfg["profile_bits"]),
-            "group_size": int(dcfg["profile_group_size"])}
+            "group_size": int(dcfg["profile_group_size"]), "kl_path": PROFILE_KL_PATH,
+            "profile_batch_tokens": int(dcfg.get("profile_batch_tokens") or 8192)}
 
 
 def saved_profile_rows(rows_dir: Path, key: str, meta: dict) -> list | None:
@@ -103,15 +114,20 @@ def warn_slow_kernels(log=print) -> None:
 def profile_rows(model, model_dir: Path, spec: ModelSpec, texts: list[str], dcfg: dict, *, rows_dir: Path,
                  groups: list[str] | None = None, log=print) -> list[dict]:
     """The profile table on `texts` with an already-loaded model: contexts packed into batches of
-    diagnostics.profile_batch_tokens tokens (default 8192), one reference pass, then every group x bits."""
+    diagnostics.profile_batch_tokens tokens (default 8192), one reference pass, then every group x bits. Since
+    2026-11-25 the reference is M_0's final hidden states per chunk and full-vocab log-probs exist for one chunk at a
+    time (quant/kl.py), ~20 GB less GPU memory per worker on Qwen3.8-27B than the full-logits path."""
     from .quant.hessian import tokenize_texts
-    from .quant.kl import kl_to_reference_packed, pack, reference_packed
+    from .quant.kl import KL_PATH, kl_to_reference_packed, pack, reference_packed
+    assert KL_PATH == PROFILE_KL_PATH, (KL_PATH, PROFILE_KL_PATH)
     meta = profile_meta(texts, dcfg)
     pb = tokenize_texts(model_dir, texts, dcfg["profile_max_len"])
     packed = pack(pb, int(dcfg.get("profile_batch_tokens") or 8192))
     t0 = time.time()
     refs = reference_packed(model, packed)
-    log(f"[profile] {len(pb)} contexts in {len(packed)} batches, reference pass {time.time() - t0:.1f}s")
+    how = "final hidden states" if refs.kind == "hidden" else "full-vocab log-probs (no backbone / LM head split)"
+    log(f"[profile] {len(pb)} contexts in {len(packed)} batches, reference pass {time.time() - t0:.1f}s, "
+        f"reference kept as {how}")
     rows = profile_table_real(model, spec, packed, refs, bits_list=dcfg["profile_bits"],
                               group_size=dcfg["profile_group_size"], log=log, groups=groups,
                               kl=kl_to_reference_packed, rows_dir=rows_dir, meta=meta)
@@ -123,7 +139,14 @@ def profile_worker(model_dir: str, device: str, spec_path: str, texts: list[str]
                    groups: list[str], tag: str = "") -> None:  # pragma: no cover - GPU path (own process)
     """One prep worker of the profile table (2026-11-21): a separate PROCESS per GPU (the earlier threads shared one
     GIL), loads its own HF model and writes rows_dir/<key>.json for each of its groups."""
+    import os
+    # (2026-11-25) expandable segments against fragmentation of the per-chunk [512, vocab] fp32 buffers. Only in this
+    # spawned worker: the parent's environment is inherited by the vLLM servers, whose sleep mode (CuMem allocator)
+    # does not work with expandable segments.
+    if not os.environ.get("PYTORCH_ALLOC_CONF"):
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     import torch
+    from .common import GIB
     from .quant.hessian import load_hf_model
 
     def log(msg):
@@ -136,12 +159,41 @@ def profile_worker(model_dir: str, device: str, spec_path: str, texts: list[str]
         log(f"[profile] all {len(groups)} groups already done")
         return
     warn_slow_kernels(log)
-    if str(device).startswith("cuda"):
+    spec = ModelSpec.from_json(read_json(spec_path))
+    cuda = str(device).startswith("cuda")
+    if cuda:
         torch.cuda.set_device(device)
+        check_free_memory(device, spec, log)
     log(f"[profile] loading {model_dir}; {len(todo)}/{len(groups)} groups to compute")
-    model = load_hf_model(Path(model_dir), device)
-    profile_rows(model, Path(model_dir), ModelSpec.from_json(read_json(spec_path)), texts, dcfg,
-                 rows_dir=Path(rows_dir), groups=todo, log=log)
+    try:
+        model = load_hf_model(Path(model_dir), device)
+        profile_rows(model, Path(model_dir), spec, texts, dcfg, rows_dir=Path(rows_dir), groups=todo, log=log)
+    finally:
+        if cuda:   # (2026-11-25) the real peak of this worker, for the memory plan of the next run
+            log(f"[profile] peak GPU memory: {torch.cuda.max_memory_allocated(device) / GIB:.1f} GiB allocated, "
+                f"{torch.cuda.max_memory_reserved(device) / GIB:.1f} GiB reserved")
+
+
+PROFILE_HEADROOM_GIB = 8.0   # on top of the BF16 model: hidden-state reference, one packed forward, KL chunk buffers
+
+
+def check_free_memory(device: str, spec: ModelSpec, log=print, headroom_gib: float = PROFILE_HEADROOM_GIB) -> None:
+    """(2026-11-25) Fail fast, with the reason, when the GPU lacks room for a profile worker: the BF16 model
+    (sizes.bf16_bytes) plus headroom_gib. A card that is already in use usually holds vLLM servers of an earlier run
+    that was killed (their EngineCore processes outlive the run), which would otherwise surface as an OOM deep inside
+    the profile table."""
+    import torch
+    from .common import GIB
+    free, total = torch.cuda.mem_get_info(device)
+    need = sizes.bf16_bytes(spec) + headroom_gib * GIB
+    log(f"[profile] GPU memory: {free / GIB:.1f} GiB free of {total / GIB:.1f} GiB; need ~{need / GIB:.1f} GiB "
+        f"(BF16 model {sizes.bf16_bytes(spec) / GIB:.1f} + {headroom_gib:.0f})")
+    if free < need:
+        raise RuntimeError(
+            f"{device}: only {free / GIB:.1f} GiB of {total / GIB:.1f} GiB free, the profile worker needs "
+            f"~{need / GIB:.1f} GiB (BF16 model {sizes.bf16_bytes(spec) / GIB:.1f} GiB + {headroom_gib:.0f} GiB). "
+            f"Another process holds this GPU; check 'nvidia-smi --query-compute-apps=pid,used_memory --format=csv' "
+            f"for leftover vLLM servers (EngineCore) of an earlier run and kill them")
 
 
 def activation_table_real(spec: ModelSpec, stats: dict, *, red_absmax_ratio: float = 50.0,

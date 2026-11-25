@@ -1263,6 +1263,7 @@ def main(argv=None):
     from rsicore.config import build_arg_parser, load_run_config
     ap = build_arg_parser("B")
     args = ap.parse_args(argv)
+    from rsicore.servers import install_exit_handlers; install_exit_handlers()  # kill -> stop vLLM servers (2026-11-25)
     rc = load_run_config("B", args)
     cfg = rc.paper_cfg   # hardware profile already merged by rsicore.config (before --set)
     hw = cfg.get("hardware", "b300")
