@@ -80,9 +80,13 @@ LOCK_IGNORED_PATHS = ("kl.domains", "heldout", "mock_overrides.heldout", "max_to
 # gpu_layout.gate_split (Paper A, 2026-11-24: GPUs per candidate gate); 2026-11-25 (the h20 profile re-planned at
 # 100 GiB per card after an OOM): kl_eval.max_num_batched_tokens (vLLM's prefill chunk) and calibration.layers_per_pass
 # (the window of layers per calibration pass; the Hessians are the same sums whatever the window), so an OOMed run
-# resumes with the new memory plan
+# resumes with the new memory plan; 2026-11-26: editor.tensor_parallel (Paper A: how many GPUs the editor's vLLM
+# server spans; 'all' resolves from --gpus, which is not locked either), so a run can change the editor's placement
+# on any resume (e.g. back to 1 if TP fails) and runs locked before the key existed still compare equal;
+# gpu_layout.explore_tool_gpus (which GPUs the editor's exploration GPU tools use, 2026-11-26)
 LOCK_IGNORED_SUFFIXES = ("scoring.concurrency", "gpu_layout.gate_split", "gate.kl.max_num_batched_tokens",
-                         "kl_eval.max_num_batched_tokens", "calibration.layers_per_pass")
+                         "kl_eval.max_num_batched_tokens", "calibration.layers_per_pass", "editor.tensor_parallel",
+                         "gpu_layout.explore_tool_gpus")
 # vLLM arg lists (2026-11-25), at any depth (vllm.editor_args / candidate_args, Paper B's server.main_args, also under
 # hardware_profiles.<name>. and mock_overrides.): the lock compares them without these memory-only flags and their
 # values ("--flag X" or "--flag=X"); every other flag (--max-model-len, --max-num-seqs, --max-logprobs ...) stays locked
@@ -499,6 +503,21 @@ def _removed_features_used(ocfg: dict, domain: str, mock: bool = False) -> list[
     return out
 
 
+# (2026-11-26) The editor block is read only by editor sessions (rsicore.editor), which start in the first search
+# (Paper A generation 1, Paper B generation 0). Until a session has written its transcript
+# (gen_XX/editor/thread_*.jsonl) a changed editor.* value has influenced nothing, so a run that stopped earlier (e.g.
+# an OOM in generation-0 prep) resumes with it; afterwards editor.* is locked like everything else.
+# editor.context_tokens stays locked (it also sets the --max-model-len of servers used before the first session), and
+# so do the hardware profiles' editor blocks.
+EDITOR_PREFIXES = ("editor.", "mock_overrides.editor.")
+EDITOR_LOCKED = ("editor.context_tokens", "mock_overrides.editor.context_tokens")   # also a server --max-model-len
+
+
+def editor_started(run_dir) -> bool:
+    """True once any editor session of the run has written its transcript."""
+    return any(Path(run_dir).glob("gen_*/editor/thread_*.jsonl"))
+
+
 def _diff_paths(a, b, path: str = "") -> list[str]:
     if isinstance(a, dict) and isinstance(b, dict):
         out = []
@@ -574,7 +593,13 @@ def load_run_config(paper: str, args) -> RunConfig:
                              "be resumed. Use a new --run-id.")
         lines = [f"  {k}: locked={old.get(k)!r} now={new[k]!r}" for k in LOCKED
                  if k != "paper_cfg" and old.get(k) != new[k]]
-        lines += [f"  paper_cfg.{d}" for d in _diff_paths(lock_view(ocfg, paper), lock_view(cfg, paper))]
+        diffs = _diff_paths(lock_view(ocfg, paper), lock_view(cfg, paper))
+        free = [d for d in diffs if d.startswith(EDITOR_PREFIXES) and not d.startswith(EDITOR_LOCKED)] \
+            if not editor_started(run_dir) else []
+        if free:                                     # (2026-11-26) no editor session has run yet: nothing used them
+            print("[rsicore] editor settings changed before the first editor session; accepted:\n"
+                  + "\n".join(f"  paper_cfg.{d}" for d in free), file=sys.stderr)
+        lines += [f"  paper_cfg.{d}" for d in diffs if d not in free]
         if lines:
             raise SystemExit(f"{lock} is locked and differs from this invocation:\n" + "\n".join(lines) + "\n"
                              "Use a new --run-id, or rerun with the original arguments.")

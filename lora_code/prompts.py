@@ -299,7 +299,7 @@ def system_prompt(cfg: dict, *, budget: dict, mode: str = "scratch", gate_n: int
 
 REPLY_LINE = "Each turn, reply with a short plan and exactly ONE ```python code block defining"
 TOOL_PROTOCOL = """Before answering you may call functions for up to {rounds} rounds (one round = one reply with \
-function calls; at most {calls} calls in all):
+function calls{calls}):
 - run_python(code) runs exploratory code in the program sandbox with the same `api` (look at modules, diagnostics, \
 SVDs, train items, earlier candidates, compare, try constructions and inspect them). Not available there: \
 {missing}; only your final program's result is evaluated, and exploring spends none of the budgets below{gpu_note}.
@@ -423,7 +423,9 @@ def _with_tool_protocol(text: str, cfg: dict, *, mode: str) -> str:
                                          "api.load_edit(name)" if "save_edit" in have else "")
     else:
         persist = PERSIST_NONE
-    para = TOOL_PROTOCOL.format(rounds=rounds, calls=int(s.get("max_tool_calls") or 0), missing=miss, gpu_note=note,
+    calls = int(s.get("max_tool_calls") or 0)       # 0 / null = no tool-call cap (rsicore.editor, 2026-11-26)
+    para = TOOL_PROTOCOL.format(rounds=rounds, calls=f"; at most {calls} calls in all" if calls else "", missing=miss,
+                                gpu_note=note,
                                 history_read=HISTORY_READ if hist else "", history=HISTORY_LINE if hist else "",
                                 persist=persist)
     assert REPLY_LINE in text

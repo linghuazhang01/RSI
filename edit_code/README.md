@@ -43,21 +43,23 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 ## 改造者：thinking + 工具轮次（2026-11-21）
 
 改造者写每个候选时开 Qwen3 thinking（`editor.extra_body.chat_template_kwargs.enable_thinking: true`，temperature 0.6 / top_p 0.95 / top_k 20 / min_p 0），并且可以先调用工具再交程序（`rsicore.editor` + `rsicore.chat_tools`）：
-- **一轮** = 模型的一次回复里带了工具调用（并行的几个调用算一轮）。最多 `editor.tool_rounds` 轮（base.yaml 20，代码默认 50），之后再给一次 `tool_choice: "none"` 的最终回复。候选 = 不带工具调用、含一个 ```python 块的那次回复。
+- **一轮** = 模型的一次回复里带了工具调用（并行的几个调用算一轮）。最多 `editor.tool_rounds` 轮（base.yaml 50，2026-11-26 起；以前 20），之后再给一次 `tool_choice: "none"` 的最终回复。候选 = 不带工具调用、含一个 ```python 块的那次回复。
 - 工具：`run_python(code)` 在同一个沙箱里跑探索代码，`api` 和最终程序的一样（`make_tool_api(explore=True)`；两边都没有 `api.evaluate`），`group_error` 只能查已缓存的设置（`hessian_table` 那些；`editor.explore.gpu_tools: true` 才允许现算）；`read_record(cid, part)` 看表里某个候选的完整程序 / 反馈；`search_history(gen, sort, offset)`（2026-11-21，默认开，`editor.history_tool=false` 关）列出所有试过的候选（本代可见的 + 往期所有代），每个一行：config 描述（默认设置 + 按设置分组的覆盖及其模块类型）、GiB、平均位数、KL、相对 incumbent 的 KL 降低量，`same_as` = config hash 与更早候选相同；`read_record` 也能打开往期候选。系统提示写明 KL 评测方式和接受规则（KL 最低且低于 incumbent），并写明程序里 `api` 只是 `main(api)` 的参数。探索不占候选槽。每次调用的完整输出在 `gen_XX/explore/<cid>/rNN_i/`。
 - 记录：`gen_XX/editor/thread_K.jsonl`（format 2，每轮的推理、工具调用和结果都在）；`candidates.jsonl` 的 cost 里有 `editor_rounds / editor_tool_calls / editor_tool_s / editor_prompt_tokens / editor_completion_tokens / editor_stop`。
 
 | 配置（`editor.*`） | 默认 | 作用 |
 |---|---|---|
-| `tool_rounds` | 20 | 每个候选最多几轮工具调用；**0 = 以前的单次调用**（请求里没有 tools，提示词逐字不变） |
+| `tool_rounds` | 50 | 每个候选最多几轮工具调用，**会话唯一的上限**（2026-11-26：不再限时间、token 和调用次数）；**0 = 以前的单次调用**（请求里没有 tools，提示词逐字不变） |
 | `context_tokens` | 131072（`h20_80`: 49152） | **上下文长度的唯一旋钮**：客户端按它限制每轮 max_tokens、触发压缩，同时作为改造者 vLLM 服务的 `--max-model-len`（覆盖 `vllm.editor_args` 里写的值；候选服务由 `vllm.candidate_max_model_len` 设成 32768）。null = 用 `editor_args` 原样 |
-| `turn_max_tokens` / `max_tokens` | 8192 / 16384 | 工具轮 / 最终回复的 max_tokens |
-| `max_tool_calls` / `proposal_tokens` / `proposal_wall_s` | 100 / 160000 / 2400 | 任一到顶就强制进入最终回复 |
+| `turn_max_tokens` / `max_tokens` | 16384 / 16384 | 工具轮 / 最终回复的 max_tokens（2026-11-26 工具轮由 8192 提到 16384；第一个 editor 会话开始前改 `editor.*` 仍可续跑） |
+| `max_tool_calls` / `proposal_tokens` / `proposal_wall_s` | null / null / null | 设了值时任一到顶就强制进入最终回复；null = 不限（2026-11-26 起，以前 100 / 160000 / 2400：限墙钟会让改造者写出的内容取决于解码速度）。每个请求仍有 `timeout_s` 3600 秒超时 |
+| `tensor_parallel` | all | （2026-11-26）改造者 vLLM 服务跨几张卡做张量并行：all = `--gpus` 的全部卡（取不超过卡数的最大 2 的幂），1 = 只用自己的一张卡（以前的布局）。解码受显存带宽限制，TP 让每个会话都变快；评测候选时改造者睡眠，所有卡都给候选。第 0 代 M_0 的批量任务仍是每卡一个副本；`h20_80` 档固定为 1。只决定放在哪些卡上，不进运行锁：任何一次续跑都能改（TP 起不来就 `--set editor.tensor_parallel=1` 接着跑） |
 | `tool_result_chars` | 6000 | 工具结果截断长度 |
 | `compact_at` / `keep_tool_rounds` / `keep_reasoning_rounds` | 0.6 / 8 / 2 | 提示超过 0.6 × context_tokens 时压缩：只留最近 8 轮的工具输出、最近 2 轮的推理 |
 | `reasoning_passback` | think_tag | 轮内推理怎么传回（think_tag / field / drop） |
 | `history_keep` | 2 | 跨步历史：第 0 步 + 最近 2 步完整，其余只留代码（null = 全部；tool_rounds 0 时总是全部） |
-| `explore` | timeout_s 300, mem_gb 8, gpu_tools false | run_python 的限制 |
+| `explore` | timeout_s 300, mem_gb 8, gpu_tools false | run_python 的限制；`gpu_tools: true` 时探索里的 `group_error` 可以现算没缓存的设置（GPTQ / AWQ + Hessian 误差，用 GPU），放在 `gpu_layout.explore_tool_gpus` 那几张卡上 |
+| `gpu_layout.explore_tool_gpus` | rest | （2026-11-26）写候选阶段给探索 GPU 工具的卡（只在 `gpu_tools: true` 时生效）：rest = 改造者 TP 组以外的所有卡；整数 k = `--gpus` 的最后 k 张，改造者的 TP 组从剩下的卡里取。每张卡同一时间算一个调用，几个会话分散到不同卡上；一次调用在 run_python 的时间上限前 30 秒停下，报告算好并缓存了几个设置，再调一次接着算；评测阶段所有卡照样都给候选。`rest` 而改造者 TP 组占满所有卡时启动就报错（要么调小 `editor.tensor_parallel`，要么设 k，要么设 0 接受和改造者共用第一张候选卡）。只决定放在哪些卡上，不进运行锁。例：8 张卡 + `editor.tensor_parallel: 4` → 改造者 TP 在 0–3，工具在 4–7（`plan/configs/run/A_math_kl_4x1_g10.yaml` 用的是 TP 8、不开 GPU 工具） |
 | `mock_tool_rounds` | 1 | `--mock` 时 mock 改造者先调几次 run_python（`api.profile_summary()`） |
 
 怎么改：
@@ -67,6 +69,8 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 --set editor.context_tokens=65536        # 上下文 64K（改造者服务 --max-model-len 也跟着变）
 --set editor.extra_body={}               # 不显式开 thinking（用模板默认）
 ```
+续跑与 `editor.*`（2026-11-26）：还没有任何改造者会话写出 transcript（`gen_XX/editor/thread_*.jsonl`）时，改了 `editor.*`（`context_tokens` 除外）也能用同一条命令续跑；之后 `editor.*` 和其他配置一样锁定。2026-11-26 之前开的、已经跑过改造者会话的 run，续跑时要把旧的上限用 `--set` 传回去：`--set editor.tool_rounds=20 --set editor.turn_max_tokens=8192 --set editor.max_tool_calls=100 --set editor.proposal_tokens=160000 --set editor.proposal_wall_s=2400`（run config 里另设过的以 run config 为准）。
+
 `context_tokens` 的默认值写在 `hardware_profiles`（b300 / h20: 131072，h20_80: 49152；硬件档在 `editor:` 块之后合并），所以改默认值要改那里，或用 `--set`（`--set` 优先）。真实服务器上 `rsicore.servers` 会把 `--max-model-len` 压到模型 `config.json` 的 `max_position_embeddings` 以内（打警告，不加 YaRN），工具解析器按聊天模板自动选（qwen3_coder / hermes）。这些键都在锁定的配置里：改了要用新的 `--run-id`。
 
 ## 校准文本 = 题目 + M_0 自己的回答（2026-11-20）
@@ -133,17 +137,17 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 - 磁盘：每个候选服务各留一个检查点（约 54 GB），8 张卡时约 7 × 54 GB。被接受的候选直接把它评测时的检查点移到 `gen_XX/model`（`QuantProblem.adopt_checkpoint`，不再重新导出一遍）；每代结束删掉 `gen_XX/ckpt`（以前没接受的代会留下）；
 - 只有 1 组时（2 张卡）就是原来的逐个评测。手动指定：`--set 'gpu_roles.editor=[0,1]'`（改造者张量并行 2），候选用剩下的卡。
 
-H20 档（2026-11-25 起按每张卡 **100 GiB** 规划（我们在一张卡上的所有进程加起来），卡约 140.4 GiB；以前 110 GiB 时第 0 代敏感度表 OOM）：至少 2 张（每张卡只放一个 27B，vLLM 权重约 52 GiB，HF 模型约 54.7 GiB）；改造者 `--rsi-gpu-memory-gib 90`（没有 nvidia-smi 时 0.64），候选服务和 M_0 副本 `--rsi-gpu-memory-gib 84`（0.60），`--max-num-seqs 128`，`kl_eval.max_num_batched_tokens 2048`（prompt logprob 在 vLLM 预算外约 4.7 GiB），校准每次 12 层 Hessian。每张卡的估算（GiB）：
+H20 档（2026-11-25 起按每张卡 **100 GiB** 规划（我们在一张卡上的所有进程加起来），卡约 140.4 GiB；以前 110 GiB 时第 0 代敏感度表 OOM）：至少 2 张（每张卡只放一个 27B，vLLM 权重约 52 GiB，HF 模型约 54.7 GiB）；改造者 `--rsi-gpu-memory-gib 90`（没有 nvidia-smi 时 0.64；TP 时每张卡都是 90），候选服务和 M_0 副本 `--rsi-gpu-memory-gib 82`（0.58；2026-11-26 由 84 下调，给睡眠的 TP 改造者在每张卡上的残留留空间），`--max-num-seqs 128`，`kl_eval.max_num_batched_tokens 2048`（prompt logprob 在 vLLM 预算外约 4.7 GiB），校准每次 12 层 Hessian。每张卡的估算（GiB）：
 
 | 卡 | 组成 | 合计 |
 |---|---|---|
-| 改造者 | vLLM 90 + prompt logprob ~4.7 | ~95 |
-| 借出的改造者卡 | 睡眠的改造者 ~1–2 + 候选 84 + ~4.7 | ~91 |
-| 第一张候选卡 | 候选 84 + ~4.7 + 本进程的 group_error / 现算 GPTQ 3–8 | ~97 |
-| 其他候选卡 | 候选 84 + ~4.7（第 0 代 M_0 副本相同） | ~89 |
+| 第 0 代 M_0 副本 | GPU 0：90 + prompt logprob ~4.7；其他卡：82 + ~4.7 | ~95 / ~87 |
+| 写候选阶段（TP 8 改造者） | 每张卡 vLLM 90（权重约 6.5，其余是 KV） | ~90 |
+| 评测阶段，一般候选卡 | 睡眠的改造者 ~1–2 + 候选 82 + ~4.7 | ~89 |
+| 评测阶段，第一张候选卡 | 上一行 + 本进程的 group_error / 现算 GPTQ 3–8 | ~97 |
 | 第 0 代准备（无 vLLM） | 校准 ~78（HF 模型 + 12 × 1.57 fp32 Hessian + 激活）、敏感度表进程 ~60、缓存预热 ~8 | ≤ 78 |
 
-改造者 KV 约 36 GiB：4 个线程 × 8 GiB（131072 token）放得下，8 个线程上下文都很长时会被抢占（变慢，不报错）。显存 / 批处理旋钮（vLLM 参数里的 `--rsi-gpu-memory-gib`、`--gpu-memory-utilization`、`--max-num-batched-tokens`，`kl_eval.max_num_batched_tokens`，`calibration.layers_per_pass`）不进运行锁：OOM 或中断的运行用同一条命令按新的显存规划续跑。80 GB 的卡用 `h20_80`（0.92、32 条序列、校准每次 4 层）。B300 / mock 只给 1 张时两个角色共用。
+改造者 KV：TP 8 时每张卡约 80 GiB，8 个线程跑满 131072 token 也放得下；`editor.tensor_parallel: 1` 时约 36 GiB，4 个线程 × 8 GiB 放得下。显存 / 批处理旋钮（vLLM 参数里的 `--rsi-gpu-memory-gib`、`--gpu-memory-utilization`、`--max-num-batched-tokens`，`kl_eval.max_num_batched_tokens`，`calibration.layers_per_pass`）不进运行锁：OOM 或中断的运行用同一条命令按新的显存规划续跑。80 GB 的卡用 `h20_80`（0.92、32 条序列、校准每次 4 层）。B300 / mock 只给 1 张时两个角色共用。
 
 ## 模块组（Qwen3.5 dense，含 GDN）
 

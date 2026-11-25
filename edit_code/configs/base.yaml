@@ -133,11 +133,22 @@ editor:
   top_p: 0.95
   max_tokens: 16384                   # final turn (thinking + answer)
   extra_body: {chat_template_kwargs: {enable_thinking: true}, top_k: 20, min_p: 0.0}   # {} = the template default
-  tool_rounds: 20                     # max tool rounds per candidate, then one forced final turn (0 = no tools)
-  turn_max_tokens: 8192               # max_tokens of a tool turn
-  max_tool_calls: 100                 # tool calls per candidate (parallel calls count one each)
-  proposal_tokens: 160000             # completion tokens per candidate (all turns) -> forced final turn
-  proposal_wall_s: 2400               # wall clock per candidate -> forced final turn
+  # (2026-11-26) A session is bounded by ROUNDS only: no wall-clock, completion-token or tool-call cap (null = none;
+  # a wall cap made the editor's output depend on decode speed). Each request still times out after timeout_s and each
+  # run_python call after explore.timeout_s, but nothing bounds a session's total time: worst case ~tool_rounds x
+  # (one turn + its calls), and the generation waits for its slowest session (the TP editor holds every GPU meanwhile).
+  tool_rounds: 50                     # max tool rounds per candidate, then one forced final turn (0 = no tools)
+  turn_max_tokens: 16384              # max_tokens of a tool turn (2026-11-26: 16384 like the final turn; was 8192)
+  max_tool_calls: null                # tool calls per candidate (parallel calls count one each); null = no cap (was 100)
+  proposal_tokens: null               # completion tokens per candidate (all turns) -> forced final turn; null = no cap
+                                      # (was 160000)
+  proposal_wall_s: null               # wall clock per candidate -> forced final turn; null = no cap (was 2400)
+  tensor_parallel: all                # (2026-11-26) the editor's vLLM server spans this many GPUs (tensor parallel):
+                                      # all = every GPU of --gpus (the largest power of two <= their number), 1 = its
+                                      # own GPU only (before 2026-11-26). Decoding is memory-bandwidth bound, so TP
+                                      # speeds up every session; while candidates are evaluated the editor sleeps
+                                      # (gpu_layout.editor_sleep) and every GPU serves candidates. Generation 0's M_0
+                                      # batch jobs keep one replica per GPU (data parallel)
   context_tokens: 131072              # THE context-length knob: client-side clamp of max_tokens / compaction AND
                                       # --max-model-len of the editor's vLLM server (overrides the one in
                                       # vllm.editor_args; null = keep editor_args). Candidate servers are unaffected.
@@ -155,7 +166,8 @@ editor:
   explore:                            # run_python
     timeout_s: 300                    # per call
     mem_gb: 8
-    gpu_tools: false                  # true: group_error may compute uncached settings (lazy GPTQ / AWQ on the GPU)
+    gpu_tools: false                  # true: group_error may compute uncached settings (lazy GPTQ / AWQ on the GPU),
+                                      # on gpu_layout.explore_tool_gpus (2026-11-26)
     persistent: true                  # (rsicore.chat_tools, 2026-11-21): one sandbox session per proposal, variables
                                       # persist across run_python calls (timeout -> restart); false = a fresh one per call
     gpu_seconds: 300                  # (Paper B only; kept for a shared editor block)
@@ -199,6 +211,15 @@ gpu_layout:
   gate_split: true                    # a candidate's KL evaluation on ceil(slots / proposals per step) slots, the
                                       # traces split over them: 8 GPUs and 4 proposals -> 2 GPUs per candidate; 8 x 1
                                       # -> 1; batching only (not part of the run lock)
+  explore_tool_gpus: rest             # (2026-11-26) with editor.explore.gpu_tools: GPUs for the run_python GPU tools
+                                      # while the editor writes (group_error on uncached settings: lazy GPTQ / AWQ +
+                                      # the Hessian-weighted error; one call per GPU at a time, the sessions spread
+                                      # over them). rest = every GPU outside the editor's TP group (e.g. 8 GPUs and
+                                      # editor.tensor_parallel 4: TP on 0-3, tools on 4-7); an integer k = the last k
+                                      # GPUs, the editor's TP group taken from the others; 0 = no separate GPU: the
+                                      # layer cache on the first candidate GPU (next to a TP editor; rest with a TP
+                                      # group over every GPU is refused). A call stops before its run_python time limit
+                                      # and keeps what it computed. Placement only: not part of the run lock
 
 # Hardware profile (--set hardware=h20, or ./launch.sh --hw h20). The defaults above assume 288 GB B300
 # cards; the b300 profile plans them at 220 GB (2026-11-21). rsicore.config merges the profile over base/domain
@@ -219,34 +240,40 @@ hardware_profiles:
     # every process of ours on a GPU together stays <= 100 GiB ("GiB" = nvidia-smi MiB / 1024). 110 OOMed in the
     # generation-0 profile table (a profile worker peaked ~86 GiB reserved next to foreign memory on the card).
     # Qwen3.8-27B BF16: ~52 GiB of vLLM weights, ~54.7 GiB as an HF model. Per GPU (vLLM budget + what sits outside it):
-    #   editor GPU       : editor 90 + prompt logprobs ~4.7 (chunk 2048, below)                         = ~95
-    #   lent editor GPU  : sleeping editor ~1-2 (weights in CPU RAM, KV freed) + a candidate 84 + ~4.7  = ~91
-    #   1st candidate GPU: candidate 84 + ~4.7 + group_error / lazy GPTQ torch work of the run (+3-8)   = ~97
-    #   other candidates : candidate 84 + ~4.7 (also the M_0 replicas of generation 0)                  = ~89
+    #   generation 0     : M_0 replicas (TP 1 each): GPU 0 editor_args 90 + prompt logprobs ~4.7 (chunk 2048, below)
+    #                      = ~95; the others candidate_args 82 + ~4.7 = ~87
+    #   editor phase     : the editor (2026-11-26: editor.tensor_parallel all = TP 8 over every GPU) uses editor_args
+    #                      90 on EACH GPU: ~6.5 GiB of weights per GPU, the rest KV (~80 GiB per GPU: 8 threads at
+    #                      131072 tokens fit easily); besides it only the run's CUDA context and cached blocks
+    #                      (freed before the editor starts / wakes; explore tools run on the CPU unless
+    #                      editor.explore.gpu_tools). TP 4 + exploration GPU tools (e.g. editor.tensor_parallel 4,
+    #                      gpu_tools true): GPUs 0-3 editor 90 each (~13 GiB weights, ~75 GiB KV per GPU);
+    #                      GPUs 4-7 the run's GPTQ / Hessian-error work, 3-8 + CUDA context ~0.5
+    #   evaluation phase : the editor sleeps (weights -> CPU RAM, KV freed; ~1-2 GiB left on every GPU) and every GPU
+    #                      serves candidates: candidate 82 + ~4.7 + ~1-2 = ~89; the 1st candidate GPU also runs the
+    #                      run's group_error / lazy GPTQ torch work (+3-8) = ~97
     #   prep (no vLLM)   : calibration ~78 (54.7 HF model + 12 x 1.57 fp32 Hessians + activations), profile worker
-    #                      ~60 (HF model + reference log-probs / packed-batch logits; ~79 allocated / ~86 reserved
-    #                      before its 2026-11-25 hidden-state change), cache warm-up ~8
+    #                      ~60 (HF model + hidden-state reference + per-chunk log-probs; ~86 reserved before the
+    #                      2026-11-25 change), cache warm-up ~8
     #   not counted above: the run process's CUDA context on every GPU prep touched (~0.5 each) and vLLM's own
-    #   context / CUDA graphs (~1-1.5); worst case ~99 on the 1st candidate GPU. Lower candidate_args to 82 if the
-    #   first H20 run's logs show less headroom (profile workers log their peak; vLLM logs its KV size)
-    # KV left: editor 90 - 52 weights - ~2 activations = ~36 GiB (~64 KB/token on the 16 full-attention layers + GDN
-    # states [estimate]): 4 threads x 8 GiB at 131072 tokens fit; 8 threads at full context preempt (slower, not an
-    # error). Candidates 84 - 52 - ~2 = ~30 GiB: plenty for 32768-token KL traces.
+    #   context / CUDA graphs (~1-1.5); worst case ~99 on the 1st candidate GPU (candidate_args 84 -> 82 on
+    #   2026-11-26 for the sleeping TP editor's residue). Profile workers log their peak; vLLM logs its KV size.
+    # Candidates: 82 - 52 - ~2 = ~28 GiB KV, plenty for 32768-token KL traces.
     gpu_layout: {share_single_gpu: false}   # still one model per card (editor + a candidate = 104 GiB, no KV left)
     vllm:                             # --rsi-gpu-memory-gib X -> --gpu-memory-utilization = X GiB / card total
-      # (rsicore.servers; 0.64 = 90/140.4 and 0.60 = 84/140.4 if nvidia-smi is unavailable). candidate_args also
-      # serve the M_0 replicas; the first candidate GPU keeps 6 GiB more room for the run's own torch work.
+      # (rsicore.servers; 0.64 = 90/140.4 and 0.58 = 82/140.4 if nvidia-smi is unavailable). editor_args apply to
+      # every GPU of the TP editor; candidate_args also serve the M_0 replicas of generation 0.
       # The memory flags (and --max-num-batched-tokens) are not part of the run lock (rsicore.config, 2026-11-25).
       editor_args: [--rsi-gpu-memory-gib, "90", --gpu-memory-utilization, "0.64", --max-model-len, "131072",
                     --max-num-seqs, "128", --max-logprobs, "20"]
-      candidate_args: [--rsi-gpu-memory-gib, "84", --gpu-memory-utilization, "0.60", --max-model-len, "20480",
+      candidate_args: [--rsi-gpu-memory-gib, "82", --gpu-memory-utilization, "0.58", --max-model-len, "20480",
                        --max-num-seqs, "128", --max-logprobs, "20"]
     kl_eval:                          # vLLM computes prompt logprobs for every prefill token of a chunk OUTSIDE its
       max_num_batched_tokens: 2048    # profiled budget: ~10 B x chunk x 248320 vocab -> 8192: ~19 GiB, 2048: ~4.7 GiB
                                       # (edit_code.common.with_kl_chunk_cap; batching only, not locked)
     calibration:                      # fp32 Hessians ~1.57 GiB/layer: 12 x 1.57 = ~19 GiB next to the 54.7 GiB HF
       layers_per_pass: 12             # model -> ~78 GiB peak (16 was ~84); the same Hessian sums, not locked
-    editor: {context_tokens: 131072}  # ~36 GiB KV >= 4 threads x 8 GiB at 131072 tokens
+    editor: {context_tokens: 131072}  # TP 8: ~80 GiB KV per GPU; TP 1 (editor.tensor_parallel 1): ~36 GiB >= 4 x 8
   h20_80:                             # 80 GB H20 (the earlier plan): one model per card, ~15 GB KV
     gpu_layout: {share_single_gpu: false}
     vllm:
@@ -257,7 +284,9 @@ hardware_profiles:
       max_len: 2048
     diagnostics:
       profile_contexts: 16
-    editor: {context_tokens: 49152}   # ~15 GB KV: 4 threads x 3 GiB at 49152 tokens (65536 only with <= 3 threads)
+    editor: {context_tokens: 49152,   # ~15 GB KV: 4 threads x 3 GiB at 49152 tokens (65536 only with <= 3 threads)
+             tensor_parallel: 1}      # (2026-11-26) 0.92 leaves no room for a sleeping TP editor's residue next to a
+                                      # candidate server, so the editor keeps its own GPU here
 
 mock:
   base_quality: 0.8                   # mock accuracy of M_0

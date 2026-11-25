@@ -226,6 +226,70 @@ def candidate_groups(rc, cfg: dict) -> list[list[int]]:
     return [cand[i:i + gs] for i in range(0, len(cand), gs)]
 
 
+def editor_tp_gpus(rc, cfg: dict, gpu_editor: list[int], exclude=()) -> list[int]:
+    """(2026-11-26) The GPUs of the editor's vLLM server: editor.tensor_parallel GPUs (all = every GPU of --gpus not in
+    `exclude`; absent = 1, the editor role's own GPUs), rounded down to a power of two (vLLM tensor parallel), starting
+    with the editor role's GPUs and continuing over the candidate GPUs in --gpus order (never `exclude`, the GPUs kept
+    for the editor's GPU tools, explore_layout). A TP size not above the editor role's GPU count keeps the editor
+    role's GPUs (the layout before 2026-11-26). The editor then shares the candidate GPUs: it must sleep while
+    candidates are evaluated (Runner checks gpu_layout.editor_sleep)."""
+    v = (cfg.get("editor") or {}).get("tensor_parallel", 1)
+    gpus = [g for g in (rc.gpus or [0]) if g not in set(exclude) or g in gpu_editor]
+    if v is None or str(v).lower() == "all":
+        n = len(gpus)
+    else:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"editor.tensor_parallel must be a positive integer or 'all', got {v!r}") from None
+        if n < 1:
+            raise ValueError(f"editor.tensor_parallel must be a positive integer or 'all', got {v!r}")
+        if exclude and n > len(gpus):
+            raise ValueError(f"editor.tensor_parallel {n} does not fit next to the {len(set(exclude))} GPU(s) kept for "
+                             f"the editor's GPU tools (gpu_layout.explore_tool_gpus) on --gpus {list(rc.gpus)}")
+    n = min(n, len(gpus))
+    tp = 1
+    while tp * 2 <= n:
+        tp *= 2
+    if tp <= len(gpu_editor):
+        return list(gpu_editor)
+    order = list(gpu_editor) + [g for g in gpus if g not in gpu_editor]
+    return order[:tp]
+
+
+def explore_layout(rc, cfg: dict, gpu_editor: list[int]) -> tuple[list[int], list[int]]:
+    """(2026-11-26) (editor GPUs, GPU-tool GPUs) while the editor writes candidates. editor.explore.gpu_tools false:
+    (editor_tp_gpus, []). True: the GPU tools of its run_python calls (group_error on settings not cached yet: lazy
+    GPTQ / AWQ + the Hessian-weighted error) run on gpu_layout.explore_tool_gpus GPUs: 'rest' (default) = every GPU
+    outside the editor's TP group; an integer k = the last k GPUs of --gpus outside the editor role, and the editor's
+    TP group ('all' included) is chosen from the other GPUs. [] = no separate GPU: the tools use the layer cache on the
+    first candidate GPU (as before). While candidates are evaluated every GPU serves them again."""
+    gpus = list(rc.gpus or [0])
+    on = bool(((cfg.get("editor") or {}).get("explore") or {}).get("gpu_tools", False))
+    want = (cfg.get("gpu_layout") or {}).get("explore_tool_gpus", "rest")
+    if not on:
+        return editor_tp_gpus(rc, cfg, gpu_editor), []
+    if want is None or str(want).lower() == "rest":
+        ed = editor_tp_gpus(rc, cfg, gpu_editor)
+        tools = [g for g in gpus if g not in ed]
+        if not tools and len(ed) > len(gpu_editor):
+            raise ValueError(f"editor.explore.gpu_tools: the editor's TP group {ed} covers every GPU, so its GPU tools "
+                             "would run next to it on the first candidate GPU; set editor.tensor_parallel (e.g. "
+                             f"{len(gpus) // 2}) or gpu_layout.explore_tool_gpus k (tools on the last k GPUs), or "
+                             "gpu_layout.explore_tool_gpus 0 to accept the shared GPU")
+        return ed, tools
+    try:
+        k = int(want)
+    except (TypeError, ValueError):
+        raise ValueError(f"gpu_layout.explore_tool_gpus must be 'rest' or an integer >= 0, got {want!r}") from None
+    others = [g for g in gpus if g not in gpu_editor]
+    if k < 0 or k > len(others):
+        raise ValueError(f"gpu_layout.explore_tool_gpus {want!r}: between 0 and {len(others)} on --gpus {gpus} "
+                         f"(the editor role keeps {list(gpu_editor)})")
+    tools = others[len(others) - k:] if k else []
+    return editor_tp_gpus(rc, cfg, gpu_editor, exclude=tools), tools
+
+
 def role_gpus(rc, cfg: dict, role: str) -> list[int]:
     """GPU ids of one role (see gpu_layout)."""
     return gpu_layout(rc, cfg)[0][role]

@@ -56,7 +56,7 @@ FINAL_RULE = "Answer with a short plan, then exactly one ```python code block co
 SYSTEM_PROMPT = SYSTEM_BODY + FINAL_RULE
 
 # editor.tool_rounds > 0 (2026-11-21): the editor may call chat tools before answering; replaces FINAL_RULE
-TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds (one round = one reply with function calls; at most {calls} calls in all):
+TOOL_PROTOCOL = """Before you answer you may call functions, for up to {rounds} rounds (one round = one reply with function calls{calls}):
 - run_python(code) runs exploratory code in the same sandbox with the same `api` (keyword arguments as above), so you can inspect and filter the tables and check configs before you commit to a program.{group_error}. print() what you need or set `result = ...`; output is cut to a few thousand characters, so filter big tables in the code.
 - read_record(cid, part) shows the full program ("program") or the full feedback ("feedback", with the full config) of a candidate in the table{history_read}.{history}
 {persist}
@@ -70,7 +70,7 @@ def _tool_rounds(cfg: dict) -> tuple[int, bool, bool, int]:
     s = editor_settings(cfg)
     ex = s["explore"]
     return (int(s["tool_rounds"] or 0), bool(ex.get("gpu_tools")), bool(ex.get("persistent")),
-            int(s.get("max_tool_calls") or 0))
+            int(s.get("max_tool_calls") or 0))          # 0 = no tool-call cap (null, 2026-11-26)
 
 
 KL_DESC = ("Every config your program returns gets ONE evaluation that samples nothing: the model it quantizes reads "
@@ -128,9 +128,17 @@ def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False) -> s
     rounds, gpu_tools, persistent, calls = _tool_rounds(cfg)
     if rounds <= 0:                          # tool_rounds 0: the single-call prompt
         return text + FINAL_RULE
-    ge = ("" if gpu_tools or not (cfg.get("tools") or {}).get("group_error", True)
-          else "; group_error there only accepts settings already cached (those of hessian_table)")
-    return text + TOOL_PROTOCOL.format(rounds=rounds, calls=calls, group_error=ge, history_read=HISTORY_READ if history else "",
+    if not (cfg.get("tools") or {}).get("group_error", True):
+        ge = ""
+    elif gpu_tools:                         # (2026-11-26) computed on a GPU while exploring
+        ge = ("; group_error there also computes settings that are not cached yet, on a GPU (seconds per module, so "
+              "a config with hundreds of uncached modules takes minutes): such a call stops before the run_python "
+              "time limit and says how many it cached, calling again continues, and cached settings (those of "
+              "hessian_table and any computed before) return at once")
+    else:
+        ge = "; group_error there only accepts settings already cached (those of hessian_table)"
+    return text + TOOL_PROTOCOL.format(rounds=rounds, calls=f"; at most {calls} calls in all" if calls else "",
+                                       group_error=ge, history_read=HISTORY_READ if history else "",
                                        history=HISTORY_LINE if history else "",
                                        persist=PERSIST_SESSION if persistent else PERSIST_NONE)
 

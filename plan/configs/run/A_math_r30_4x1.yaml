@@ -10,5 +10,5 @@ search:
   max_candidates: 4
 editor:
   tool_rounds: 30                 # at most 30 rounds of tool calls per candidate (persistent run_python session)
-  turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 8192
+  turn_max_tokens: 16384          # output-token cap of each tool turn (thinking + calls); base default 16384 since 2026-11-26
   max_tokens: 16384               # output-token cap of the final turn (thinking + answer / program)

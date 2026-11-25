@@ -18,6 +18,7 @@ being evaluated by another thread is waited for (evaluated once).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import queue
@@ -50,6 +51,11 @@ def _herr_key(module: str, s: dict) -> str:
     """The herr cache key of a module under a setting: "module|quantizer|bits|gs"."""
     b, q, gs = _setting(s)
     return f"{module}|{q}|{b}|{gs}"
+
+
+class HerrDeadline(RuntimeError):
+    """(2026-11-26) An exploration group_error ran out of its run_python call's time (tools.py turns it into a
+    ToolError that says how many settings were computed and cached)."""
 
 
 class QuantProblem:
@@ -96,6 +102,11 @@ class QuantProblem:
         self._evals = {r["hash"]: r for r in read_jsonl(self.out_dir / "evals.jsonl") if r.get("stage") == "kl"}
         self._herr_lock = threading.Lock()
         self._herr: dict | None = None             # {"module|q|b|gs": [h_err, tr(W H W^T), tokens]} (persisted)
+        # (2026-11-26) GPUs of the editor's exploration GPU tools (run.Runner sets them for the search; [] = the layer
+        # cache on the first candidate GPU): a pool, one layer cache + lock per GPU, see tool_device()
+        self.tool_gpus: list[int] = []
+        self._tool_pool: queue.Queue | None = None
+        self._tool_caches: dict = {}
         self._herr_dirty = False
 
     # ------------------------------------------------------------------ bookkeeping
@@ -176,7 +187,8 @@ class QuantProblem:
             self._herr = read_json(self.prep_dir / "diagnostics" / "herr_cache.json", {}) or {}
         return self._herr
 
-    def herr_module(self, module: str, setting: dict, cache=None, lock=None) -> tuple[float, float, int]:
+    def herr_module(self, module: str, setting: dict, cache=None, lock=None,
+                    deadline: float | None = None) -> tuple[float, float, int]:
         """(tr((W - Wq) H (W - Wq)^T), tr(W H W^T), calibration tokens) of one module under a resolved
         setting; H = the module's input Hessian from the calibration pass (sum over tokens). Memoised and
         persisted (prep/diagnostics/herr_cache.json). bits 16 -> 0 error. cache / lock: a worker's own layer
@@ -188,6 +200,8 @@ class QuantProblem:
             return tuple(got)
         if b >= 16:
             return (0.0, 1.0, 1)
+        if deadline is not None and time.monotonic() >= deadline:   # (2026-11-26) an exploration call's time is up
+            raise HerrDeadline(module)
         if self.mock:
             m = self.spec.module(module)
             d = M.setting_damage(self.spec, f"{m.layer}.{m.group}", setting) * (0.9 + 0.2 * M._h("herr", module))
@@ -212,12 +226,13 @@ class QuantProblem:
             self._herr_dirty = True
         return tuple(val)
 
-    def _group_herr(self, mods, setting: dict, cache=None, lock=None) -> tuple[float, float, int]:
+    def _group_herr(self, mods, setting: dict, cache=None, lock=None,
+                    deadline: float | None = None) -> tuple[float, float, int]:
         """herr_module summed over a group's modules: (error, tr(W H W^T), tokens of the last module, at least 1)."""
         err = ref = 0.0
         tok = 1
         for m in mods:
-            e, r, n = self.herr_module(m.name, setting, cache=cache, lock=lock)
+            e, r, n = self.herr_module(m.name, setting, cache=cache, lock=lock, deadline=deadline)
             err, ref, tok = err + e, ref + r, max(1, n)
         return err, ref, tok
 
@@ -242,7 +257,38 @@ class QuantProblem:
                 out.extend(k for k in (_herr_key(m.name, s) for m in groups[key]) if k not in store)
         return out
 
-    def group_error(self, config_or_norm, top: int | None = None) -> dict:
+    @contextlib.contextmanager
+    def tool_device(self, deadline: float | None = None):
+        """(cache, lock) for ONE exploration GPU-tool call (2026-11-26): a free GPU of tool_gpus with its own layer
+        cache (waits while every tool GPU is busy, so several editor sessions use different GPUs at once; until
+        `deadline` (time.monotonic), then HerrDeadline); (None, None) without tool GPUs or in mock mode = self.cache
+        under the export lock, as before. cache.device cpu: the caches stay on the CPU (the pool only limits
+        concurrency), as for the slot caches."""
+        if not self.tool_gpus or self.mock:
+            yield None, None
+            return
+        with self._lock:
+            if self._tool_pool is None:
+                self._tool_pool = queue.Queue()
+                for g in self.tool_gpus:
+                    self._tool_pool.put(int(g))
+        try:
+            g = self._tool_pool.get(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            raise HerrDeadline("every exploration tool GPU stayed busy") from None
+        try:
+            with self._lock:
+                got = self._tool_caches.get(g)
+                if got is None:
+                    dev = self._device()
+                    dev = f"cuda:{g}" if str(dev).startswith("cuda") else dev
+                    got = self._tool_caches[g] = (self._open_cache(device=dev), threading.Lock())
+            yield got
+        finally:
+            self._tool_pool.put(g)
+
+    def group_error(self, config_or_norm, top: int | None = None, cache=None, lock=None,
+                    deadline: float | None = None) -> dict:
         """Hessian-weighted output error of every linear module group under a config (no forward pass):
         {"groups": {key: {"setting", "herr_per_token", "herr_rel", "share"}}, "total_per_token", "top"}.
         herr_per_token = tr(dW H dW^T) / calibration tokens (summed over the group's modules); herr_rel = that
@@ -251,7 +297,11 @@ class QuantProblem:
         groups = self.spec.groups()
         out, total = {}, 0.0
         for key, s in norm["groups"].items():
-            err, ref, tok = self._group_herr(groups[key], s)
+            try:
+                err, ref, tok = self._group_herr(groups[key], s, cache=cache, lock=lock, deadline=deadline)
+            except HerrDeadline:
+                self._herr_flush()                 # what was computed so far is kept: a retry continues from it
+                raise
             pt = err / tok
             out[key] = {"setting": s, "herr_per_token": pt, "herr_rel": err / ref if ref > 0 else 0.0}
             total += pt

@@ -51,7 +51,8 @@ from rsicore.servers import VLLMServer  # noqa: E402
 from rsicore.state import RunState  # noqa: E402
 
 from edit_code import mock as M  # noqa: E402
-from edit_code.common import (candidate_args, candidate_groups, deep_merge, error_line, gpu_layout, kl_eval_cfg,  # noqa: E402
+from edit_code.common import (candidate_args, candidate_groups, deep_merge, error_line, explore_layout,  # noqa: E402
+                              free_cuda, gpu_layout, kl_eval_cfg,
                               load_processed, program_note, read_json, read_jsonl, record_text, search_settings, tail,
                               with_kl_chunk_cap, write_json)
 from edit_code.problem import QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
@@ -148,10 +149,12 @@ class EditorPhases:
         if self.slot is not None:
             self.prob.remove_slot(self.slot)
             self.slot = None
-        self.ed.get()                             # wakes it if it sleeps
+        free_cuda()                               # (2026-11-26) the run's cached blocks (group_error / GPTQ on the
+        self.ed.get()                             # first candidate GPU) would sit under the TP editor; wakes it
 
     def eval_phase(self) -> int:
-        if self.enabled and self.slot is None and self.ed.srv is not None:
+        free_cuda()                               # (2026-11-26) blocks cached by exploration GPU tools: candidate
+        if self.enabled and self.slot is None and self.ed.srv is not None:   # servers start on those GPUs next
             self.ed.sleep()
             self.slot = self.prob.add_slot(self.gpus)
             if not getattr(self, "_logged", False):
@@ -265,8 +268,20 @@ class Runner:
         self.prep_all_gpus = bool(lay.get("prep_all_gpus", True)) and own
         # every GPU group of the run: the editor's + one per candidate slot
         self.all_groups = ([list(self.gpu_editor)] if own else []) + [list(s) for s in self.cand_slots]
+        # (2026-11-26) the editor's server spans editor.tensor_parallel GPUs (default all): the editor role's GPU(s)
+        # plus candidate GPUs, so it must sleep while the candidates are evaluated on them. Generation 0's M_0 batch
+        # jobs keep one replica per GPU group (m0_server / m0_replicas_for)
+        # (2026-11-26) editor.explore.gpu_tools: the run_python GPU tools get their own GPUs while the editor writes
+        # (gpu_layout.explore_tool_gpus; edit_code.common.explore_layout)
+        self.editor_gpus, self.tool_gpus = explore_layout(rc, cfg, self.gpu_editor)
+        if self.editor_gpus != list(self.gpu_editor) and not self.editor_sleep:
+            raise ValueError(f"editor.tensor_parallel: the editor would span {self.editor_gpus}, which the candidate "
+                             "servers also use, but it cannot sleep while they run (gpu_layout.editor_sleep false or "
+                             "the editor role shares a GPU with them); set editor.tensor_parallel: 1")
         print(f"[edit_code] hardware={cfg.get('hardware', 'b300')} gpus={rc.gpus} "
-              f"editor={self.gpu_editor} candidate servers={self.cand_slots} "
+              f"editor={self.gpu_editor} (vLLM TP {len(self.editor_gpus)} on {self.editor_gpus}) "
+              + (f"explore GPU tools on {self.tool_gpus} " if self.tool_gpus else "")
+              + f"candidate servers={self.cand_slots} "
               f"({len(self.cand_slots)} candidate(s) evaluated at a time)"
               + (f" UNUSED {unused} (gpu_layout.candidate_group_size)" if unused else ""), flush=True)
         self.editor_mode = (cfg.get("loop") or {}).get("editor", "frozen")
@@ -349,10 +364,18 @@ class Runner:
             return [m0]
         return [m0] + [self.m0_server(gpus=g) for g in self.cand_slots]
 
-    def model_server(self, model_dir: Path, name: str, gpus: list[int], args_key: str) -> LazyServer:
+    def model_server(self, model_dir: Path, name: str, gpus: list[int], args_key: str,
+                     sleep_mode: bool = False) -> LazyServer:
         """An exported quantized model (fake-quant checkpoint, or mock_model.json in mock mode)."""
         q = M.load_state(Path(model_dir) / "mock_model.json")["quality"] if self.rc.mock else None
-        return self._server(name, Path(model_dir), q, gpus, args_key)
+        return self._server(name, Path(model_dir), q, gpus, args_key, sleep_mode=sleep_mode)
+
+    def editor_m0(self) -> LazyServer:
+        """(2026-11-26) The frozen editor: M_0 on the editor's GPUs (editor_gpus, tensor parallel), editor_args,
+        sleeping while candidates are evaluated. With editor.tensor_parallel 1 it is m0_server() itself."""
+        return self._server(f"{self.rc.run_id}-m0", Path(self.rc.model_path),
+                            self.cfg["mock"]["base_quality"] if self.rc.mock else None,
+                            self.editor_gpus, "editor_args", sleep_mode=self.editor_sleep)
 
     def kl_texts(self, m0: LazyServer, reps: list | None = None) -> list[tuple[str, str]]:
         """(domain, text) calibration texts of generation 0 (GPTQ / AWQ calibration of the layer cache and the
@@ -528,12 +551,20 @@ class Runner:
         cfg = self.cfg
 
         def explore_api(tag, ctx):
-            return make_tool_api(prob, cfg, explore=True)
-        names = explore_api("doc~x", {}).names()
+            dl = {"t": None}                  # (2026-11-26) the current run_python call's deadline (GPU tools)
+
+            def before_call(timeout_s):
+                dl["t"] = time.monotonic() + float(timeout_s)
+            return make_tool_api(prob, cfg, explore=True, deadline=dl), None, before_call
+        names = make_tool_api(prob, cfg, explore=True).names()
         doc = RUN_PYTHON_DOC + f" Tools on `api` here: {', '.join(names)}."
         if "group_error" in names and not editor_settings(cfg)["explore"].get("gpu_tools"):
             doc += (" group_error here only accepts settings whose error is cached (those of hessian_table); "
                     "other settings raise an error.")
+        elif "group_error" in names:
+            doc += (" group_error here computes settings that are not cached yet on a GPU (seconds per module); a "
+                    "call stops before the time limit and says how many it cached, so calling again continues; "
+                    "cached settings (hessian_table's and those computed before) return at once.")
         return ChatTools(explore_api, run_python_doc=doc, history=history, **chat_tools_kwargs(cfg))
 
     def run_search(self, prob, gen, gdir, ed, *, archive) -> list:
@@ -621,14 +652,16 @@ class Runner:
 
     # ------------------------------------------------------------------ editor
     def editor_server(self, g: int, m0: LazyServer) -> LazyServer:
-        """frozen: M_0; current: the incumbent Q_{g-1}."""
-        if self.editor_mode == "frozen":
+        """frozen: M_0; current: the incumbent Q_{g-1}. Both on editor_gpus (tensor parallel, 2026-11-26) and with
+        sleep mode when the editor lends its GPU during the evaluations (before 2026-11-26 the current-mode editor had
+        no sleep mode, so its GPU was lent while it still held its weights)."""
+        if self.editor_gpus == list(self.gpu_editor) and self.editor_mode == "frozen":
             return m0
-        inc = self.incumbent(g - 1)
-        if inc.get("original"):          # loop.start bf16, nothing accepted yet: the incumbent is M_0 itself
-            return m0
+        inc = None if self.editor_mode == "frozen" else self.incumbent(g - 1)
+        if inc is None or inc.get("original"):   # frozen, or loop.start bf16 with nothing accepted yet: M_0 itself
+            return m0 if self.editor_gpus == list(self.gpu_editor) else self.editor_m0()
         return self.model_server(Path(inc["model_dir"]), f"{self.rc.run_id}-q{inc['gen']:02d}-editor",
-                                 self.gpu_editor, "editor_args")
+                                 self.editor_gpus, "editor_args", sleep_mode=self.editor_sleep)
 
     # ------------------------------------------------------------------ generation g
     def archive(self, g: int, *, read_tools: bool = True) -> str:
@@ -713,6 +746,8 @@ class Runner:
         try:
             prob = self.problem(tag=f"g{g:02d}", gen=g, out_dir=gd, budget=budget, incumbent=inc)
             prob.prepare()
+            prob.tool_gpus = list(self.tool_gpus)   # exploration GPU tools (editor.explore.gpu_tools)
+            free_cuda()                       # (2026-11-26) before the editor (TP over every GPU) starts
             ed = self.editor_server(g, m0)
             if ed is not m0:
                 m0.close()

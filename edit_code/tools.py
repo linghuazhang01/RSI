@@ -31,9 +31,15 @@ class ToolError(RuntimeError):
     pass
 
 
-def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, explore: bool = False):
+EXPLORE_DEADLINE_MARGIN_S = 30.0   # (2026-11-26) an exploration GPU tool stops this long before the call's time limit
+
+
+def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, explore: bool = False,
+                  deadline: dict | None = None):
     """The program's API. No tool spends a budget. cid is ignored (accepted for older callers). explore (the
-    editor's run_python): group_error only on cached settings unless editor.explore.gpu_tools."""
+    editor's run_python): group_error only on cached settings unless editor.explore.gpu_tools. deadline (explore,
+    2026-11-26): {"t": time.monotonic() deadline of the current run_python call} set before every call
+    (run.Runner.chat_tools); an uncached group_error then stops in time with a ToolError instead of being killed."""
     from rsicore.sandbox import ToolAPI
     tcfg = cfg.get("tools", {})
     gpu_tools = bool(((cfg.get("editor") or {}).get("explore") or {}).get("gpu_tools", False))
@@ -75,7 +81,8 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, e
         return problem.tables.get("hessian") or []
 
     def group_error(config, top: int = 10):
-        """Per-group Hessian-weighted error of a config (no evaluation, no forward pass; free): {total_per_token,
+        """Per-group Hessian-weighted error of a config (no evaluation, no forward pass; settings not cached yet
+        are quantized on the GPU first, seconds per module): {total_per_token,
         top: [(key, share)], groups: {key: {setting, herr_per_token, herr_rel, share}}}. Shows where a config's
         quantization error concentrates."""
         try:
@@ -85,6 +92,23 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, e
                     raise ToolError(f"uncached setting: not available while exploring ({len(missing)} module "
                                     f"settings not computed yet, e.g. {missing[0]}); the hessian_table settings "
                                     "are cached, and your final program may call group_error on any config")
+            if explore and gpu_tools and hasattr(problem, "tool_device"):
+                missing = problem.herr_missing(config)
+                if missing:
+                    # (2026-11-26) uncached settings while exploring: computed on a GPU of
+                    # gpu_layout.explore_tool_gpus, stopping before the run_python call's time limit
+                    from .problem import HerrDeadline
+                    t = (deadline or {}).get("t")
+                    dl = None if t is None else t - EXPLORE_DEADLINE_MARGIN_S
+                    try:
+                        with problem.tool_device(deadline=dl) as (cache, lock):
+                            return problem.group_error(config, top=int(top), cache=cache, lock=lock, deadline=dl)
+                    except HerrDeadline:
+                        left = len(problem.herr_missing(config))
+                        raise ToolError(f"ran out of time in this run_python call: {len(missing) - left} of "
+                                        f"{len(missing)} uncached module settings were computed and cached, {left} "
+                                        "remain; call group_error again to continue (cached settings return at "
+                                        "once)") from None
             return problem.group_error(config, top=int(top))
         except schema.ConfigError as e:
             raise ToolError(str(e)) from None

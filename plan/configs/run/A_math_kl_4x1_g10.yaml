@@ -3,9 +3,11 @@
 # after base.yaml + domains/math.yaml + the hardware profile (--hw) and before any --set. Hardware is NOT set here.
 # The number of generations is the CLI's --gens (not a config key):
 #   ./launch.sh --hw h20 --paper A --domains math --gens 10 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_kl_4x1_g10.yaml --tag kl_4x1_g10
-# GPUs (8): GPU 0 = editor (4 sessions at once; sleeps while the candidates are evaluated and lends its GPU) -> 8
-#   candidate slots; each of the 4 candidates' KL evaluations runs on 2 GPUs (gpu_layout.gate_split: ceil(8 / 4)).
-# Memory (--hw h20, 2026-11-25): planned at 100 GiB per card (editor 90, candidates / M_0 replicas 84, prefill chunk
+# GPUs (8), 2026-11-26: while the editor writes, all 8 GPUs serve it (vLLM tensor parallel 8, the 4 sessions
+#   batched; its run_python tools run on the CPU); while the candidates are evaluated the editor sleeps and all 8 GPUs
+#   serve them: each of the 4 candidates' KL evaluations runs on 2 GPUs (gpu_layout.gate_split: ceil(8 / 4)).
+#   Editor sessions: at most 50 tool rounds, no time / token / tool-call cap.
+# Memory (--hw h20, 2026-11-25): planned at 100 GiB per card (editor 90, candidates / M_0 replicas 82, prefill chunk
 #   2048, 12 calibration layers per pass; edit_code/configs/base.yaml hardware_profiles.h20). These memory knobs
 #   are not part of the run lock: a run that OOMed under the old 110 GiB plan resumes with the same command.
 search:
@@ -15,3 +17,8 @@ search:
 loop:
   patience: 10                    # never stop early: all 10 generations run even if some keep the incumbent
                                   # (base default 3 would stop after 3 generations in a row without a lower KL)
+# The TP 8 editor is planned for --hw h20 (100 GiB per card); with --hw h20_80 add --set editor.tensor_parallel=1
+#   (0.92 utilization leaves no room for a sleeping TP editor's residue).
+editor:
+  tool_rounds: 50                 # at most 50 rounds of tool calls per candidate (= base.yaml since 2026-11-26)
+  tensor_parallel: 8              # editor inference on all 8 GPUs (placement only: not part of the run lock)

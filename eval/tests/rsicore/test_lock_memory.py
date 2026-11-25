@@ -114,14 +114,19 @@ def test_previous_plan_lock_resumes_with_the_new_base_yaml(tmp_path, hw):
     old = _load_a(runs, "oom", "--set", f"hardware={hw}", "--paper-dir", str(old_pdir))
     new_cfg = _load_a(tmp_path / "fresh", "x", "--set", f"hardware={hw}").paper_cfg
     assert old.paper_cfg != new_cfg                                       # the plan did change (not a no-op test)
-    assert C.lock_view(old.paper_cfg, "A") == C.lock_view(new_cfg, "A")
+    # the memory plan is invisible to the lock; the only locked differences are the 2026-11-26 editor settings
+    # (16384-token tool turns, 50 rounds and no other cap, tensor parallel), which a run without any editor session
+    # yet accepts (test_editor_settings_free_until_first_session)
+    diffs = C._diff_paths(C.lock_view(old.paper_cfg, "A"), C.lock_view(new_cfg, "A"))
+    assert diffs and all(d.startswith("editor.") for d in diffs), diffs
+    assert any(d.startswith("editor.turn_max_tokens") for d in diffs)
     rc = _load_a(runs, "oom", "--set", f"hardware={hw}")                  # resume: same command, new base.yaml
     assert rc.paper_cfg == new_cfg
     if hw == "h20":
         c = rc.paper_cfg
         assert c["kl_eval"]["max_num_batched_tokens"] == 2048 and c["calibration"]["layers_per_pass"] == 12
         assert c["vllm"]["editor_args"][:2] == ["--rsi-gpu-memory-gib", "90"]
-        assert c["vllm"]["candidate_args"][:2] == ["--rsi-gpu-memory-gib", "84"]
+        assert c["vllm"]["candidate_args"][:2] == ["--rsi-gpu-memory-gib", "82"]
         assert old.paper_cfg["vllm"]["editor_args"][:2] == ["--rsi-gpu-memory-gib", "110"]
     lock = yaml.safe_load((runs / "oom" / "run_config.yaml").read_text())
     assert lock["paper_cfg"] == new_cfg                                   # the lock now records the new plan
@@ -144,3 +149,47 @@ def test_memory_knob_sets_resume(tmp_path):
         _load_a(runs, "r", "--set", "hardware=h20",
                 "--set", 'vllm.candidate_args=["--rsi-gpu-memory-gib","84","--max-model-len","20480",'
                          '"--max-num-seqs","64","--max-logprobs","20"]')
+
+
+def test_editor_settings_free_until_first_session(tmp_path, capsys):
+    """(2026-11-26) editor.* is read only by editor sessions: before the first one has written its transcript a
+    changed value resumes (and is reported); afterwards it is locked. editor.context_tokens stays locked throughout
+    (it also sets servers' --max-model-len)."""
+    runs = tmp_path / "runs"
+    _load_a(runs, "r", "--set", "editor.turn_max_tokens=8192")
+    rc = _load_a(runs, "r", "--set", "editor.turn_max_tokens=12288")
+    assert rc.paper_cfg["editor"]["turn_max_tokens"] == 12288
+    assert "editor.turn_max_tokens" in capsys.readouterr().err
+    with pytest.raises(SystemExit, match="context_tokens"):
+        _load_a(runs, "r", "--set", "editor.turn_max_tokens=12288", "--set", "editor.context_tokens=65536")
+    with pytest.raises(SystemExit, match="kl_eval.n"):                    # other blocks stay locked meanwhile
+        _load_a(runs, "r", "--set", "editor.turn_max_tokens=16384", "--set", "kl_eval.n=128")
+    tr = runs / "r" / "gen_01" / "editor" / "thread_0.jsonl"
+    tr.parent.mkdir(parents=True)
+    tr.write_text("{}\n")                                                # the first editor session ran
+    with pytest.raises(SystemExit, match="editor.turn_max_tokens"):
+        _load_a(runs, "r", "--set", "editor.turn_max_tokens=16384")
+    assert _load_a(runs, "r", "--set", "editor.turn_max_tokens=12288").paper_cfg["editor"]["turn_max_tokens"] == 12288
+    # editor.tensor_parallel is placement (lock-ignored): it may change on any resume, e.g. back to 1 if TP fails
+    rc = _load_a(runs, "r", "--set", "editor.turn_max_tokens=12288", "--set", "editor.tensor_parallel=1")
+    assert rc.paper_cfg["editor"]["tensor_parallel"] == 1
+
+
+OLD_CAPS = ["editor.tool_rounds=20", "editor.turn_max_tokens=8192", "editor.max_tool_calls=100",
+            "editor.proposal_tokens=160000", "editor.proposal_wall_s=2400"]
+
+
+def test_previous_run_with_editor_sessions_resumes_with_its_caps(tmp_path):
+    """A run locked by the previous code that already ran editor sessions resumes on the new code when its old editor
+    caps are passed with --set (editor.tensor_parallel, absent from its lock, is placement and lock-ignored)."""
+    old_pdir = _old_paper_dir(tmp_path)
+    runs = tmp_path / "runs"
+    _load_a(runs, "mid", "--set", "hardware=h20", "--paper-dir", str(old_pdir))
+    tr = runs / "mid" / "gen_03" / "editor" / "thread_0.jsonl"
+    tr.parent.mkdir(parents=True)
+    tr.write_text("{}\n")
+    with pytest.raises(SystemExit, match="editor.tool_rounds"):
+        _load_a(runs, "mid", "--set", "hardware=h20")
+    sets = [x for s in OLD_CAPS for x in ("--set", s)]
+    rc = _load_a(runs, "mid", "--set", "hardware=h20", *sets)
+    assert rc.paper_cfg["editor"]["tool_rounds"] == 20 and rc.paper_cfg["editor"]["tensor_parallel"] == "all"

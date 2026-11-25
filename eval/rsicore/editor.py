@@ -22,7 +22,8 @@ One Editor per thread (its own history). One proposal = one call of propose():
     the latest program from the loop that passes check_program is used -- a ```python block of a tool turn or
     the code of a run_python call that defines main -- else the last block seen in the loop (stop
     "fallback"). Guards that force the final turn: rounds >= tool_rounds, tool calls >=
-    max_tool_calls, completion tokens >= proposal_tokens, wall clock >= proposal_wall_s, too little room left
+    max_tool_calls, completion tokens >= proposal_tokens, wall clock >= proposal_wall_s (each of these three may be
+    None or 0 = no such cap, 2026-11-26; tool_rounds always applies), too little room left
     in context_tokens, a tool-round reply that timed out. Per-turn max_tokens = min(turn_max_tokens, or
     max_tokens on the final turn, context_tokens - estimated prompt - 512). The live message list is compacted
     deterministically (reasoning of older turns dropped, older tool outputs and long arguments elided) when the
@@ -310,9 +311,10 @@ def editor_kwargs(cfg: dict | None, server_args=None) -> dict:
     s = editor_settings(cfg)
     kw = {k: s[k] for k in _EDITOR_KW}
     kw["context_tokens"] = context_tokens(cfg, server_args)
-    for k in ("max_tokens", "tool_rounds", "turn_max_tokens", "max_tool_calls", "tool_result_chars",
+    for k in ("max_tokens", "tool_rounds", "turn_max_tokens", "tool_result_chars",
               "keep_tool_rounds", "keep_reasoning_rounds"):
         kw[k] = int(kw[k])
+    kw["max_tool_calls"] = int(kw["max_tool_calls"]) if kw["max_tool_calls"] else None   # null / 0 = no cap
     for k in ("temperature", "top_p", "compact_at"):
         kw[k] = float(kw[k])
     if kw["history_keep"] is not None:
@@ -367,7 +369,7 @@ class Editor:
     def __init__(self, endpoint, served_name, *, system_prompt: str, seed: int, transcript: Path,
                  temperature: float = 0.6, top_p: float = 0.95, max_tokens: int = 8192,
                  mock_policy=None, extra_body: dict | None = None, timeout_s: float = 3600,
-                 tools=None, tool_rounds: int = 50, turn_max_tokens: int = 8192, max_tool_calls: int = 100,
+                 tools=None, tool_rounds: int = 50, turn_max_tokens: int = 8192, max_tool_calls: int | None = 100,
                  proposal_tokens: int | None = 160000, proposal_wall_s: float | None = 2400,
                  context_tokens: int | None = None, tool_result_chars: int = 6000, compact_at: float = 0.6,
                  keep_tool_rounds: int = 8, keep_reasoning_rounds: int = 2, reasoning_passback: str = "think_tag",
@@ -378,7 +380,8 @@ class Editor:
         self.mock_policy, self.extra_body, self.timeout_s = mock_policy, dict(extra_body or {}), timeout_s
         self.tools, self.tool_rounds = tools, int(tool_rounds or 0)
         self.loop = tools is not None and self.tool_rounds > 0
-        self.turn_max_tokens, self.max_tool_calls = int(turn_max_tokens), int(max_tool_calls)
+        self.turn_max_tokens = int(turn_max_tokens)
+        self.max_tool_calls = int(max_tool_calls) if max_tool_calls else None   # (2026-11-26) None / 0: no cap
         self.proposal_tokens, self.proposal_wall_s = proposal_tokens, proposal_wall_s
         self.context_tokens = None if context_tokens is None else int(context_tokens)
         self.tool_result_chars, self.compact_at = int(tool_result_chars), float(compact_at)
@@ -759,7 +762,7 @@ class Editor:
             if forced_by is None:
                 if st["rounds"] >= self.tool_rounds:
                     forced_by = "rounds"
-                elif st["tool_calls"] >= self.max_tool_calls:
+                elif self.max_tool_calls is not None and st["tool_calls"] >= self.max_tool_calls:
                     forced_by = "tool_calls"
                 elif self.proposal_tokens and st["completion_tokens"] >= int(self.proposal_tokens):
                     forced_by = "tokens"
@@ -847,7 +850,7 @@ class Editor:
                 left = self.tool_rounds - rr
                 for i, tc in enumerate(r.tool_calls):
                     wl = wall_left()
-                    if st["tool_calls"] >= self.max_tool_calls:
+                    if self.max_tool_calls is not None and st["tool_calls"] >= self.max_tool_calls:
                         res = {"content": error_json("skipped: tool-call cap of this proposal reached"), "ok": False,
                                "seconds": 0.0, "args": None}
                     elif wl is not None and wl <= 0:

@@ -221,6 +221,24 @@ def test_guards(tmp_path, fake):
     assert len(tl) == 6 and sum("tool-call cap" in l["content"] for l in tl) == 2
 
 
+def test_rounds_only_when_other_caps_are_null(tmp_path, fake):
+    """(2026-11-26) max_tool_calls / proposal_tokens / proposal_wall_s None = no cap: only tool_rounds forces the final
+    turn, however many calls, tokens or seconds the session used."""
+    t = {"now": 0.0}
+
+    def clock():
+        t["now"] += 1000.0
+        return t["now"]
+    srv = fake(default=lambda p: (tool_turn(n=3, usage={"prompt_tokens": 5, "completion_tokens": 100000})
+                                  if p["tool_choice"] == "auto" else {"content": ANSWER}))
+    tools = FakeTools()
+    ed = mk(tmp_path, srv, tools, name="r.jsonl", tool_rounds=6, max_tool_calls=None, proposal_tokens=None,
+            proposal_wall_s=None, clock=clock)
+    assert ed.propose("m") == CODE
+    st = ed.last_stats
+    assert st["stop"] == "forced:rounds" and st["rounds"] == 6 and st["tool_calls"] == 18 and len(tools.calls) == 18
+
+
 def test_nudges_then_fallback(tmp_path, fake):
     srv = fake([tool_turn(content="draft\n```python\nDRAFT = 1\n```"),
                 {"content": ""},

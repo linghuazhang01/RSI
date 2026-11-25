@@ -308,7 +308,8 @@ class TestMockFlow(unittest.TestCase):
             self.assertFalse([x for x in jl(tr) if x.get("role") == "tool" or x.get("tool_calls")])
         sys_tools = jl(gd / "editor" / "thread_0.jsonl")[0]["content"]
         sys_plain = jl(g0 / "editor" / "thread_0.jsonl")[0]["content"]
-        self.assertIn("for up to 20 rounds", sys_tools)
+        self.assertIn("for up to 50 rounds", sys_tools)                              # base.yaml (2026-11-26)
+        self.assertNotIn("calls in all", sys_tools)                                   # max_tool_calls null: no cap
         self.assertNotIn("run_python", sys_plain)
         self.assertTrue(sys_plain.endswith("exactly one ```python code block containing the full program."))
         # tool_rounds 1 with a mock that wants 3 rounds: 1 round, then the forced final turn
@@ -381,6 +382,8 @@ class TestEditorConfig(unittest.TestCase):
         t = P.system_prompt(prob, "DOC", {"editor": {"tool_rounds": 12}})
         self.assertIn("for up to 12 rounds", t)
         self.assertIn("at most 100 calls in all", t)                                  # editor.max_tool_calls default
+        self.assertNotIn("calls in all", P.system_prompt(prob, "DOC", {"editor": {"tool_rounds": 12,
+                                                                                 "max_tool_calls": None}}))
         self.assertIn("killed after 1800 s", base)                                     # sandbox.timeout_s default
         self.assertIn("group_error there only accepts settings already cached", t)
         self.assertNotIn(P.FINAL_RULE, t)

@@ -170,7 +170,7 @@ def test_h20_profiles(tmp_path):
     a, b = load("A", "h20"), load("B", "h20")
     # Paper A's h20 plan: 100 GiB per card in all (2026-11-25): editor 90, candidates / M_0 replicas 84, prefill
     # chunk 2048, 12 calibration layers per pass; Paper B's h20 profile is unchanged (110)
-    for args, gib in ((a["vllm"]["editor_args"], "90"), (a["vllm"]["candidate_args"], "84"),
+    for args, gib in ((a["vllm"]["editor_args"], "90"), (a["vllm"]["candidate_args"], "82"),
                       (b["server"]["main_args"], "110")):
         assert args[args.index("--rsi-gpu-memory-gib") + 1] == gib and "128" in args
     assert a["kl_eval"]["max_num_batched_tokens"] == 2048
