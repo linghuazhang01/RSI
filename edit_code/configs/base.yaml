@@ -62,12 +62,15 @@ kl:                                   # calibration texts (generation 0, built o
   self_generated: true                # prompt + M_0's own greedy response (cached in kl_selfgen/gen_00.jsonl): the
                                       # GPTQ / AWQ calibration and the profile table also cover the answer tokens;
                                       # false = the question alone
-  self_generated_max_tokens: 2048     # response length cap (a cut response gets no <|im_end|>)
+  self_generated_max_tokens: 16384    # response length cap (a cut response gets no <|im_end|>); 2026-11-26: 16384
+                                      # like the KL traces and the editor's turns (was 2048)
   self_generated_batch: 64            # prompts per /completions request (calibration: calibration.max_texts)
 
 calibration:                          # Hessians for GPTQ / AWQ (original model, generation-0 kl texts, once)
   max_texts: 256
-  max_len: 2560                       # tokens per text (prompt + a response of up to 2048 tokens)
+  max_len: 18432                      # tokens per text (prompt, <= kl.max_chars 8000 chars ~ 2k tokens, + a response
+                                      # of up to 16384 tokens; 2026-11-26, was 2560). One text per forward: ~6 GiB
+                                      # of activations at 18k tokens next to the HF model and the Hessian window
   layers_per_pass: 16                 # window of layers per calibration pass (fp32 Hessians ~1.6 GB/layer; h20: 12);
                                       # the Hessians are the same sums for any window: not part of the run lock
 
@@ -252,7 +255,8 @@ hardware_profiles:
     #   evaluation phase : the editor sleeps (weights -> CPU RAM, KV freed; ~1-2 GiB left on every GPU) and every GPU
     #                      serves candidates: candidate 82 + ~4.7 + ~1-2 = ~89; the 1st candidate GPU also runs the
     #                      run's group_error / lazy GPTQ torch work (+3-8) = ~97
-    #   prep (no vLLM)   : calibration ~78 (54.7 HF model + 12 x 1.57 fp32 Hessians + activations), profile worker
+    #   prep (no vLLM)   : calibration ~80 (54.7 HF model + 12 x 1.57 fp32 Hessians + ~6 activations of an 18k-token
+    #                      text, calibration.max_len 18432 since 2026-11-26), profile worker
     #                      ~60 (HF model + hidden-state reference + per-chunk log-probs; ~86 reserved before the
     #                      2026-11-25 change), cache warm-up ~8
     #   not counted above: the run process's CUDA context on every GPU prep touched (~0.5 each) and vLLM's own

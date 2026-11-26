@@ -117,10 +117,16 @@ def test_previous_plan_lock_resumes_with_the_new_base_yaml(tmp_path, hw):
     # the memory plan is invisible to the lock; the only locked differences are the 2026-11-26 editor settings
     # (16384-token tool turns, 50 rounds and no other cap, tensor parallel), which a run without any editor session
     # yet accepts (test_editor_settings_free_until_first_session)
+    # (2026-11-26) plus the 16k calibration texts, which change the Hessians: a run locked before passes its old values
     diffs = C._diff_paths(C.lock_view(old.paper_cfg, "A"), C.lock_view(new_cfg, "A"))
-    assert diffs and all(d.startswith("editor.") for d in diffs), diffs
+    calib = [d for d in diffs if not d.startswith("editor.")]
+    assert sorted(d.split(":")[0] for d in calib) == ["calibration.max_len", "kl.self_generated_max_tokens"], diffs
     assert any(d.startswith("editor.turn_max_tokens") for d in diffs)
-    rc = _load_a(runs, "oom", "--set", f"hardware={hw}")                  # resume: same command, new base.yaml
+    with pytest.raises(SystemExit, match="self_generated_max_tokens"):
+        _load_a(runs, "oom", "--set", f"hardware={hw}")
+    sets = [x for s in OLD_CALIB for x in ("--set", s)]
+    rc = _load_a(runs, "oom", "--set", f"hardware={hw}", *sets)           # resume: new base.yaml + its calibration
+    new_cfg = _load_a(tmp_path / "fresh2", "x", "--set", f"hardware={hw}", *sets).paper_cfg
     assert rc.paper_cfg == new_cfg
     if hw == "h20":
         c = rc.paper_cfg
@@ -131,9 +137,10 @@ def test_previous_plan_lock_resumes_with_the_new_base_yaml(tmp_path, hw):
     lock = yaml.safe_load((runs / "oom" / "run_config.yaml").read_text())
     assert lock["paper_cfg"] == new_cfg                                   # the lock now records the new plan
     with pytest.raises(SystemExit, match="max-model-len|context_tokens"):  # a locked knob still refuses
-        _load_a(runs, "oom", "--set", f"hardware={hw}", "--set", "editor.context_tokens=65536")
+        _load_a(runs, "oom", "--set", f"hardware={hw}", *sets, "--set", "editor.context_tokens=65536")
     with pytest.raises(SystemExit, match="calibration.max_len"):
-        _load_a(runs, "oom", "--set", f"hardware={hw}", "--set", "calibration.max_len=2048")
+        _load_a(runs, "oom", "--set", f"hardware={hw}", "--set", "kl.self_generated_max_tokens=2048",
+                "--set", "calibration.max_len=2048")
 
 
 def test_memory_knob_sets_resume(tmp_path):
@@ -175,6 +182,7 @@ def test_editor_settings_free_until_first_session(tmp_path, capsys):
     assert rc.paper_cfg["editor"]["tensor_parallel"] == 1
 
 
+OLD_CALIB = ["kl.self_generated_max_tokens=2048", "calibration.max_len=2560"]   # before 2026-11-26 (16k texts)
 OLD_CAPS = ["editor.tool_rounds=20", "editor.turn_max_tokens=8192", "editor.max_tool_calls=100",
             "editor.proposal_tokens=160000", "editor.proposal_wall_s=2400"]
 
@@ -190,6 +198,6 @@ def test_previous_run_with_editor_sessions_resumes_with_its_caps(tmp_path):
     tr.write_text("{}\n")
     with pytest.raises(SystemExit, match="editor.tool_rounds"):
         _load_a(runs, "mid", "--set", "hardware=h20")
-    sets = [x for s in OLD_CAPS for x in ("--set", s)]
+    sets = [x for s in OLD_CAPS + OLD_CALIB for x in ("--set", s)]
     rc = _load_a(runs, "mid", "--set", "hardware=h20", *sets)
     assert rc.paper_cfg["editor"]["tool_rounds"] == 20 and rc.paper_cfg["editor"]["tensor_parallel"] == "all"

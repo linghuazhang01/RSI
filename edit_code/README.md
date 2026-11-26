@@ -71,6 +71,8 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 ```
 续跑与 `editor.*`（2026-11-26）：还没有任何改造者会话写出 transcript（`gen_XX/editor/thread_*.jsonl`）时，改了 `editor.*`（`context_tokens` 除外）也能用同一条命令续跑；之后 `editor.*` 和其他配置一样锁定。2026-11-26 之前开的、已经跑过改造者会话的 run，续跑时要把旧的上限用 `--set` 传回去：`--set editor.tool_rounds=20 --set editor.turn_max_tokens=8192 --set editor.max_tool_calls=100 --set editor.proposal_tokens=160000 --set editor.proposal_wall_s=2400`（run config 里另设过的以 run config 为准）。
 
+校准文本 16k（2026-11-26）：M_0 自己的贪心回答（`kl.self_generated_max_tokens`）由 2048 提到 16384，`calibration.max_len` 由 2560 提到 18432（prompt 约 2k token + 回答 16384）。这两项会改变 Hessian，所以在运行锁里：2026-11-26 之前开的 run 续跑时要加 `--set kl.self_generated_max_tokens=2048 --set calibration.max_len=2560`（例如之前 OOM 的 `kl_4x1_g10`），新开的 run 直接用新值。
+
 `context_tokens` 的默认值写在 `hardware_profiles`（b300 / h20: 131072，h20_80: 49152；硬件档在 `editor:` 块之后合并），所以改默认值要改那里，或用 `--set`（`--set` 优先）。真实服务器上 `rsicore.servers` 会把 `--max-model-len` 压到模型 `config.json` 的 `max_position_embeddings` 以内（打警告，不加 YaRN），工具解析器按聊天模板自动选（qwen3_coder / hermes）。这些键都在锁定的配置里：改了要用新的 `--run-id`。
 
 ## 校准文本 = 题目 + M_0 自己的回答（2026-11-20）

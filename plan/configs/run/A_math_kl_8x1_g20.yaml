@@ -1,0 +1,20 @@
+# Paper A experiment config (KL only, 2026-11-26): math · 20 generations · 8 x 1 candidates per generation ·
+# the lowest KL to M_0 on the 256 fixed reference traces wins when it is below the incumbent's. Overrides only: merged
+# after base.yaml + domains/math.yaml + the hardware profile (--hw) and before any --set. Hardware is NOT set here.
+# The number of generations is the CLI's --gens (not a config key):
+#   ./launch.sh --hw h20 --paper A --domains math --gens 20 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_kl_8x1_g20.yaml --tag kl_8x1_g20
+# GPUs (8): while the editor writes, all 8 GPUs serve it (vLLM tensor parallel 8, the 8 sessions batched; ~80 GiB of
+#   KV per GPU, so 8 sessions at 131072 tokens fit); while the candidates are evaluated the editor sleeps and all 8 GPUs
+#   serve them: 8 candidates, one GPU each (gpu_layout.gate_split: ceil(8 / 8)).
+# Editor sessions: at most 50 tool rounds of up to 16384 tokens each, no time / token / tool-call cap.
+# Memory: planned for --hw h20 (100 GiB per card, edit_code/configs/base.yaml hardware_profiles.h20); with --hw h20_80
+#   add --set editor.tensor_parallel=1.
+search:
+  threads: 8                      # 8 independent sessions per generation ...
+  steps: 1                        # ... of one candidate each
+  max_candidates: 8
+loop:
+  patience: 20                    # never stop early: all 20 generations run even if some keep the incumbent
+editor:
+  tool_rounds: 50                 # at most 50 rounds of tool calls per candidate
+  tensor_parallel: 8              # editor inference on all 8 GPUs (placement only: not part of the run lock)
