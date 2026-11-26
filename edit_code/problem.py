@@ -424,7 +424,11 @@ class QuantProblem:
                               return_stats=False)     # (2026-11-23) the parts' stats were read back and discarded
             with ThreadPoolExecutor(max_workers=k) as ex:
                 list(ex.map(calib, range(k)))
-            del models, calib
+            # Transformers may retain model references after calibration; offload weights
+            # explicitly before the profile processes load their own GPU copies.
+            for model in models:
+                model.to("cpu")
+            del model, models, calib
             import gc
             gc.collect()
             free_cuda()
