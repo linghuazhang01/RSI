@@ -11,14 +11,17 @@
 #   ./launch.sh --hw h20 --paper A --domains math --gens 10 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_kl_8x1_g10_current.yaml --tag kl_8x1_g10_current
 # GPUs (8): while the editor writes, all 8 GPUs serve it (vLLM tensor parallel 8); while the candidates are evaluated
 #   the editor sleeps and all 8 GPUs serve them, one candidate per GPU.
-# Editor sessions: at most 50 tool rounds of up to 16384 tokens each, no time / token / tool-call cap.
+# Editor sessions: at most 50 tool rounds of up to 16384 tokens each, then the final turn (thinking + the program) of
+#   up to 32768 tokens (2026-11-27; base.yaml: 16384); no time / token / tool-call cap. The editor's context is 131072.
 search:
   threads: 8                      # 8 independent sessions per generation ...
   steps: 1                        # ... of one candidate each
   max_candidates: 8
 loop:
-  editor: current                 # the incumbent (latest accepted quantized model) writes each generation
+  editor: current                 # the incumbent writes each generation: the lowest-KL quantization accepted so far
+                                  # (a generation that accepts nothing keeps it, so it is the best so far)
   patience: 10                    # never stop early: all 10 generations run even if some keep the incumbent
 editor:
   tool_rounds: 50                 # at most 50 rounds of tool calls per candidate
+  max_tokens: 32768               # the final turn (thinking + the program); the tool turns stay at 16384
   tensor_parallel: 8              # editor inference on all 8 GPUs (placement only: not part of the run lock)
