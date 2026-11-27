@@ -24,7 +24,7 @@ from __future__ import annotations
 from .allocation import solve_allocation as _solve
 from .diagnostics import summarize_profile
 from .problem import QuantProblem
-from .quant import schema
+from .quant import schema, sizes
 from .quant.spec import TIED_GROUPS
 
 PACKED_SOLVER_DOC = (" Packed format: a tied pair (qk + v, gdn_qkv + gdn_z) gets one setting (fixing one group fixes "
@@ -53,7 +53,7 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, e
     def model_info():
         """Architecture, budget, action space, the incumbent config (best so far) and tool list."""
         s = spec.summary()
-        bf16 = problem.size({"default": {"bits": 16, "group_size": 128, "quantizer": "rtn"}})["gib"]
+        bf16 = sizes.bf16_bytes(spec) / 2 ** 30      # (not via a bits-16 config: the action space may exclude 16)
         return {"budget_gib": problem.budget_gib, "bf16_gib": round(bf16, 3), "num_layers": spec.num_layers,
                 "full_attention_layers": [i for i, t in enumerate(spec.layer_types) if t == "full_attention"],
                 "groups_full_attention_layer": ["qk", "v", "o", "gate_up", "down"],
@@ -152,7 +152,8 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, e
             dflt = {"bits": 16, "group_size": 128, "quantizer": "rtn"}
             # the packed rules are checked on the solver's result (it gives a fixed group's tied partner the same
             # setting), not on this stand-in config whose unfixed groups are BF16 fill-ins
-            sp_fixed = dict(problem.space, packed=False)
+            # (16 is always allowed here: it marks the groups the editor did not fix, whatever the action space)
+            sp_fixed = dict(problem.space, packed=False, bits=sorted(set(problem.space["bits"]) | {16}))
             try:
                 nf = schema.normalize({"default": dflt, "rules": fixed_rules or [], "groups": fixed_groups or {}},
                                       spec, sp_fixed)

@@ -157,6 +157,9 @@ def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False) -> s
                               quantizers=sp["quantizers"], timeout_s=int((cfg.get("sandbox") or {}).get("timeout_s", 1800)),
                               kl_desc=_kl_desc(problem, cfg), acceptance=acceptance_text(cfg, first=first))
     text = precision_lines(text, sp)
+    if 16 not in sp["bits"]:                 # every group must be quantized: no BF16 example / wording
+        text = text.replace(' (16 = keep BF16)', ' (no BF16 groups: every linear module is quantized)')
+        text = text.replace('"gdn_ba": {{"bits": 16}}'.replace("{{", "{").replace("}}", "}"), '"gdn_ba": {"bits": 8}')
     if sp.get("packed"):                     # (2026-11-27) configs must be writable as the real packed checkpoint
         text = packed_prompt(text, sp)
     if first:   # loop.start bf16, nothing accepted yet

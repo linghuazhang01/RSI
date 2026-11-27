@@ -383,6 +383,20 @@ class TestRunIntegration(unittest.TestCase):
             self.assertNotIn('"lm_head": 8', text_bf)
             self.assertEqual(schema.normalize(make_tool_api(bf, {})._tools["solve_allocation"][0](), bf.spec,
                                               bf.space)["lm_head"], "bf16")
+            # an action space without 16 (every linear module quantized): model_info, the solver with fixed rules
+            # and the prompt all work (model_info used to size a bits-16 config and failed)
+            nb = self._problem(Path(t) / "d", {"action_space": {"bits": [2, 3, 4, 8], "embed": ["bf16"],
+                                                                "lm_head": ["bf16"]}})
+            api_nb = make_tool_api(nb, {})
+            self.assertGreater(api_nb._tools["model_info"][0]()["bf16_gib"], 40)
+            cfg = api_nb._tools["solve_allocation"][0](fixed_rules=[{"layers": [3], "groups": ["down"], "bits": 8}])
+            n = schema.normalize(cfg, nb.spec, nb.space)
+            self.assertEqual(n["groups"]["3.down"]["bits"], 8)
+            self.assertTrue(all(g["bits"] < 16 for g in n["groups"].values()))
+            text_nb = system_prompt(nb, api_nb.describe(), {})
+            self.assertIn("no BF16 groups", text_nb)
+            self.assertIn('"gdn_ba": {"bits": 8}', text_nb)
+            self.assertIn('"gdn_ba": {"bits": 16}', text_dq)
             self.assertIn("ONE fused module", text_pk)
             self.assertIn("Packed format", text_pk)
             self.assertNotIn("awq", text_pk.lower())

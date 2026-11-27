@@ -1,0 +1,24 @@
+# Paper A experiment config (KL only, 2026-11-27): math · 10 generations · 8 x 1 candidates per generation · the
+# quantized model writes the next quantization (loop.editor current: the incumbent, i.e. the lowest-KL quantization
+# accepted so far, is the editor; generation 1 is written by M_0, since nothing is accepted yet with loop.start bf16).
+# Every config is still applied to M_0's original BF16 weights; the lowest KL to M_0 on the 256 fixed reference
+# traces wins when it is below the incumbent's. Only the decoder's linear weights are quantized: 2 / 3 / 4 / 8 bit or
+# 16 (kept BF16) per group (base.yaml action_space); the embedding and LM head stay BF16 (budget 17.38 GiB = uniform
+# W4 g128 + BF16 embed / head). Candidates are scored as fake-quant BF16 checkpoints (inference dequant;
+# loop.editor current cannot be combined with inference packed).
+# Overrides only: merged after base.yaml + domains/math.yaml + the hardware profile (--hw) and before any --set.
+# The number of generations is the CLI's --gens (not a config key):
+#   ./launch.sh --hw h20 --paper A --domains math --gens 10 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_kl_8x1_g10_current.yaml --tag kl_8x1_g10_current
+# GPUs (8): while the editor writes, all 8 GPUs serve it (vLLM tensor parallel 8); while the candidates are evaluated
+#   the editor sleeps and all 8 GPUs serve them, one candidate per GPU.
+# Editor sessions: at most 50 tool rounds of up to 16384 tokens each, no time / token / tool-call cap.
+search:
+  threads: 8                      # 8 independent sessions per generation ...
+  steps: 1                        # ... of one candidate each
+  max_candidates: 8
+loop:
+  editor: current                 # the incumbent (latest accepted quantized model) writes each generation
+  patience: 10                    # never stop early: all 10 generations run even if some keep the incumbent
+editor:
+  tool_rounds: 50                 # at most 50 rounds of tool calls per candidate
+  tensor_parallel: 8              # editor inference on all 8 GPUs (placement only: not part of the run lock)
