@@ -297,6 +297,32 @@ def packed_tensors(cache: QuantCache, module: str, setting: dict) -> dict[str, t
             "scales": d["scale"].t().contiguous()}
 
 
+def gptq_tensors(codes: torch.Tensor, zero: torch.Tensor, scale: torch.Tensor, bits: int) -> dict[str, torch.Tensor]:
+    """{"qweight", "qzeros", "scales"} from unpacked uint8 codes [out, in], uint8 zeros [out, in/g] and bf16 scales
+    [out, in/g]: the same layout as packed_tensors (which reuses the cache's packed bytes instead of repacking)."""
+    return {"qweight": pack_rows_int32(codes.contiguous(), bits).t().contiguous(),
+            "qzeros": pack_rows_int32(zero.t().contiguous(), bits),
+            "scales": scale.t().contiguous()}
+
+
+def decode_rows(words: torch.Tensor, bits: int, n: int, chunk: int = 4096) -> torch.Tensor:
+    """Vectorized unpack_rows_int32 (int32 [R, W] -> int64 [R, n]; any device), in row chunks to bound memory."""
+    if words.shape[1] * 32 < n * bits:
+        raise ValueError(f"{words.shape[1]} words hold fewer than {n} values of {bits} bits")
+    start = torch.arange(n, device=words.device, dtype=torch.int64) * bits
+    k, o = start // 32, start % 32
+    k1 = torch.clamp(k + 1, max=words.shape[1] - 1)
+    cross = (o + bits) > 32
+    mask = (1 << bits) - 1
+    out = torch.empty(words.shape[0], n, dtype=torch.int64, device=words.device)
+    for r0 in range(0, words.shape[0], chunk):
+        w = words[r0:r0 + chunk].to(torch.int64) & 0xFFFFFFFF
+        v = w[:, k] >> o
+        hi = (w[:, k1] << (32 - o)) & 0xFFFFFFFF
+        out[r0:r0 + chunk] = torch.where(cross, v | hi, v) & mask
+    return out
+
+
 def unpack_rows_int32(words: torch.Tensor, bits: int, n: int) -> torch.Tensor:
     """Reference reader of pack_rows_int32 (int32 [R, W] -> int64 values [R, n]), written from humming's
     extract_packed_value (kernel/process.cuh): value j = bits [j*b, j*b+b) of the row's little-endian stream."""

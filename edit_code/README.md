@@ -118,6 +118,26 @@ python -I edit_code/packed_check.py --model <Qwen3.8-27B 目录> --out <临时�
 - 3 比特打包、g32、in_proj_ba 的 N=96 填充；
 - 速度和显存。
 
+**2026-11-28 H20 结果：FAIL。** KL(M_0‖dequant) = 0.0136，KL(M_0‖packed) = 4.05，KL(dequant‖packed) = 4.03；日志里没有 "skip loading"。两种格式的权重按设计逐位相同，所以 4.03 来自真量化推理本身算错，不是量化误差。在查清之前，正式实验不要用 `inference: packed`。
+
+**逐层定位（`packed_kernel_check.py`，不起 vLLM 服务，单卡）**：每个用例是一个 vLLM 线性模块（融合后的，例如 gate_up_proj = gate + up）在一种比特 / 分组下，对若干 batch 大小 M 计算 y = x·W'ᵀ，和 fp32 参考比较，旁边给出同一 W' 的 BF16 cuBLAS 误差作对照。每个用例分几层检查：
+- `fmt`：用 humming 自己的 GPU 解包和反量化（`dequantize_weight`）读 `convert_humming` 之后的张量，和 W' 逐位比较：humming 读我们张量的方式对不对；
+- `vllm`：vLLM 0.24 自己的 `HummingLinearMethod`（从 quantization_config 解析出每层设置，`process_weights_after_loading`，`apply`），即 `vllm serve --quantization humming` 的代码路径；
+- `humming`：同样的步骤直接调用 humming（不经过 vLLM），用来区分是 vLLM 集成的问题还是 kernel 的问题；
+- `native`：humming 自己量化同一组权重（uint 加零点、bf16 scale）再算 GEMM：这一层也错，就是 kernel 在这个形状上本身有 bug，和我们的格式无关；
+- `loader`（可选，`--impls ...,loader`）：vLLM 真正的层类加上 weight_loader_v2，按 checkpoint 分片逐个加载，额外覆盖 qzeros 的分片偏移。
+
+判据：输出有限，且 rel_err ≤ 2 × cuBLAS 误差 + 2e-3。格式或 kernel 出错时误差通常在 0.1 到 1。每个用例在子进程里跑：非法显存访问会毁掉 CUDA 上下文，父进程记下崩在哪个用例、哪个 M，然后从下一个用例重启。
+
+```bash
+# ① 先测 packed_check 那次导出的真实模块（每种 模块 × 比特 × 分组 各取一个，默认混合配置下十几个用例），并核对和 dequant 检查点逐位一致
+python -I edit_code/packed_kernel_check.py --out <临时目录>/kernel_ckpt --gpu 0 --ckpt <packed_check 的 --out>/packed --dequant <packed_check 的 --out>/dequant
+# ② 再扫全部形状：7 种模块 × 2/3/4/8 比特 × g32/64/128（81 个用例），M 从 1 到 8192
+python -I edit_code/packed_kernel_check.py --out <临时目录>/kernel_sweep --gpu 0 --model <Qwen3.8-27B 目录>
+```
+
+输出 `kernel_check.json`（失败的排在前面，带每个 M 的误差、各分片误差、误差最大的 256 列、kernel 的 layer meta）和 `results.jsonl`（原始事件）；终端会打印表格和 `[diagnosis]` 结论，退出码 0 表示全部通过。`--quick` 只测 g128 和 5 个 M；`--modules`、`--bits`、`--group-sizes`、`--m`、`--impls` 可以缩小范围；`--blocking` 设 `CUDA_LAUNCH_BLOCKING=1`，用来精确定位崩溃位置；某个 worker 超过 `--stall-timeout`（默认 1800 秒）没有新事件会被杀掉，记为卡死。终端每完成一个用例打印一行进度，失败的 M 会立即打印。
+
 ## 校准后的显存释放与检查点恢复（2026-11-26）
 
 多卡校准结束后，`QuantProblem._prepare_real_parallel()` 先对每个校准模型调用
@@ -186,6 +206,7 @@ python -I edit_code/packed_check.py --model <Qwen3.8-27B 目录> --out <临时�
 | `quant/cache.py` | 逐层量化缓存（打包整数 + fp16 scale（packed 档 bf16，`*_sbf16`）+ 打包 zero point；缺的条目按需计算并落盘） |
 | `quant/export.py` | 候选检查点导出：fake-quant BF16（结构、配置、tokenizer 文件原样复制，分片布局和张量名不变），或真量化 GPTQ 格式 + humming（`export_packed`、`validate_packed`、`server_args`） |
 | `packed_check.py` | GPU 检查：同一配置的 dequant / packed 两种检查点在 vLLM 上的 KL 是否一致 |
+| `packed_kernel_check.py` | GPU 逐层定位：每个融合模块 × 比特 × 分组的 humming GEMM 和反量化矩阵乘是否一致（格式读取、vLLM 路径、直接 humming、humming 自己量化，四层分开检查） |
 | `quant/kl.py` | 本地 transformers 精确 token KL（诊断表和测试用） |
 | `configs/base.yaml`、`configs/domains/*.yaml` | 全部参数（固定体积 `budget`、`loop`（改造者冻结与否、patience）、动作空间、搜索规模、KL 题集 `kl_eval`、校准文本、校准、缓存、硬件档 `hardware_profiles`、mock 覆盖） |
 
@@ -242,7 +263,7 @@ H20 档（2026-11-25 起按每张卡 **100 GiB** 规划（我们在一张卡上�
 
 ## 尚未做 / 后续
 
-- 真量化格式已加（2026-11-27，`inference=packed`，见上），但还没有在 H20 上跑通 `packed_check.py`；速度和显存测量还没做。
+- 真量化格式已加（2026-11-27，`inference=packed`，见上）。2026-11-28 在 H20 上 `packed_check.py` 失败（KL(dequant‖packed) = 4.03），正在用 `packed_kernel_check.py` 逐层定位；速度和显存测量还没做。
 - `behavior_sensitivity` 诊断表（METHOD_DESIGN §2.2）、`profile_in_context` 工具。
 - 经典基线和测试集准确率已删除（2026-11-25）；如需报告准确率，要另外评测导出的 `gen_XX/model`。
 - 对照：`archive.enabled=false`（不带经验）、`loop.editor=current`（不冻结改造者）都已支持。
