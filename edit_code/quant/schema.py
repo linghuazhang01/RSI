@@ -22,14 +22,22 @@ A config is a JSON object:
 
 `normalize()` returns a fully resolved config ({"groups": {key: setting} for every group, ...}),
 which is what is hashed, sized, cached and exported.
+
+Packed constraints (action_space.packed, 2026-11-27; the real packed export of quant/export.py, served by vLLM's Humming
+kernels): one setting per fused vLLM module (qk == v and gdn_qkv == gdn_z of a layer in bits and group size, BF16
+included), every quantized module's shape packs into int32 words (in % group_size == 0, in * bits % 32 == 0 and
+out * bits % 32 == 0: e.g. 3 bit is impossible for a 48-row in_proj_b), no AWQ (no per-channel scale slot), and the
+embedding / LM head stay BF16 (vLLM never quantizes them in this format).
 """
 from __future__ import annotations
 
-from .spec import GROUP_NAMES, ModelSpec
+from .spec import GROUP_NAMES, TIED_GROUPS, VLLM_FUSED, ModelSpec
 
 DEFAULT_ACTION_SPACE = {"bits": [2, 3, 4, 8, 16], "group_sizes": [32, 64, 128],
                         "quantizers": ["rtn", "gptq", "awq"], "embed": ["bf16", 8, 4],
-                        "lm_head": ["bf16", 8, 4]}
+                        "lm_head": ["bf16", 8, 4], "packed": False}
+# what the real packed export can express (action_space.packed; see packed_problems)
+PACKED_QUANTIZERS = ("rtn", "gptq")
 SETTING_KEYS = ("bits", "group_size", "quantizer")
 
 
@@ -204,7 +212,59 @@ def normalize(config, spec: ModelSpec, action_space: dict | None = None) -> dict
     for k, s in resolved.items():
         if s.get("bits") == 16:
             resolved[k] = {"bits": 16, "group_size": 0, "quantizer": "none"}
-    return {"groups": resolved, "embed": embed, "lm_head": lm_head}
+    norm = {"groups": resolved, "embed": embed, "lm_head": lm_head}
+    if space.get("packed"):
+        problems = packed_problems(norm, spec)
+        if problems:
+            raise ConfigError(problems)
+    return norm
+
+
+def setting_packable(mods, s: dict) -> str | None:
+    """None if these modules can be packed under setting s (bits < 16), else why not."""
+    b, gs = int(s["bits"]), int(s.get("group_size") or 0)
+    if b >= 16:
+        return None
+    if s.get("quantizer") not in PACKED_QUANTIZERS:
+        return f"quantizer {s.get('quantizer')!r} has no packed form (allowed: {', '.join(PACKED_QUANTIZERS)})"
+    for m in mods:
+        out_f, in_f = int(m.shape[0]), int(m.shape[1])
+        if gs <= 0 or in_f % gs:
+            return f"{m.proj} has {in_f} input features, not a multiple of group_size {gs}"
+        if (in_f * b) % 32 or (out_f * b) % 32:
+            return (f"{b}-bit {m.proj} ({out_f} x {in_f}) does not pack into 32-bit words "
+                    f"(needs rows * bits and columns * bits divisible by 32)")
+    return None
+
+
+def packed_problems(norm: dict, spec: ModelSpec) -> list[str]:
+    """Why a resolved config cannot be written as the real packed checkpoint (empty = it can)."""
+    problems = []
+    groups = spec.groups()
+    for i in range(spec.num_layers):
+        for a, b in TIED_GROUPS:
+            sa, sb = norm["groups"].get(f"{i}.{a}"), norm["groups"].get(f"{i}.{b}")
+            if sa is None or sb is None:
+                continue
+            ka = (sa["bits"], sa["group_size"] if sa["bits"] < 16 else 0)
+            kb = (sb["bits"], sb["group_size"] if sb["bits"] < 16 else 0)
+            if ka != kb:
+                fused = VLLM_FUSED[groups[f"{i}.{a}"][0].proj]
+                problems.append(f"{i}.{a} ({_desc(sa)}) and {i}.{b} ({_desc(sb)}) are one vLLM module ({fused}) in the "
+                                f"packed checkpoint: give them the same bits and group_size (e.g. one rule with "
+                                f'"groups": ["{a}", "{b}"])')
+    for key, s in norm["groups"].items():
+        why = setting_packable(groups[key], s)
+        if why:
+            problems.append(f"{key}: {why}")
+    for name in ("embed", "lm_head"):
+        if norm[name] != "bf16" and (name == "embed" or spec.lm_head is not None):
+            problems.append(f"{name}={norm[name]!r}: the packed checkpoint keeps the {name} in BF16")
+    return problems
+
+
+def _desc(s: dict) -> str:
+    return "bf16" if s["bits"] >= 16 else f"{s['bits']} bit g{s['group_size']}"
 
 
 def compress(norm: dict, spec: ModelSpec) -> dict:

@@ -55,7 +55,7 @@ from edit_code.common import (candidate_args, candidate_groups, deep_merge, erro
                               free_cuda, gpu_layout, kl_eval_cfg,
                               load_processed, program_note, read_json, read_jsonl, record_text, search_settings, tail,
                               with_kl_chunk_cap, write_json)
-from edit_code.problem import QuantProblem, add_self_generated, kl_texts_for  # noqa: E402
+from edit_code.problem import QuantProblem, add_self_generated, check_packed_run, kl_texts_for  # noqa: E402
 from edit_code.prompts import archive_row, archive_text, history_row, make_render_context, system_prompt  # noqa: E402
 from edit_code.quant import schema, sizes  # noqa: E402
 from edit_code.tools import make_tool_api  # noqa: E402
@@ -293,6 +293,10 @@ class Runner:
         self.start = (cfg.get("loop") or {}).get("start", "bf16")
         if self.start not in ("bf16", "q0"):
             raise ValueError(f"loop.start must be bf16 or q0, got {self.start!r}")
+        # (2026-11-27) the inference profile (candidates.format, action_space.packed), TP 1 for packed candidates and
+        # the humming kernels, checked before generation 0's M_0 work so a bad combination fails at once
+        lent = [list(self.gpu_editor)] if self.editor_gpus_own and self.editor_sleep else []   # EditorSleep's slot
+        self.checkpoint_format = check_packed_run(cfg, mock=rc.mock, candidate_slots=list(self.cand_slots) + lent)
         self.prep_dir = self.run_dir / "prep"
         self.logf = self.run_dir / "logs" / "edit_run.log"
         self.logf.parent.mkdir(parents=True, exist_ok=True)
@@ -342,7 +346,9 @@ class Runner:
             extra = []
             path = "mock-" + name
         else:
-            extra = server_args(self.cfg, args_key)
+            from edit_code.quant.export import server_args as checkpoint_args   # run.py runs as a script
+            # + the checkpoint's own vLLM args (a packed export: --quantization humming; M_0 / dequant: none)
+            extra = server_args(self.cfg, args_key) + checkpoint_args(model_dir)
             path = model_dir
         return LazyServer(model_path=path, served_name=name, gpu_ids=list(gpus), mock=self.rc.mock,
                           mock_registry=self.registry, seed=self.rc.seed, log_dir=self.run_dir / "logs", extra_args=extra,
@@ -366,7 +372,7 @@ class Runner:
 
     def model_server(self, model_dir: Path, name: str, gpus: list[int], args_key: str,
                      sleep_mode: bool = False) -> LazyServer:
-        """An exported quantized model (fake-quant checkpoint, or mock_model.json in mock mode)."""
+        """An exported quantized model (fake-quant or packed checkpoint, or mock_model.json in mock mode)."""
         q = M.load_state(Path(model_dir) / "mock_model.json")["quality"] if self.rc.mock else None
         return self._server(name, Path(model_dir), q, gpus, args_key, sleep_mode=sleep_mode)
 
@@ -441,14 +447,15 @@ class Runner:
                             prep_gpus=[g[0] for g in self.all_groups] if self.prep_all_gpus else None)
 
     def export(self, prob: QuantProblem, art: dict, dst: Path):
-        """Write the quantized model (fake-quant BF16 checkpoint; mock: its mock state)."""
-        if (dst / "fake_quant.json").exists():
+        """Write the quantized model (candidates.format: fake-quant BF16 or packed checkpoint; mock: its mock state)."""
+        if (dst / "fake_quant.json").exists() and (self.rc.mock or prob.has_checkpoint(dst)):
             return
         if self.rc.mock:
             norm = prob.norm_of(art)
             stt = prob.mock_state(norm)
             M.save_state(dst / "mock_model.json", stt)
-            write_json(dst / "fake_quant.json", {"config": norm, "mock": True, "bytes_gib": art["bytes_gib"]})
+            write_json(dst / "fake_quant.json", {"config": norm, "mock": True, "bytes_gib": art["bytes_gib"],
+                                                 "format": prob.checkpoint_fmt})
         else:  # pragma: no cover - GPU path
             prob.prepare()
             # the accepted candidate's evaluated checkpoint is the same export: move it instead of rewriting

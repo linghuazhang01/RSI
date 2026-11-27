@@ -13,9 +13,11 @@ layers):
                           gdn_out = {out_proj}
   every layer (MLP)     : gate_up = {gate_proj, up_proj}, down = {down_proj}
 Group key = "<layer>.<group>", e.g. "17.down". Embedding / LM head are separate settings.
-vLLM fuses q/k/v, gate/up, in_proj_qkv/z and in_proj_b/a at load time; for the fake-quant BF16
-checkpoints used here that does not matter (a real packed export would need equal settings inside
-each fused module -- see README, future work).
+vLLM fuses q/k/v, gate/up, in_proj_qkv/z and in_proj_b/a at load time (one vLLM module each). For the
+fake-quant BF16 checkpoints that does not matter; the real packed export (quant/export.py, 2026-11-27) has ONE
+quantization setting per fused vLLM module, so qk and v of a layer, and gdn_qkv and gdn_z, must then be equal
+(TIED_GROUPS; schema.normalize enforces it under action_space.packed). VLLM_FUSED maps each projection to its vLLM
+module name (vllm 0.24.0 qwen3_5.py stacked_params_mapping).
 """
 from __future__ import annotations
 
@@ -32,6 +34,14 @@ GROUPS = {
     "mlp": {"gate_up": ["gate_proj", "up_proj"], "down": ["down_proj"]},
 }
 PROJ_GROUP = {p: g for kind in GROUPS.values() for g, ps in kind.items() for p in ps}
+# vLLM module (fused) of each projection (vllm 0.24.0 models/qwen3_5.py:280-294): every module of a fused vLLM module
+# shares one quantization setting in the real packed export
+VLLM_FUSED = {"q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj", "o_proj": "o_proj",
+              "in_proj_qkv": "in_proj_qkvz", "in_proj_z": "in_proj_qkvz", "in_proj_b": "in_proj_ba",
+              "in_proj_a": "in_proj_ba", "out_proj": "out_proj",
+              "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj", "down_proj": "down_proj"}
+# group pairs of one layer that share a fused vLLM module (gdn_ba and gate_up are single groups already)
+TIED_GROUPS = (("qk", "v"), ("gdn_qkv", "gdn_z"))
 GROUP_NAMES = [g for kind in GROUPS.values() for g in kind]
 # modules that see the same input activations share one Hessian / activation statistic
 INPUT_KEY = {"q_proj": "attn_in", "k_proj": "attn_in", "v_proj": "attn_in", "o_proj": "o_in",
@@ -59,6 +69,29 @@ class ModuleInfo:
     @property
     def module_path(self) -> str:
         return self.name[: -len(".weight")]
+
+    @property
+    def vllm_prefix(self) -> str:
+        """The vLLM module prefix this module is loaded into (fused name), e.g.
+        model.language_model.layers.3.mlp.gate_proj.weight -> language_model.model.layers.3.mlp.gate_up_proj
+        (Qwen3.5 / Qwen3-VL hf_to_vllm_mapper: "model.language_model." -> "language_model.model."; a text-only
+        checkpoint keeps "model.layers.")."""
+        return vllm_module_prefix(self.module_path)
+
+
+def vllm_module_prefix(module_path: str) -> str:
+    """HF module path (no ".weight") -> vLLM module prefix (vllm 0.24.0: qwen3_vl.py hf_to_vllm_mapper, qwen3_5.py
+    stacked_params_mapping). Non-decoder modules keep their (mapped) name."""
+    p = module_path
+    for a, b in (("model.language_model.", "language_model.model."), ("model.visual.", "visual."),
+                 ("lm_head", "language_model.lm_head")):
+        if p.startswith(a):
+            p = b + p[len(a):]
+            break
+    head, _, proj = p.rpartition(".")
+    if head and proj in VLLM_FUSED and _LAYER_RE.match(module_path + ".weight"):
+        p = f"{head}.{VLLM_FUSED[proj]}"
+    return p
 
 
 @dataclass

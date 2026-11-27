@@ -2,7 +2,7 @@
 
 Per quantized linear weight [out, in] with b bits and group size g (groups along the input dim):
     codes       out * in * b / 8                    bytes
-    scales      out * ceil(in / g) * 2              (fp16, one per group)
+    scales      out * ceil(in / g) * 2              (fp16, or bf16 under action_space.packed; one per group)
     zero points out * ceil(in / g) * b / 8          (asymmetric, b-bit packed, GPTQ-style)
     awq only    in * 2                              (fp16 per-input-channel scale)
 BF16 (bits 16) modules count 2 bytes per weight. Embedding / LM head: "bf16", or 8/4-bit RTN with

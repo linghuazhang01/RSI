@@ -46,7 +46,10 @@ RUN_SUFFIX = "_single_simple"     # default run-id suffix (kept from the objecti
 # token, dotted paths, and the defaults of keys a newer base.yaml may add (absent = the default)
 LOCK_IGNORED_KEYS = frozenset({
     "objective", "objective_profiles", "scope", "scope_profiles", "mock_objective_overrides", "data", "data_roles",
-    "eval_target", "draw_config", "e_t", "e_task", "e_ref", "e_branch", "kl_contexts", "lambda_kl", "kl_limit"})
+    "eval_target", "draw_config", "e_t", "e_task", "e_ref", "e_branch", "kl_contexts", "lambda_kl", "kl_limit",
+    # (2026-11-27) the profile definitions: what a run uses is the merged result (inference + the keys it set), which
+    # stays locked; the definitions themselves may gain profiles without touching older locks
+    "inference_profiles"})
 LOCK_IGNORED_TOKENS = ("retention", "theta0", "regmean")
 # 2026-11-23: knobs of the removed search / gate variants, the noise band and Paper A's KL score term, by dotted path
 # (also matched under mock_overrides.) -> the values equal to the hard-wired flow. --set / --config of such a key is
@@ -99,7 +102,10 @@ HARDWIRED_FLOW = ("candidates are never screened; every candidate gets one gate 
 # compared only when gate.metric is kl (lock_view drops it under the accuracy gate, where nothing reads it; 2026-11-25:
 # so its defaults, e.g. gate.kl.traces null = the whole gate set, can change without touching accuracy-gate locks)
 # loop.start (Paper A, 2026-11-25): runs locked before it existed started from Q_0
-LOCK_DEFAULTS = {"simple.screen_n": 500, "gate.metric": "accuracy", "loop.start": "q0"}
+# inference / candidates.format / action_space.packed (Paper A, 2026-11-27): runs locked before the inference profiles
+# existed served the fake-quant BF16 checkpoint with the full action space (the dequant profile, which changes nothing)
+LOCK_DEFAULTS = {"simple.screen_n": 500, "gate.metric": "accuracy", "loop.start": "q0", "inference": "dequant",
+                 "candidates.format": "dequant", "action_space.packed": False}
 # --set / --config values of the removed selectors that are accepted as no-ops (the one remaining flow)
 LEGACY_SELECTORS = {"objective": "simple", "scope": "single"}
 
@@ -148,7 +154,7 @@ def build_arg_parser(paper: str) -> argparse.ArgumentParser:
     return ap
 
 
-PROFILE_KEYS = ("hardware",)
+PROFILE_KEYS = ("hardware", "inference")
 
 
 def _legacy_selector(key: str, value, where: str) -> bool:
@@ -230,8 +236,10 @@ def _apply_profile(cfg: dict, sets, key: str, default: str) -> dict:
 
 
 def _apply_hardware(cfg: dict, sets) -> dict:
-    """hardware: b300 | h20 ... (hardware_profiles)."""
-    return _apply_profile(cfg, sets, "hardware", "b300")
+    """hardware: b300 | h20 ... (hardware_profiles), then (2026-11-27) inference: dequant | packed | packed_dequant
+    (inference_profiles, Paper A; a paper config without inference_profiles is unchanged)."""
+    cfg = _apply_profile(cfg, sets, "hardware", "b300")
+    return _apply_profile(cfg, sets, "inference", "dequant")
 
 
 # ---------------------------------------------------------------------------- decoding (2026-11-21)

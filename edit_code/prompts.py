@@ -115,12 +115,50 @@ HISTORY_LINE = ("\n- search_history(gen, sort, offset) lists every candidate alr
                 "so you do not repeat a config that was already tried.")
 
 
+PACKED_RULE = ("- Real quantized checkpoint (vLLM's Humming kernels): qk and v of a layer are ONE fused module, as are "
+               "gdn_qkv and gdn_z, so each pair needs the same bits and group_size (BF16 included). A quantized module "
+               "needs rows * bits and columns * bits divisible by 32 and columns divisible by group_size (e.g. no 3-bit "
+               "gdn_ba when its projections have 48 rows). api.bytes(config) rejects a config that breaks these rules.")
+
+
+def precision_lines(text: str, space: dict) -> str:
+    """The schema's embed / lm_head lines from the action space (the default space keeps the original text); BF16 only
+    (2026-11-27, base.yaml): the embedding and LM head are not quantized."""
+    for key, line, ex in (("embed", '  "embed": "bf16",      # "bf16" | 8 | 4\n', '"bf16",     '),
+                          ("lm_head", '  "lm_head": 8,         # "bf16" | 8 | 4\n', '"bf16",   ')):
+        opts = list(space.get(key, ["bf16", 8, 4]))
+        if opts == ["bf16", 8, 4]:
+            continue
+        if opts == ["bf16"]:
+            new = f'  "{key}": {ex}  # "bf16" only: the {"embedding" if key == "embed" else "LM head"} is not quantized\n'
+        else:
+            new = f'  "{key}": {ex}  # ' + " | ".join(json.dumps(v) for v in opts) + "\n"
+        text = text.replace(line, new)
+    return text
+
+
+def packed_prompt(text: str, space: dict) -> str:
+    """The system prompt under action_space.packed: bf16 scales, no awq in the examples, and the packed-format rules
+    after the module-group line."""
+    text = text.replace("codes + fp16 scales + zero points", "codes + bf16 scales + zero points")
+    text = text.replace("quantizer (rtn / gptq / awq)", "quantizer (" + " / ".join(space["quantizers"]) + ")")
+    text = text.replace("at group size 128; rtn / gptq / awq.", "at group size 128; " + " / ".join(space["quantizers"])
+                        + ".")                                       # the hessian_table tool doc
+    text = text.replace("rejected: awq on gdn_qkv, group_error total +9% vs gptq",
+                        "rejected: rtn on gdn_qkv, group_error total +9% vs gptq")
+    anchor = 'Group keys look like "17.down".\n'
+    return text.replace(anchor, anchor + PACKED_RULE + "\n", 1)
+
+
 def system_prompt(problem, tool_doc: str, cfg: dict, history: bool = False) -> str:
     sp = problem.space
     first = bool(getattr(problem, "incumbent_is_original", False))
     text = SYSTEM_BODY.format(tools=tool_doc, bits=sp["bits"], group_sizes=sp["group_sizes"],
                               quantizers=sp["quantizers"], timeout_s=int((cfg.get("sandbox") or {}).get("timeout_s", 1800)),
                               kl_desc=_kl_desc(problem, cfg), acceptance=acceptance_text(cfg, first=first))
+    text = precision_lines(text, sp)
+    if sp.get("packed"):                     # (2026-11-27) configs must be writable as the real packed checkpoint
+        text = packed_prompt(text, sp)
     if first:   # loop.start bf16, nothing accepted yet
         text = text.replace("the lowest-KL quantization accepted so far (the incumbent)",
                             "the lowest-KL quantization accepted so far (the incumbent; none yet: this round picks the "

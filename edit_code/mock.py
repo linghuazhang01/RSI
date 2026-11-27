@@ -121,13 +121,29 @@ def main(api):
     info = api.model_info()
     budget = info["budget_gib"] * {margin}
     tools = info["tools"]
+    quant = "{quantizer}" if "{quantizer}" in info["quantizers"] else "gptq"
+    emb = {embed} if {embed} in info["embed_options"] else "bf16"
+    head = 8 if 8 in info.get("lm_head_options", [8]) else "bf16"
+    def tie(ch):   # packed format: one setting per fused module, no 3-bit gdn_ba
+        if not info.get("packed_format"):
+            return ch
+        ch = dict(ch)
+        for a, b in info["tied_groups"]:
+            for k in list(ch):
+                if k.endswith("." + a) and k[: -len(a)] + b in ch:
+                    lo_ = min(ch[k], ch[k[: -len(a)] + b])
+                    ch[k] = ch[k[: -len(a)] + b] = lo_
+        for k in ch:
+            if k.endswith(".gdn_ba") and ch[k] == 3:
+                ch[k] = 2
+        return ch
     rules = []
     if {protect} > 0:
         n = info["num_layers"]
         rules.append({{"layers": "%d-%d" % (n - {protect}, n - 1), "groups": ["down", "gate_up"], "bits": 8}})
     if "{strategy}" == "solver" and "solve_allocation" in tools:
         weights = {{"*.down": {down_w}, "*.v": 1.5, "*.gdn_ba": 3.0}}
-        cfg = api.solve_allocation(budget_gib=budget, weights=weights, quantizer="{quantizer}",
+        cfg = api.solve_allocation(budget_gib=budget, weights=weights, quantizer=quant,
                                    fixed_rules=rules)
         return cfg
     # hand-written greedy: start every group at the lowest bit width, upgrade the groups with the
@@ -141,9 +157,10 @@ def main(api):
     lo = ladder[0] if "{strategy}" != "uniform" else ladder[1]
     choice = {{k: lo for k in keys}}
     def cfg_of(ch):
-        return {{"default": {{"bits": lo, "group_size": {gs}, "quantizer": "{quantizer}"}},
+        ch = tie(ch)
+        return {{"default": {{"bits": lo, "group_size": {gs}, "quantizer": quant}},
                 "rules": rules, "groups": {{k: {{"bits": b}} for k, b in ch.items() if b != lo}},
-                "embed": {embed}, "lm_head": 8}}
+                "embed": emb, "lm_head": head}}
     if api.bytes(config=cfg_of(choice))["gib"] > budget:
         return cfg_of(choice)
     improved = True
@@ -198,10 +215,26 @@ def main(api):
     def m(k, b):
         return mib[k]["b%d_g128" % b] if b < 16 else mib[k]["bf16"]
 
+    e0 = 8 if 8 in info["embed_options"] else "bf16"
+    h0 = 8 if 8 in info.get("lm_head_options", [8]) else "bf16"
+
+    def tied():   # packed format: one setting per fused module, no 3-bit gdn_ba
+        ch = dict(bits)
+        if info.get("packed_format"):
+            for a, b in info["tied_groups"]:
+                for k in list(ch):
+                    if k.endswith("." + a) and k[: -len(a)] + b in ch:
+                        lo_ = min(ch[k], ch[k[: -len(a)] + b])
+                        ch[k] = ch[k[: -len(a)] + b] = lo_
+            for k in ch:
+                if k.endswith(".gdn_ba") and ch[k] == 3:
+                    ch[k] = 2
+        return ch
+
     def cfg_of():
         return {"default": {"bits": base, "group_size": 128, "quantizer": "__QUANT__"},
-                "groups": {k: {"bits": b} for k, b in bits.items() if b != base},
-                "embed": inc.get("embed", 8), "lm_head": inc.get("lm_head", 8)}
+                "groups": {k: {"bits": b} for k, b in tied().items() if b != base},
+                "embed": inc.get("embed", e0), "lm_head": inc.get("lm_head", h0)}
 
     slack = (budget - api.bytes(config=cfg_of())["gib"]) * 1024 * 0.999
     def options():

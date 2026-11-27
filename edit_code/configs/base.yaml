@@ -19,8 +19,12 @@ budget:
   reference:                          # null gib -> budget = packed size of this config; it is also the
     default: {bits: 4, group_size: 128, quantizer: gptq}   # starting incumbent Q_0 (uniform W4 GPTQ;
                                                            # was W3 until 2026-11-20: W4 leaves room for 2/3-bit trades)
-    embed: 8
-    lm_head: 8
+    embed: bf16                       # (2026-11-27) only the decoder's linear weights are quantized: the embedding
+    lm_head: bf16                     # and LM head stay BF16 in every inference mode (vLLM's packed format cannot
+                                      # quantize them), so the W4 g128 reference is 17.38 GiB (15.06 with the 8-bit
+                                      # embed / head of runs locked before; resume those with
+                                      # --set budget.reference.embed=8 --set budget.reference.lm_head=8
+                                      # --set 'action_space.embed=[bf16,8,4]' --set 'action_space.lm_head=[bf16,8,4]')
 
 loop:
   editor: frozen                      # frozen: M_0 (BF16) writes every generation; current: the incumbent (ablation)
@@ -31,12 +35,32 @@ loop:
   patience: 3                         # stop after this many consecutive generations without a new incumbent
                                       # (2026-11-22, as Paper B)
 
+# How candidates are served (2026-11-27): --set inference=<profile> (inference_profiles below; --set of a single key
+# still wins). dequant = what every run did before: the fake-quant BF16 checkpoint (quantize -> dequantize, plain vLLM
+# BF16: the quantized model's numbers, no speed / memory gain). packed = REAL quantization: a GPTQ-format checkpoint
+# (int codes + bf16 scales + true zero points, per-module 2/3/4/8 bit, BF16 kept as BF16) served by vLLM 0.24.0's
+# Humming kernels (vllm serve --quantization humming; humming-kernels 0.1.6, pinned by vllm). packed_dequant = the
+# packed action space and bf16-scale cache, served as the fake-quant BF16 checkpoint (the same weights as packed,
+# without the humming kernels: a fallback, and the control that tells kernel effects from config effects).
+inference: dequant
+inference_profiles:
+  dequant: {}
+  packed:
+    candidates: {format: packed}
+    action_space: {packed: true, quantizers: [rtn, gptq]}
+  packed_dequant:
+    candidates: {format: dequant}
+    action_space: {packed: true, quantizers: [rtn, gptq]}
+
 action_space:                         # what a config may use
+  packed: false                       # true (inference packed / packed_dequant): only configs the real packed checkpoint
+                                      # can express (qk == v and gdn_qkv == gdn_z per layer, int32-aligned shapes, no
+                                      # awq, BF16 embed / lm_head) and bf16 scales in the layer cache
   bits: [2, 3, 4, 8, 16]              # 16 = keep BF16
   group_sizes: [32, 64, 128]
   quantizers: [rtn, gptq, awq]        # awq = AWQ-lite (activation-aware channel scaling, RTN grid)
-  embed: [bf16, 8, 4]
-  lm_head: [bf16, 8, 4]
+  embed: [bf16]                       # (2026-11-27) BF16 only: only the linear weights are quantized (the code still
+  lm_head: [bf16]                     # supports 8 / 4 / ... RTN g128 in the dequant format: --set 'action_space.embed=[bf16,8,4]')
 
 search:                               # inner search (RSI_LOOP_DESIGN §1.2; edit_code.common.search_settings)
   threads: 8                          # independent editor sessions per generation (prompts use the configured numbers)
@@ -104,6 +128,8 @@ cache:
     - {quantizer: awq, bits: 4, group_size: 128}
 
 candidates:
+  format: dequant                     # dequant: fake-quant BF16 checkpoint | packed: GPTQ-format + humming (set by the
+                                      # inference profile; packed needs action_space.packed)
   keep_checkpoints: 1                 # fake-quant checkpoints kept per candidate server (~54 GB each; disk = servers x 54 GB)
                                       # (2026-11-23: the slots export in parallel; an accepted candidate's checkpoint is
                                       # moved to gen_XX/model, and gen_XX/ckpt is removed after every generation)

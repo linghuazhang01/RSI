@@ -25,6 +25,10 @@ from .allocation import solve_allocation as _solve
 from .diagnostics import summarize_profile
 from .problem import QuantProblem
 from .quant import schema
+from .quant.spec import TIED_GROUPS
+
+PACKED_SOLVER_DOC = (" Packed format: a tied pair (qk + v, gdn_qkv + gdn_z) gets one setting (fixing one group fixes "
+                     "both), only packable settings are used.")
 
 
 class ToolError(RuntimeError):
@@ -59,8 +63,15 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, e
                 "lm_head_tied": s["lm_head_tied"],
                 "allowed_bits": problem.space["bits"], "group_sizes": problem.space["group_sizes"],
                 "quantizers": problem.space["quantizers"], "embed_options": problem.space["embed"],
+                "lm_head_options": problem.space["lm_head"],
                 "incumbent_config": (problem.incumbent or {}).get("config"),
-                "incumbent_kl": problem.incumbent_kl, "tools": api.names()}
+                "incumbent_kl": problem.incumbent_kl, "tools": api.names()} | (
+            {"packed_format": True,
+             "tied_groups": [list(t) for t in TIED_GROUPS],
+             "packed_rules": "qk and v (and gdn_qkv and gdn_z) of a layer need the same bits and group_size; a "
+                             "quantized module needs rows*bits and columns*bits divisible by 32 and columns divisible "
+                             "by group_size; quantizers rtn / gptq; embed and lm_head bf16"}
+            if problem.space.get("packed") else {})
 
     def profile_table():
         """Whole-model DeltaKL when ONLY this module group is RTN-quantized (original model = reference)."""
@@ -129,19 +140,23 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, e
 
     def solve_allocation(budget_gib: float = None, weights: dict = None, bits: list = None, group_sizes: list = None,
                          quantizer: str = "gptq", fixed_rules: list = None, fixed_groups: dict = None,
-                         embed="bf16", lm_head=8):
+                         embed="bf16", lm_head=None):
         """Multiple-choice knapsack over the profile table: minimise sum(weight(key) * dkl(key, bits, gs))
         s.t. size <= budget_gib (default: this generation's budget). weights: {selector: multiplier}
         (selectors like '*.down', '60-63.gate_up', '7.qk', 'v'); fixed_rules / fixed_groups use the
-        config's rules / groups syntax and are kept as given. Returns a config."""
+        config's rules / groups syntax and are kept as given. lm_head None = 8 if the action space allows it, else
+        "bf16". Returns a config."""
         budget = float(budget_gib if budget_gib is not None else problem.budget_gib)
         fixed = {}
         if fixed_rules or fixed_groups:
             dflt = {"bits": 16, "group_size": 128, "quantizer": "rtn"}
+            # the packed rules are checked on the solver's result (it gives a fixed group's tied partner the same
+            # setting), not on this stand-in config whose unfixed groups are BF16 fill-ins
+            sp_fixed = dict(problem.space, packed=False)
             try:
                 nf = schema.normalize({"default": dflt, "rules": fixed_rules or [], "groups": fixed_groups or {}},
-                                      spec, problem.space)
-                n0 = schema.normalize({"default": dflt}, spec, problem.space)
+                                      spec, sp_fixed)
+                n0 = schema.normalize({"default": dflt}, spec, sp_fixed)
             except schema.ConfigError as e:
                 raise ToolError(str(e)) from None
             fixed = {k: s for k, s in nf["groups"].items() if s != n0["groups"][k]}
@@ -166,5 +181,8 @@ def make_tool_api(problem: QuantProblem, cfg: dict, *, cid: str | None = None, e
     api.register("bytes_table", bytes_table)
     api.register("bytes", bytes)
     if tcfg.get("solve_allocation", True):
-        api.register("solve_allocation", solve_allocation)
+        # the packed format adds its rules to the description (the dequant text stays as it was)
+        api.register("solve_allocation", solve_allocation,
+                     doc=(solve_allocation.__doc__.strip() + PACKED_SOLVER_DOC)
+                     if (getattr(problem, "space", None) or {}).get("packed") else "")
     return api

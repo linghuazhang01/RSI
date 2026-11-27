@@ -3,14 +3,20 @@
 Paper A (fixed size; KL only since 2026-11-25): every problem quantizes the ORIGINAL BF16 model M_0 to the same budget;
 generation g tries to beat the incumbent (lowest-KL quantization accepted so far; loop.start bf16: until one is
 accepted the incumbent is M_0 itself and the lowest-KL in-budget candidate is accepted). It owns: the model spec, the
-layer cache + diagnostics (prepare), config validation / sizing, candidate build (artifact), lazy fake-quant
+layer cache + diagnostics (prepare), config validation / sizing, candidate build (artifact), lazy checkpoint
 materialization, candidate serving, and the ONE evaluation a config gets: the per-trace token KL(M_0 || config) on
 the fixed KL set (kl_eval.n items of generation 0's draw of the training pool, one thinking-mode answer each written
 by M_0 in generation 0; the quantized model reads them, nothing is sampled; rsicore.kl). There is no screen, no
 accuracy gate and no held-out test.
 
+Checkpoint format (candidates.format, 2026-11-27; set by the inference profile in configs/base.yaml): dequant = the
+fake-quant BF16 checkpoint (plain vLLM BF16); packed = the real GPTQ-format checkpoint served by vLLM's Humming kernels
+(--quantization humming). Under action_space.packed (the packed and packed_dequant profiles) every config must be
+writable as the packed checkpoint (schema.packed_problems) and the layer cache computes bf16 scales, so both formats of
+one config give the same weights.
+
 Candidate serving (2026-11-19): the candidate GPUs are split into groups (common.candidate_groups); each
-group is one slot of a pool. serve() takes a free slot, exports the candidate's fake-quant checkpoint into
+group is one slot of a pool. serve() takes a free slot, exports the candidate's checkpoint into
 that slot's directory on the slot's own GPU (exports of different slots run in parallel, one layer cache per slot),
 starts vLLM on the slot's GPUs, and gives the slot back afterwards. So with N groups, N candidates are evaluated at
 the same time (rsicore.search.inner_search(parallel=N)). evaluate() is thread-safe: an identical config
@@ -47,10 +53,68 @@ def _setting(s: dict) -> tuple[int, str, int]:
     return int(s["bits"]), s.get("quantizer", "rtn"), int(s.get("group_size") or 128)
 
 
-def _herr_key(module: str, s: dict) -> str:
-    """The herr cache key of a module under a setting: "module|quantizer|bits|gs"."""
+def _herr_key(module: str, s: dict, tag: str = "") -> str:
+    """The herr cache key of a module under a setting: "module|quantizer|bits|gs" (+ "|sbf16" for the bf16-scale
+    cache of action_space.packed)."""
     b, q, gs = _setting(s)
-    return f"{module}|{q}|{b}|{gs}"
+    return f"{module}|{q}|{b}|{gs}{tag}"
+
+
+def checkpoint_format(cfg: dict) -> str:
+    """candidates.format: "dequant" (default) or "packed"."""
+    from .quant.export import FORMATS
+    fmt = str((cfg.get("candidates") or {}).get("format") or "dequant")
+    if fmt not in FORMATS:
+        raise ValueError(f"candidates.format must be one of {FORMATS}, got {fmt!r}")
+    return fmt
+
+
+PACKED_TP1 = ("inference=packed serves every candidate with tensor parallel 1: under --quantization humming vLLM 0.24.0 "
+              "splits in_proj_ba across GPUs (it keeps it whole only for AWQ / GPTQ / INC configs) and loads a split "
+              "shard's packed zero points at the wrong offset (2-bit gdn_ba at TP 2, 2/4-bit at TP 4, any at TP 8)")
+
+
+def check_packed_run(cfg: dict, *, mock: bool, candidate_slots=None) -> str:
+    """Before any server starts (run.Runner.__init__): the inference profile is consistent, packed candidates are
+    served with TP 1, the current-mode editor ablation is not combined with packed checkpoints (a TP editor would
+    serve the packed incumbent), and the vLLM environment has the humming kernels. Returns the checkpoint format."""
+    space = dict(schema.DEFAULT_ACTION_SPACE, **(cfg.get("action_space") or {}))
+    fmt = checkpoint_format(cfg)
+    check_packed_space(space, fmt)
+    if fmt == "packed":
+        if int((cfg.get("gpu_layout") or {}).get("candidate_group_size", 1) or 1) > 1 or \
+                any(len(s) > 1 for s in (candidate_slots or [])):
+            raise ValueError(PACKED_TP1 + "; set gpu_layout.candidate_group_size: 1 (or use inference=packed_dequant)")
+        if (cfg.get("loop") or {}).get("editor", "frozen") == "current":
+            raise ValueError("loop.editor=current would serve the packed incumbent as the (tensor-parallel) editor; "
+                             "use inference=packed_dequant for that ablation")
+        if not mock:
+            _humming_ok()
+    return fmt
+
+
+def check_packed_space(space: dict, fmt: str) -> None:
+    """A packed checkpoint format needs the packed action space, and that space must allow only what the packed
+    format can express (set together by the inference profiles of configs/base.yaml)."""
+    if fmt == "packed" and not space.get("packed"):
+        raise ValueError("candidates.format packed needs action_space.packed: true (use --set inference=packed)")
+    if space.get("packed"):
+        bad = [q for q in space["quantizers"] if q not in schema.PACKED_QUANTIZERS]
+        bad += [f"{k}={v!r}" for k in ("embed", "lm_head") for v in space[k] if v != "bf16"]
+        if bad:
+            raise ValueError(f"action_space.packed allows only quantizers {list(schema.PACKED_QUANTIZERS)} and a BF16 "
+                             f"embed / lm_head; remove {bad} (the inference=packed profile sets this)")
+
+
+_HUMMING = {"ok": False}
+
+
+def _humming_ok() -> None:
+    """Once per process: the vLLM environment can import humming (candidates.format packed)."""
+    if not _HUMMING["ok"]:
+        from .quant.export import humming_check
+        humming_check()
+        _HUMMING["ok"] = True
 
 
 class HerrDeadline(RuntimeError):
@@ -78,6 +142,8 @@ class QuantProblem:
         self.kl_cfg = kl_eval_cfg(cfg)
         self.log = log
         self.space = dict(schema.DEFAULT_ACTION_SPACE, **(cfg.get("action_space") or {}))
+        self.fmt = checkpoint_format(cfg)          # candidate checkpoints: dequant | packed (2026-11-27)
+        check_packed_space(self.space, self.fmt)
         self.registry = Path(rc.run_dir) / "mock_registry.json"
         self.spec: ModelSpec | None = None
         self.tables: dict | None = None
@@ -87,7 +153,7 @@ class QuantProblem:
         # only serialises herr_module's GPU use of self.cache
         self._export_lock = threading.Lock()
         self._slot_caches: dict = {}               # slot index -> (QuantCache on the slot's first GPU, its lock)
-        self.exported: dict = {}                   # config hash -> a finished fake-quant export (served by serve_all)
+        self.exported: dict = {}                   # config hash -> a finished candidate export (served by serve_all)
         self._inflight: dict = {}                  # (hash, stage) -> threading.Event
         self.slots = candidate_groups(rc, cfg)     # [[GPU ids]] one candidate server per slot
         self._removed: set = set()                 # slot indices taken back (add_slot / remove_slot)
@@ -108,6 +174,20 @@ class QuantProblem:
         self._tool_pool: queue.Queue | None = None
         self._tool_caches: dict = {}
         self._herr_dirty = False
+
+    # ------------------------------------------------------------------ format (2026-11-27)
+    @property
+    def packed_space(self) -> bool:
+        """action_space.packed: configs must be writable as the packed checkpoint; the cache uses bf16 scales."""
+        return bool((getattr(self, "space", None) or {}).get("packed"))
+
+    @property
+    def checkpoint_fmt(self) -> str:
+        return getattr(self, "fmt", "dequant")
+
+    @property
+    def _herr_tag(self) -> str:
+        return "|sbf16" if self.packed_space else ""
 
     # ------------------------------------------------------------------ bookkeeping
     @property
@@ -176,6 +256,8 @@ class QuantProblem:
                                                   self.space["group_sizes"]), meta)
         if not self.mock and self.cache is None:
             self.cache = self._open_cache()
+        if not self.mock and self.checkpoint_fmt == "packed":
+            _humming_ok()
         if self.tables.get("hessian") is None:     # built after the layer cache (it reads cached entries)
             self.tables["hessian"] = self.hessian_table()
             write_json(self.prep_dir / "diagnostics" / "hessian_table.json", self.tables["hessian"])
@@ -193,7 +275,7 @@ class QuantProblem:
         setting; H = the module's input Hessian from the calibration pass (sum over tokens). Memoised and
         persisted (prep/diagnostics/herr_cache.json). bits 16 -> 0 error. cache / lock: a worker's own layer
         cache on its GPU (hessian_table over several GPUs); default self.cache under the export lock."""
-        key, (b, q, gs) = _herr_key(module, setting), _setting(setting)
+        key, (b, q, gs) = _herr_key(module, setting, self._herr_tag), _setting(setting)
         with self._herr_lock:
             got = self._herr_store().get(key)
         if got is not None:
@@ -254,7 +336,7 @@ class QuantProblem:
             for key, s in norm["groups"].items():
                 if _setting(s)[0] >= 16:
                     continue
-                out.extend(k for k in (_herr_key(m.name, s) for m in groups[key]) if k not in store)
+                out.extend(k for k in (_herr_key(m.name, s, self._herr_tag) for m in groups[key]) if k not in store)
         return out
 
     @contextlib.contextmanager
@@ -360,10 +442,18 @@ class QuantProblem:
         return f"cuda:{g}" if dev == "cuda" else dev
 
     def _open_cache(self, device: str | None = None):
+        import torch
         from .quant.cache import QuantCache
+        # action_space.packed (2026-11-27): bf16 scales, the ones vLLM's Humming kernels use (cache files *_sbf16)
+        sd = torch.bfloat16 if self.packed_space else torch.float16
         return QuantCache(self.prep_dir / "cache", self.spec, self.source_dir, hessian_dir=self.prep_dir / "hessians",
                           device=device or self._device(), damp=self.cfg["cache"].get("gptq_damp", 0.01),
-                          lazy=self.cfg["cache"].get("lazy", True), log=self.log)
+                          lazy=self.cfg["cache"].get("lazy", True), scale_dtype=sd, log=self.log)
+
+    def _warm_variants(self) -> list[dict]:
+        """cache.warm without the quantizers the action space does not allow (awq under action_space.packed)."""
+        allowed = (getattr(self, "space", None) or schema.DEFAULT_ACTION_SPACE)["quantizers"]
+        return [v for v in (self.cfg["cache"].get("warm") or []) if v.get("quantizer") in allowed]
 
     def _prepare_real(self):  # GPU path on the cluster; exercised on CPU by tests/test_quant.py
         from .diagnostics import activation_table_real, profile_rows, warn_slow_kernels
@@ -387,7 +477,7 @@ class QuantProblem:
         del model
         free_cuda()
         self.cache = self._open_cache()
-        self.cache.warm(self.cfg["cache"].get("warm", []))
+        self.cache.warm(self._warm_variants())
         free_cuda()
         return prof, act, {"seconds": time.time() - t0, "contexts": len(batches), "profile_contexts": len(ptexts),
                            "cache_disk_gib": self.cache.disk_bytes() / 2 ** 30}
@@ -490,7 +580,7 @@ class QuantProblem:
         free_cuda()
         mods = [m.name for m in self.spec.modules]
         caches = [self._open_cache(device=d) for d in devs]
-        warm = self.cfg["cache"].get("warm", [])
+        warm = self._warm_variants()
         with ThreadPoolExecutor(max_workers=k) as ex:
             list(ex.map(lambda i: caches[i].warm(warm, modules=mods[i::k]), range(k)))
         self.cache = self._open_cache()
@@ -545,16 +635,22 @@ class QuantProblem:
         return read_json(self.out_dir / "configs" / f"{art['config_hash']}.json")
 
     # ------------------------------------------------------------------ candidate model
+    def has_checkpoint(self, d) -> bool:
+        """d holds a finished export in this problem's format (candidates.format)."""
+        from .quant.export import read_marker
+        info = read_marker(d) if d else None
+        return bool(info) and info.get("format", "dequant") == self.checkpoint_fmt
+
     def materialize(self, art: dict, dst: Path | None = None, slot: int = 0) -> Path | None:
-        """Write the fake-quant checkpoint (real mode) on the first GPU of candidate slot `slot` (free at this
-        point: its previous server has stopped). Default dst: out_dir/ckpt/slot<k>/<hash>, one checkpoint
-        per slot on disk (candidates.keep_checkpoints <= 1). Returns its path."""
+        """Write the candidate checkpoint (candidates.format: dequant or packed) on the first GPU of candidate slot
+        `slot` (free at this point: its previous server has stopped). Default dst: out_dir/ckpt/slot<k>/<hash>, one
+        checkpoint per slot on disk (candidates.keep_checkpoints <= 1). Returns its path."""
         if self.mock:
             return None
-        from .quant.export import export_fake_quant
+        from .quant.export import export_checkpoint
         sdir = self.out_dir / "ckpt" / f"slot{slot}"
         dst = Path(dst) if dst else sdir / art["config_hash"]
-        if (dst / "fake_quant.json").exists():
+        if self.has_checkpoint(dst):
             return dst
         if dst.parent == sdir and self.cfg["candidates"].get("keep_checkpoints", 1) <= 1:
             for p in sdir.glob("*"):  # bounded disk: one candidate checkpoint per slot
@@ -562,7 +658,7 @@ class QuantProblem:
                     shutil.rmtree(p, ignore_errors=True)
         cache, lock = self._slot_cache(slot)
         with lock:              # (2026-11-23) per slot: the exports of different slots run at the same time
-            export_fake_quant(self.source_dir, dst, self.norm_of(art), self.spec, cache,
+            export_checkpoint(self.checkpoint_fmt, self.source_dir, dst, self.norm_of(art), self.spec, cache,
                               meta={"tag": self.tag, "gen": self.gen, "budget_gib": self.budget_gib}, log=self.log)
             free_cuda()   # the candidate vLLM server starts on this GPU next (80 GB cards: every GB counts)
         return dst
@@ -594,7 +690,7 @@ class QuantProblem:
                 continue
             info = json.loads(fq.read_text())
             if info.get("config") != want or info.get("gen") != self.gen or info.get("tag") != self.tag \
-                    or str(info.get("source")) != str(self.source_dir):
+                    or str(info.get("source")) != str(self.source_dir) or info.get("format", "dequant") != self.checkpoint_fmt:
                 continue
             dst = Path(dst)
             if dst.exists():
@@ -604,6 +700,10 @@ class QuantProblem:
             self.log(f"[export] reused the evaluated checkpoint {d} -> {dst}")
             return True
         return False
+
+    def _check_tp(self, gpus) -> None:
+        if self.checkpoint_fmt == "packed" and len(gpus) > 1:
+            raise RuntimeError(PACKED_TP1 + f" (slot GPUs {list(gpus)})")
 
     @contextmanager
     def serve(self, art: dict, name: str):
@@ -621,9 +721,11 @@ class QuantProblem:
                                 seed=self.rc.seed, log_dir=logs) as srv:
                     yield srv
             else:  # pragma: no cover - GPU path
+                from .quant.export import server_args
+                self._check_tp(gpus)
                 ckpt = self.materialize(art, slot=slot)
                 with VLLMServer(ckpt, name, gpus, seed=self.rc.seed, log_dir=logs,
-                                extra_args=candidate_args(self.cfg)) as srv:
+                                extra_args=candidate_args(self.cfg) + server_args(ckpt)) as srv:
                     yield srv
         finally:
             self._pool.put(slot)
@@ -653,11 +755,14 @@ class QuantProblem:
                 srvs = [VLLMServer("mock-" + name, name, self.slots[s], mock=True, mock_registry=self.registry,
                                    seed=self.rc.seed, log_dir=logs) for s in slots]
             else:  # pragma: no cover - GPU path
+                from .quant.export import server_args
+                for s in slots:
+                    self._check_tp(self.slots[s])
                 inc = self.incumbent or {}
                 ckpt = Path(inc["model_dir"]) if (inc.get("config_hash") == art["config_hash"] and inc.get("model_dir")
-                                                  and (Path(inc["model_dir"]) / "fake_quant.json").exists()) else None
+                                                  and self.has_checkpoint(inc["model_dir"])) else None
                 ex = self.exported.get(art["config_hash"])
-                if ckpt is None and ex and (Path(ex) / "fake_quant.json").exists():   # e.g. Q_0's exported model
+                if ckpt is None and ex and self.has_checkpoint(ex):   # e.g. Q_0's exported model
                     ckpt = Path(ex)
                 if ckpt is None and keep:
                     ckpt = self.materialize(art, slot=slots[0])
@@ -665,7 +770,7 @@ class QuantProblem:
                     tmp = self.out_dir / "ckpt" / "shared" / art["config_hash"]
                     ckpt = self.materialize(art, dst=tmp, slot=slots[0])
                 srvs = [VLLMServer(ckpt, name, self.slots[s], seed=self.rc.seed, log_dir=logs,
-                                   extra_args=candidate_args(self.cfg)) for s in slots]
+                                   extra_args=candidate_args(self.cfg) + server_args(ckpt)) for s in slots]
             try:
                 start_all(srvs)
                 yield srvs

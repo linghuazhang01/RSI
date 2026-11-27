@@ -75,6 +75,49 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 
 `context_tokens` 的默认值写在 `hardware_profiles`（b300 / h20: 131072，h20_80: 49152；硬件档在 `editor:` 块之后合并），所以改默认值要改那里，或用 `--set`（`--set` 优先）。真实服务器上 `rsicore.servers` 会把 `--max-model-len` 压到模型 `config.json` 的 `max_position_embeddings` 以内（打警告，不加 YaRN），工具解析器按聊天模板自动选（qwen3_coder / hermes）。这些键都在锁定的配置里：改了要用新的 `--run-id`。
 
+## 候选怎么推理：反量化 BF16 或真量化（`inference`，2026-11-27）
+
+**只量化解码层的线性层权重（2026-11-27 起，所有档都一样）**：embedding 和 lm_head 一律保持 BF16（各 2.37 GiB，[248320 × 5120]）。原因是 packed 格式下 vLLM 不量化它们；为了让各档的预算和数值口径一致，dequant 档也不再量化。`action_space.embed / lm_head` 只有 `[bf16]`，基准 Q_0 = 线性层 W4 g128 GPTQ + embed/lm_head BF16，预算 **17.38 GiB**（以前是 15.06 GiB：embed/lm_head 8 比特）。代码仍支持 dequant 档量化它们（RTN g128）：`--set 'action_space.embed=[bf16,8,4]'` 等。**这之前锁定的 run 续跑时要带回旧值**：`--set budget.reference.embed=8 --set budget.reference.lm_head=8 --set 'action_space.embed=[bf16,8,4]' --set 'action_space.lm_head=[bf16,8,4]'`，否则配置锁会拒绝。
+
+用 `--set inference=<档>` 选（`configs/base.yaml` 的 `inference_profiles`，和 `hardware` 一样在 `--set` 之前合并，单个键再 `--set` 仍然优先；写进锁定的配置，换档要新的 `--run-id`）：
+
+| 档 | 候选检查点 | 配置空间 | 用途 |
+|---|---|---|---|
+| `dequant`（默认） | fake-quant BF16（量化再反量化），vLLM 当普通 BF16 加载 | 2/3/4/8/16 比特、g32/64/128、rtn/gptq/awq | 只看量化后的数值，没有速度和显存收益 |
+| `packed` | **真量化**：GPTQ 格式（整数码 + bf16 scale + 真实零点），`vllm serve --quantization humming` | 只允许真格式能表达的配置（见下） | 真 kernel 上的 KL，可部署 |
+| `packed_dequant` | fake-quant BF16，但配置空间和 bf16 scale 缓存与 `packed` 相同 | 同 `packed` | 和 `packed` 权重逐位相同，不依赖 humming：备用，也用来区分 kernel 误差和配置本身的误差 |
+
+真量化格式（`quant/export.py` 的 `export_packed`）：
+- 每个量化模块存 `qweight` int32 `[in·b/32, out]`（沿输入维的连续小端位流，3 比特会跨字）、`qzeros` int32 `[in/g, out·b/32]`（**真实零点**，不是 GPTQ v1 的 零点−1）、`scales` bf16 `[in/g, out]`；不写 `g_idx`（humming 不用）。BF16 模块保留原来的 `.weight`。
+- `config.json` 加 `quantization_config`：`quant_method: gptq, sym: false, desc_act: false`，`dynamic` 里每个 vLLM 模块一条 `"+:<正则>": {bits, group_size}`，BF16 模块一条 `"-:<正则>"`，再加一条只放行解码层线性层的 `"-:"`（视觉塔、MTP、embedding、lm_head 一律 BF16）。正则按 vLLM 的模块名写（`language_model.model.layers.N.mlp.gate_up_proj` 这种融合后的名字）。
+- 读这种格式的是 vLLM 0.24.0 自带的 Humming 后端（依赖 `humming-kernels[cu13]==0.1.6`，vLLM 的 `requirements/cuda.txt` 固定了这个版本）。必须加 `--quantization humming`，不加的话 vLLM 走 AutoGPTQ，只认对称 4/8 比特。这个参数由导出时写进 `fake_quant.json` 的 `vllm_args` 自动带上，M_0 和 dequant 检查点不会带。
+- 权重 = bf16((code − zero) · bf16(scale))。`action_space.packed` 下逐层缓存用 bf16 scale 计算（文件名 `*_sbf16.safetensors`；以前的 fp16 scale 转成 bf16 会让 8 比特明显变差），所以同一个配置的两种格式权重逐位相同（`tests/test_packed.py` 在 CPU 上验证）。
+
+`packed` / `packed_dequant` 下配置必须满足（`schema.packed_problems`，`api.bytes` / `normalize` 会直接报错；`solve_allocation` 自动遵守；提示词和 `model_info` 会告诉改造者）：
+1. 同一层的 `qk` 和 `v`、`gdn_qkv` 和 `gdn_z` 在 vLLM 里是**一个**融合模块，bits 和 group_size 必须相同（BF16 也要一起）；
+2. 量化模块要能整齐打进 int32：`in % g == 0`、`in·b % 32 == 0`、`out·b % 32 == 0`（例：in_proj_b 只有 48 行时不能用 3 比特）；
+3. 量化器只有 rtn / gptq（AWQ 的逐通道缩放在这个格式里没有位置）；
+4. embedding 和 lm_head 必须是 BF16（vLLM 在这个格式下不量化它们；现在所有档都如此，见上）。
+
+`packed` 档的限制，在 `Runner` 初始化时（第 0 代任何 M_0 服务启动之前）一次检查完（`problem.check_packed_run`），不满足就直接报错，不会白跑第 0 代：
+- 档位前后一致：`candidates.format` 和 `action_space` 要匹配；
+- 候选服务只能 TP1：vLLM 0.24.0 在 `--quantization humming` 下会把 in_proj_ba 切到多卡，被切开的分片零点会加载到错误位置（gdn_ba 2 比特在 TP2、2/4 比特在 TP4、任何比特在 TP8 都会错，而且静默）。所以 `gpu_layout.candidate_group_size` 必须是 1，借给候选的改造者卡也必须是单卡；
+- 不能和 `loop.editor=current` 一起用，因为那样会让多卡 TP 的改造者去服务 packed incumbent。这个消融请用 `packed_dequant`；
+- vLLM 的 Python 环境要能 `import humming`（解释器从 `vllm` 启动脚本推出来，可用 `RSI_VLLM_PYTHON` 指定）。
+
+vLLM 加载时**不检查**量化张量是否齐全，名字或配置写错会静默产生错误权重。所以导出后 `validate_packed` 会按 vLLM 的规则从 `quantization_config` 重新推出每个模块的设置，并检查张量形状和 dtype，不一致就拒绝这个导出。
+
+**上 H20 先跑一次 GPU 检查**（本机没有 GPU，下面几点都还没有实测）：
+
+```bash
+python -I edit_code/packed_check.py --model <Qwen3.8-27B 目录> --out <临时目录> --gpu 0 --traces <某次 run>/baseline/kl_gate/traces.json
+```
+
+默认每个服务用 82 GiB、prefill 分块 2048（和 h20 的候选服务一致，`--gpu-memory-gib` / `--max-num-batched-tokens` 可改）；`--prep <run>/prep --quantizer gptq` 会用那次 run 的 Hessian 和 `cache.gptq_damp`，并把它已算好的 bf16 条目复制过来，但不会写入那次 run 的缓存。它用一个覆盖 2/3/4/8/16 比特、g32/64/128、绑定模块的混合配置（默认 RTN，不需要校准），导出两种格式，在同一张卡上依次启动 M_0、dequant、packed 三个服务，报告 KL(M_0‖dequant)、KL(M_0‖packed) 和 KL(dequant‖packed)。最后一个应接近 0，同时检查服务日志里有没有 vLLM 的 "skip loading" 警告；通过返回 0 并写 `packed_check.json`。没有实测的项：
+- humming 的整数零点 kernel 路径（上游测试只覆盖浮点零点）；
+- 3 比特打包、g32、in_proj_ba 的 N=96 填充；
+- 速度和显存。
+
 ## 校准后的显存释放与检查点恢复（2026-11-26）
 
 多卡校准结束后，`QuantProblem._prepare_real_parallel()` 先对每个校准模型调用
@@ -140,8 +183,9 @@ mock：`mock_overrides` 把布局缩小到 3 线程 × 1 步、KL 题集 24 道�
 | `quant/sizes.py` | 解析大小 `bytes(config)` |
 | `quant/quantizers.py` | RTN / GPTQ / AWQ-lite（非对称 min-max、按输入维分组），bit 打包 |
 | `quant/hessian.py` | 校准前向（transformers）：每层每种输入的 Hessian 与激活统计，按层窗口分批 |
-| `quant/cache.py` | 逐层量化缓存（打包整数 + fp16 scale + 打包 zero point；缺的条目按需计算并落盘） |
-| `quant/export.py` | fake-quant BF16 检查点导出（结构、配置、tokenizer 文件原样复制，分片布局和张量名不变） |
+| `quant/cache.py` | 逐层量化缓存（打包整数 + fp16 scale（packed 档 bf16，`*_sbf16`）+ 打包 zero point；缺的条目按需计算并落盘） |
+| `quant/export.py` | 候选检查点导出：fake-quant BF16（结构、配置、tokenizer 文件原样复制，分片布局和张量名不变），或真量化 GPTQ 格式 + humming（`export_packed`、`validate_packed`、`server_args`） |
+| `packed_check.py` | GPU 检查：同一配置的 dequant / packed 两种检查点在 vLLM 上的 KL 是否一致 |
 | `quant/kl.py` | 本地 transformers 精确 token KL（诊断表和测试用） |
 | `configs/base.yaml`、`configs/domains/*.yaml` | 全部参数（固定体积 `budget`、`loop`（改造者冻结与否、patience）、动作空间、搜索规模、KL 题集 `kl_eval`、校准文本、校准、缓存、硬件档 `hardware_profiles`、mock 覆盖） |
 
@@ -183,11 +227,11 @@ H20 档（2026-11-25 起按每张卡 **100 GiB** 规划（我们在一张卡上�
 - 全注意力层：`qk`={q_proj,k_proj}、`v`、`o`
 - 线性注意力层（Gated DeltaNet）：`gdn_qkv`={in_proj_qkv}、`gdn_z`={in_proj_z}、`gdn_ba`={in_proj_b,in_proj_a}、`gdn_out`={out_proj}
 - 每层：`gate_up`={gate_proj,up_proj}、`down`
-- 另有 `embed` / `lm_head` 精度（bf16 / 8 / 4，RTN g128）。组键形如 `17.down`。
+- embedding / lm_head 保持 BF16（2026-11-27 起；代码支持的 8 / 4 比特 RTN g128 默认关闭）。组键形如 `17.down`。
 
 ## 大小怎么算（`quant/sizes.py`）
 
-每个量化权重 [out,in]，b 比特、group size g：codes `out·in·b/8` + scale `out·⌈in/g⌉·2`（fp16）+ zero point `out·⌈in/g⌉·b/8`；AWQ 另加 `in·2`。16 比特按 2 字节。其余张量（norm、conv1d、A_log、dt_bias、视觉塔）按存储 dtype 计；`mtp.*` 不计。
+每个量化权重 [out,in]，b 比特、group size g：codes `out·in·b/8` + scale `out·⌈in/g⌉·2`（fp16；packed 档 bf16，同样 2 字节）+ zero point `out·⌈in/g⌉·b/8`（packed 档的真实检查点正好是这么多字节）；AWQ 另加 `in·2`。16 比特按 2 字节。其余张量（norm、conv1d、A_log、dt_bias、视觉塔）按存储 dtype 计；`mtp.*` 不计。
 
 ## 验证状态（2026-11-19，本机 macOS 无 GPU）
 
@@ -198,7 +242,7 @@ H20 档（2026-11-25 起按每张卡 **100 GiB** 规划（我们在一张卡上�
 
 ## 尚未做 / 后续
 
-- 真实打包格式（compressed-tensors）导出和速度测量：llm-compressor 装不进 vLLM 0.24.0 + Transformers 5.9.0，没有依赖它。真实打包时，vLLM 的融合模块（qkv、gate_up、in_proj_qkvz、in_proj_ba）内部要求设置相同，目前 fake-quant 下不受此限制。
+- 真量化格式已加（2026-11-27，`inference=packed`，见上），但还没有在 H20 上跑通 `packed_check.py`；速度和显存测量还没做。
 - `behavior_sensitivity` 诊断表（METHOD_DESIGN §2.2）、`profile_in_context` 工具。
 - 经典基线和测试集准确率已删除（2026-11-25）；如需报告准确率，要另外评测导出的 `gen_XX/model`。
 - 对照：`archive.enabled=false`（不带经验）、`loop.editor=current`（不冻结改造者）都已支持。

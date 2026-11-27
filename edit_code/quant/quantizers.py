@@ -1,7 +1,9 @@
 """Weight quantizers (torch): RTN, GPTQ, AWQ-lite; bit packing; dequantization.
 
 All quantizers are asymmetric min-max per group along the input dimension (GPTQ/AutoGPTQ style):
-    scale = (max(w_g, 0) - min(w_g, 0)) / (2^b - 1)   (stored fp16)
+    scale = (max(w_g, 0) - min(w_g, 0)) / (2^b - 1)   (rounded to and stored in `scale_dtype`: fp16 by
+                                                       default; bf16 for the real packed export, whose kernels
+                                                       (vLLM Humming) cast every scale to the model's bf16)
     zero  = round(-min / scale)                        (b-bit int)
     code  = clamp(round(w / scale) + zero, 0, 2^b - 1)
     w'    = (code - zero) * scale
@@ -24,7 +26,7 @@ import torch
 @dataclass
 class QResult:
     codes: torch.Tensor          # uint8 [out, in]
-    scale: torch.Tensor          # fp16  [out, ngroups]
+    scale: torch.Tensor          # fp16 (or bf16, scale_dtype) [out, ngroups]
     zero: torch.Tensor           # uint8 [out, ngroups]
     bits: int
     group_size: int
@@ -38,15 +40,15 @@ def _groups(in_f: int, gs: int) -> int:
     return math.ceil(in_f / gs)
 
 
-def _qparams(wg: torch.Tensor, bits: int):
-    """wg [..., gs] float -> (scale fp16-rounded float, zero float) per group."""
+def _qparams(wg: torch.Tensor, bits: int, scale_dtype=torch.float16):
+    """wg [..., gs] float -> (scale rounded to scale_dtype, as float; zero float) per group."""
     maxq = 2 ** bits - 1
     xmin = torch.clamp(wg.amin(dim=-1), max=0)
     xmax = torch.clamp(wg.amax(dim=-1), min=0)
     both0 = (xmin == 0) & (xmax == 0)
     xmin = torch.where(both0, torch.full_like(xmin, -1.0), xmin)
     xmax = torch.where(both0, torch.full_like(xmax, 1.0), xmax)
-    scale = ((xmax - xmin) / maxq).to(torch.float16).float()
+    scale = ((xmax - xmin) / maxq).to(scale_dtype).float()
     scale = torch.where(scale <= 0, torch.full_like(scale, 1e-8), scale)
     zero = torch.clamp(torch.round(-xmin / scale), 0, maxq)
     return scale, zero
@@ -60,7 +62,7 @@ def _pad_cols(W: torch.Tensor, gs: int) -> tuple[torch.Tensor, int]:
     return W, pad
 
 
-def rtn(W: torch.Tensor, bits: int, group_size: int) -> QResult:
+def rtn(W: torch.Tensor, bits: int, group_size: int, scale_dtype=torch.float16) -> QResult:
     W = W.float()
     out_f, in_f = W.shape
     Wp, pad = _pad_cols(W, group_size)
@@ -69,11 +71,11 @@ def rtn(W: torch.Tensor, bits: int, group_size: int) -> QResult:
         last = wg[:, -1, :]
         valid = group_size - pad
         last[:, valid:] = last[:, :1]
-    scale, zero = _qparams(wg, bits)
+    scale, zero = _qparams(wg, bits, scale_dtype)
     maxq = 2 ** bits - 1
     codes = torch.clamp(torch.round(wg / scale[..., None]) + zero[..., None], 0, maxq)
     codes = codes.reshape(out_f, -1)[:, :in_f].to(torch.uint8)
-    return QResult(codes=codes, scale=scale.to(torch.float16), zero=zero.to(torch.uint8), bits=bits,
+    return QResult(codes=codes, scale=scale.to(scale_dtype), zero=zero.to(torch.uint8), bits=bits,
                    group_size=group_size)
 
 
@@ -109,7 +111,7 @@ def _prep_hessian(H: torch.Tensor, W: torch.Tensor, damp: float):
 
 
 def gptq(W: torch.Tensor, H: torch.Tensor, bits: int, group_size: int, *, damp: float = 0.01,
-         block_size: int = 128) -> QResult:
+         block_size: int = 128, scale_dtype=torch.float16) -> QResult:
     """GPTQ with lazy batch updates. W [out, in] (any float dtype), H [in, in] (sum of x x^T)."""
     dev = W.device
     W = W.float()
@@ -146,7 +148,7 @@ def gptq(W: torch.Tensor, H: torch.Tensor, bits: int, group_size: int, *, damp: 
                 # current (error-compensated) weights of this group: part in W1, rest in W
                 seg = torch.cat([W1[:, i:min(count, i + gend - col)], W[:, i2:gend]], dim=1) \
                     if gend > i2 else W1[:, i:i + (gend - col)]
-                s, z = _qparams(seg[:, None, :], bits)
+                s, z = _qparams(seg[:, None, :], bits, scale_dtype)
                 scales[:, g], zeros[:, g] = s[:, 0], z[:, 0]
             g = col // group_size
             s, z = scales[:, g], zeros[:, g]
@@ -159,12 +161,12 @@ def gptq(W: torch.Tensor, H: torch.Tensor, bits: int, group_size: int, *, damp: 
             W1[:, i:] -= err[:, None] * Hinv1[i, i:][None, :]
             Err1[:, i] = err
         W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
-    return QResult(codes=codes.to(torch.uint8), scale=scales.to(torch.float16), zero=zeros.to(torch.uint8),
+    return QResult(codes=codes.to(torch.uint8), scale=scales.to(scale_dtype), zero=zeros.to(torch.uint8),
                    bits=bits, group_size=group_size)
 
 
 def awq_lite(W: torch.Tensor, H: torch.Tensor, n_tokens: int, bits: int, group_size: int,
-             grid: int = 11) -> QResult:
+             grid: int = 11, scale_dtype=torch.float16) -> QResult:
     dev = W.device
     W = W.float()
     H = H.to(dev).float()
@@ -176,7 +178,7 @@ def awq_lite(W: torch.Tensor, H: torch.Tensor, n_tokens: int, bits: int, group_s
         s = s / torch.sqrt(s.max() * s.min())
         s16 = s.to(torch.float16)
         s = s16.float()
-        q = rtn(W * s[None, :], bits, group_size)
+        q = rtn(W * s[None, :], bits, group_size, scale_dtype)
         q.col_scale = s16
         err = h_error(W, dequant(q, torch.float32), H)
         if err < best_err:
@@ -185,15 +187,15 @@ def awq_lite(W: torch.Tensor, H: torch.Tensor, n_tokens: int, bits: int, group_s
 
 
 def quantize(W: torch.Tensor, quantizer: str, bits: int, group_size: int, *, H: torch.Tensor | None = None,
-             n_tokens: int = 0, damp: float = 0.01) -> QResult:
+             n_tokens: int = 0, damp: float = 0.01, scale_dtype=torch.float16) -> QResult:
     if quantizer == "rtn":
-        return rtn(W, bits, group_size)
+        return rtn(W, bits, group_size, scale_dtype)
     if H is None:
         raise ValueError(f"quantizer {quantizer!r} needs a Hessian (calibration statistics)")
     if quantizer == "gptq":
-        return gptq(W, H, bits, group_size, damp=damp)
+        return gptq(W, H, bits, group_size, damp=damp, scale_dtype=scale_dtype)
     if quantizer == "awq":
-        return awq_lite(W, H, n_tokens, bits, group_size)
+        return awq_lite(W, H, n_tokens, bits, group_size, scale_dtype=scale_dtype)
     raise ValueError(f"unknown quantizer {quantizer!r}")
 
 

@@ -1,8 +1,11 @@
 """Run-level layer quantization cache, built once from M_0 (run_dir/prep/cache).
 
 Every (module, quantizer, bits, group size) of the original model M_0 is quantized at most once and
-stored on disk as packed integer codes + fp16 scales + packed zero points (+ AWQ channel scales):
-    <root>/<module tensor name>/<quantizer>_b<bits>_g<gs>.safetensors
+stored on disk as packed integer codes + scales + packed zero points (+ AWQ channel scales):
+    <root>/<module tensor name>/<quantizer>_b<bits>_g<gs>.safetensors         fp16 scales (dequant runs)
+    <root>/<module tensor name>/<quantizer>_b<bits>_g<gs>_sbf16.safetensors   bf16 scales (2026-11-27: runs whose
+        configs must be servable as the real packed checkpoint, action_space.packed; vLLM's Humming kernels cast
+        every scale to bf16, so the codes are computed with bf16-rounded scales and both export formats agree)
 A candidate config is then assembled by dequantizing cached entries (seconds per layer), instead of
 running GPTQ for the whole model per candidate (EvoPress-style). Missing entries are computed
 lazily (RTN needs only the weight; GPTQ / AWQ need the Hessians from quant/hessian.py) and then
@@ -57,7 +60,7 @@ class QuantCache:
             return lk
 
     def __init__(self, root: Path, spec: ModelSpec, model_dir: Path, *, hessian_dir: Path | None = None,
-                 device: str = "cpu", damp: float = 0.01, lazy: bool = True, log=print):
+                 device: str = "cpu", damp: float = 0.01, lazy: bool = True, scale_dtype=torch.float16, log=print):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.spec = spec
@@ -66,12 +69,16 @@ class QuantCache:
         self.device = device
         self.damp = damp
         self.lazy = lazy
+        if scale_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"scale_dtype must be torch.float16 or torch.bfloat16, got {scale_dtype}")
+        self.scale_dtype = scale_dtype
         self.log = log
         self.stats = {"hits": 0, "computed": 0, "seconds": 0.0}
 
     # ------------------------------------------------------------------------------ paths
     def path(self, module: str, quantizer: str, bits: int, gs: int) -> Path:
-        return self.root / module / f"{quantizer}_b{bits}_g{gs}.safetensors"
+        tag = "_sbf16" if self.scale_dtype == torch.bfloat16 else ""
+        return self.root / module / f"{quantizer}_b{bits}_g{gs}{tag}.safetensors"
 
     def has(self, module: str, quantizer: str, bits: int, gs: int) -> bool:
         return self.path(module, quantizer, bits, gs).exists()
@@ -116,7 +123,7 @@ class QuantCache:
                 raise RuntimeError(f"no Hessian for {module}: cannot compute {quantizer}")
             m = self.spec.module(module)
             H, n, _ = load_hessian(self.hessian_dir, m.layer, m.input_key, device=self.device)
-        return Q.quantize(W, quantizer, bits, gs, H=H, n_tokens=n, damp=self.damp)
+        return Q.quantize(W, quantizer, bits, gs, H=H, n_tokens=n, damp=self.damp, scale_dtype=self.scale_dtype)
 
     def get(self, module: str, quantizer: str, bits: int, gs: int) -> Q.QResult:
         p = self.path(module, quantizer, bits, gs)
@@ -135,6 +142,22 @@ class QuantCache:
             self.stats["computed"] += 1
             self.stats["seconds"] += time.time() - t0
             return q
+
+    def raw(self, module: str, quantizer: str, bits: int, gs: int) -> dict:
+        """The stored tensors of an entry, computing it first when missing: {"codes" (uint8, Q.pack: one LSB-first
+        bitstream over the row-major [out, in] codes), "scale", "zero" (packed the same way over [out, ngroups]),
+        "shape" (out, in, out, ngroups), "col_scale" (awq only)}. The real packed export reads it."""
+        p = self.path(module, quantizer, bits, gs)
+        if not p.exists():
+            self.get(module, quantizer, bits, gs)
+        else:
+            self.stats["hits"] += 1
+        with safe_open(str(p), framework="pt") as f:
+            meta = f.metadata()
+            d = {k: f.get_tensor(k) for k in f.keys()}
+        if int(meta["bits"]) != bits or int(meta["group_size"]) != gs:
+            raise RuntimeError(f"cache entry {p} holds b{meta['bits']} g{meta['group_size']}")
+        return d
 
     def dequant(self, module: str, setting: dict, dtype=torch.bfloat16) -> torch.Tensor:
         """Fake-quant weight for one module under a resolved setting (bits 16 = original)."""
