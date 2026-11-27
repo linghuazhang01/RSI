@@ -1,0 +1,29 @@
+# Paper A experiment config (KL only, 2026-11-27): math · 5 generations · 8 x 1 candidates per generation.
+# The editor is always the original BF16 model M_0 (loop.editor frozen). Every candidate it writes is exported as the
+# REAL packed low-bit checkpoint (inference packed: GPTQ format, served on vLLM's Humming kernels with
+# --quantization humming, one GPU each), and its score is KL(M_0 || that deployed model) on the 256 fixed reference
+# traces; the lowest KL wins when it is below the incumbent's (loop.start bf16: generation 1 accepts the lowest-KL
+# in-budget candidate). Only the decoder's linear weights are quantized, 2 / 3 / 4 / 8 bit or 16 (kept BF16) per
+# group; the embedding and LM head stay BF16 (budget 17.38 GiB = uniform W4 g128 + BF16 embed / head). The packed
+# format restricts configs to what it can express: qk == v and gdn_qkv == gdn_z per layer, int32-aligned shapes,
+# quantizers rtn / gptq.
+# Check the packed format once on the H20 first: python -I edit_code/packed_check.py --model <M_0> --out <dir> --gpu 0
+# Overrides only: merged after base.yaml + domains/math.yaml + the hardware profile (--hw) and before any --set.
+# The number of generations is the CLI's --gens (not a config key):
+#   ./launch.sh --hw h20 --paper A --domains math --gens 5 --gpus 0,1,2,3,4,5,6,7 --config plan/configs/run/A_math_kl_8x1_g5_frozen_packed.yaml --tag kl_8x1_g5_frozen_packed
+# GPUs (8): while M_0 writes, all 8 GPUs serve it (vLLM tensor parallel 8); while the candidates are evaluated the
+#   editor sleeps and all 8 GPUs serve them, one packed candidate per GPU (packed candidates must be TP 1).
+# Editor sessions: at most 50 tool rounds of up to 16384 tokens each, then the final turn (thinking + the program) of
+#   up to 32768 tokens (base.yaml: 16384); no time / token / tool-call cap. The editor's context is 131072.
+inference: packed                 # real low-bit candidates (base.yaml inference_profiles; selects the profile)
+search:
+  threads: 8                      # 8 independent sessions per generation ...
+  steps: 1                        # ... of one candidate each
+  max_candidates: 8
+loop:
+  editor: frozen                  # the original BF16 model M_0 writes every generation
+  patience: 5                     # never stop early: all 5 generations run even if some keep the incumbent
+editor:
+  tool_rounds: 50                 # at most 50 rounds of tool calls per candidate
+  max_tokens: 32768               # the final turn (thinking + the program); the tool turns stay at 16384
+  tensor_parallel: 8              # editor inference on all 8 GPUs (placement only: not part of the run lock)
